@@ -21,7 +21,6 @@ include $(SPDK_ROOT_DIR)/mk/spdk.app.mk
 # spdk.app.mk supplies the canonical linker command; keep project objects and
 # output directories outside the SPDK source tree.
 OBJS := $(OBJ)
-CLEAN_FILES += $(BUILD_DIR)
 $(APP): $(OBJ) | $(BUILD_DIR)/bin
 
 .PHONY: all app spdk spdk-configure check-spdk compile-commands run clean distclean
@@ -56,5 +55,10 @@ run: all
 
 distclean: clean
 	$(MAKE) -C $(SPDK_ROOT_DIR) clean
+
+# Override spdk.app.mk's clean (it only removes files, cannot remove the
+# build directory). SPDK is only cleaned by distclean.
+clean:
+	rm -rf $(BUILD_DIR)
 
 -include $(DEP)
