@@ -5,42 +5,74 @@
 
 #include "hfs.h"
 
-#define HFS_SUPER_MAGIC	0x48465342U	/* 'HFSB' */
+/* Magic value stored in the super block ('HFSB'). */
+#define HFS_SUPER_MAGIC	0x48465342U
+/* Super block format version. */
 #define HFS_SUPER_VERSION	1U
+/* Maximum number of inodes held in the in-memory table. */
 #define HFS_MAX_INODES	65536U
 
+/* Inode types. */
 #define HFS_INODE_DIR	1
 #define HFS_INODE_FILE	2
 
+/*
+ * Super block: persisted in the blobstore super blob.
+ * Points to the metadata blob which stores the serialized inode table.
+ */
 struct hfs_super_block {
-	uint64_t magic;
-	uint32_t version;
-	uint64_t metaBlobId;
-	uint64_t rootInodeId;
-	uint32_t checksum;
+	uint64_t magic;		/* HFS_SUPER_MAGIC, detects unformatted storage */
+	uint32_t version;	/* HFS_SUPER_VERSION */
+	uint64_t metaBlobId;	/* blob id holding the serialized inode table */
+	uint64_t rootInodeId;	/* inode id of the root directory */
+	uint32_t checksum;	/* simple checksum of the super block */
 };
 
+/*
+ * Inode: one entry per directory or file.
+ * Directories and files share one flat table; hierarchy is expressed
+ * through parentId.
+ */
 struct hfs_inode {
-	uint64_t id;
-	uint8_t type;
-	uint64_t parentId;
-	uint64_t blobId;
-	uint64_t size;
-	uint64_t mtimeNs;
-	uint64_t ctimeNs;
-	char name[FILENAME_LENGTH];
+	uint64_t id;		/* unique inode number */
+	uint8_t type;		/* HFS_INODE_DIR or HFS_INODE_FILE */
+	uint64_t parentId;	/* inode id of the parent directory */
+	uint64_t blobId;	/* data blob (file) or metadata blob (dir) */
+	uint64_t size;		/* file size in bytes */
+	uint64_t mtimeNs;	/* last modification time, ns since epoch */
+	uint64_t ctimeNs;	/* creation time, ns since epoch */
+	char name[FILENAME_LENGTH];	/* name within the parent directory */
 };
 
+/*
+ * Load or format the metadata: allocates the inode table, then either
+ * reads it back from the metadata blob or formats a fresh one.
+ * Returns 0 on success, -1 on failure.
+ */
 int hfsMetaInit(Hfs *fs);
+
+/* Read the super blob id from the blobstore. */
 int hfsMetaLoad(Hfs *fs);
+
+/* Create the metadata blob and register it as the blobstore super blob. */
 int hfsMetaFormat(Hfs *fs);
+
+/* Persist the super block (currently a no-op stub). */
 int hfsMetaSave(Hfs *fs);
 
+/* Serialize the in-memory inode table into the metadata blob. */
 int hfsMetaSaveAll(Hfs *fs);
+
+/* Read the metadata blob and rebuild the in-memory inode table. */
 int hfsMetaLoadAll(Hfs *fs);
 
+/* Append a zeroed inode to the table and return it, or NULL if full. */
 struct hfs_inode *hfsMetaAddInode(Hfs *fs);
+
+/* Look up an inode by (parentId, name), or NULL if not found. */
 struct hfs_inode *hfsMetaFindByName(Hfs *fs, uint64_t parentId, const char *name);
+
+/* Look up an inode by its id, or NULL if not found. */
 struct hfs_inode *hfsMetaFindById(Hfs *fs, uint64_t id);
 
 #endif /* HFS_META_H */

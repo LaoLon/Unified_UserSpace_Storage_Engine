@@ -6,11 +6,13 @@
 
 #include "hfs_internal.h"
 
+/* Completion callback for spdk_bs_unload. */
 static void hfsSpdkBsUnloadCb(void *arg, int bserrno) {
 	Hfs *fs = (Hfs *)arg;
 	fs->finished = true;
 }
 
+/* SPDK-thread task: release the I/O channel and unload the blobstore. */
 static void hfsDoUmount(void *arg) {
 	Hfs *fs = (Hfs *)arg;
 
@@ -22,6 +24,10 @@ static void hfsDoUmount(void *arg) {
 	}
 }
 
+/*
+ * Completion callback for spdk_bs_init: record the blobstore, io unit
+ * size and allocate the I/O channel used by all blob operations.
+ */
 static void hfsSpdkBsInitCb(void *arg, struct spdk_blob_store *bs, int bserrno) {
 	Hfs *fs = (Hfs *)arg;
 
@@ -41,11 +47,16 @@ static void hfsSpdkBsInitCb(void *arg, struct spdk_blob_store *bs, int bserrno) 
 	SPDK_NOTICELOG("mount finished\n");
 }
 
+/* Bdev event callback (informational, currently unused). */
 static void hfsSpdkBdevEventCb(enum spdk_bdev_event_type type, struct spdk_bdev *bdev,
 				void *event_ctx) {
 	SPDK_NOTICELOG("hfsSpdkBdevEventCb\n");
 }
 
+/*
+ * SPDK-thread task: wrap the "Malloc0" bdev as a blobstore device and
+ * initialize the blobstore on it.
+ */
 static void hfsDoMount(void *arg) {
 	Hfs *fs = (Hfs *)arg;
 
@@ -61,14 +72,14 @@ static void hfsDoMount(void *arg) {
 	SPDK_NOTICELOG("hfs_entry\n");
 }
 
-// mount
+/* Mount the blobstore synchronously; returns waiter success. */
 int hfsMount(Hfs *fs) {
 	fs->finished = false;
 
 	return waiter(globalThread, hfsDoMount, fs, &fs->finished);
 }
 
-// umount
+/* Unmount the blobstore synchronously; returns waiter success. */
 int hfsUmount(Hfs *fs) {
 	fs->finished = false;
 

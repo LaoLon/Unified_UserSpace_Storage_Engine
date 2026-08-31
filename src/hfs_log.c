@@ -22,6 +22,10 @@
 
 #include "hfs_log.h"
 
+/*
+ * Rotation and retention limits: rotate at 1 MiB, keep at most 300
+ * tar.gz archives, ring queue of 1024 formatted lines, 10 ms poll.
+ */
 #define HFS_LOG_MAX_SIZE	(1024U * 1024U)
 #define HFS_LOG_MAX_BACKUPS	300U
 #define HFS_LOG_QUEUE_SIZE	1024U
@@ -37,11 +41,13 @@
 #define HFS_LOG_FILE_NAME	"hfs_base_spdk.log"
 #define HFS_LOG_FILE_PREFIX	"hfs_base_spdk"
 
+/* One pre-formatted log line waiting in the ring queue. */
 struct hfs_log_entry {
 	uint32_t len;
 	char data[HFS_LOG_LINE_SIZE];
 };
 
+/* Ring queue shared by producers (hfs_log_write) and the writer thread. */
 static struct hfs_log_entry g_queue[HFS_LOG_QUEUE_SIZE];
 static uint32_t g_queueHead;
 static uint32_t g_queueTail;
@@ -59,12 +65,14 @@ static FILE *g_logFile;
 static uint64_t g_fileSize;
 static uint64_t g_reopenAfterMs;
 
+/* Monotonic clock in milliseconds (scheduling/flush timing). */
 static uint64_t hfsLogNowMs(void) {
 	struct timespec ts;
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	return (uint64_t)ts.tv_sec * 1000U + (uint64_t)ts.tv_nsec / 1000000U;
 }
 
+/* Map a log level to its printable name. */
 static const char *hfsLogLevelName(enum hfs_log_level level) {
 	switch (level) {
 	case HFS_LEVEL_DEBUG:
@@ -79,6 +87,7 @@ static const char *hfsLogLevelName(enum hfs_log_level level) {
 	return "INFO";
 }
 
+/* Format the current wall-clock time as YYYY-MM-DD HH:MM:SS.mmmZ. */
 static void hfsLogTimestamp(char *buf, size_t size) {
 	struct timespec ts;
 	struct tm tm;
@@ -90,6 +99,7 @@ static void hfsLogTimestamp(char *buf, size_t size) {
 		 tm.tm_hour, tm.tm_min, tm.tm_sec, ts.tv_nsec / 1000000);
 }
 
+/* Replace newlines/carriage returns with escaped forms, keeping one line per entry. */
 static void hfsLogEscapeNewlines(char *msg) {
 	char tmp[HFS_LOG_LINE_SIZE];
 	size_t src = 0;
@@ -111,6 +121,7 @@ static void hfsLogEscapeNewlines(char *msg) {
 	memcpy(msg, tmp, dst + 1);
 }
 
+/* Reopen the log file after a write failure, with a 1 s backoff. */
 static void hfsLogTryReopen(void) {
 	char path[PATH_MAX];
 	struct stat st;
@@ -142,6 +153,7 @@ static void hfsLogCloseFile(void) {
 	}
 }
 
+/* Run tar via posix_spawnp with a timeout; capture stdout into 'out'. */
 static int hfsLogRunTar(char *const argv[], char *out, size_t outSize) {
 	posix_spawn_file_actions_t actions;
 	struct pollfd pfd;
@@ -233,6 +245,7 @@ static int hfsLogBackupCmp(const void *a, const void *b) {
 	return strcmp(ba->name, bb->name);
 }
 
+/* Delete oldest archives so at most HFS_LOG_MAX_BACKUPS-1 remain before publish. */
 static int hfsLogCleanupBackups(void) {
 	DIR *dir;
 	struct dirent *de;
@@ -299,6 +312,7 @@ static int hfsLogCleanupBackups(void) {
 	return rc;
 }
 
+/* Compress one rotated .log segment into a verified .tar.gz archive. */
 static int hfsLogArchiveOne(const char *name) {
 	char src[PATH_MAX];
 	char tmp[PATH_MAX];
@@ -334,6 +348,7 @@ static int hfsLogArchiveOne(const char *name) {
 	return 0;
 }
 
+/* Finish any rotated-but-uncompressed .log segments left in bak/. */
 static int hfsLogArchiveOldSegments(void) {
 	DIR *dir;
 	struct dirent *de;
@@ -363,6 +378,7 @@ static int hfsLogArchiveOldSegments(void) {
 	return rc;
 }
 
+/* Build a unique archive base name: prefix.timestamp.pid.seq. */
 static int hfsLogMakeArchiveName(char *buf, size_t size) {
 	uint32_t i;
 
@@ -388,6 +404,7 @@ static int hfsLogMakeArchiveName(char *buf, size_t size) {
 	return -1;
 }
 
+/* Rotate the active log: close, rename to bak, reopen, then archive the old segment. */
 static bool hfsLogRotate(void) {
 	char name[NAME_MAX + 1];
 	char src[PATH_MAX];
@@ -429,6 +446,7 @@ static bool hfsLogRotate(void) {
 	return true;
 }
 
+/* Write a batch of queued lines to the log file, rotating when the size limit is hit. */
 static void hfsLogWriteBatch(struct hfs_log_entry *batch, uint32_t n) {
 	uint32_t i;
 	bool rotated = false;
@@ -462,6 +480,7 @@ static void hfsLogWriteBatch(struct hfs_log_entry *batch, uint32_t n) {
 	}
 }
 
+/* Direct write from the writer thread (drops summary), bypassing the queue. */
 static void hfsLogBackendWrite(enum hfs_log_level level, const char *fmt, ...) {
 	char ts[64];
 	char msg[HFS_LOG_LINE_SIZE];
@@ -496,6 +515,7 @@ static void hfsLogBackendWrite(enum hfs_log_level level, const char *fmt, ...) {
 	g_fileSize += (uint64_t)n;
 }
 
+/* Writer thread: drains the queue, flushes, rotates and reports drops. */
 static void *hfsLogThread(void *arg) {
 	struct hfs_log_entry batch[HFS_LOG_BATCH_MAX];
 	uint64_t lastFlush = hfsLogNowMs();
@@ -561,6 +581,7 @@ static void *hfsLogThread(void *arg) {
 	return NULL;
 }
 
+/* Trim a partial trailing line left by a crash so appends start on a clean line. */
 static void hfsLogTrimTail(void) {
 	char path[PATH_MAX];
 	struct stat st;
@@ -601,6 +622,7 @@ static void hfsLogTrimTail(void) {
 	close(fd);
 }
 
+/* Remove leftover *.tar.gz.tmp files from previous runs. */
 static void hfsLogCleanupTmp(void) {
 	DIR *dir;
 	struct dirent *de;
@@ -625,6 +647,7 @@ static void hfsLogCleanupTmp(void) {
 	closedir(dir);
 }
 
+/* Override the minimum level via the HFS_LOG_LEVEL environment variable. */
 static void hfsLogSetLevelFromEnv(void) {
 	const char *s = getenv("HFS_LOG_LEVEL");
 
@@ -642,6 +665,10 @@ static void hfsLogSetLevelFromEnv(void) {
 	}
 }
 
+/*
+ * Initialize logging: create directories, repair leftovers, open the
+ * active log and start the writer thread.
+ */
 int hfs_log_init(void) {
 	char path[PATH_MAX];
 	struct stat st;
@@ -684,6 +711,7 @@ int hfs_log_init(void) {
 	return 0;
 }
 
+/* Stop the writer thread, drain the queue and close the log file. */
 void hfs_log_fini(void) {
 	if (!atomic_load(&g_running)) {
 		return;
@@ -697,10 +725,12 @@ void hfs_log_fini(void) {
 	}
 }
 
+/* True if messages at this level should be logged. */
 bool hfs_log_enabled(enum hfs_log_level level) {
 	return level >= g_minLevel;
 }
 
+/* Format a line (non-blocking) and enqueue it; drop on contention/full queue. */
 void hfs_log_write(enum hfs_log_level level, const char *file, int line,
 		   const char *fmt, ...) {
 	char ts[64];

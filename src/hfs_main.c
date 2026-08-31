@@ -10,6 +10,11 @@
 #include "hfs_log.h"
 #include "hfs_meta.h"
 
+/*
+ * Self-test program: exercises the full HFS lifecycle.
+ * Runs mount -> open -> write -> offset read/write -> close -> umount,
+ * plus metadata (super blob + inode table) persistence checks.
+ */
 int main(int argc, char *argv[]) {
 	if (hfs_lib_init() != 0) {
 		fprintf(stderr, "hfs_lib_init failed\n");
@@ -18,12 +23,18 @@ int main(int argc, char *argv[]) {
 
 	Hfs *fs = hfs_lib_get_fs();
 
-	/* 同一进程内重复 load：验证 set_super 持久化生效（malloc bdev 重启即失） */
+	/*
+	 * Reload the super blob id within the same process: verifies that
+	 * set_super persisted (malloc bdev loses data across restarts).
+	 */
 	int loadRc = hfsMetaLoad(fs);
 	SPDK_NOTICELOG("reload meta rc=%d\n", loadRc);
 	HFS_LOG_INFO("reload meta rc=%d", loadRc);
 
-	/* inode 表：加一条 → saveAll → 重置内存 → loadAll 应恢复 */
+	/*
+	 * Inode table round-trip: add an inode -> saveAll -> reset the
+	 * in-memory table -> loadAll should restore it from the blob.
+	 */
 	struct hfs_inode *in = hfsMetaAddInode(fs);
 	if (in != NULL) {
 		in->type = HFS_INODE_DIR;

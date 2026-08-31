@@ -6,6 +6,7 @@
 
 #include "hfs_internal.h"
 
+/* Completion callback for spdk_bs_delete_blob. */
 static void hfsSpdkBlobDeleteCb(void *arg, int bserrno) {
 	HfsFile *file = (HfsFile *)arg;
 
@@ -13,6 +14,7 @@ static void hfsSpdkBlobDeleteCb(void *arg, int bserrno) {
 	file->finished = true;
 }
 
+/* Completion callback for spdk_blob_close. */
 static void hfsSpdkBlobCloseCb(void *arg, int bserrno) {
 	HfsFile *file = (HfsFile *)arg;
 
@@ -20,42 +22,50 @@ static void hfsSpdkBlobCloseCb(void *arg, int bserrno) {
 	file->finished = true;
 }
 
+/* SPDK-thread task: close the data blob (handle only). */
 static void hfsDoClose(void *arg) {
 	HfsFile *file = (HfsFile *)arg;
 
 	spdk_blob_close(file->blob, hfsSpdkBlobCloseCb, file);
 }
 
+/* Completion callback for spdk_bs_delete_blob (delete path). */
 static void hfsSpdkBsDeleteDoneCb(void *arg, int bserrno) {
 	hfsSpdkBlobDeleteCb(arg, bserrno);
 }
 
+/* SPDK-thread task: delete the data blob by id (unlink path). */
 static void hfsDoDeleteBlob(void *arg) {
 	HfsFile *file = (HfsFile *)arg;
 
 	spdk_bs_delete_blob(file->fs->blobstore, file->blobId, hfsSpdkBsDeleteDoneCb, file);
 }
 
-// close: 只关闭句柄，不删除 blob（删除由 unlink 负责）
+/*
+ * Close the file handle only; the blob is kept.
+ * Blob deletion is the responsibility of unlink (hfsDeleteBlobById).
+ */
 int hfsClose(HfsFile *file) {
 	file->finished = false;
 
 	return waiter(globalThread, hfsDoClose, file, &file->finished);
 }
 
-// delete: 按 blobId 删除数据 blob（unlink 使用）
+/* Delete the data blob by id (used by unlink). */
 int hfsDeleteBlobById(HfsFile *file) {
 	file->finished = false;
 
 	return waiter(globalThread, hfsDoDeleteBlob, file, &file->finished);
 }
 
+/* Completion callback for spdk_blob_io_read. */
 static void hfsSpdkBlobReadCb(void *arg, int bserrno) {
 	HfsFile *file = (HfsFile *)arg;
 
 	file->finished = true;
 }
 
+/* SPDK-thread task: read ioUnits starting at ioOffset into readBuffer. */
 static void hfsDoRead(void *arg) {
 	HfsFile *file = (HfsFile *)arg;
 
@@ -63,12 +73,14 @@ static void hfsDoRead(void *arg) {
 		file->ioOffset, file->ioUnits, hfsSpdkBlobReadCb, file);
 }
 
+/* Completion callback for spdk_blob_io_write. */
 static void hfsSpdkBlobWriteCb(void *arg, int bserrno) {
 	HfsFile *file = (HfsFile *)arg;
 
 	file->finished = true;
 }
 
+/* SPDK-thread task: write ioUnits at ioOffset from writeBuffer. */
 static void hfsDoWrite(void *arg) {
 	HfsFile *file = (HfsFile *)arg;
 
@@ -76,6 +88,7 @@ static void hfsDoWrite(void *arg) {
 		file->ioOffset, file->ioUnits, hfsSpdkBlobWriteCb, file);
 }
 
+/* Completion callback for spdk_blob_sync_md (open path). */
 static void hfsSpdkBlobSyncCb(void *arg, int bserrno) {
 	HfsFile *file = (HfsFile *)arg;
 
@@ -84,6 +97,7 @@ static void hfsSpdkBlobSyncCb(void *arg, int bserrno) {
 	file->finished = true;
 }
 
+/* Completion callback for spdk_blob_resize (open path): sync metadata. */
 static void hfsSpdkBlobResizeCb(void *arg, int bserrno) {
 	HfsFile *file = (HfsFile *)arg;
 
@@ -95,6 +109,10 @@ static void hfsSpdkBlobResizeCb(void *arg, int bserrno) {
 	spdk_blob_sync_md(file->blob, hfsSpdkBlobSyncCb, file);
 }
 
+/*
+ * Completion callback for spdk_bs_open_blob (open path):
+ * grow the blob to all free clusters, then sync metadata.
+ */
 static void hfsSpdkBsOpenBlobCb(void *arg, struct spdk_blob *blb, int bserrno) {
 	HfsFile *file = (HfsFile *)arg;
 
@@ -107,6 +125,7 @@ static void hfsSpdkBsOpenBlobCb(void *arg, struct spdk_blob *blb, int bserrno) {
 	spdk_blob_resize(blb, freeCluster, hfsSpdkBlobResizeCb, file);
 }
 
+/* Completion callback for spdk_bs_create_blob (open path). */
 static void hfsSpdkBsCreateBlobCb(void *arg, spdk_blob_id blobId, int bserrno) {
 	HfsFile *file = (HfsFile *)arg;
 
@@ -116,31 +135,35 @@ static void hfsSpdkBsCreateBlobCb(void *arg, spdk_blob_id blobId, int bserrno) {
 	spdk_bs_open_blob(file->fs->blobstore, blobId, hfsSpdkBsOpenBlobCb, file);
 }
 
+/* SPDK-thread task: create a new blob (open creates a fresh file). */
 static void hfsDoOpen(void *arg) {
 	HfsFile *file = (HfsFile *)arg;
 
 	spdk_bs_create_blob(file->fs->blobstore, hfsSpdkBsCreateBlobCb, file);
 }
 
-// open
+/* Open a fresh file: create blob -> open -> grow -> sync. */
 int hfsOpen(HfsFile *file) {
 	file->finished = false;
 
 	return waiter(globalThread, hfsDoOpen, file, &file->finished);
 }
 
+/* Completion callback for spdk_blob_resize (write path). */
 static void hfsSpdkBlobResizeDoneCb(void *arg, int bserrno) {
 	HfsFile *file = (HfsFile *)arg;
 
 	file->finished = true;
 }
 
+/* SPDK-thread task: grow the blob to cover 'bytes'. */
 static void hfsDoResize(void *arg) {
 	HfsFile *file = (HfsFile *)arg;
 
 	spdk_blob_resize(file->blob, file->resizeClusters, hfsSpdkBlobResizeDoneCb, file);
 }
 
+/* Grow the blob if needed so that offset+bytes fits; returns success. */
 static bool hfsEnsureSize(HfsFile *file, uint64_t bytes) {
 	uint64_t clusterSize = spdk_bs_get_cluster_size(file->fs->blobstore);
 	uint64_t needClusters = (bytes + clusterSize - 1) / clusterSize;
@@ -154,7 +177,11 @@ static bool hfsEnsureSize(HfsFile *file, uint64_t bytes) {
 	return waiter(globalThread, hfsDoResize, file, &file->finished);
 }
 
-// read at offset
+/*
+ * Read 'count' bytes at an explicit byte offset.
+ * Reads whole io units into a DMA buffer, then copies the requested
+ * window back to the caller.
+ */
 ssize_t hfsReadAt(HfsFile *file, uint8_t *buffer, size_t count, uint64_t offset) {
 	uint64_t unitSize = file->fs->unitSize;
 	uint64_t startUnit = offset / unitSize;
@@ -189,7 +216,12 @@ ssize_t hfsReadAt(HfsFile *file, uint8_t *buffer, size_t count, uint64_t offset)
 	return (ssize_t)toCopy;
 }
 
-// write at offset
+/*
+ * Write 'count' bytes at an explicit byte offset.
+ * Uses read-modify-write on the covering io units so that
+ * unaligned writes do not clobber surrounding data. Grows the blob
+ * first if the write extends beyond the current size.
+ */
 ssize_t hfsWriteAt(HfsFile *file, const uint8_t *buffer, size_t count, uint64_t offset) {
 	uint64_t unitSize = file->fs->unitSize;
 	uint64_t startUnit = offset / unitSize;
@@ -209,6 +241,7 @@ ssize_t hfsWriteAt(HfsFile *file, const uint8_t *buffer, size_t count, uint64_t 
 		return -1;
 	}
 
+	/* Read the covering units first (modify-in-place below). */
 	file->readBuffer = tmp;
 	file->writeBuffer = tmp;
 	file->ioOffset = startUnit;
@@ -220,6 +253,7 @@ ssize_t hfsWriteAt(HfsFile *file, const uint8_t *buffer, size_t count, uint64_t 
 		return -1;
 	}
 
+	/* Splice the user data into the buffer, then write it back. */
 	memcpy(tmp + skip, buffer, count);
 
 	file->finished = false;
@@ -234,7 +268,7 @@ ssize_t hfsWriteAt(HfsFile *file, const uint8_t *buffer, size_t count, uint64_t 
 	return (ssize_t)count;
 }
 
-// read
+/* Sequential read at file->offset; advances the offset. */
 int hfsRead(HfsFile *file, uint8_t *buffer, size_t count) {
 	ssize_t n = hfsReadAt(file, buffer, count, file->offset);
 	if (n > 0) {
@@ -243,7 +277,7 @@ int hfsRead(HfsFile *file, uint8_t *buffer, size_t count) {
 	return (int)n;
 }
 
-// write
+/* Sequential write at file->offset; advances the offset. */
 int hfsWrite(HfsFile *file, const uint8_t *buffer, size_t count) {
 	ssize_t n = hfsWriteAt(file, buffer, count, file->offset);
 	if (n > 0) {

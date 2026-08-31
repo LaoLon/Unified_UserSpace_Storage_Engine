@@ -14,8 +14,15 @@
 #include "hfs_internal.h"
 #include "hfs_log.h"
 
+/* SPDK thread that runs all async blobstore operations. */
 struct spdk_thread *globalThread = NULL;
 
+/*
+ * Turn an async SPDK operation into a synchronous call.
+ * Posts startFn to the SPDK thread, then polls the thread until the
+ * callback sets *finished, or until WAITER_MAX_TIME is exceeded.
+ * Returns false on timeout.
+ */
 bool waiter(struct spdk_thread *thread, spdk_msg_fn startFn, void *ctx, bool *finished) {
 	spdk_thread_send_msg(thread, startFn, ctx);
 
@@ -27,20 +34,20 @@ bool waiter(struct spdk_thread *thread, spdk_msg_fn startFn, void *ctx, bool *fi
 	} while(!(*finished) && waiterCount < WAITER_MAX_TIME);
 
 	if (!(*finished) && waiterCount >= WAITER_MAX_TIME) {
-		return false; // timeout
+		return false; /* timeout */
 	}
 
 	return true;
 }
 
-// zvfs.json
-
+/* Path of the JSON config describing the bdev (compile-time default). */
 #ifdef HFS_DEFAULT_CONFIG
 static const char *jsonFile = HFS_DEFAULT_CONFIG;
 #else
 static const char *jsonFile = "config/hfs.json";
 #endif
 
+/* Completion callback for subsystem (JSON config) loading. */
 static void jsonAppLoadDone(int rc, void *ctx) {
 	bool *done = ctx;
 	*done = true;
@@ -48,6 +55,10 @@ static void jsonAppLoadDone(int rc, void *ctx) {
 	SPDK_NOTICELOG("jsonAppLoadDone\n");
 }
 
+/*
+ * Called after spdk_subsystem_init completes: load the JSON config
+ * (e.g. create the malloc bdev) through SPDK's JSON-RPC mechanism.
+ */
 static void hfsSubsystemInitDone(int rc, void *arg) {
 	void *json;
 	size_t jsonSize;
@@ -71,10 +82,15 @@ static void hfsSubsystemInitDone(int rc, void *arg) {
 	free(json);
 }
 
+/* SPDK-thread task: initialize all SPDK subsystems. */
 static void hfsJsonLoadFn(void *arg) {
 	spdk_subsystem_init(hfsSubsystemInitDone, arg);
 }
 
+/*
+ * Set up the SPDK environment: DPDK env init, log levels, the global
+ * SPDK thread, and subsystem/JSON config loading.
+ */
 int hfsEnvSetup(void) {
 	struct spdk_env_opts opts;
 	spdk_env_opts_init(&opts);
