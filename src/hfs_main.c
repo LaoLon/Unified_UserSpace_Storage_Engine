@@ -23,6 +23,30 @@ int main(int argc, char *argv[]) {
 	SPDK_NOTICELOG("reload meta rc=%d\n", loadRc);
 	HFS_LOG_INFO("reload meta rc=%d", loadRc);
 
+	/* inode 表：加一条 → saveAll → 重置内存 → loadAll 应恢复 */
+	struct hfs_inode *in = hfsMetaAddInode(fs);
+	if (in != NULL) {
+		in->type = HFS_INODE_DIR;
+		in->parentId = 0;
+		in->blobId = SPDK_BLOBID_INVALID;
+		snprintf(in->name, sizeof(in->name), "rootdir");
+	}
+	if (hfsMetaSaveAll(fs) != 0) {
+		SPDK_NOTICELOG("saveAll failed\n");
+		return -1;
+	}
+	fs->inodeCount = 0;
+	if (hfsMetaLoadAll(fs) != 0) {
+		SPDK_NOTICELOG("loadAll failed\n");
+		return -1;
+	}
+	SPDK_NOTICELOG("inodeCount=%u first=%s id=%llu\n", fs->inodeCount,
+		       fs->inodeCount > 0 ? fs->inodes[0].name : "?",
+		       (unsigned long long)(fs->inodeCount > 0 ? fs->inodes[0].id : 0));
+	HFS_LOG_INFO("inodeCount=%u first=%s id=%llu", fs->inodeCount,
+		      fs->inodeCount > 0 ? fs->inodes[0].name : "?",
+		      (unsigned long long)(fs->inodeCount > 0 ? fs->inodes[0].id : 0));
+
 	SPDK_NOTICELOG("hfsEnvSetup success\n");
 
 	SPDK_NOTICELOG("\n\n hfs mount start \n\n");

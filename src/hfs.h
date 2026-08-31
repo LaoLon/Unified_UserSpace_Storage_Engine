@@ -7,6 +7,8 @@
 
 #include <spdk/blob.h>
 
+struct hfs_inode;
+
 #define BUFFER_SIZE		512
 #define FILENAME_LENGTH		128
 
@@ -18,6 +20,12 @@ typedef struct Hfs {
 
 	spdk_blob_id metaBlobId;
 	uint64_t rootInodeId;
+	struct hfs_inode *inodes;
+	uint32_t inodeCount;
+	struct spdk_blob *metaBlob;
+	void *metaBuf;
+	uint64_t metaUnits;
+	uint64_t metaClusters;
 
 	struct spdk_io_channel *channel;
 	bool finished;

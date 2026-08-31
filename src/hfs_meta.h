@@ -36,4 +36,11 @@ int hfsMetaLoad(Hfs *fs);
 int hfsMetaFormat(Hfs *fs);
 int hfsMetaSave(Hfs *fs);
 
+int hfsMetaSaveAll(Hfs *fs);
+int hfsMetaLoadAll(Hfs *fs);
+
+struct hfs_inode *hfsMetaAddInode(Hfs *fs);
+struct hfs_inode *hfsMetaFindByName(Hfs *fs, uint64_t parentId, const char *name);
+struct hfs_inode *hfsMetaFindById(Hfs *fs, uint64_t id);
+
 #endif /* HFS_META_H */
