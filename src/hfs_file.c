@@ -31,23 +31,18 @@ static void hfsDoClose(void *arg) {
 static void hfsSpdkBlobReadCb(void *arg, int bserrno) {
 	HfsFile *file = (HfsFile *)arg;
 
-	SPDK_NOTICELOG("READ BUFFER : %s\n", file->readBuffer);
-
 	file->finished = true;
 }
 
 static void hfsDoRead(void *arg) {
 	HfsFile *file = (HfsFile *)arg;
 
-	memset(file->readBuffer, 0x0, BUFFER_SIZE);
-
 	spdk_blob_io_read(file->blob, file->fs->channel, file->readBuffer,
-		0, 1, hfsSpdkBlobReadCb, file);
+		file->ioOffset, file->ioUnits, hfsSpdkBlobReadCb, file);
 }
 
 static void hfsSpdkBlobWriteCb(void *arg, int bserrno) {
 	HfsFile *file = (HfsFile *)arg;
-	SPDK_NOTICELOG("write complete\n");
 
 	file->finished = true;
 }
@@ -56,7 +51,7 @@ static void hfsDoWrite(void *arg) {
 	HfsFile *file = (HfsFile *)arg;
 
 	spdk_blob_io_write(file->blob, file->fs->channel, file->writeBuffer,
-		0, 1, hfsSpdkBlobWriteCb, file);
+		file->ioOffset, file->ioUnits, hfsSpdkBlobWriteCb, file);
 }
 
 static void hfsSpdkBlobSyncCb(void *arg, int bserrno) {
@@ -121,24 +116,127 @@ int hfsOpen(HfsFile *file) {
 	return waiter(globalThread, hfsDoOpen, file, &file->finished);
 }
 
+static void hfsSpdkBlobResizeDoneCb(void *arg, int bserrno) {
+	HfsFile *file = (HfsFile *)arg;
+
+	file->finished = true;
+}
+
+static void hfsDoResize(void *arg) {
+	HfsFile *file = (HfsFile *)arg;
+
+	spdk_blob_resize(file->blob, file->resizeClusters, hfsSpdkBlobResizeDoneCb, file);
+}
+
+static bool hfsEnsureSize(HfsFile *file, uint64_t bytes) {
+	uint64_t clusterSize = spdk_bs_get_cluster_size(file->fs->blobstore);
+	uint64_t needClusters = (bytes + clusterSize - 1) / clusterSize;
+
+	if (spdk_blob_get_num_clusters(file->blob) >= needClusters) {
+		return true;
+	}
+
+	file->resizeClusters = needClusters;
+	file->finished = false;
+	return waiter(globalThread, hfsDoResize, file, &file->finished);
+}
+
+// read at offset
+ssize_t hfsReadAt(HfsFile *file, uint8_t *buffer, size_t count, uint64_t offset) {
+	uint64_t unitSize = file->fs->unitSize;
+	uint64_t startUnit = offset / unitSize;
+	uint64_t endByte = offset + count;
+	uint64_t endUnit = (endByte + unitSize - 1) / unitSize;
+	uint64_t units = endUnit - startUnit;
+	size_t bufSize = (size_t)(units * unitSize);
+	size_t skip = (size_t)(offset - startUnit * unitSize);
+	size_t toCopy;
+	uint8_t *tmp;
+
+	tmp = spdk_malloc(bufSize, 0x1000, NULL, SPDK_ENV_LCORE_ID_ANY, SPDK_MALLOC_DMA);
+	if (tmp == NULL) {
+		return -1;
+	}
+
+	file->readBuffer = tmp;
+	file->ioOffset = startUnit;
+	file->ioUnits = units;
+	file->finished = false;
+
+	if (!waiter(globalThread, hfsDoRead, file, &file->finished)) {
+		spdk_free(tmp);
+		return -1;
+	}
+
+	toCopy = (bufSize > skip && count > bufSize - skip) ? (bufSize - skip) : count;
+	memcpy(buffer, tmp + skip, toCopy);
+
+	spdk_free(tmp);
+	file->readBuffer = NULL;
+	return (ssize_t)toCopy;
+}
+
+// write at offset
+ssize_t hfsWriteAt(HfsFile *file, const uint8_t *buffer, size_t count, uint64_t offset) {
+	uint64_t unitSize = file->fs->unitSize;
+	uint64_t startUnit = offset / unitSize;
+	uint64_t endByte = offset + count;
+	uint64_t endUnit = (endByte + unitSize - 1) / unitSize;
+	uint64_t units = endUnit - startUnit;
+	size_t bufSize = (size_t)(units * unitSize);
+	size_t skip = (size_t)(offset - startUnit * unitSize);
+	uint8_t *tmp;
+
+	if (!hfsEnsureSize(file, endByte)) {
+		return -1;
+	}
+
+	tmp = spdk_malloc(bufSize, 0x1000, NULL, SPDK_ENV_LCORE_ID_ANY, SPDK_MALLOC_DMA);
+	if (tmp == NULL) {
+		return -1;
+	}
+
+	file->readBuffer = tmp;
+	file->writeBuffer = tmp;
+	file->ioOffset = startUnit;
+	file->ioUnits = units;
+	file->finished = false;
+
+	if (!waiter(globalThread, hfsDoRead, file, &file->finished)) {
+		spdk_free(tmp);
+		return -1;
+	}
+
+	memcpy(tmp + skip, buffer, count);
+
+	file->finished = false;
+	if (!waiter(globalThread, hfsDoWrite, file, &file->finished)) {
+		spdk_free(tmp);
+		return -1;
+	}
+
+	spdk_free(tmp);
+	file->readBuffer = NULL;
+	file->writeBuffer = NULL;
+	return (ssize_t)count;
+}
+
 // read
 int hfsRead(HfsFile *file, uint8_t *buffer, size_t count) {
-	file->finished = false;
-	waiter(globalThread, hfsDoRead, file, &file->finished);
-
-	int len = strlen(file->readBuffer);
-	memcpy(buffer, file->readBuffer, len);
-
-	return len;
+	ssize_t n = hfsReadAt(file, buffer, count, file->offset);
+	if (n > 0) {
+		file->offset += (uint64_t)n;
+	}
+	return (int)n;
 }
 
 // write
 int hfsWrite(HfsFile *file, const uint8_t *buffer, size_t count) {
-	file->finished = false;
-
-	memcpy(file->writeBuffer, buffer, count);
-
-	return waiter(globalThread, hfsDoWrite, file, &file->finished);
+	ssize_t n = hfsWriteAt(file, buffer, count, file->offset);
+	if (n > 0) {
+		file->offset += (uint64_t)n;
+	}
+	return (int)n;
 }
 
 // close

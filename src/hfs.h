@@ -34,6 +34,11 @@ typedef struct HfsFile {
 	uint8_t *writeBuffer;
 	uint8_t *readBuffer;
 
+	uint64_t offset;
+	uint64_t ioOffset;
+	uint64_t ioUnits;
+	uint64_t resizeClusters;
+
 	bool finished;
 } HfsFile;
 
@@ -52,6 +57,8 @@ int hfsUmount(Hfs *fs);
 int hfsOpen(HfsFile *file);
 int hfsRead(HfsFile *file, uint8_t *buffer, size_t count);
 int hfsWrite(HfsFile *file, const uint8_t *buffer, size_t count);
+ssize_t hfsReadAt(HfsFile *file, uint8_t *buffer, size_t count, uint64_t offset);
+ssize_t hfsWriteAt(HfsFile *file, const uint8_t *buffer, size_t count, uint64_t offset);
 int hfsClose(HfsFile *file);
 
 #endif /* HFS_H */

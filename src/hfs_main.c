@@ -34,10 +34,18 @@ int main(int argc, char *argv[]) {
 	char *buffer = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 	hfsWrite(file, buffer, strlen(buffer));
 
+	SPDK_NOTICELOG("\n\n hfs offset write/read start \n\n");
+	HFS_LOG_INFO("hfs offset write/read start");
+	hfsWriteAt(file, (uint8_t *)"BBBB", 4, 100);
+	char oBuffer[16] = {0};
+	ssize_t on = hfsReadAt(file, (uint8_t *)oBuffer, 4, 100);
+	SPDK_NOTICELOG("OFFSET READ: %.*s (n=%zd)\n", (int)on, oBuffer, on);
+	HFS_LOG_INFO("OFFSET READ: %.*s (n=%zd)", (int)on, oBuffer, on);
+
 	SPDK_NOTICELOG("\n\n hfs read start \n\n");
 	HFS_LOG_INFO("hfs read start");
 	char rBuffer[BUFFER_SIZE] = {0};
-	hfsRead(file, rBuffer, BUFFER_SIZE);
+	hfsReadAt(file, rBuffer, strlen(buffer), 0);
 	SPDK_NOTICELOG("READ BUFFER: %s\n", rBuffer);
 	HFS_LOG_INFO("READ BUFFER: %s", rBuffer);
 
