@@ -6,26 +6,21 @@
 
 #include "hfs.h"
 #include "hfs_internal.h"
+#include "hfs_lib.h"
 #include "hfs_log.h"
 
 int main(int argc, char *argv[]) {
-	if (hfs_log_init() != 0) {
-		fprintf(stderr, "hfs_log_init failed\n");
+	if (hfs_lib_init() != 0) {
+		fprintf(stderr, "hfs_lib_init failed\n");
 		return -1;
 	}
-	HFS_LOG_INFO("hfs_log initialized");
 
-	if (hfsEnvSetup()) {
-		HFS_LOG_ERROR("hfsEnvSetup failed");
-		hfs_log_fini();
-		return -1;
-	}
+	Hfs *fs = hfs_lib_get_fs();
 
 	SPDK_NOTICELOG("hfsEnvSetup success\n");
 
 	SPDK_NOTICELOG("\n\n hfs mount start \n\n");
 	HFS_LOG_INFO("hfs mount start");
-	Hfs *fs = calloc(1, sizeof(Hfs));
 	hfsMount(fs);
 
 	SPDK_NOTICELOG("\n\n hfs open start \n\n");
@@ -55,8 +50,7 @@ int main(int argc, char *argv[]) {
 	SPDK_NOTICELOG("\n\n hfs umount start \n\n");
 	HFS_LOG_INFO("hfs umount start");
 	hfsUmount(fs);
-	free(fs);
 
 	HFS_LOG_INFO("hfs exiting");
-	hfs_log_fini();
+	hfs_lib_fini();
 }

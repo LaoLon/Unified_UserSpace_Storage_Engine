@@ -20,6 +20,7 @@ struct hfs_dirent {
 
 int hfs_lib_init(void);
 void hfs_lib_fini(void);
+Hfs *hfs_lib_get_fs(void);
 
 int hfs_lib_open(const char *path, int flags, mode_t mode);
 ssize_t hfs_lib_read(int fd, void *buf, size_t count);

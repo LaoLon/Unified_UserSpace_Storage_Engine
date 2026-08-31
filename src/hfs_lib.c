@@ -5,9 +5,14 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 
+#include "hfs.h"
+#include "hfs_internal.h"
 #include "hfs_lib.h"
+#include "hfs_log.h"
 
 static pthread_mutex_t g_libLock = PTHREAD_MUTEX_INITIALIZER;
+
+static Hfs *g_fs;
 
 struct hfs_handle {
 	int fd;
@@ -28,13 +33,53 @@ struct hfs_dir {
 };
 
 int hfs_lib_init(void) {
+	if (g_fs != NULL) {
+		return 0;
+	}
+
+	if (hfs_log_init() != 0) {
+		return -1;
+	}
+
+	if (hfsEnvSetup() != 0) {
+		HFS_LOG_ERROR("hfsEnvSetup failed");
+		hfs_log_fini();
+		return -1;
+	}
+
+	g_fs = calloc(1, sizeof(Hfs));
+	if (g_fs == NULL) {
+		hfs_log_fini();
+		return -1;
+	}
+
+	if (!hfsMount(g_fs)) {
+		HFS_LOG_ERROR("hfsMount failed");
+		free(g_fs);
+		g_fs = NULL;
+		hfs_log_fini();
+		return -1;
+	}
+
 	memset(g_fdTable, 0, sizeof(g_fdTable));
-	(void)g_libLock;
-	errno = ENOSYS;
-	return -1;
+	HFS_LOG_INFO("libhfs initialized");
+	return 0;
+}
+
+Hfs *hfs_lib_get_fs(void) {
+	return g_fs;
 }
 
 void hfs_lib_fini(void) {
+	if (g_fs == NULL) {
+		return;
+	}
+
+	hfsUmount(g_fs);
+	free(g_fs);
+	g_fs = NULL;
+	hfs_log_fini();
+	HFS_LOG_INFO("libhfs finalized");
 }
 
 int hfs_lib_open(const char *path, int flags, mode_t mode) {
