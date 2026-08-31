@@ -2,7 +2,8 @@ PROJECT_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 SPDK_ROOT_DIR ?= $(PROJECT_ROOT)/spdk
 BUILD_DIR ?= $(PROJECT_ROOT)/build
 APP := $(BUILD_DIR)/bin/spdk-hfs
-OBJ := $(BUILD_DIR)/obj/hfs.o
+SRC := $(PROJECT_ROOT)/src/hfs.c $(PROJECT_ROOT)/src/hfs_mount.c $(PROJECT_ROOT)/src/hfs_file.c
+OBJ := $(patsubst $(PROJECT_ROOT)/src/%.c,$(BUILD_DIR)/obj/%.o,$(SRC))
 DEP := $(OBJ:.o=.d)
 CONFIG ?= $(PROJECT_ROOT)/config/hfs.json
 
@@ -21,7 +22,7 @@ include $(SPDK_ROOT_DIR)/mk/spdk.app.mk
 # spdk.app.mk supplies the canonical linker command; keep project objects and
 # output directories outside the SPDK source tree.
 OBJS := $(OBJ)
-$(APP): $(OBJ) | $(BUILD_DIR)/bin
+$(APP): $(OBJS) | $(BUILD_DIR)/bin
 
 .PHONY: all app spdk spdk-configure check-spdk compile-commands run clean distclean
 
@@ -42,15 +43,21 @@ check-spdk:
 $(BUILD_DIR)/obj $(BUILD_DIR)/bin:
 	mkdir -p $@
 
-$(OBJ): $(PROJECT_ROOT)/src/hfs.c | $(BUILD_DIR)/obj
-	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -MF $(DEP) -c $< -o $@
+$(BUILD_DIR)/obj/%.o: $(PROJECT_ROOT)/src/%.c | $(BUILD_DIR)/obj
+	$(CC) $(CPPFLAGS) $(CFLAGS) -I$(PROJECT_ROOT)/src -MMD -MP -MF $(@:.o=.d) -c $< -o $@
 
 compile-commands: check-spdk
 	@command -v bear >/dev/null || { echo "bear is required" >&2; exit 1; }
 	@rm -f $(PROJECT_ROOT)/compile_commands.json
 	bear --output $(PROJECT_ROOT)/compile_commands.json -- $(MAKE) clean app
 
+HUGEPAGES_TOTAL := $(shell cat /proc/sys/vm/nr_hugepages 2>/dev/null || echo 0)
+
 run: all
+	@if [ "$(HUGEPAGES_TOTAL)" = "0" ]; then \
+		echo "No hugepages configured, allocating 1024 x 2MB..."; \
+		echo 1024 > /proc/sys/vm/nr_hugepages; \
+	fi
 	$(APP)
 
 distclean: clean

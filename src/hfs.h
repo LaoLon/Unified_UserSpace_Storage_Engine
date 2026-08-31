@@ -1,0 +1,57 @@
+#ifndef HFS_H
+#define HFS_H
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#include <spdk/blob.h>
+
+#define BUFFER_SIZE		512
+#define FILENAME_LENGTH		128
+
+typedef struct Hfs {
+	struct spdk_blob_store *blobstore;
+	uint64_t unitSize;
+	uint64_t freeClusterCount;
+	uint64_t numCluster;
+
+	struct spdk_io_channel *channel;
+	bool finished;
+} Hfs;
+
+typedef struct HfsOperation {
+	int (*mount)(struct Hfs *fs);
+	int (*umount)(struct Hfs *fs);
+} HfsOperation;
+
+typedef struct HfsFile {
+	uint8_t filename[FILENAME_LENGTH];
+	spdk_blob_id blobId;
+	struct spdk_blob *blob;
+	Hfs *fs;
+
+	uint8_t *writeBuffer;
+	uint8_t *readBuffer;
+
+	bool finished;
+} HfsFile;
+
+typedef struct HfsFileOperation {
+	int (*open)(struct HfsFile *file);
+	int (*read)(struct HfsFile *file);
+	int (*write)(struct HfsFile *file);
+	int (*close)(struct HfsFile *file);
+} HfsFileOperation;
+
+int hfsEnvSetup(void);
+
+int hfsMount(Hfs *fs);
+int hfsUmount(Hfs *fs);
+
+int hfsOpen(HfsFile *file);
+int hfsRead(HfsFile *file, uint8_t *buffer, size_t count);
+int hfsWrite(HfsFile *file, const uint8_t *buffer, size_t count);
+int hfsClose(HfsFile *file);
+
+#endif /* HFS_H */
