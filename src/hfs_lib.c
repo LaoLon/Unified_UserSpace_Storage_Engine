@@ -33,23 +33,28 @@ struct hfs_dir {
 };
 
 int hfs_lib_init(void) {
+	pthread_mutex_lock(&g_libLock);
 	if (g_fs != NULL) {
+		pthread_mutex_unlock(&g_libLock);
 		return 0;
 	}
 
 	if (hfs_log_init() != 0) {
+		pthread_mutex_unlock(&g_libLock);
 		return -1;
 	}
 
 	if (hfsEnvSetup() != 0) {
 		HFS_LOG_ERROR("hfsEnvSetup failed");
 		hfs_log_fini();
+		pthread_mutex_unlock(&g_libLock);
 		return -1;
 	}
 
 	g_fs = calloc(1, sizeof(Hfs));
 	if (g_fs == NULL) {
 		hfs_log_fini();
+		pthread_mutex_unlock(&g_libLock);
 		return -1;
 	}
 
@@ -58,11 +63,13 @@ int hfs_lib_init(void) {
 		free(g_fs);
 		g_fs = NULL;
 		hfs_log_fini();
+		pthread_mutex_unlock(&g_libLock);
 		return -1;
 	}
 
 	memset(g_fdTable, 0, sizeof(g_fdTable));
 	HFS_LOG_INFO("libhfs initialized");
+	pthread_mutex_unlock(&g_libLock);
 	return 0;
 }
 
@@ -70,8 +77,21 @@ Hfs *hfs_lib_get_fs(void) {
 	return g_fs;
 }
 
+__attribute__((constructor))
+static void hfs_preload_ctor(void) {
+	fprintf(stderr, "libhfs loaded\n");
+	HFS_LOG_INFO("libhfs loaded");
+}
+
+__attribute__((destructor))
+static void hfs_preload_dtor(void) {
+	HFS_LOG_INFO("libhfs unloaded");
+}
+
 void hfs_lib_fini(void) {
+	pthread_mutex_lock(&g_libLock);
 	if (g_fs == NULL) {
+		pthread_mutex_unlock(&g_libLock);
 		return;
 	}
 
@@ -80,6 +100,7 @@ void hfs_lib_fini(void) {
 	g_fs = NULL;
 	hfs_log_fini();
 	HFS_LOG_INFO("libhfs finalized");
+	pthread_mutex_unlock(&g_libLock);
 }
 
 int hfs_lib_open(const char *path, int flags, mode_t mode) {
