@@ -6,5 +6,4 @@
 /spdk/dpdk/build-tmp/
 *.o
 *.d
-/AGENTS.md
 
