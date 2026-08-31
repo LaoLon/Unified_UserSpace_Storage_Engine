@@ -2,8 +2,13 @@ PROJECT_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 SPDK_ROOT_DIR ?= $(PROJECT_ROOT)/spdk
 BUILD_DIR ?= $(PROJECT_ROOT)/build
 APP := $(BUILD_DIR)/bin/spdk-hfs
-SRC := $(PROJECT_ROOT)/src/hfs.c $(PROJECT_ROOT)/src/hfs_mount.c $(PROJECT_ROOT)/src/hfs_file.c $(PROJECT_ROOT)/src/hfs_log.c
-OBJ := $(patsubst $(PROJECT_ROOT)/src/%.c,$(BUILD_DIR)/obj/%.o,$(SRC))
+LIB := $(BUILD_DIR)/lib/libhfs.so
+CORE_SRC := $(PROJECT_ROOT)/src/hfs.c $(PROJECT_ROOT)/src/hfs_mount.c $(PROJECT_ROOT)/src/hfs_file.c $(PROJECT_ROOT)/src/hfs_log.c
+APP_SRC := $(CORE_SRC) $(PROJECT_ROOT)/src/hfs_main.c
+LIB_SRC := $(CORE_SRC)
+APP_OBJ := $(patsubst $(PROJECT_ROOT)/src/%.c,$(BUILD_DIR)/obj/%.o,$(APP_SRC))
+LIB_OBJ := $(patsubst $(PROJECT_ROOT)/src/%.c,$(BUILD_DIR)/obj/%.o,$(LIB_SRC))
+OBJ := $(APP_OBJ)
 DEP := $(OBJ:.o=.d)
 CONFIG ?= $(PROJECT_ROOT)/config/hfs.json
 
@@ -21,14 +26,21 @@ include $(SPDK_ROOT_DIR)/mk/spdk.app.mk
 
 # spdk.app.mk supplies the canonical linker command; keep project objects and
 # output directories outside the SPDK source tree.
-OBJS := $(OBJ)
+OBJS := $(APP_OBJ)
 $(APP): $(OBJS) | $(BUILD_DIR)/bin
 
-.PHONY: all app spdk spdk-configure check-spdk compile-commands run clean distclean
+$(LIB): $(LIB_OBJ) | $(BUILD_DIR)/lib
+	$(CC) -o $@ -shared $(CFLAGS) $(LDFLAGS) \
+		-Wl,-soname,libhfs.so \
+		$(LIB_OBJ) $(SPDK_LIB_LINKER_ARGS) $(ENV_LDFLAGS) $(SYS_LIBS)
+
+.PHONY: all app lib spdk spdk-configure check-spdk compile-commands run clean distclean
 
 all: app
 
 app: check-spdk $(APP)
+
+lib: check-spdk $(LIB)
 
 spdk-configure:
 	@test -f $(SPDK_ROOT_DIR)/CONFIG || (cd $(SPDK_ROOT_DIR) && ./configure)
@@ -40,7 +52,7 @@ check-spdk:
 	@test -f $(SPDK_ROOT_DIR)/CONFIG || { echo "SPDK is not configured. Follow README.md, then run 'make spdk'." >&2; exit 1; }
 	@test -d $(SPDK_ROOT_DIR)/build/lib || { echo "SPDK is not built. Run 'make spdk' first." >&2; exit 1; }
 
-$(BUILD_DIR)/obj $(BUILD_DIR)/bin:
+$(BUILD_DIR)/obj $(BUILD_DIR)/bin $(BUILD_DIR)/lib:
 	mkdir -p $@
 
 $(BUILD_DIR)/obj/%.o: $(PROJECT_ROOT)/src/%.c | $(BUILD_DIR)/obj
