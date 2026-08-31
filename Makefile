@@ -2,7 +2,7 @@ PROJECT_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 SPDK_ROOT_DIR ?= $(PROJECT_ROOT)/spdk
 BUILD_DIR ?= $(PROJECT_ROOT)/build
 APP := $(BUILD_DIR)/bin/spdk-hfs
-SRC := $(PROJECT_ROOT)/src/hfs.c $(PROJECT_ROOT)/src/hfs_mount.c $(PROJECT_ROOT)/src/hfs_file.c
+SRC := $(PROJECT_ROOT)/src/hfs.c $(PROJECT_ROOT)/src/hfs_mount.c $(PROJECT_ROOT)/src/hfs_file.c $(PROJECT_ROOT)/src/hfs_log.c
 OBJ := $(patsubst $(PROJECT_ROOT)/src/%.c,$(BUILD_DIR)/obj/%.o,$(SRC))
 DEP := $(OBJ:.o=.d)
 CONFIG ?= $(PROJECT_ROOT)/config/hfs.json
