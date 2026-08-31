@@ -16,6 +16,9 @@ typedef struct Hfs {
 	uint64_t freeClusterCount;
 	uint64_t numCluster;
 
+	spdk_blob_id metaBlobId;
+	uint64_t rootInodeId;
+
 	struct spdk_io_channel *channel;
 	bool finished;
 } Hfs;

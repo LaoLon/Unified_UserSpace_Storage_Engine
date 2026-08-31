@@ -8,6 +8,7 @@
 #include "hfs_internal.h"
 #include "hfs_lib.h"
 #include "hfs_log.h"
+#include "hfs_meta.h"
 
 int main(int argc, char *argv[]) {
 	if (hfs_lib_init() != 0) {
@@ -16,6 +17,11 @@ int main(int argc, char *argv[]) {
 	}
 
 	Hfs *fs = hfs_lib_get_fs();
+
+	/* 同一进程内重复 load：验证 set_super 持久化生效（malloc bdev 重启即失） */
+	int loadRc = hfsMetaLoad(fs);
+	SPDK_NOTICELOG("reload meta rc=%d\n", loadRc);
+	HFS_LOG_INFO("reload meta rc=%d", loadRc);
 
 	SPDK_NOTICELOG("hfsEnvSetup success\n");
 

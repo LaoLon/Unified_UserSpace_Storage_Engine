@@ -9,6 +9,7 @@
 #include "hfs_internal.h"
 #include "hfs_lib.h"
 #include "hfs_log.h"
+#include "hfs_meta.h"
 
 static pthread_mutex_t g_libLock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -60,6 +61,15 @@ int hfs_lib_init(void) {
 
 	if (!hfsMount(g_fs)) {
 		HFS_LOG_ERROR("hfsMount failed");
+		free(g_fs);
+		g_fs = NULL;
+		hfs_log_fini();
+		pthread_mutex_unlock(&g_libLock);
+		return -1;
+	}
+
+	if (hfsMetaInit(g_fs) != 0) {
+		HFS_LOG_ERROR("hfsMetaInit failed");
 		free(g_fs);
 		g_fs = NULL;
 		hfs_log_fini();
