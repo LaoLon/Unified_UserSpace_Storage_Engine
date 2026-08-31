@@ -60,5 +60,6 @@ int hfsWrite(HfsFile *file, const uint8_t *buffer, size_t count);
 ssize_t hfsReadAt(HfsFile *file, uint8_t *buffer, size_t count, uint64_t offset);
 ssize_t hfsWriteAt(HfsFile *file, const uint8_t *buffer, size_t count, uint64_t offset);
 int hfsClose(HfsFile *file);
+int hfsDeleteBlobById(HfsFile *file);
 
 #endif /* HFS_H */

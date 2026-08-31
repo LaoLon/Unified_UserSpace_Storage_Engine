@@ -9,23 +9,45 @@
 static void hfsSpdkBlobDeleteCb(void *arg, int bserrno) {
 	HfsFile *file = (HfsFile *)arg;
 
-	spdk_free(file->writeBuffer);
-	spdk_free(file->readBuffer);
-
-	SPDK_NOTICELOG("close complete\n");
+	SPDK_NOTICELOG("blob deleted, id=%"PRIu64"\n", file->blobId);
 	file->finished = true;
 }
 
 static void hfsSpdkBlobCloseCb(void *arg, int bserrno) {
 	HfsFile *file = (HfsFile *)arg;
 
-	spdk_bs_delete_blob(file->fs->blobstore, file->blobId, hfsSpdkBlobDeleteCb, file);
+	SPDK_NOTICELOG("close complete\n");
+	file->finished = true;
 }
 
 static void hfsDoClose(void *arg) {
 	HfsFile *file = (HfsFile *)arg;
 
 	spdk_blob_close(file->blob, hfsSpdkBlobCloseCb, file);
+}
+
+static void hfsSpdkBsDeleteDoneCb(void *arg, int bserrno) {
+	hfsSpdkBlobDeleteCb(arg, bserrno);
+}
+
+static void hfsDoDeleteBlob(void *arg) {
+	HfsFile *file = (HfsFile *)arg;
+
+	spdk_bs_delete_blob(file->fs->blobstore, file->blobId, hfsSpdkBsDeleteDoneCb, file);
+}
+
+// close: 只关闭句柄，不删除 blob（删除由 unlink 负责）
+int hfsClose(HfsFile *file) {
+	file->finished = false;
+
+	return waiter(globalThread, hfsDoClose, file, &file->finished);
+}
+
+// delete: 按 blobId 删除数据 blob（unlink 使用）
+int hfsDeleteBlobById(HfsFile *file) {
+	file->finished = false;
+
+	return waiter(globalThread, hfsDoDeleteBlob, file, &file->finished);
 }
 
 static void hfsSpdkBlobReadCb(void *arg, int bserrno) {
@@ -56,15 +78,6 @@ static void hfsDoWrite(void *arg) {
 
 static void hfsSpdkBlobSyncCb(void *arg, int bserrno) {
 	HfsFile *file = (HfsFile *)arg;
-	file->writeBuffer = spdk_malloc(BUFFER_SIZE, 0x1000, NULL, SPDK_ENV_LCORE_ID_ANY, SPDK_MALLOC_DMA);
-	if (file->writeBuffer == NULL) {
-		return ;
-	}
-
-	file->readBuffer = spdk_malloc(BUFFER_SIZE, 0x1000, NULL, SPDK_ENV_LCORE_ID_ANY, SPDK_MALLOC_DMA);
-	if (file->readBuffer == NULL) {
-		return ;
-	}
 
 	SPDK_NOTICELOG("open complete\n");
 
@@ -237,11 +250,4 @@ int hfsWrite(HfsFile *file, const uint8_t *buffer, size_t count) {
 		file->offset += (uint64_t)n;
 	}
 	return (int)n;
-}
-
-// close
-int hfsClose(HfsFile *file) {
-	file->finished = false;
-
-	return waiter(globalThread, hfsDoClose, file, &file->finished);
 }
