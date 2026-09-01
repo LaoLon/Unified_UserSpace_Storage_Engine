@@ -199,13 +199,20 @@ int hfs_lib_open(const char *path, int flags, mode_t mode) {
 		}
 	}
 
-	/* Allocate a free slot in the fd table. */
-	for (fd = 3; fd < HFS_FD_TABLE_SIZE; fd++) {
-		if (g_fdTable[fd].file == NULL) {
-			break;
-		}
+	/*
+	 * Reserve a matching kernel fd (via /dev/null) so that later real
+	 * opens in the same process cannot reuse this number. Otherwise a
+	 * genuine kernel fd would collide with the HFS fd and the close
+	 * interceptor would close the wrong handle.
+	 */
+	fd = open("/dev/null", O_RDONLY);
+	if (fd < 0) {
+		pthread_mutex_unlock(&g_libLock);
+		errno = EMFILE;
+		return -1;
 	}
 	if (fd >= HFS_FD_TABLE_SIZE) {
+		close(fd);
 		pthread_mutex_unlock(&g_libLock);
 		errno = EMFILE;
 		return -1;
@@ -219,6 +226,7 @@ int hfs_lib_open(const char *path, int flags, mode_t mode) {
 	}
 	file->fs = g_fs;
 	file->blobId = in->blobId;
+	file->refCount = 1;
 
 	if (!hfsOpenById(file)) {
 		free(file);
@@ -239,56 +247,307 @@ int hfs_lib_open(const char *path, int flags, mode_t mode) {
 	return fd;
 }
 
-/* Stub: filled in by shard-16 (read/write path). */
+/*
+ * Read from the current offset of an HFS fd.
+ * Returns 0 at end of file; updates the fd offset.
+ */
 ssize_t hfs_lib_read(int fd, void *buf, size_t count) {
-	errno = ENOSYS;
-	return -1;
-}
+	struct hfs_handle *h;
+	struct hfs_inode *in;
+	ssize_t n;
 
-/* Stub: filled in by shard-16 (read/write path). */
-ssize_t hfs_lib_write(int fd, const void *buf, size_t count) {
-	errno = ENOSYS;
-	return -1;
-}
-
-/* Stub: filled in by shard-16 (read/write path). */
-ssize_t hfs_lib_pread(int fd, void *buf, size_t count, off_t offset) {
-	errno = ENOSYS;
-	return -1;
-}
-
-/* Stub: filled in by shard-16 (read/write path). */
-ssize_t hfs_lib_pwrite(int fd, const void *buf, size_t count, off_t offset) {
-	errno = ENOSYS;
-	return -1;
-}
-
-/* Stub: filled in by shard-16 (read/write path). */
-off_t hfs_lib_lseek(int fd, off_t offset, int whence) {
-	errno = ENOSYS;
-	return -1;
-}
-
-/* Returns true when the fd belongs to HFS (interception helper). */
-bool hfs_is_hfs_fd(int fd) {
-	bool isHfs;
-
-	if (fd < 0 || fd >= HFS_FD_TABLE_SIZE) {
-		return false;
+	if (count == 0) {
+		return 0;
 	}
 
 	pthread_mutex_lock(&g_libLock);
-	isHfs = (g_fdTable[fd].file != NULL);
+	if (g_fs == NULL) {
+		pthread_mutex_unlock(&g_libLock);
+		errno = ENODEV;
+		return -1;
+	}
+	if (fd < 0 || fd >= HFS_FD_TABLE_SIZE || g_fdTable[fd].file == NULL) {
+		pthread_mutex_unlock(&g_libLock);
+		errno = EBADF;
+		return -1;
+	}
+
+	h = &g_fdTable[fd];
+	in = hfsMetaFindById(g_fs, h->inodeId);
+	if (in == NULL) {
+		pthread_mutex_unlock(&g_libLock);
+		errno = ENOENT;
+		return -1;
+	}
+	if (h->offset >= in->size) {
+		pthread_mutex_unlock(&g_libLock);
+		return 0;	/* end of file */
+	}
+	if (h->offset + count > in->size) {
+		count = (size_t)(in->size - h->offset);
+	}
+
+	n = hfsReadAt(h->file, buf, count, h->offset);
+	if (n > 0) {
+		h->offset += (uint64_t)n;
+	}
 	pthread_mutex_unlock(&g_libLock);
-	return isHfs;
+	return n;
 }
 
 /*
- * Close an HFS fd: close the blob handle and free the fd table slot.
+ * Write at the current offset of an HFS fd.
+ * Grows the file size when writing past the end.
+ */
+ssize_t hfs_lib_write(int fd, const void *buf, size_t count) {
+	struct hfs_handle *h;
+	struct hfs_inode *in;
+	struct timespec ts;
+	ssize_t n;
+
+	if (count == 0) {
+		return 0;
+	}
+
+	pthread_mutex_lock(&g_libLock);
+	if (g_fs == NULL) {
+		pthread_mutex_unlock(&g_libLock);
+		errno = ENODEV;
+		return -1;
+	}
+	if (fd < 0 || fd >= HFS_FD_TABLE_SIZE || g_fdTable[fd].file == NULL) {
+		pthread_mutex_unlock(&g_libLock);
+		errno = EBADF;
+		return -1;
+	}
+
+	h = &g_fdTable[fd];
+	if (!h->writable) {
+		pthread_mutex_unlock(&g_libLock);
+		errno = EBADF;
+		return -1;
+	}
+
+	n = hfsWriteAt(h->file, buf, count, h->offset);
+	if (n <= 0) {
+		pthread_mutex_unlock(&g_libLock);
+		errno = EIO;
+		return -1;
+	}
+
+	h->offset += (uint64_t)n;
+	in = hfsMetaFindById(g_fs, h->inodeId);
+	if (in != NULL && h->offset > in->size) {
+		/* Update size/mtime in memory; persisted at fsync/close. */
+		clock_gettime(CLOCK_REALTIME, &ts);
+		in->size = h->offset;
+		in->mtimeNs = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+	}
+	pthread_mutex_unlock(&g_libLock);
+	return n;
+}
+
+/* Read at an explicit offset without moving the fd offset. */
+ssize_t hfs_lib_pread(int fd, void *buf, size_t count, off_t offset) {
+	struct hfs_handle *h;
+	struct hfs_inode *in;
+	ssize_t n;
+
+	if (count == 0) {
+		return 0;
+	}
+	if (offset < 0) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	pthread_mutex_lock(&g_libLock);
+	if (g_fs == NULL) {
+		pthread_mutex_unlock(&g_libLock);
+		errno = ENODEV;
+		return -1;
+	}
+	if (fd < 0 || fd >= HFS_FD_TABLE_SIZE || g_fdTable[fd].file == NULL) {
+		pthread_mutex_unlock(&g_libLock);
+		errno = EBADF;
+		return -1;
+	}
+
+	h = &g_fdTable[fd];
+	in = hfsMetaFindById(g_fs, h->inodeId);
+	if (in == NULL) {
+		pthread_mutex_unlock(&g_libLock);
+		errno = ENOENT;
+		return -1;
+	}
+	if ((uint64_t)offset >= in->size) {
+		pthread_mutex_unlock(&g_libLock);
+		return 0;
+	}
+	if ((uint64_t)offset + count > in->size) {
+		count = (size_t)(in->size - (uint64_t)offset);
+	}
+
+	n = hfsReadAt(h->file, buf, count, (uint64_t)offset);
+	pthread_mutex_unlock(&g_libLock);
+	return n;
+}
+
+/* Write at an explicit offset without moving the fd offset. */
+ssize_t hfs_lib_pwrite(int fd, const void *buf, size_t count, off_t offset) {
+	struct hfs_handle *h;
+	struct hfs_inode *in;
+	struct timespec ts;
+	ssize_t n;
+
+	if (count == 0) {
+		return 0;
+	}
+	if (offset < 0) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	pthread_mutex_lock(&g_libLock);
+	if (g_fs == NULL) {
+		pthread_mutex_unlock(&g_libLock);
+		errno = ENODEV;
+		return -1;
+	}
+	if (fd < 0 || fd >= HFS_FD_TABLE_SIZE || g_fdTable[fd].file == NULL) {
+		pthread_mutex_unlock(&g_libLock);
+		errno = EBADF;
+		return -1;
+	}
+
+	h = &g_fdTable[fd];
+	if (!h->writable) {
+		pthread_mutex_unlock(&g_libLock);
+		errno = EBADF;
+		return -1;
+	}
+
+	n = hfsWriteAt(h->file, buf, count, (uint64_t)offset);
+	if (n <= 0) {
+		pthread_mutex_unlock(&g_libLock);
+		errno = EIO;
+		return -1;
+	}
+
+	in = hfsMetaFindById(g_fs, h->inodeId);
+	if (in != NULL && (uint64_t)offset + (uint64_t)n > in->size) {
+		clock_gettime(CLOCK_REALTIME, &ts);
+		in->size = (uint64_t)offset + (uint64_t)n;
+		in->mtimeNs = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+	}
+	pthread_mutex_unlock(&g_libLock);
+	return n;
+}
+
+/* Change the current offset of an HFS fd (SEEK_SET/CUR/END). */
+off_t hfs_lib_lseek(int fd, off_t offset, int whence) {
+	struct hfs_handle *h;
+	struct hfs_inode *in;
+	uint64_t base;
+
+	pthread_mutex_lock(&g_libLock);
+	if (g_fs == NULL) {
+		pthread_mutex_unlock(&g_libLock);
+		errno = ENODEV;
+		return -1;
+	}
+	if (fd < 0 || fd >= HFS_FD_TABLE_SIZE || g_fdTable[fd].file == NULL) {
+		pthread_mutex_unlock(&g_libLock);
+		errno = EBADF;
+		return -1;
+	}
+
+	h = &g_fdTable[fd];
+	switch (whence) {
+	case SEEK_SET:
+		base = 0;
+		break;
+	case SEEK_CUR:
+		base = h->offset;
+		break;
+	case SEEK_END:
+		in = hfsMetaFindById(g_fs, h->inodeId);
+		if (in == NULL) {
+			pthread_mutex_unlock(&g_libLock);
+			errno = ENOENT;
+			return -1;
+		}
+		base = in->size;
+		break;
+	default:
+		pthread_mutex_unlock(&g_libLock);
+		errno = EINVAL;
+		return -1;
+	}
+
+	if (offset < 0 && (uint64_t)(-offset) > base) {
+		pthread_mutex_unlock(&g_libLock);
+		errno = EINVAL;
+		return -1;
+	}
+
+	h->offset = base + (uint64_t)offset;
+	offset = (off_t)h->offset;
+	pthread_mutex_unlock(&g_libLock);
+	return offset;
+}
+
+/* Copy the HFS fd table slot to another fd (dup/dup2 interceptor helper). */
+int hfs_lib_fd_copy(int oldfd, int newfd) {
+	pthread_mutex_lock(&g_libLock);
+	if (oldfd < 0 || oldfd >= HFS_FD_TABLE_SIZE ||
+	    g_fdTable[oldfd].file == NULL) {
+		pthread_mutex_unlock(&g_libLock);
+		errno = EBADF;
+		return -1;
+	}
+	if (newfd < 0 || newfd >= HFS_FD_TABLE_SIZE) {
+		pthread_mutex_unlock(&g_libLock);
+		errno = EBADF;
+		return -1;
+	}
+	/* dup2 overwrites the target: drop any existing HFS slot first. */
+	if (g_fdTable[newfd].file != NULL) {
+		HfsFile *f = g_fdTable[newfd].file;
+		if (--f->refCount == 0) {
+			hfsClose(f);
+			free(f);
+		}
+	}
+	g_fdTable[newfd] = g_fdTable[oldfd];
+	g_fdTable[newfd].file->refCount++;
+	pthread_mutex_unlock(&g_libLock);
+	return 0;
+}
+
+/*
+ * Returns true when the fd belongs to HFS (interception helper).
+ * Lock-free on purpose: this is a fast path called by the close()
+ * interceptor, which may run while hfs_lib_init already holds
+ * g_libLock (e.g. hfsLogTrimTail closes its fd during init). Taking
+ * the lock there would self-deadlock. The fd table is a fixed-size
+ * array whose slots are only written by hfs_lib_open/hfs_lib_close.
+ */
+bool hfs_is_hfs_fd(int fd) {
+	if (fd < 0 || fd >= HFS_FD_TABLE_SIZE) {
+		return false;
+	}
+	return (g_fdTable[fd].file != NULL);
+}
+
+/*
+ * Close an HFS fd: drop one reference; close the blob handle and free
+ * the file only when the last reference (dup shares) goes away.
  */
 int hfs_lib_close(int fd) {
 	struct hfs_handle *h;
 	HfsFile *file;
+	bool lastRef;
 
 	pthread_mutex_lock(&g_libLock);
 	if (g_fs == NULL) {
@@ -304,16 +563,23 @@ int hfs_lib_close(int fd) {
 
 	h = &g_fdTable[fd];
 	file = h->file;
+	lastRef = (--file->refCount == 0);
 
-	if (!hfsClose(file)) {
+	if (lastRef && !hfsClose(file)) {
 		pthread_mutex_unlock(&g_libLock);
 		errno = EIO;
 		return -1;
 	}
 
-	free(file);
+	if (lastRef) {
+		free(file);
+	}
 	memset(h, 0, sizeof(*h));
 	pthread_mutex_unlock(&g_libLock);
+
+	/* Release the kernel placeholder fd. The table slot is already
+	 * cleared, so the close interceptor passes this through. */
+	close(fd);
 	return 0;
 }
 

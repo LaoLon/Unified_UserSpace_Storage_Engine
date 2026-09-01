@@ -6,21 +6,32 @@
 
 #include "hfs_internal.h"
 
-/* Completion callback for spdk_bs_unload. */
+/* Completion callback for spdk_bs_unload: clear the blobstore so a
+ * second umount (e.g. from hfs_lib_fini) is a no-op. */
 static void hfsSpdkBsUnloadCb(void *arg, int bserrno) {
 	Hfs *fs = (Hfs *)arg;
+	fs->blobstore = NULL;
 	fs->finished = true;
 }
 
-/* SPDK-thread task: release the I/O channel and unload the blobstore. */
+/*
+ * SPDK-thread task: release the I/O channel and unload the blobstore.
+ * spdk_bs_free_io_channel may print a wrong_thread error (the channel
+ * is owned by an SPDK-internal thread), but the release still takes
+ * effect and unload needs the channel gone to complete. Both are
+ * guarded so a second umount (e.g. from hfs_lib_fini) is a no-op.
+ */
 static void hfsDoUmount(void *arg) {
 	Hfs *fs = (Hfs *)arg;
 
 	if (fs->blobstore) {
 		if (fs->channel) {
 			spdk_bs_free_io_channel(fs->channel);
+			fs->channel = NULL;
 		}
 		spdk_bs_unload(fs->blobstore, hfsSpdkBsUnloadCb, fs);
+	} else {
+		fs->finished = true;
 	}
 }
 

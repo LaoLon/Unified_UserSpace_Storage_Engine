@@ -22,7 +22,21 @@
 
 /* Real libc symbols captured once at load time. */
 static int (*real_open)(const char *path, int flags, ...);
+static int (*real_open64)(const char *path, int flags, ...);
+static int (*real_openat)(int dirfd, const char *path, int flags, ...);
+static int (*real_openat64)(int dirfd, const char *path, int flags, ...);
 static int (*real_close)(int fd);
+static ssize_t (*real_read)(int fd, void *buf, size_t count);
+static ssize_t (*real_write)(int fd, const void *buf, size_t count);
+static ssize_t (*real_pread)(int fd, void *buf, size_t count, off_t offset);
+static ssize_t (*real_pwrite)(int fd, const void *buf, size_t count, off_t offset);
+static ssize_t (*real_pread64)(int fd, void *buf, size_t count, off64_t offset);
+static ssize_t (*real_pwrite64)(int fd, const void *buf, size_t count, off64_t offset);
+static off_t (*real_lseek)(int fd, off_t offset, int whence);
+static off64_t (*real_lseek64)(int fd, off64_t offset, int whence);
+static int (*real_dup)(int oldfd);
+static int (*real_dup2)(int oldfd, int newfd);
+static int (*real_dup3)(int oldfd, int newfd, int flags);
 
 /* Length of the HFS mount prefix (default "/hfs/"). */
 static const char *hfs_prefix;
@@ -57,6 +71,19 @@ static void *hfs_real_sym(const char *name) {
 	return sym;
 }
 
+/* Shared body of the open/open64 interception. */
+static int hfs_intercept_open(const char *path, int flags, mode_t mode) {
+	if (hfs_path_managed(path)) {
+		if (hfs_lib_init() != 0) {
+			errno = ENODEV;
+			return -1;
+		}
+		/* Strip the mount prefix; the library sees the inner path. */
+		return hfs_lib_open(path + hfs_prefix_len, flags, mode);
+	}
+	return -2;	/* not managed: caller falls through to real libc */
+}
+
 /*
  * Intercepted open(2): managed paths go to hfs_lib_open, everything
  * else is passed through to the real libc open.
@@ -67,22 +94,79 @@ static void *hfs_real_sym(const char *name) {
 int open(const char *path, int flags, ...) {
 	va_list ap;
 	mode_t mode = 0;
-
-	if (hfs_path_managed(path)) {
-		if (hfs_lib_init() != 0) {
-			errno = ENODEV;
-			return -1;
-		}
-		va_start(ap, flags);
-		mode = va_arg(ap, mode_t);
-		va_end(ap);
-		return hfs_lib_open(path, flags, mode);
-	}
+	int rc;
 
 	va_start(ap, flags);
 	mode = va_arg(ap, mode_t);
 	va_end(ap);
+
+	rc = hfs_intercept_open(path, flags, mode);
+	if (rc != -2) {
+		return rc;
+	}
 	return real_open(path, flags, mode);
+}
+
+/*
+ * Intercepted open64(2) (large-file variant, used by dash/busybox).
+ * Same routing as open(2).
+ */
+int open64(const char *path, int flags, ...) {
+	va_list ap;
+	mode_t mode = 0;
+	int rc;
+
+	va_start(ap, flags);
+	mode = va_arg(ap, mode_t);
+	va_end(ap);
+
+	rc = hfs_intercept_open(path, flags, mode);
+	if (rc != -2) {
+		return rc;
+	}
+	return real_open64(path, flags, mode);
+}
+
+/*
+ * Intercepted openat(2). Only AT_FDCWD with a managed path is routed
+ * to HFS; everything else (including dirfd-relative paths) is passed
+ * through to the real libc call.
+ */
+int openat(int dirfd, const char *path, int flags, ...) {
+	va_list ap;
+	mode_t mode = 0;
+
+	va_start(ap, flags);
+	mode = va_arg(ap, mode_t);
+	va_end(ap);
+
+	if (dirfd == AT_FDCWD) {
+		int rc = hfs_intercept_open(path, flags, mode);
+		if (rc != -2) {
+			return rc;
+		}
+	}
+	return real_openat(dirfd, path, flags, mode);
+}
+
+/*
+ * Intercepted openat64(2) (large-file variant). Same routing as openat.
+ */
+int openat64(int dirfd, const char *path, int flags, ...) {
+	va_list ap;
+	mode_t mode = 0;
+
+	va_start(ap, flags);
+	mode = va_arg(ap, mode_t);
+	va_end(ap);
+
+	if (dirfd == AT_FDCWD) {
+		int rc = hfs_intercept_open(path, flags, mode);
+		if (rc != -2) {
+			return rc;
+		}
+	}
+	return real_openat64(dirfd, path, flags, mode);
 }
 
 /* Intercepted close(2): HFS fds are closed via hfs_lib_close. */
@@ -91,6 +175,111 @@ int close(int fd) {
 		return hfs_lib_close(fd);
 	}
 	return real_close(fd);
+}
+
+/* Intercepted read(2). */
+ssize_t read(int fd, void *buf, size_t count) {
+	if (hfs_is_hfs_fd(fd)) {
+		return hfs_lib_read(fd, buf, count);
+	}
+	return real_read(fd, buf, count);
+}
+
+/* Intercepted write(2). */
+ssize_t write(int fd, const void *buf, size_t count) {
+	if (hfs_is_hfs_fd(fd)) {
+		return hfs_lib_write(fd, buf, count);
+	}
+	return real_write(fd, buf, count);
+}
+
+/* Intercepted pread(2). */
+ssize_t pread(int fd, void *buf, size_t count, off_t offset) {
+	if (hfs_is_hfs_fd(fd)) {
+		return hfs_lib_pread(fd, buf, count, offset);
+	}
+	return real_pread(fd, buf, count, offset);
+}
+
+/* Intercepted pwrite(2). */
+ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset) {
+	if (hfs_is_hfs_fd(fd)) {
+		return hfs_lib_pwrite(fd, buf, count, offset);
+	}
+	return real_pwrite(fd, buf, count, offset);
+}
+
+/* Intercepted lseek(2). */
+off_t lseek(int fd, off_t offset, int whence) {
+	if (hfs_is_hfs_fd(fd)) {
+		return hfs_lib_lseek(fd, offset, whence);
+	}
+	return real_lseek(fd, offset, whence);
+}
+
+/* Intercepted lseek64(2) (large-file variant, used by 64-bit builds). */
+off64_t lseek64(int fd, off64_t offset, int whence) {
+	if (hfs_is_hfs_fd(fd)) {
+		return (off64_t)hfs_lib_lseek(fd, (off_t)offset, whence);
+	}
+	return real_lseek64(fd, offset, whence);
+}
+
+/* Intercepted pread64(2) (large-file variant). */
+ssize_t pread64(int fd, void *buf, size_t count, off64_t offset) {
+	if (hfs_is_hfs_fd(fd)) {
+		return hfs_lib_pread(fd, buf, count, (off_t)offset);
+	}
+	return real_pread64(fd, buf, count, offset);
+}
+
+/* Intercepted pwrite64(2) (large-file variant). */
+ssize_t pwrite64(int fd, const void *buf, size_t count, off64_t offset) {
+	if (hfs_is_hfs_fd(fd)) {
+		return hfs_lib_pwrite(fd, buf, count, (off_t)offset);
+	}
+	return real_pwrite64(fd, buf, count, offset);
+}
+
+/*
+ * Intercepted dup(2): duplicate an HFS fd. The kernel side is reserved
+ * with the real dup (the placeholder /dev/null is copied), then the fd
+ * table slot is copied so both fds share the same file handle.
+ */
+int dup(int oldfd) {
+	if (hfs_is_hfs_fd(oldfd)) {
+		int nf = real_dup(oldfd);
+		if (nf >= 0 && hfs_lib_fd_copy(oldfd, nf) != 0) {
+			real_close(nf);
+			return -1;
+		}
+		return nf;
+	}
+	return real_dup(oldfd);
+}
+
+/* Intercepted dup2(2): same slot copying as dup(). */
+int dup2(int oldfd, int newfd) {
+	if (hfs_is_hfs_fd(oldfd)) {
+		int rc = real_dup2(oldfd, newfd);
+		if (rc >= 0 && hfs_lib_fd_copy(oldfd, newfd) != 0) {
+			return -1;
+		}
+		return rc;
+	}
+	return real_dup2(oldfd, newfd);
+}
+
+/* Intercepted dup3(2): same slot copying as dup(). */
+int dup3(int oldfd, int newfd, int flags) {
+	if (hfs_is_hfs_fd(oldfd)) {
+		int rc = real_dup3(oldfd, newfd, flags);
+		if (rc >= 0 && hfs_lib_fd_copy(oldfd, newfd) != 0) {
+			return -1;
+		}
+		return rc;
+	}
+	return real_dup3(oldfd, newfd, flags);
 }
 
 /*
@@ -111,7 +300,21 @@ static void hfs_preload_ctor(void) {
 	hfs_prefix_len = strlen(hfs_prefix);
 
 	real_open = hfs_real_sym("open");
+	real_open64 = hfs_real_sym("open64");
+	real_openat = hfs_real_sym("openat");
+	real_openat64 = hfs_real_sym("openat64");
 	real_close = hfs_real_sym("close");
+	real_read = hfs_real_sym("read");
+	real_write = hfs_real_sym("write");
+	real_pread = hfs_real_sym("pread");
+	real_pwrite = hfs_real_sym("pwrite");
+	real_pread64 = hfs_real_sym("pread64");
+	real_pwrite64 = hfs_real_sym("pwrite64");
+	real_lseek = hfs_real_sym("lseek");
+	real_lseek64 = hfs_real_sym("lseek64");
+	real_dup = hfs_real_sym("dup");
+	real_dup2 = hfs_real_sym("dup2");
+	real_dup3 = hfs_real_sym("dup3");
 
 	if (getenv("_HFS_INIT_DONE") != NULL) {
 		hfs_inherited = true;

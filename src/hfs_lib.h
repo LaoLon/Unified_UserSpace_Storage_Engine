@@ -43,6 +43,8 @@ ssize_t hfs_lib_pwrite(int fd, const void *buf, size_t count, off_t offset);
 off_t hfs_lib_lseek(int fd, off_t offset, int whence);
 /* Close an HFS fd. */
 int hfs_lib_close(int fd);
+/* Copy an HFS fd table slot (dup/dup2 support, interceptor helper). */
+int hfs_lib_fd_copy(int oldfd, int newfd);
 /* Remove a file (deletes its inode and data blob). */
 int hfs_lib_unlink(const char *path);
 /* Truncate an HFS file to 'length' bytes. */
