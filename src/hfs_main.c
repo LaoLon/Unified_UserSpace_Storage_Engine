@@ -148,6 +148,42 @@ int main(int argc, char *argv[]) {
 		hfs_lib_close(fd4);
 	}
 
+	/* rename: /a.txt -> /c.txt (same dir), old path ENOENT. */
+	errno = 0;
+	int rrc = hfs_lib_rename("/a.txt", "/c.txt");
+	SPDK_NOTICELOG("rename /a.txt -> /c.txt rc=%d errno=%d\n", rrc, errno);
+	HFS_LOG_INFO("rename /a.txt -> /c.txt rc=%d errno=%d", rrc, errno);
+
+	errno = 0;
+	sr = hfs_lib_stat("/a.txt", &dstat);
+	SPDK_NOTICELOG("stat /a.txt after rename rc=%d errno=%d\n", sr, errno);
+	HFS_LOG_INFO("stat /a.txt after rename rc=%d errno=%d", sr, errno);
+
+	sr = hfs_lib_stat("/c.txt", &dstat);
+	SPDK_NOTICELOG("stat /c.txt rc=%d size=%lld\n", sr,
+		       (long long)(sr == 0 ? dstat.st_size : -1));
+	HFS_LOG_INFO("stat /c.txt rc=%d size=%lld", sr,
+		      (long long)(sr == 0 ? dstat.st_size : -1));
+
+	/* Cross-directory rename: mkdir /d2, move /c.txt into it. */
+	if (hfs_lib_mkdir("/d2", 0755) != 0) {
+		SPDK_NOTICELOG("mkdir /d2 failed errno=%d\n", errno);
+		return -1;
+	}
+	rrc = hfs_lib_rename("/c.txt", "/d2/c.txt");
+	SPDK_NOTICELOG("rename /c.txt -> /d2/c.txt rc=%d errno=%d\n", rrc, errno);
+	HFS_LOG_INFO("rename /c.txt -> /d2/c.txt rc=%d errno=%d", rrc, errno);
+
+	sr = hfs_lib_stat("/d2/c.txt", &dstat);
+	SPDK_NOTICELOG("stat /d2/c.txt rc=%d\n", sr);
+	HFS_LOG_INFO("stat /d2/c.txt rc=%d", sr);
+
+	/* rmdir /d2 must now fail with ENOTEMPTY (c.txt inside). */
+	errno = 0;
+	int rr = hfs_lib_rmdir("/d2");
+	SPDK_NOTICELOG("rmdir /d2 (non-empty) rc=%d errno=%d\n", rr, errno);
+	HFS_LOG_INFO("rmdir /d2 (non-empty) rc=%d errno=%d", rr, errno);
+
 	SPDK_NOTICELOG("hfsEnvSetup success\n");
 
 	SPDK_NOTICELOG("\n\n hfs mount start \n\n");

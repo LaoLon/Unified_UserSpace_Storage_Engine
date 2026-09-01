@@ -120,4 +120,11 @@ int hfsMetaCreateFile(Hfs *fs, struct hfs_inode *parent, const char *name);
 int hfsMetaRemoveFile(Hfs *fs, struct hfs_inode *parent, const char *name,
 		      uint64_t *blobId);
 
+/*
+ * Rename 'oldPath' to 'newPath' (same or different directory).
+ * POSIX semantics: a plain-file target is overwritten; a directory
+ * target must be empty. Persists the table once (atomic).
+ */
+int hfsMetaRename(Hfs *fs, const char *oldPath, const char *newPath);
+
 #endif /* HFS_META_H */

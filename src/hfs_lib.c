@@ -372,10 +372,20 @@ int hfs_lib_rmdir(const char *path) {
 	return rc;
 }
 
-/* Stub: filled in by shard-13 (rename). */
+/* Rename a path under the HFS mount prefix (same or cross-directory). */
 int hfs_lib_rename(const char *oldPath, const char *newPath) {
-	errno = ENOSYS;
-	return -1;
+	int rc;
+
+	pthread_mutex_lock(&g_libLock);
+	if (g_fs == NULL) {
+		pthread_mutex_unlock(&g_libLock);
+		errno = ENODEV;
+		return -1;
+	}
+
+	rc = hfsMetaRename(g_fs, oldPath, newPath);
+	pthread_mutex_unlock(&g_libLock);
+	return rc;
 }
 
 /* Stub: filled in by shard-19 (directory listing). */

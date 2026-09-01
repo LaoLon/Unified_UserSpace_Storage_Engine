@@ -539,6 +539,76 @@ int hfsMetaRemoveFile(Hfs *fs, struct hfs_inode *parent, const char *name,
 	return 0;
 }
 
+/*
+ * Rename 'oldPath' to 'newPath'. POSIX semantics: a plain-file target
+ * is overwritten (its inode is dropped); a directory target must be
+ * empty. The table is persisted once, so the rename is atomic.
+ */
+int hfsMetaRename(Hfs *fs, const char *oldPath, const char *newPath) {
+	struct hfs_inode *src;
+	struct hfs_inode *dst;
+	struct hfs_inode *newParent;
+	const char *newLeaf;
+	uint32_t i;
+
+	src = hfsMetaResolvePath(fs, oldPath);
+	if (src == NULL) {
+		return -1;
+	}
+
+	/* Resolve the destination parent directory and leaf name. */
+	if (hfsMetaResolveParent(fs, newPath, &newParent, &newLeaf) != 0) {
+		return -1;
+	}
+	if (strlen(newLeaf) >= FILENAME_LENGTH) {
+		errno = ENAMETOOLONG;
+		return -1;
+	}
+
+	/* A rename onto itself is a no-op. */
+	if (src->parentId == newParent->id &&
+	    strcmp(src->name, newLeaf) == 0) {
+		return 0;
+	}
+
+	dst = hfsMetaFindByName(fs, newParent->id, newLeaf);
+	if (dst != NULL) {
+		/* Type mismatches between file and directory. */
+		if (src->type == HFS_INODE_DIR && dst->type != HFS_INODE_DIR) {
+			errno = ENOTDIR;
+			return -1;
+		}
+		if (src->type != HFS_INODE_DIR && dst->type == HFS_INODE_DIR) {
+			errno = EISDIR;
+			return -1;
+		}
+		if (dst->type == HFS_INODE_DIR) {
+			/* A directory target must be empty. */
+			for (i = 0; i < fs->inodeCount; i++) {
+				if (fs->inodes[i].parentId == dst->id) {
+					errno = ENOTEMPTY;
+					return -1;
+				}
+			}
+		}
+		/* Overwrite: drop the destination inode (its blob is
+		 * leaked for now; cleaned up by a later shard). */
+		for (i = 0; i < fs->inodeCount; i++) {
+			if (fs->inodes[i].id == dst->id) {
+				fs->inodes[i] = fs->inodes[fs->inodeCount - 1];
+				fs->inodeCount--;
+				break;
+			}
+		}
+	}
+
+	/* Move the source inode into the destination slot. */
+	src->parentId = newParent->id;
+	snprintf(src->name, sizeof(src->name), "%s", newLeaf);
+
+	return hfsMetaSaveAll(fs);
+}
+
 /* Completion callback for spdk_bs_get_super: records the super blob id. */
 static void hfsMetaGetSuperCb(void *arg, spdk_blob_id blobId, int bserrno) {
 	Hfs *fs = (Hfs *)arg;
