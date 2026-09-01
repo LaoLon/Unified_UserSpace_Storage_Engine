@@ -609,6 +609,17 @@ int hfsMetaRename(Hfs *fs, const char *oldPath, const char *newPath) {
 	return hfsMetaSaveAll(fs);
 }
 
+/* Update an inode's size and mtime, then persist the table. */
+int hfsMetaSetSize(Hfs *fs, struct hfs_inode *in, uint64_t size) {
+	struct timespec ts;
+
+	clock_gettime(CLOCK_REALTIME, &ts);
+	in->size = size;
+	in->mtimeNs = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+
+	return hfsMetaSaveAll(fs);
+}
+
 /* Completion callback for spdk_bs_get_super: records the super blob id. */
 static void hfsMetaGetSuperCb(void *arg, spdk_blob_id blobId, int bserrno) {
 	Hfs *fs = (Hfs *)arg;

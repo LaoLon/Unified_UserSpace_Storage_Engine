@@ -5,6 +5,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "hfs.h"
 #include "hfs_internal.h"
@@ -25,6 +26,7 @@ static Hfs *g_fs;
 struct hfs_handle {
 	int fd;			/* application-visible fd */
 	HfsFile *file;		/* open HFS file handle */
+	uint64_t inodeId;	/* inode id backing this fd */
 	uint64_t offset;	/* current file offset */
 	int flags;		/* open flags (O_APPEND etc.) */
 	int isHfs;		/* 1 = HFS handle, 0 = pass-through fd */
@@ -220,6 +222,7 @@ int hfs_lib_open(const char *path, int flags, mode_t mode) {
 
 	g_fdTable[fd].fd = fd;
 	g_fdTable[fd].file = file;
+	g_fdTable[fd].inodeId = in->id;
 	g_fdTable[fd].offset = 0;
 	g_fdTable[fd].flags = flags;
 	g_fdTable[fd].isHfs = 1;
@@ -310,20 +313,94 @@ int hfs_lib_unlink(const char *path) {
 	return rc;
 }
 
-/* Stub: filled in by shard-14 (ftruncate). */
+/*
+ * Truncate the file behind 'fd' to 'length'.
+ * Updates the inode size and grows the data blob as needed.
+ */
 int hfs_lib_ftruncate(int fd, off_t length) {
-	errno = ENOSYS;
-	return -1;
+	struct hfs_handle *h;
+	struct hfs_inode *in;
+	int rc;
+
+	if (length < 0) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	pthread_mutex_lock(&g_libLock);
+	if (g_fs == NULL) {
+		pthread_mutex_unlock(&g_libLock);
+		errno = ENODEV;
+		return -1;
+	}
+	if (fd < 0 || fd >= HFS_FD_TABLE_SIZE || g_fdTable[fd].file == NULL) {
+		pthread_mutex_unlock(&g_libLock);
+		errno = EBADF;
+		return -1;
+	}
+
+	h = &g_fdTable[fd];
+	in = hfsMetaFindById(g_fs, h->inodeId);
+	if (in == NULL) {
+		pthread_mutex_unlock(&g_libLock);
+		errno = ENOENT;
+		return -1;
+	}
+
+	/* Grow the blob first so the new size is backed by storage. */
+	if (length > (off_t)in->size) {
+		if (hfsResizeTo(h->file, (uint64_t)length) != 0) {
+			pthread_mutex_unlock(&g_libLock);
+			errno = EIO;
+			return -1;
+		}
+	}
+
+	rc = hfsMetaSetSize(g_fs, in, (uint64_t)length);
+	pthread_mutex_unlock(&g_libLock);
+	return rc;
+}
+
+/* Stat the file behind 'fd' (filled from the inode table). */
+int hfs_lib_fstat(int fd, struct stat *st) {
+	struct hfs_inode *in;
+
+	pthread_mutex_lock(&g_libLock);
+	if (g_fs == NULL) {
+		pthread_mutex_unlock(&g_libLock);
+		errno = ENODEV;
+		return -1;
+	}
+	if (fd < 0 || fd >= HFS_FD_TABLE_SIZE || g_fdTable[fd].file == NULL) {
+		pthread_mutex_unlock(&g_libLock);
+		errno = EBADF;
+		return -1;
+	}
+
+	in = hfsMetaFindById(g_fs, g_fdTable[fd].inodeId);
+	pthread_mutex_unlock(&g_libLock);
+	if (in == NULL) {
+		errno = ENOENT;
+		return -1;
+	}
+
+	memset(st, 0, sizeof(*st));
+	st->st_ino = (ino_t)in->id;
+	st->st_mode = (in->type == HFS_INODE_DIR) ? (S_IFDIR | 0755) : (S_IFREG | 0644);
+	st->st_size = (off_t)in->size;
+	st->st_mtim.tv_sec = (time_t)(in->mtimeNs / 1000000000ULL);
+	st->st_mtim.tv_nsec = (long)(in->mtimeNs % 1000000000ULL);
+	st->st_ctim.tv_sec = (time_t)(in->ctimeNs / 1000000000ULL);
+	st->st_ctim.tv_nsec = (long)(in->ctimeNs % 1000000000ULL);
+	st->st_uid = getuid();
+	st->st_gid = getgid();
+	st->st_nlink = 1;
+	st->st_blksize = 4096;
+	return 0;
 }
 
 /* Stub: filled in by shard-17 (fsync handling). */
 int hfs_lib_fsync(int fd) {
-	errno = ENOSYS;
-	return -1;
-}
-
-/* Stub: filled in by shard-14 (stat family). */
-int hfs_lib_fstat(int fd, struct stat *st) {
 	errno = ENOSYS;
 	return -1;
 }
@@ -407,9 +484,7 @@ int hfs_lib_closedir(struct hfs_dir *dir) {
 }
 
 /*
- * Stat a path under the HFS mount prefix.
- * Basic placeholder backed by path resolution; extended fields are
- * filled in by shard-14.
+ * Stat a path under the HFS mount prefix; fields come from the inode.
  */
 int hfs_lib_stat(const char *path, struct stat *st) {
 	struct hfs_inode *in;
@@ -432,5 +507,12 @@ int hfs_lib_stat(const char *path, struct stat *st) {
 	st->st_mode = (in->type == HFS_INODE_DIR) ? (S_IFDIR | 0755) : (S_IFREG | 0644);
 	st->st_size = (off_t)in->size;
 	st->st_mtim.tv_sec = (time_t)(in->mtimeNs / 1000000000ULL);
+	st->st_mtim.tv_nsec = (long)(in->mtimeNs % 1000000000ULL);
+	st->st_ctim.tv_sec = (time_t)(in->ctimeNs / 1000000000ULL);
+	st->st_ctim.tv_nsec = (long)(in->ctimeNs % 1000000000ULL);
+	st->st_uid = getuid();
+	st->st_gid = getgid();
+	st->st_nlink = 1;
+	st->st_blksize = 4096;
 	return 0;
 }

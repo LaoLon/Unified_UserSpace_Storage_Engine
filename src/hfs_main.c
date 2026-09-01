@@ -184,6 +184,38 @@ int main(int argc, char *argv[]) {
 	SPDK_NOTICELOG("rmdir /d2 (non-empty) rc=%d errno=%d\n", rr, errno);
 	HFS_LOG_INFO("rmdir /d2 (non-empty) rc=%d errno=%d", rr, errno);
 
+	/* ftruncate: open /e.txt, write 4 bytes, stat size=4, truncate 100. */
+	int fd5 = hfs_lib_open("/e.txt", O_CREAT | O_RDWR, 0644);
+	SPDK_NOTICELOG("open /e.txt fd=%d\n", fd5);
+	HFS_LOG_INFO("open /e.txt fd=%d", fd5);
+	if (fd5 >= 0) {
+		hfs_lib_write(fd5, "data", 4);
+		sr = hfs_lib_stat("/e.txt", &dstat);
+		SPDK_NOTICELOG("stat /e.txt after write size=%lld\n",
+			       (long long)(sr == 0 ? dstat.st_size : -1));
+		HFS_LOG_INFO("stat /e.txt after write size=%lld",
+			      (long long)(sr == 0 ? dstat.st_size : -1));
+
+		int trc = hfs_lib_ftruncate(fd5, 100);
+		SPDK_NOTICELOG("ftruncate /e.txt 100 rc=%d errno=%d\n", trc, errno);
+		HFS_LOG_INFO("ftruncate /e.txt 100 rc=%d errno=%d", trc, errno);
+
+		sr = hfs_lib_stat("/e.txt", &dstat);
+		SPDK_NOTICELOG("stat /e.txt after truncate size=%lld\n",
+			       (long long)(sr == 0 ? dstat.st_size : -1));
+		HFS_LOG_INFO("stat /e.txt after truncate size=%lld",
+			      (long long)(sr == 0 ? dstat.st_size : -1));
+
+		errno = 0;
+		int frc = hfs_lib_fstat(fd5, &dstat);
+		SPDK_NOTICELOG("fstat /e.txt rc=%d size=%lld errno=%d\n", frc,
+			       (long long)(frc == 0 ? dstat.st_size : -1), errno);
+		HFS_LOG_INFO("fstat /e.txt rc=%d size=%lld errno=%d", frc,
+			      (long long)(frc == 0 ? dstat.st_size : -1), errno);
+
+		hfs_lib_close(fd5);
+	}
+
 	SPDK_NOTICELOG("hfsEnvSetup success\n");
 
 	SPDK_NOTICELOG("\n\n hfs mount start \n\n");

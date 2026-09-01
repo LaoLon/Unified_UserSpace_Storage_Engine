@@ -127,4 +127,9 @@ int hfsMetaRemoveFile(Hfs *fs, struct hfs_inode *parent, const char *name,
  */
 int hfsMetaRename(Hfs *fs, const char *oldPath, const char *newPath);
 
+/*
+ * Update the size of 'in' and its mtime, then persist the table.
+ */
+int hfsMetaSetSize(Hfs *fs, struct hfs_inode *in, uint64_t size);
+
 #endif /* HFS_META_H */

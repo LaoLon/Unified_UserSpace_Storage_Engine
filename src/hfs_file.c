@@ -199,6 +199,23 @@ static bool hfsEnsureSize(HfsFile *file, uint64_t bytes) {
 	return waiter(globalThread, hfsDoResize, file, &file->finished);
 }
 
+/* Resize the blob so it covers at least 'bytes' (grow only). */
+int hfsResizeTo(HfsFile *file, uint64_t bytes) {
+	uint64_t clusterSize = spdk_bs_get_cluster_size(file->fs->blobstore);
+	uint64_t needClusters = (bytes + clusterSize - 1) / clusterSize;
+
+	if (spdk_blob_get_num_clusters(file->blob) >= needClusters) {
+		return 0;
+	}
+
+	file->resizeClusters = needClusters;
+	file->finished = false;
+	if (!waiter(globalThread, hfsDoResize, file, &file->finished)) {
+		return -1;
+	}
+	return 0;
+}
+
 /*
  * Read 'count' bytes at an explicit byte offset.
  * Reads whole io units into a DMA buffer, then copies the requested
