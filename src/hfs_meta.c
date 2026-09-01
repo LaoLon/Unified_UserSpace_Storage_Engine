@@ -1,6 +1,7 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include <spdk/blob.h>
 #include <spdk/env.h>
@@ -350,6 +351,81 @@ int hfsMetaResolveParent(Hfs *fs, const char *path,
 		return -1;
 	}
 	return 0;
+}
+
+/*
+ * Create a new directory inode under 'parent'.
+ * Rejects duplicate names with EEXIST; persists the inode table.
+ */
+int hfsMetaMkdir(Hfs *fs, struct hfs_inode *parent, const char *name) {
+	struct hfs_inode *dir;
+	struct timespec ts;
+
+	if (parent->type != HFS_INODE_DIR) {
+		errno = ENOTDIR;
+		return -1;
+	}
+	if (strlen(name) >= FILENAME_LENGTH) {
+		errno = ENAMETOOLONG;
+		return -1;
+	}
+	if (hfsMetaFindByName(fs, parent->id, name) != NULL) {
+		errno = EEXIST;
+		return -1;
+	}
+
+	dir = hfsMetaAddInode(fs);
+	if (dir == NULL) {
+		errno = ENOSPC;
+		return -1;
+	}
+
+	clock_gettime(CLOCK_REALTIME, &ts);
+	dir->type = HFS_INODE_DIR;
+	dir->parentId = parent->id;
+	dir->blobId = SPDK_BLOBID_INVALID;
+	dir->ctimeNs = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+	dir->mtimeNs = dir->ctimeNs;
+	snprintf(dir->name, sizeof(dir->name), "%s", name);
+
+	return hfsMetaSaveAll(fs);
+}
+
+/*
+ * Remove an empty directory resolved from 'path'.
+ * Fails with ENOTDIR if it is a file, ENOTEMPTY if it has children.
+ */
+int hfsMetaRmdir(Hfs *fs, const char *path) {
+	struct hfs_inode *dir;
+	uint32_t i;
+
+	dir = hfsMetaResolvePath(fs, path);
+	if (dir == NULL) {
+		return -1;
+	}
+	if (dir->type != HFS_INODE_DIR) {
+		errno = ENOTDIR;
+		return -1;
+	}
+
+	/* A directory is non-empty if any inode lists it as parent. */
+	for (i = 0; i < fs->inodeCount; i++) {
+		if (fs->inodes[i].parentId == dir->id) {
+			errno = ENOTEMPTY;
+			return -1;
+		}
+	}
+
+	/* Remove by shifting the tail of the table over the entry. */
+	for (i = 0; i < fs->inodeCount; i++) {
+		if (fs->inodes[i].id == dir->id) {
+			fs->inodes[i] = fs->inodes[fs->inodeCount - 1];
+			fs->inodeCount--;
+			break;
+		}
+	}
+
+	return hfsMetaSaveAll(fs);
 }
 
 /* Completion callback for spdk_bs_get_super: records the super blob id. */

@@ -200,16 +200,48 @@ int hfs_lib_fstat(int fd, struct stat *st) {
 	return -1;
 }
 
-/* Stub: filled in by shard-10 (mkdir). */
+/*
+ * Create a directory under the HFS mount prefix.
+ * Uses resolveParent to locate the target's parent, then creates
+ * the directory inode and persists the table.
+ */
 int hfs_lib_mkdir(const char *path, mode_t mode) {
-	errno = ENOSYS;
-	return -1;
+	struct hfs_inode *parent;
+	const char *leaf;
+	int rc;
+
+	pthread_mutex_lock(&g_libLock);
+	if (g_fs == NULL) {
+		pthread_mutex_unlock(&g_libLock);
+		errno = ENODEV;
+		return -1;
+	}
+
+	rc = hfsMetaResolveParent(g_fs, path, &parent, &leaf);
+	if (rc != 0) {
+		pthread_mutex_unlock(&g_libLock);
+		return -1;
+	}
+
+	rc = hfsMetaMkdir(g_fs, parent, leaf);
+	pthread_mutex_unlock(&g_libLock);
+	return rc;
 }
 
-/* Stub: filled in by shard-10 (rmdir). */
+/* Remove an empty directory under the HFS mount prefix. */
 int hfs_lib_rmdir(const char *path) {
-	errno = ENOSYS;
-	return -1;
+	int rc;
+
+	pthread_mutex_lock(&g_libLock);
+	if (g_fs == NULL) {
+		pthread_mutex_unlock(&g_libLock);
+		errno = ENODEV;
+		return -1;
+	}
+
+	rc = hfsMetaRmdir(g_fs, path);
+	pthread_mutex_unlock(&g_libLock);
+	return rc;
 }
 
 /* Stub: filled in by shard-13 (rename). */

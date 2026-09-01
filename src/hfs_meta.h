@@ -94,4 +94,16 @@ struct hfs_inode *hfsMetaResolvePath(Hfs *fs, const char *path);
 int hfsMetaResolveParent(Hfs *fs, const char *path,
 			 struct hfs_inode **parent, const char **leafName);
 
+/*
+ * Create a new directory inode under 'parent' with the given name.
+ * Persists the inode table. Fails with EEXIST if the name is taken.
+ */
+int hfsMetaMkdir(Hfs *fs, struct hfs_inode *parent, const char *name);
+
+/*
+ * Remove an empty directory resolved from 'path'.
+ * Fails with ENOTEMPTY if it still contains children.
+ */
+int hfsMetaRmdir(Hfs *fs, const char *path);
+
 #endif /* HFS_META_H */

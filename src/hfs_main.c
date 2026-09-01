@@ -67,6 +67,35 @@ int main(int argc, char *argv[]) {
 	HFS_LOG_INFO("resolve /nonexist -> %s errno=%d",
 		      missing ? missing->name : "(null)", errno);
 
+	/* mkdir /d1 -> stat exists -> rmdir -> stat gone. */
+	if (hfs_lib_mkdir("/d1", 0755) != 0) {
+		SPDK_NOTICELOG("mkdir /d1 failed errno=%d\n", errno);
+		return -1;
+	}
+	struct stat dstat;
+	int sr = hfs_lib_stat("/d1", &dstat);
+	SPDK_NOTICELOG("stat /d1 rc=%d mode=%o\n", sr,
+		       (unsigned int)(sr == 0 ? dstat.st_mode : 0));
+	HFS_LOG_INFO("stat /d1 rc=%d mode=%o", sr,
+		      (unsigned int)(sr == 0 ? dstat.st_mode : 0));
+
+	/* Duplicate mkdir must fail with EEXIST. */
+	errno = 0;
+	int dupRc = hfs_lib_mkdir("/d1", 0755);
+	SPDK_NOTICELOG("mkdir /d1 (dup) rc=%d errno=%d\n", dupRc, errno);
+	HFS_LOG_INFO("mkdir /d1 (dup) rc=%d errno=%d", dupRc, errno);
+
+	/* rmdir on the (empty) directory. */
+	errno = 0;
+	int rmRc = hfs_lib_rmdir("/d1");
+	SPDK_NOTICELOG("rmdir /d1 rc=%d errno=%d\n", rmRc, errno);
+	HFS_LOG_INFO("rmdir /d1 rc=%d errno=%d", rmRc, errno);
+
+	/* After removal the path must be gone. */
+	sr = hfs_lib_stat("/d1", &dstat);
+	SPDK_NOTICELOG("stat /d1 after rmdir rc=%d errno=%d\n", sr, errno);
+	HFS_LOG_INFO("stat /d1 after rmdir rc=%d errno=%d", sr, errno);
+
 	SPDK_NOTICELOG("hfsEnvSetup success\n");
 
 	SPDK_NOTICELOG("\n\n hfs mount start \n\n");
