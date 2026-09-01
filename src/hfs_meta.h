@@ -112,4 +112,12 @@ int hfsMetaRmdir(Hfs *fs, const char *path);
  */
 int hfsMetaCreateFile(Hfs *fs, struct hfs_inode *parent, const char *name);
 
+/*
+ * Remove a file inode from the table without touching the data blob.
+ * The removed blob id is returned via '*blobId' for later deletion.
+ * Fails with EISDIR if the name refers to a directory.
+ */
+int hfsMetaRemoveFile(Hfs *fs, struct hfs_inode *parent, const char *name,
+		      uint64_t *blobId);
+
 #endif /* HFS_META_H */

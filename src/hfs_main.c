@@ -123,6 +123,31 @@ int main(int argc, char *argv[]) {
 		hfs_lib_close(fd2);
 	}
 
+	/* unlink: create /b.txt -> unlink -> stat ENOENT -> recreate ok. */
+	int fd3 = hfs_lib_open("/b.txt", O_CREAT | O_RDWR, 0644);
+	SPDK_NOTICELOG("open /b.txt (O_CREAT) fd=%d\n", fd3);
+	HFS_LOG_INFO("open /b.txt (O_CREAT) fd=%d", fd3);
+	if (fd3 >= 0) {
+		hfs_lib_close(fd3);
+	}
+
+	errno = 0;
+	int urc = hfs_lib_unlink("/b.txt");
+	SPDK_NOTICELOG("unlink /b.txt rc=%d errno=%d\n", urc, errno);
+	HFS_LOG_INFO("unlink /b.txt rc=%d errno=%d", urc, errno);
+
+	errno = 0;
+	sr = hfs_lib_stat("/b.txt", &dstat);
+	SPDK_NOTICELOG("stat /b.txt after unlink rc=%d errno=%d\n", sr, errno);
+	HFS_LOG_INFO("stat /b.txt after unlink rc=%d errno=%d", sr, errno);
+
+	int fd4 = hfs_lib_open("/b.txt", O_CREAT | O_RDWR, 0644);
+	SPDK_NOTICELOG("recreate /b.txt fd=%d\n", fd4);
+	HFS_LOG_INFO("recreate /b.txt fd=%d", fd4);
+	if (fd4 >= 0) {
+		hfs_lib_close(fd4);
+	}
+
 	SPDK_NOTICELOG("hfsEnvSetup success\n");
 
 	SPDK_NOTICELOG("\n\n hfs mount start \n\n");

@@ -265,10 +265,49 @@ int hfs_lib_close(int fd) {
 	return -1;
 }
 
-/* Stub: filled in by shard-12 (unlink). */
+/*
+ * Remove a file under the HFS mount prefix: drop the inode, then
+ * delete its data blob and persist the table.
+ */
 int hfs_lib_unlink(const char *path) {
-	errno = ENOSYS;
-	return -1;
+	struct hfs_inode *parent;
+	const char *leaf;
+	uint64_t blobId;
+	HfsFile file;
+	int rc;
+
+	pthread_mutex_lock(&g_libLock);
+	if (g_fs == NULL) {
+		pthread_mutex_unlock(&g_libLock);
+		errno = ENODEV;
+		return -1;
+	}
+
+	rc = hfsMetaResolveParent(g_fs, path, &parent, &leaf);
+	if (rc != 0) {
+		pthread_mutex_unlock(&g_libLock);
+		return -1;
+	}
+
+	rc = hfsMetaRemoveFile(g_fs, parent, leaf, &blobId);
+	if (rc != 0) {
+		pthread_mutex_unlock(&g_libLock);
+		return -1;
+	}
+
+	/* Delete the data blob via the waiter chain. */
+	memset(&file, 0, sizeof(file));
+	file.fs = g_fs;
+	file.blobId = blobId;
+	if (!hfsDeleteBlobById(&file)) {
+		pthread_mutex_unlock(&g_libLock);
+		errno = EIO;
+		return -1;
+	}
+
+	rc = hfsMetaSaveAll(g_fs);
+	pthread_mutex_unlock(&g_libLock);
+	return rc;
 }
 
 /* Stub: filled in by shard-14 (ftruncate). */

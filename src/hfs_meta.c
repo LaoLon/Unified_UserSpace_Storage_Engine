@@ -506,6 +506,39 @@ int hfsMetaCreateFile(Hfs *fs, struct hfs_inode *parent, const char *name) {
 	return hfsMetaSaveAll(fs);
 }
 
+/*
+ * Remove a file inode from the table; the caller deletes its blob.
+ * Fails with EISDIR for a directory; returns the blob id to delete.
+ */
+int hfsMetaRemoveFile(Hfs *fs, struct hfs_inode *parent, const char *name,
+		      uint64_t *blobId) {
+	struct hfs_inode *in;
+	uint32_t i;
+
+	in = hfsMetaFindByName(fs, parent->id, name);
+	if (in == NULL) {
+		errno = ENOENT;
+		return -1;
+	}
+	if (in->type != HFS_INODE_FILE) {
+		errno = EISDIR;
+		return -1;
+	}
+
+	*blobId = in->blobId;
+
+	/* Remove by shifting the tail of the table over the entry. */
+	for (i = 0; i < fs->inodeCount; i++) {
+		if (fs->inodes[i].id == in->id) {
+			fs->inodes[i] = fs->inodes[fs->inodeCount - 1];
+			fs->inodeCount--;
+			break;
+		}
+	}
+
+	return 0;
+}
+
 /* Completion callback for spdk_bs_get_super: records the super blob id. */
 static void hfsMetaGetSuperCb(void *arg, spdk_blob_id blobId, int bserrno) {
 	Hfs *fs = (Hfs *)arg;
