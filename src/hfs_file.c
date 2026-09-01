@@ -149,6 +149,28 @@ int hfsOpen(HfsFile *file) {
 	return waiter(globalThread, hfsDoOpen, file, &file->finished);
 }
 
+/* Completion callback for spdk_bs_open_blob (open-by-id path). */
+static void hfsSpdkBsOpenByIdCb(void *arg, struct spdk_blob *blb, int bserrno) {
+	HfsFile *file = (HfsFile *)arg;
+
+	file->blob = blb;
+	file->finished = true;
+}
+
+/* SPDK-thread task: open an existing blob by id (no create). */
+static void hfsDoOpenById(void *arg) {
+	HfsFile *file = (HfsFile *)arg;
+
+	spdk_bs_open_blob(file->fs->blobstore, file->blobId, hfsSpdkBsOpenByIdCb, file);
+}
+
+/* Open an existing blob by id; used by the library open path. */
+int hfsOpenById(HfsFile *file) {
+	file->finished = false;
+
+	return waiter(globalThread, hfsDoOpenById, file, &file->finished);
+}
+
 /* Completion callback for spdk_blob_resize (write path). */
 static void hfsSpdkBlobResizeDoneCb(void *arg, int bserrno) {
 	HfsFile *file = (HfsFile *)arg;

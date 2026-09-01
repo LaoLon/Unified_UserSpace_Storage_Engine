@@ -134,10 +134,99 @@ void hfs_lib_fini(void) {
 	pthread_mutex_unlock(&g_libLock);
 }
 
-/* Stubs: filled in by shard-11 (open) and later shards. */
+/*
+ * Open a file under the HFS mount prefix.
+ * O_CREAT creates a fresh file (data blob + inode); O_TRUNC resets its
+ * size. Returns a file descriptor registered in the fd table.
+ */
 int hfs_lib_open(const char *path, int flags, mode_t mode) {
-	errno = ENOSYS;
-	return -1;
+	struct hfs_inode *in;
+	struct hfs_inode *parent;
+	const char *leaf;
+	HfsFile *file;
+	int fd;
+	int rc;
+
+	pthread_mutex_lock(&g_libLock);
+	if (g_fs == NULL) {
+		pthread_mutex_unlock(&g_libLock);
+		errno = ENODEV;
+		return -1;
+	}
+
+	in = hfsMetaResolvePath(g_fs, path);
+	if (in == NULL) {
+		if (errno != ENOENT || !(flags & O_CREAT)) {
+			pthread_mutex_unlock(&g_libLock);
+			return -1;
+		}
+		/* Create the file and re-resolve its inode. */
+		if (hfsMetaResolveParent(g_fs, path, &parent, &leaf) != 0) {
+			pthread_mutex_unlock(&g_libLock);
+			return -1;
+		}
+		rc = hfsMetaCreateFile(g_fs, parent, leaf);
+		if (rc != 0) {
+			pthread_mutex_unlock(&g_libLock);
+			return -1;
+		}
+		in = hfsMetaFindByName(g_fs, parent->id, leaf);
+		if (in == NULL) {
+			pthread_mutex_unlock(&g_libLock);
+			errno = ENOENT;
+			return -1;
+		}
+	} else if (in->type != HFS_INODE_FILE) {
+		pthread_mutex_unlock(&g_libLock);
+		errno = EISDIR;
+		return -1;
+	}
+
+	if ((flags & O_TRUNC) && in->size != 0) {
+		in->size = 0;
+		if (hfsMetaSaveAll(g_fs) != 0) {
+			pthread_mutex_unlock(&g_libLock);
+			return -1;
+		}
+	}
+
+	/* Allocate a free slot in the fd table. */
+	for (fd = 3; fd < HFS_FD_TABLE_SIZE; fd++) {
+		if (g_fdTable[fd].file == NULL) {
+			break;
+		}
+	}
+	if (fd >= HFS_FD_TABLE_SIZE) {
+		pthread_mutex_unlock(&g_libLock);
+		errno = EMFILE;
+		return -1;
+	}
+
+	file = calloc(1, sizeof(HfsFile));
+	if (file == NULL) {
+		pthread_mutex_unlock(&g_libLock);
+		errno = ENOMEM;
+		return -1;
+	}
+	file->fs = g_fs;
+	file->blobId = in->blobId;
+
+	if (!hfsOpenById(file)) {
+		free(file);
+		pthread_mutex_unlock(&g_libLock);
+		errno = EIO;
+		return -1;
+	}
+
+	g_fdTable[fd].fd = fd;
+	g_fdTable[fd].file = file;
+	g_fdTable[fd].offset = 0;
+	g_fdTable[fd].flags = flags;
+	g_fdTable[fd].isHfs = 1;
+	g_fdTable[fd].writable = ((flags & O_ACCMODE) != O_RDONLY);
+
+	pthread_mutex_unlock(&g_libLock);
+	return fd;
 }
 
 /* Stub: filled in by shard-16 (read/write path). */

@@ -106,4 +106,10 @@ int hfsMetaMkdir(Hfs *fs, struct hfs_inode *parent, const char *name);
  */
 int hfsMetaRmdir(Hfs *fs, const char *path);
 
+/*
+ * Create a new file: allocate a data blob, add a FILE inode under
+ * 'parent' and persist the table. Fails with EEXIST if the name is taken.
+ */
+int hfsMetaCreateFile(Hfs *fs, struct hfs_inode *parent, const char *name);
+
 #endif /* HFS_META_H */

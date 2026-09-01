@@ -428,6 +428,84 @@ int hfsMetaRmdir(Hfs *fs, const char *path) {
 	return hfsMetaSaveAll(fs);
 }
 
+/* Async context for hfsMetaCreateFile (blob creation waiter). */
+struct hfs_meta_create_ctx {
+	Hfs *fs;
+	bool finished;
+	int rc;
+	spdk_blob_id blobId;
+};
+
+/* Completion callback for spdk_bs_create_blob (file data blob). */
+static void hfsMetaCreateFileCb(void *arg, spdk_blob_id blobId, int bserrno) {
+	struct hfs_meta_create_ctx *ctx = (struct hfs_meta_create_ctx *)arg;
+
+	ctx->blobId = blobId;
+	ctx->rc = bserrno;
+	ctx->finished = true;
+}
+
+/* SPDK-thread task: allocate a new data blob for a file. */
+static void hfsMetaDoCreateFileBlob(void *arg) {
+	struct hfs_meta_create_ctx *ctx = (struct hfs_meta_create_ctx *)arg;
+
+	spdk_bs_create_blob(ctx->fs->blobstore, hfsMetaCreateFileCb, ctx);
+}
+
+/*
+ * Create a new file: allocate a data blob, add a FILE inode under
+ * 'parent' and persist the table. Fails with EEXIST if the name is taken.
+ */
+int hfsMetaCreateFile(Hfs *fs, struct hfs_inode *parent, const char *name) {
+	struct hfs_meta_create_ctx ctx;
+	struct hfs_inode *in;
+	struct timespec ts;
+
+	if (parent->type != HFS_INODE_DIR) {
+		errno = ENOTDIR;
+		return -1;
+	}
+	if (strlen(name) >= FILENAME_LENGTH) {
+		errno = ENAMETOOLONG;
+		return -1;
+	}
+	if (hfsMetaFindByName(fs, parent->id, name) != NULL) {
+		errno = EEXIST;
+		return -1;
+	}
+
+	ctx.finished = false;
+	ctx.rc = 0;
+	ctx.blobId = SPDK_BLOBID_INVALID;
+	ctx.fs = fs;
+
+	if (!waiter(globalThread, hfsMetaDoCreateFileBlob, &ctx, &ctx.finished)) {
+		errno = ETIMEDOUT;
+		return -1;
+	}
+	if (ctx.rc != 0) {
+		errno = -ctx.rc;
+		return -1;
+	}
+
+	in = hfsMetaAddInode(fs);
+	if (in == NULL) {
+		errno = ENOSPC;
+		return -1;
+	}
+
+	clock_gettime(CLOCK_REALTIME, &ts);
+	in->type = HFS_INODE_FILE;
+	in->parentId = parent->id;
+	in->blobId = ctx.blobId;
+	in->size = 0;
+	in->ctimeNs = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+	in->mtimeNs = in->ctimeNs;
+	snprintf(in->name, sizeof(in->name), "%s", name);
+
+	return hfsMetaSaveAll(fs);
+}
+
 /* Completion callback for spdk_bs_get_super: records the super blob id. */
 static void hfsMetaGetSuperCb(void *arg, spdk_blob_id blobId, int bserrno) {
 	Hfs *fs = (Hfs *)arg;

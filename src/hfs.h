@@ -87,6 +87,8 @@ int hfsUmount(Hfs *fs);
 
 /* Create a new blob and open it (creates a fresh file). */
 int hfsOpen(HfsFile *file);
+/* Open an existing blob by id (open-by-id path). */
+int hfsOpenById(HfsFile *file);
 /* Sequential read at file->offset; advances the offset. */
 int hfsRead(HfsFile *file, uint8_t *buffer, size_t count);
 /* Sequential write at file->offset; advances the offset. */

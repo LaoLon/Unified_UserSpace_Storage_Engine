@@ -1,3 +1,4 @@
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -95,6 +96,32 @@ int main(int argc, char *argv[]) {
 	sr = hfs_lib_stat("/d1", &dstat);
 	SPDK_NOTICELOG("stat /d1 after rmdir rc=%d errno=%d\n", sr, errno);
 	HFS_LOG_INFO("stat /d1 after rmdir rc=%d errno=%d", sr, errno);
+
+	/* Create /a.txt with O_CREAT, stat size=0, reopen without O_CREAT. */
+	errno = 0;
+	int fd1 = hfs_lib_open("/a.txt", O_CREAT | O_RDWR, 0644);
+	SPDK_NOTICELOG("open /a.txt (O_CREAT) fd=%d errno=%d\n", fd1, errno);
+	HFS_LOG_INFO("open /a.txt (O_CREAT) fd=%d errno=%d", fd1, errno);
+
+	errno = 0;
+	sr = hfs_lib_stat("/a.txt", &dstat);
+	SPDK_NOTICELOG("stat /a.txt rc=%d size=%lld mode=%o\n", sr,
+		       (long long)(sr == 0 ? dstat.st_size : -1),
+		       (unsigned int)(sr == 0 ? dstat.st_mode : 0));
+	HFS_LOG_INFO("stat /a.txt rc=%d size=%lld mode=%o", sr,
+		      (long long)(sr == 0 ? dstat.st_size : -1),
+		      (unsigned int)(sr == 0 ? dstat.st_mode : 0));
+
+	errno = 0;
+	int fd2 = hfs_lib_open("/a.txt", O_RDONLY, 0);
+	SPDK_NOTICELOG("reopen /a.txt fd=%d errno=%d\n", fd2, errno);
+	HFS_LOG_INFO("reopen /a.txt fd=%d errno=%d", fd2, errno);
+	if (fd1 >= 0) {
+		hfs_lib_close(fd1);
+	}
+	if (fd2 >= 0) {
+		hfs_lib_close(fd2);
+	}
 
 	SPDK_NOTICELOG("hfsEnvSetup success\n");
 
