@@ -41,6 +41,7 @@ set(HFS_CORE_SRC
   src/hfs_log.c
   src/hfs_lib.c
   src/hfs_meta.c
+  src/hfs_preload.c
 )
 
 # SPDK 模块库列表（与 Makefile 的 ALL_MODULES_LIST + event + event_bdev 一致）

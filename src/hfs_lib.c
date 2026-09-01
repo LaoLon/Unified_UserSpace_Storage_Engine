@@ -98,6 +98,13 @@ int hfs_lib_init(void) {
 
 	memset(g_fdTable, 0, sizeof(g_fdTable));
 	HFS_LOG_INFO("libhfs initialized");
+
+	/*
+	 * Mark the environment so forked+exec'd children of this process
+	 * skip SPDK re-initialization (a second primary conflicts with the
+	 * parent's DPDK state and hangs). They run in pass-through mode.
+	 */
+	setenv("_HFS_INIT_DONE", "1", 0);
 	pthread_mutex_unlock(&g_libLock);
 	return 0;
 }
@@ -262,10 +269,52 @@ off_t hfs_lib_lseek(int fd, off_t offset, int whence) {
 	return -1;
 }
 
-/* Stub: filled in by shard-15 (close handling). */
+/* Returns true when the fd belongs to HFS (interception helper). */
+bool hfs_is_hfs_fd(int fd) {
+	bool isHfs;
+
+	if (fd < 0 || fd >= HFS_FD_TABLE_SIZE) {
+		return false;
+	}
+
+	pthread_mutex_lock(&g_libLock);
+	isHfs = (g_fdTable[fd].file != NULL);
+	pthread_mutex_unlock(&g_libLock);
+	return isHfs;
+}
+
+/*
+ * Close an HFS fd: close the blob handle and free the fd table slot.
+ */
 int hfs_lib_close(int fd) {
-	errno = ENOSYS;
-	return -1;
+	struct hfs_handle *h;
+	HfsFile *file;
+
+	pthread_mutex_lock(&g_libLock);
+	if (g_fs == NULL) {
+		pthread_mutex_unlock(&g_libLock);
+		errno = ENODEV;
+		return -1;
+	}
+	if (fd < 0 || fd >= HFS_FD_TABLE_SIZE || g_fdTable[fd].file == NULL) {
+		pthread_mutex_unlock(&g_libLock);
+		errno = EBADF;
+		return -1;
+	}
+
+	h = &g_fdTable[fd];
+	file = h->file;
+
+	if (!hfsClose(file)) {
+		pthread_mutex_unlock(&g_libLock);
+		errno = EIO;
+		return -1;
+	}
+
+	free(file);
+	memset(h, 0, sizeof(*h));
+	pthread_mutex_unlock(&g_libLock);
+	return 0;
 }
 
 /*

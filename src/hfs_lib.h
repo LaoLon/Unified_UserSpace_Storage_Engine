@@ -22,6 +22,8 @@ struct hfs_dirent {
 
 /* Initialize the library (logging, SPDK env, mount, metadata). */
 int hfs_lib_init(void);
+/* Returns true when the fd belongs to HFS (interception helper). */
+bool hfs_is_hfs_fd(int fd);
 /* Tear down the library (unmount, stop logging). */
 void hfs_lib_fini(void);
 /* Return the mounted filesystem instance, or NULL before init. */
