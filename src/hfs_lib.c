@@ -4,6 +4,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <time.h>
 
 #include "hfs.h"
 #include "hfs_internal.h"
@@ -235,8 +236,31 @@ int hfs_lib_closedir(struct hfs_dir *dir) {
 	return -1;
 }
 
-/* Stub: filled in by shard-14 (stat family). */
+/*
+ * Stat a path under the HFS mount prefix.
+ * Basic placeholder backed by path resolution; extended fields are
+ * filled in by shard-14.
+ */
 int hfs_lib_stat(const char *path, struct stat *st) {
-	errno = ENOSYS;
-	return -1;
+	struct hfs_inode *in;
+
+	pthread_mutex_lock(&g_libLock);
+	if (g_fs == NULL) {
+		pthread_mutex_unlock(&g_libLock);
+		errno = ENODEV;
+		return -1;
+	}
+
+	in = hfsMetaResolvePath(g_fs, path);
+	pthread_mutex_unlock(&g_libLock);
+	if (in == NULL) {
+		return -1;
+	}
+
+	memset(st, 0, sizeof(*st));
+	st->st_ino = (ino_t)in->id;
+	st->st_mode = (in->type == HFS_INODE_DIR) ? (S_IFDIR | 0755) : (S_IFREG | 0644);
+	st->st_size = (off_t)in->size;
+	st->st_mtim.tv_sec = (time_t)(in->mtimeNs / 1000000000ULL);
+	return 0;
 }

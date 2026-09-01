@@ -32,16 +32,9 @@ int main(int argc, char *argv[]) {
 	HFS_LOG_INFO("reload meta rc=%d", loadRc);
 
 	/*
-	 * Inode table round-trip: add an inode -> saveAll -> reset the
-	 * in-memory table -> loadAll should restore it from the blob.
+	 * Inode table round-trip: the root inode created at format time
+	 * must survive saveAll -> reset -> loadAll.
 	 */
-	struct hfs_inode *in = hfsMetaAddInode(fs);
-	if (in != NULL) {
-		in->type = HFS_INODE_DIR;
-		in->parentId = 0;
-		in->blobId = SPDK_BLOBID_INVALID;
-		snprintf(in->name, sizeof(in->name), "rootdir");
-	}
 	if (hfsMetaSaveAll(fs) != 0) {
 		SPDK_NOTICELOG("saveAll failed\n");
 		return -1;
@@ -57,6 +50,22 @@ int main(int argc, char *argv[]) {
 	HFS_LOG_INFO("inodeCount=%u first=%s id=%llu", fs->inodeCount,
 		      fs->inodeCount > 0 ? fs->inodes[0].name : "?",
 		      (unsigned long long)(fs->inodeCount > 0 ? fs->inodes[0].id : 0));
+
+	/* Path resolution: "/" resolves to the root inode. */
+	struct hfs_inode *root = hfsMetaResolvePath(fs, "/");
+	SPDK_NOTICELOG("resolve / -> %s id=%llu\n",
+		       root ? root->name : "(null)",
+		       (unsigned long long)(root ? root->id : 0));
+	HFS_LOG_INFO("resolve / -> %s id=%llu", root ? root->name : "(null)",
+		      (unsigned long long)(root ? root->id : 0));
+
+	/* A missing path must resolve to NULL with errno=ENOENT. */
+	errno = 0;
+	struct hfs_inode *missing = hfsMetaResolvePath(fs, "/nonexist");
+	SPDK_NOTICELOG("resolve /nonexist -> %s errno=%d\n",
+		       missing ? missing->name : "(null)", errno);
+	HFS_LOG_INFO("resolve /nonexist -> %s errno=%d",
+		      missing ? missing->name : "(null)", errno);
 
 	SPDK_NOTICELOG("hfsEnvSetup success\n");
 

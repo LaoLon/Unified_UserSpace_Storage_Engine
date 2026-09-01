@@ -75,4 +75,23 @@ struct hfs_inode *hfsMetaFindByName(Hfs *fs, uint64_t parentId, const char *name
 /* Look up an inode by its id, or NULL if not found. */
 struct hfs_inode *hfsMetaFindById(Hfs *fs, uint64_t id);
 
+/* Root directory inode id (created at format time). */
+#define HFS_ROOT_INODE_ID	1
+
+/*
+ * Resolve an absolute path (e.g. "/hfs/a/b.txt") into its inode by
+ * walking each component with findByName. Returns the inode or NULL;
+ * on error errno is set to ENOENT (missing component) or ENOTDIR
+ * (an intermediate component is not a directory).
+ */
+struct hfs_inode *hfsMetaResolvePath(Hfs *fs, const char *path);
+
+/*
+ * Split an absolute path into its parent directory inode and the leaf
+ * name. "*leafName" points into 'path' (or a static buffer for "/").
+ * Returns -1 and sets errno if the parent directory does not exist.
+ */
+int hfsMetaResolveParent(Hfs *fs, const char *path,
+			 struct hfs_inode **parent, const char **leafName);
+
 #endif /* HFS_META_H */

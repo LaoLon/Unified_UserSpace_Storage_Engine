@@ -252,6 +252,106 @@ struct hfs_inode *hfsMetaFindById(Hfs *fs, uint64_t id) {
 	return NULL;
 }
 
+/* Skip any leading '/' characters. */
+static const char *hfsMetaSkipSlashes(const char *p) {
+	while (*p == '/') {
+		p++;
+	}
+	return p;
+}
+
+/*
+ * Resolve an absolute path (e.g. "/hfs/a/b.txt") into its inode.
+ * Walks each component with findByName starting from the root inode.
+ * Returns NULL and sets errno=ENOENT for a missing component, or
+ * errno=ENOTDIR when an intermediate component is not a directory.
+ */
+struct hfs_inode *hfsMetaResolvePath(Hfs *fs, const char *path) {
+	struct hfs_inode *cur;
+	const char *p;
+	char comp[FILENAME_LENGTH];
+	size_t len;
+
+	cur = hfsMetaFindById(fs, HFS_ROOT_INODE_ID);
+	if (cur == NULL) {
+		errno = ENOENT;
+		return NULL;
+	}
+
+	p = hfsMetaSkipSlashes(path);
+	while (*p != '\0') {
+		/* Extract the next path component. */
+		len = 0;
+		while (*p != '\0' && *p != '/' && len + 1 < sizeof(comp)) {
+			comp[len++] = *p++;
+		}
+		comp[len] = '\0';
+		if (len == 0) {
+			p = hfsMetaSkipSlashes(p);
+			continue;
+		}
+
+		/* Only directories can be descended into. */
+		if (cur->type != HFS_INODE_DIR) {
+			errno = ENOTDIR;
+			return NULL;
+		}
+		cur = hfsMetaFindByName(fs, cur->id, comp);
+		if (cur == NULL) {
+			errno = ENOENT;
+			return NULL;
+		}
+		p = hfsMetaSkipSlashes(p);
+	}
+	return cur;
+}
+
+/*
+ * Split an absolute path into its parent directory inode and the leaf
+ * name. The leaf name is returned in an internal buffer (valid until
+ * the next call). Fails with EINVAL for the root itself and ENOENT
+ * when the parent directory does not exist.
+ */
+int hfsMetaResolveParent(Hfs *fs, const char *path,
+			 struct hfs_inode **parent, const char **leafName) {
+	static char buf[PATH_MAX];
+	char *slash;
+	size_t len;
+
+	*parent = NULL;
+	*leafName = NULL;
+
+	if (*hfsMetaSkipSlashes(path) == '\0') {
+		errno = EINVAL;	/* the root directory has no parent */
+		return -1;
+	}
+
+	snprintf(buf, sizeof(buf), "%s", path);
+
+	/* Strip trailing slashes so the last component is the leaf. */
+	len = strlen(buf);
+	while (len > 1 && buf[len - 1] == '/') {
+		buf[--len] = '\0';
+	}
+
+	slash = strrchr(buf, '/');
+	if (slash == NULL || slash == buf) {
+		/* Parent is the root directory. */
+		*parent = hfsMetaFindById(fs, HFS_ROOT_INODE_ID);
+		*leafName = slash ? slash + 1 : buf;
+	} else {
+		*slash = '\0';
+		*parent = hfsMetaResolvePath(fs, buf);
+		*leafName = slash + 1;
+	}
+
+	if (*parent == NULL || (*leafName)[0] == '\0') {
+		errno = ENOENT;
+		return -1;
+	}
+	return 0;
+}
+
 /* Completion callback for spdk_bs_get_super: records the super blob id. */
 static void hfsMetaGetSuperCb(void *arg, spdk_blob_id blobId, int bserrno) {
 	Hfs *fs = (Hfs *)arg;
@@ -346,6 +446,8 @@ int hfsMetaFormat(Hfs *fs) {
  * formats a fresh one (with an empty table persisted).
  */
 int hfsMetaInit(Hfs *fs) {
+	struct hfs_inode *root;
+
 	fs->inodes = calloc(HFS_MAX_INODES, sizeof(struct hfs_inode));
 	if (fs->inodes == NULL) {
 		return -1;
@@ -366,6 +468,18 @@ int hfsMetaInit(Hfs *fs) {
 		return -1;
 	}
 
+	/* Create the root directory inode and persist the table. */
 	fs->inodeCount = 0;
+	root = hfsMetaAddInode(fs);
+	if (root == NULL) {
+		free(fs->inodes);
+		fs->inodes = NULL;
+		return -1;
+	}
+	root->type = HFS_INODE_DIR;
+	root->parentId = 0;
+	root->blobId = SPDK_BLOBID_INVALID;
+	snprintf(root->name, sizeof(root->name), "/");
+	fs->rootInodeId = root->id;
 	return hfsMetaSaveAll(fs);
 }
