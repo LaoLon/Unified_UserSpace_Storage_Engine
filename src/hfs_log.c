@@ -615,7 +615,8 @@ static void hfsLogTrimTail(void) {
 			}
 		}
 		if (keep < rd && ftruncate(fd, keep) != 0) {
-			/* ignore */
+			HFS_LOG_WARN("trim tail ftruncate to %lld failed errno=%d",
+				     (long long)keep, errno);
 		}
 	}
 	free(buf);

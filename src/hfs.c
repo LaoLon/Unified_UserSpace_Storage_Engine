@@ -34,6 +34,7 @@ bool waiter(struct spdk_thread *thread, spdk_msg_fn startFn, void *ctx, bool *fi
 	} while(!(*finished) && waiterCount < WAITER_MAX_TIME);
 
 	if (!(*finished) && waiterCount >= WAITER_MAX_TIME) {
+		HFS_LOG_ERROR("waiter timed out (msg never completed)");
 		return false; /* timeout */
 	}
 

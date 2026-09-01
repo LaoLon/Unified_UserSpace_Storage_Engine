@@ -63,6 +63,7 @@ int hfs_lib_init(void) {
 		pthread_mutex_unlock(&g_libLock);
 		return -1;
 	}
+	HFS_LOG_DEBUG("hfs_log_init done");
 
 	if (hfsEnvSetup() != 0) {
 		HFS_LOG_ERROR("hfsEnvSetup failed");
@@ -118,13 +119,13 @@ Hfs *hfs_lib_get_fs(void) {
 __attribute__((constructor))
 static void hfs_preload_ctor(void) {
 	fprintf(stderr, "libhfs loaded\n");
-	HFS_LOG_INFO("libhfs loaded");
+	HFS_LOG_DEBUG("libhfs loaded");
 }
 
 /* Runs at process exit. */
 __attribute__((destructor))
 static void hfs_preload_dtor(void) {
-	HFS_LOG_INFO("libhfs unloaded");
+	HFS_LOG_DEBUG("libhfs unloaded");
 }
 
 /* Tear down: unmount, free the instance and stop logging. */
@@ -139,7 +140,7 @@ void hfs_lib_fini(void) {
 	free(g_fs);
 	g_fs = NULL;
 	hfs_log_fini();
-	HFS_LOG_INFO("libhfs finalized");
+	HFS_LOG_DEBUG("libhfs finalized");
 	pthread_mutex_unlock(&g_libLock);
 }
 

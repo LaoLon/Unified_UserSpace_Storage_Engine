@@ -290,8 +290,7 @@ int dup3(int oldfd, int newfd, int flags) {
  */
 __attribute__((constructor))
 static void hfs_preload_ctor(void) {
-	fprintf(stderr, "libhfs preload active\n");
-	HFS_LOG_INFO("libhfs preload active");
+	HFS_LOG_DEBUG("libhfs preload active");
 
 	hfs_prefix = getenv("HFS_MOUNT_PREFIX");
 	if (hfs_prefix == NULL) {
@@ -318,8 +317,7 @@ static void hfs_preload_ctor(void) {
 
 	if (getenv("_HFS_INIT_DONE") != NULL) {
 		hfs_inherited = true;
-		fprintf(stderr, "libhfs pass-through mode (inherited)\n");
-		HFS_LOG_INFO("libhfs pass-through mode (inherited)");
+		HFS_LOG_DEBUG("libhfs pass-through mode (inherited)");
 	}
 }
 

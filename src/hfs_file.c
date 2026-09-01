@@ -5,11 +5,16 @@
 #include <spdk/log.h>
 
 #include "hfs_internal.h"
+#include "hfs_log.h"
 
 /* Completion callback for spdk_bs_delete_blob. */
 static void hfsSpdkBlobDeleteCb(void *arg, int bserrno) {
 	HfsFile *file = (HfsFile *)arg;
 
+	if (bserrno != 0) {
+		HFS_LOG_ERROR("delete blob %"PRIu64" failed bserrno=%d",
+			      file->blobId, bserrno);
+	}
 	SPDK_NOTICELOG("blob deleted, id=%"PRIu64"\n", file->blobId);
 	file->finished = true;
 }
@@ -18,6 +23,10 @@ static void hfsSpdkBlobDeleteCb(void *arg, int bserrno) {
 static void hfsSpdkBlobCloseCb(void *arg, int bserrno) {
 	HfsFile *file = (HfsFile *)arg;
 
+	if (bserrno != 0) {
+		HFS_LOG_ERROR("close blob %"PRIu64" failed bserrno=%d",
+			      file->blobId, bserrno);
+	}
 	SPDK_NOTICELOG("close complete\n");
 	file->finished = true;
 }
@@ -62,6 +71,10 @@ int hfsDeleteBlobById(HfsFile *file) {
 static void hfsSpdkBlobReadCb(void *arg, int bserrno) {
 	HfsFile *file = (HfsFile *)arg;
 
+	if (bserrno != 0) {
+		HFS_LOG_ERROR("blob read failed unit=%"PRIu64" n=%"PRIu64
+			      " bserrno=%d", file->ioOffset, file->ioUnits, bserrno);
+	}
 	file->finished = true;
 }
 
@@ -77,6 +90,10 @@ static void hfsDoRead(void *arg) {
 static void hfsSpdkBlobWriteCb(void *arg, int bserrno) {
 	HfsFile *file = (HfsFile *)arg;
 
+	if (bserrno != 0) {
+		HFS_LOG_ERROR("blob write failed unit=%"PRIu64" n=%"PRIu64
+			      " bserrno=%d", file->ioOffset, file->ioUnits, bserrno);
+	}
 	file->finished = true;
 }
 
@@ -92,6 +109,9 @@ static void hfsDoWrite(void *arg) {
 static void hfsSpdkBlobSyncCb(void *arg, int bserrno) {
 	HfsFile *file = (HfsFile *)arg;
 
+	if (bserrno != 0) {
+		HFS_LOG_ERROR("blob sync failed bserrno=%d", bserrno);
+	}
 	SPDK_NOTICELOG("open complete\n");
 
 	file->finished = true;
@@ -101,6 +121,9 @@ static void hfsSpdkBlobSyncCb(void *arg, int bserrno) {
 static void hfsSpdkBlobResizeCb(void *arg, int bserrno) {
 	HfsFile *file = (HfsFile *)arg;
 
+	if (bserrno != 0) {
+		HFS_LOG_ERROR("blob resize failed bserrno=%d", bserrno);
+	}
 	uint64_t total = spdk_blob_get_num_clusters(file->blob);
 	file->fs->numCluster = total;
 
@@ -116,6 +139,11 @@ static void hfsSpdkBlobResizeCb(void *arg, int bserrno) {
 static void hfsSpdkBsOpenBlobCb(void *arg, struct spdk_blob *blb, int bserrno) {
 	HfsFile *file = (HfsFile *)arg;
 
+	if (bserrno != 0) {
+		HFS_LOG_ERROR("open blob failed bserrno=%d", bserrno);
+		file->finished = true;
+		return;
+	}
 	file->blob = blb;
 
 	uint64_t freeCluster = spdk_bs_free_cluster_count(file->fs->blobstore);
@@ -129,6 +157,11 @@ static void hfsSpdkBsOpenBlobCb(void *arg, struct spdk_blob *blb, int bserrno) {
 static void hfsSpdkBsCreateBlobCb(void *arg, spdk_blob_id blobId, int bserrno) {
 	HfsFile *file = (HfsFile *)arg;
 
+	if (bserrno != 0) {
+		HFS_LOG_ERROR("create blob failed bserrno=%d", bserrno);
+		file->finished = true;
+		return;
+	}
 	file->blobId = blobId;
 	SPDK_NOTICELOG("blobId : %"PRIu64"\n", blobId);
 
@@ -153,6 +186,10 @@ int hfsOpen(HfsFile *file) {
 static void hfsSpdkBsOpenByIdCb(void *arg, struct spdk_blob *blb, int bserrno) {
 	HfsFile *file = (HfsFile *)arg;
 
+	if (bserrno != 0) {
+		HFS_LOG_ERROR("open blob %"PRIu64" failed bserrno=%d",
+			      file->blobId, bserrno);
+	}
 	file->blob = blb;
 	file->finished = true;
 }
@@ -175,6 +212,9 @@ int hfsOpenById(HfsFile *file) {
 static void hfsSpdkBlobResizeDoneCb(void *arg, int bserrno) {
 	HfsFile *file = (HfsFile *)arg;
 
+	if (bserrno != 0) {
+		HFS_LOG_ERROR("blob resize (write path) failed bserrno=%d", bserrno);
+	}
 	file->finished = true;
 }
 

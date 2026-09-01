@@ -5,11 +5,16 @@
 #include <spdk/log.h>
 
 #include "hfs_internal.h"
+#include "hfs_log.h"
 
 /* Completion callback for spdk_bs_unload: clear the blobstore so a
  * second umount (e.g. from hfs_lib_fini) is a no-op. */
 static void hfsSpdkBsUnloadCb(void *arg, int bserrno) {
 	Hfs *fs = (Hfs *)arg;
+
+	if (bserrno != 0) {
+		HFS_LOG_ERROR("blobstore unload failed bserrno=%d", bserrno);
+	}
 	fs->blobstore = NULL;
 	fs->finished = true;
 }
@@ -42,6 +47,12 @@ static void hfsDoUmount(void *arg) {
 static void hfsSpdkBsInitCb(void *arg, struct spdk_blob_store *bs, int bserrno) {
 	Hfs *fs = (Hfs *)arg;
 
+	if (bserrno != 0 || bs == NULL) {
+		HFS_LOG_ERROR("blobstore init failed bserrno=%d", bserrno);
+		fs->finished = true;
+		return;
+	}
+
 	uint64_t ioUnitSize = spdk_bs_get_io_unit_size(bs);
 	SPDK_NOTICELOG("ioUnitSize : %"PRIu64"\n", ioUnitSize);
 
@@ -50,7 +61,9 @@ static void hfsSpdkBsInitCb(void *arg, struct spdk_blob_store *bs, int bserrno) 
 
 	fs->channel = spdk_bs_alloc_io_channel(fs->blobstore);
 	if (fs->channel == NULL) {
-		return ;
+		HFS_LOG_ERROR("blobstore io channel allocation failed");
+		fs->finished = true;
+		return;
 	}
 
 	fs->finished = true;
@@ -75,6 +88,7 @@ static void hfsDoMount(void *arg) {
 
 	int rc = spdk_bdev_create_bs_dev_ext("Malloc0", hfsSpdkBdevEventCb, NULL, &bsDev);
 	if (rc != 0) {
+		HFS_LOG_ERROR("create bs dev failed rc=%d", rc);
 		spdk_app_stop(0);
 	}
 
