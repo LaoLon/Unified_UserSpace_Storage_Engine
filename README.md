@@ -69,3 +69,40 @@ Generate a clangd compilation database with Bear after both SPDK configuration a
 ```bash
 make compile-commands
 ```
+
+## LD_PRELOAD Usage
+
+The interceptor library (`libhfs.so`) exposes an HFS namespace under a mount prefix
+(default `/hfs/`). Programs that operate on paths under the prefix are routed to the
+HFS filesystem; everything else passes through to the kernel.
+
+```bash
+# Build the library (cmake-based build also produces build-cmake/libhfs.so)
+make lib
+
+# Route a single process's file operations to HFS
+LD_PRELOAD=$PWD/build/lib/libhfs.so python3 - <<'EOF'
+import os
+os.mkdir('/hfs/d')
+fd = os.open('/hfs/d/f', os.O_CREAT | os.O_RDWR, 0o644)
+os.write(fd, b'hello')
+os.close(fd)
+print(os.listdir('/hfs/d'))
+EOF
+
+# Custom mount prefix
+HFS_MOUNT_PREFIX=/data LD_PRELOAD=$PWD/build/lib/libhfs.so <program>
+```
+
+Known limitations:
+
+- External shell commands (`mkdir`, `cat`, `dd`, ...) run in fork+exec children that
+  inherit `_HFS_INIT_DONE` and fall through to the kernel. Use single-process
+  workloads (python, C programs) or run everything in one shell built-in.
+- The default malloc bdev is process-private: data does not survive across processes.
+
+Run the interceptor smoke test (assertions run in a single python process):
+
+```bash
+bash scripts/preload_smoke.sh build/lib/libhfs.so
+```

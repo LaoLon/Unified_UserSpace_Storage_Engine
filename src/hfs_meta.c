@@ -291,6 +291,11 @@ struct hfs_inode *hfsMetaResolvePath(Hfs *fs, const char *path) {
 			p = hfsMetaSkipSlashes(p);
 			continue;
 		}
+		/* "." refers to the current directory (POSIX). */
+		if (strcmp(comp, ".") == 0) {
+			p = hfsMetaSkipSlashes(p);
+			continue;
+		}
 
 		/* Only directories can be descended into. */
 		if (cur->type != HFS_INODE_DIR) {
