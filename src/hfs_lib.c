@@ -1,4 +1,5 @@
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
@@ -715,10 +716,50 @@ int hfs_lib_fstat(int fd, struct stat *st) {
 	return 0;
 }
 
-/* Stub: filled in by shard-17 (fsync handling). */
+/*
+ * Flush an HFS fd: persist the inode table so size/mtime changes made
+ * in memory survive. Blob data itself is already written by
+ * hfsWriteAt before it returns.
+ */
 int hfs_lib_fsync(int fd) {
-	errno = ENOSYS;
-	return -1;
+	struct hfs_handle *h;
+
+	pthread_mutex_lock(&g_libLock);
+	if (g_fs == NULL) {
+		pthread_mutex_unlock(&g_libLock);
+		errno = ENODEV;
+		return -1;
+	}
+	if (fd < 0 || fd >= HFS_FD_TABLE_SIZE || g_fdTable[fd].file == NULL) {
+		pthread_mutex_unlock(&g_libLock);
+		errno = EBADF;
+		return -1;
+	}
+
+	h = &g_fdTable[fd];
+	if (hfsMetaSaveAll(g_fs) != 0) {
+		pthread_mutex_unlock(&g_libLock);
+		errno = EIO;
+		return -1;
+	}
+	pthread_mutex_unlock(&g_libLock);
+	return 0;
+}
+
+/*
+ * Preallocate space for an HFS fd. The blobstore grows on demand, so
+ * KEEP_SIZE is a no-op; the default mode extends the file size like
+ * ftruncate.
+ */
+int hfs_lib_fallocate(int fd, int mode, off_t offset, off_t len) {
+	if (mode & FALLOC_FL_KEEP_SIZE) {
+		return 0;
+	}
+	if (mode != 0) {
+		errno = EOPNOTSUPP;
+		return -1;
+	}
+	return hfs_lib_ftruncate(fd, offset + len);
 }
 
 /*

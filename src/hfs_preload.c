@@ -37,6 +37,18 @@ static off64_t (*real_lseek64)(int fd, off64_t offset, int whence);
 static int (*real_dup)(int oldfd);
 static int (*real_dup2)(int oldfd, int newfd);
 static int (*real_dup3)(int oldfd, int newfd, int flags);
+static int (*real_fsync)(int fd);
+static int (*real_fdatasync)(int fd);
+static int (*real_ftruncate)(int fd, off_t length);
+static int (*real_ftruncate64)(int fd, off64_t length);
+static int (*real_fallocate)(int fd, int mode, off_t offset, off_t len);
+static int (*real_unlink)(const char *path);
+static int (*real_unlinkat)(int dirfd, const char *path, int flags);
+static int (*real_mkdir)(const char *path, mode_t mode);
+static int (*real_rmdir)(const char *path);
+static int (*real_rename)(const char *oldpath, const char *newpath);
+static int (*real_renameat)(int olddirfd, const char *oldpath,
+			    int newdirfd, const char *newpath);
 
 /* Length of the HFS mount prefix (default "/hfs/"). */
 static const char *hfs_prefix;
@@ -282,6 +294,144 @@ int dup3(int oldfd, int newfd, int flags) {
 	return real_dup3(oldfd, newfd, flags);
 }
 
+/* Intercepted fsync(2): flush HFS data and metadata. */
+int fsync(int fd) {
+	if (hfs_is_hfs_fd(fd)) {
+		return hfs_lib_fsync(fd);
+	}
+	return real_fsync(fd);
+}
+
+/* Intercepted fdatasync(2): same flush path as fsync. */
+int fdatasync(int fd) {
+	if (hfs_is_hfs_fd(fd)) {
+		return hfs_lib_fsync(fd);
+	}
+	return real_fdatasync(fd);
+}
+
+/* Intercepted ftruncate(2). */
+int ftruncate(int fd, off_t length) {
+	if (hfs_is_hfs_fd(fd)) {
+		return hfs_lib_ftruncate(fd, length);
+	}
+	return real_ftruncate(fd, length);
+}
+
+/* Intercepted ftruncate64(2) (large-file variant). */
+int ftruncate64(int fd, off64_t length) {
+	if (hfs_is_hfs_fd(fd)) {
+		return hfs_lib_ftruncate(fd, (off_t)length);
+	}
+	return real_ftruncate64(fd, length);
+}
+
+/* Intercepted fallocate(2): HFS grows on demand, so KEEP_SIZE is free. */
+int fallocate(int fd, int mode, off_t offset, off_t len) {
+	if (hfs_is_hfs_fd(fd)) {
+		return hfs_lib_fallocate(fd, mode, offset, len);
+	}
+	return real_fallocate(fd, mode, offset, len);
+}
+
+/* Intercepted unlink(2): managed paths remove an HFS file. */
+int unlink(const char *path) {
+	if (hfs_path_managed(path)) {
+		if (hfs_lib_init() != 0) {
+			errno = ENODEV;
+			return -1;
+		}
+		return hfs_lib_unlink(path + hfs_prefix_len);
+	}
+	return real_unlink(path);
+}
+
+/*
+ * Intercepted unlinkat(2). AT_FDCWD with a managed path is routed to
+ * HFS (AT_REMOVEDIR maps to rmdir); everything else passes through.
+ */
+int unlinkat(int dirfd, const char *path, int flags) {
+	if (dirfd == AT_FDCWD && hfs_path_managed(path)) {
+		if (hfs_lib_init() != 0) {
+			errno = ENODEV;
+			return -1;
+		}
+		if (flags & AT_REMOVEDIR) {
+			return hfs_lib_rmdir(path + hfs_prefix_len);
+		}
+		return hfs_lib_unlink(path + hfs_prefix_len);
+	}
+	return real_unlinkat(dirfd, path, flags);
+}
+
+/* Intercepted mkdir(2): managed paths create an HFS directory. */
+int mkdir(const char *path, mode_t mode) {
+	if (hfs_path_managed(path)) {
+		if (hfs_lib_init() != 0) {
+			errno = ENODEV;
+			return -1;
+		}
+		return hfs_lib_mkdir(path + hfs_prefix_len, mode);
+	}
+	return real_mkdir(path, mode);
+}
+
+/* Intercepted rmdir(2): managed paths remove an HFS directory. */
+int rmdir(const char *path) {
+	if (hfs_path_managed(path)) {
+		if (hfs_lib_init() != 0) {
+			errno = ENODEV;
+			return -1;
+		}
+		return hfs_lib_rmdir(path + hfs_prefix_len);
+	}
+	return real_rmdir(path);
+}
+
+/*
+ * Intercepted rename(2). Both sides must be managed by HFS (or both
+ * outside); a mixed pair is rejected with EXDEV like a cross-fs move.
+ */
+int rename(const char *oldpath, const char *newpath) {
+	bool oldManaged = hfs_path_managed(oldpath);
+	bool newManaged = hfs_path_managed(newpath);
+
+	if (oldManaged || newManaged) {
+		if (oldManaged != newManaged) {
+			errno = EXDEV;
+			return -1;
+		}
+		if (hfs_lib_init() != 0) {
+			errno = ENODEV;
+			return -1;
+		}
+		return hfs_lib_rename(oldpath + hfs_prefix_len,
+				      newpath + hfs_prefix_len);
+	}
+	return real_rename(oldpath, newpath);
+}
+
+/* Intercepted renameat(2): AT_FDCWD relative paths, same rules as rename. */
+int renameat(int olddirfd, const char *oldpath,
+	     int newdirfd, const char *newpath) {
+	bool oldManaged = (olddirfd == AT_FDCWD) && hfs_path_managed(oldpath);
+	bool newManaged = (newdirfd == AT_FDCWD) && hfs_path_managed(newpath);
+
+	if (oldManaged || newManaged) {
+		if (oldManaged != newManaged) {
+			errno = EXDEV;
+			return -1;
+		}
+		if (hfs_lib_init() != 0) {
+			errno = ENODEV;
+			return -1;
+		}
+		return hfs_lib_rename(oldpath + hfs_prefix_len,
+				      newpath + hfs_prefix_len);
+	}
+	return real_renameat(olddirfd, oldpath, newdirfd, newpath);
+}
+
 /*
  * Runs before main(): capture the real libc symbols and the mount
  * prefix. SPDK initialization is deferred to the first managed call:
@@ -314,6 +464,17 @@ static void hfs_preload_ctor(void) {
 	real_dup = hfs_real_sym("dup");
 	real_dup2 = hfs_real_sym("dup2");
 	real_dup3 = hfs_real_sym("dup3");
+	real_fsync = hfs_real_sym("fsync");
+	real_fdatasync = hfs_real_sym("fdatasync");
+	real_ftruncate = hfs_real_sym("ftruncate");
+	real_ftruncate64 = hfs_real_sym("ftruncate64");
+	real_fallocate = hfs_real_sym("fallocate");
+	real_unlink = hfs_real_sym("unlink");
+	real_unlinkat = hfs_real_sym("unlinkat");
+	real_mkdir = hfs_real_sym("mkdir");
+	real_rmdir = hfs_real_sym("rmdir");
+	real_rename = hfs_real_sym("rename");
+	real_renameat = hfs_real_sym("renameat");
 
 	if (getenv("_HFS_INIT_DONE") != NULL) {
 		hfs_inherited = true;

@@ -51,6 +51,8 @@ int hfs_lib_unlink(const char *path);
 int hfs_lib_ftruncate(int fd, off_t length);
 /* Flush data and metadata of an HFS fd. */
 int hfs_lib_fsync(int fd);
+/* Preallocate space for an HFS fd (KEEP_SIZE is a no-op). */
+int hfs_lib_fallocate(int fd, int mode, off_t offset, off_t len);
 /* Stat an open HFS fd. */
 int hfs_lib_fstat(int fd, struct stat *st);
 
