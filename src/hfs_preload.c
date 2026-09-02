@@ -49,6 +49,31 @@ static int (*real_rmdir)(const char *path);
 static int (*real_rename)(const char *oldpath, const char *newpath);
 static int (*real_renameat)(int olddirfd, const char *oldpath,
 			    int newdirfd, const char *newpath);
+static int (*real_stat)(const char *path, struct stat *st);
+static int (*real_lstat)(const char *path, struct stat *st);
+static int (*real_fstat)(int fd, struct stat *st);
+static int (*real_fstatat)(int dirfd, const char *path, struct stat *st, int flags);
+static int (*real_access)(const char *path, int mode);
+static int (*real_faccessat)(int dirfd, const char *path, int mode, int flags);
+static int (*real_fcntl)(int fd, int cmd, ...);
+static int (*real_fcntl64)(int fd, int cmd, ...);
+/* glibc versioned stat family (__xstat/__fxstat/__lxstat/__fxstatat). */
+static int (*real___xstat)(int ver, const char *path, struct stat *st);
+static int (*real___lxstat)(int ver, const char *path, struct stat *st);
+static int (*real___fxstat)(int ver, int fd, struct stat *st);
+static int (*real___fxstatat)(int ver, int dirfd, const char *path,
+			      struct stat *st, int flags);
+/* 64-bit stat variants used by 64-bit binaries (python, etc.). */
+static int (*real_stat64)(const char *path, struct stat64 *st);
+static int (*real_lstat64)(const char *path, struct stat64 *st);
+static int (*real_fstat64)(int fd, struct stat64 *st);
+static int (*real_fstatat64)(int dirfd, const char *path, struct stat64 *st,
+			     int flags);
+static int (*real___xstat64)(int ver, const char *path, struct stat64 *st);
+static int (*real___lxstat64)(int ver, const char *path, struct stat64 *st);
+static int (*real___fxstat64)(int ver, int fd, struct stat64 *st);
+static int (*real___fxstatat64)(int ver, int dirfd, const char *path,
+				struct stat64 *st, int flags);
 
 /* Length of the HFS mount prefix (default "/hfs/"). */
 static const char *hfs_prefix;
@@ -432,6 +457,272 @@ int renameat(int olddirfd, const char *oldpath,
 	return real_renameat(olddirfd, oldpath, newdirfd, newpath);
 }
 
+/* Intercepted stat(2): managed paths stat an HFS inode. */
+int stat(const char *path, struct stat *st) {
+	if (hfs_path_managed(path)) {
+		if (hfs_lib_init() != 0) {
+			errno = ENODEV;
+			return -1;
+		}
+		return hfs_lib_stat(path + hfs_prefix_len, st);
+	}
+	return real_stat(path, st);
+}
+
+/* Intercepted lstat(2): HFS has no symlinks, same as stat. */
+int lstat(const char *path, struct stat *st) {
+	if (hfs_path_managed(path)) {
+		if (hfs_lib_init() != 0) {
+			errno = ENODEV;
+			return -1;
+		}
+		return hfs_lib_stat(path + hfs_prefix_len, st);
+	}
+	return real_lstat(path, st);
+}
+
+/* Intercepted fstat(2): HFS fds report the inode metadata. */
+int fstat(int fd, struct stat *st) {
+	if (hfs_is_hfs_fd(fd)) {
+		return hfs_lib_fstat(fd, st);
+	}
+	return real_fstat(fd, st);
+}
+
+/* Intercepted fstatat(2) / newfstatat: AT_FDCWD with a managed path. */
+int fstatat(int dirfd, const char *path, struct stat *st, int flags) {
+	if (dirfd == AT_FDCWD && hfs_path_managed(path)) {
+		if (hfs_lib_init() != 0) {
+			errno = ENODEV;
+			return -1;
+		}
+		return hfs_lib_stat(path + hfs_prefix_len, st);
+	}
+	return real_fstatat(dirfd, path, st, flags);
+}
+
+/* Intercepted newfstatat(2): glibc legacy name of fstatat. */
+int newfstatat(int dirfd, const char *path, struct stat *st, int flags) {
+	return fstatat(dirfd, path, st, flags);
+}
+
+/*
+ * Glibc versioned stat wrappers (__xstat/__fxstat/__lxstat/__fxstatat)
+ * used by binaries compiled against older glibc headers (python etc.).
+ * The version argument is ignored; the routing matches stat/fstat.
+ */
+int __xstat(int ver, const char *path, struct stat *st) {
+	if (hfs_path_managed(path)) {
+		if (hfs_lib_init() != 0) {
+			errno = ENODEV;
+			return -1;
+		}
+		return hfs_lib_stat(path + hfs_prefix_len, st);
+	}
+	return real___xstat(ver, path, st);
+}
+
+/* Versioned lstat: HFS has no symlinks, same as stat. */
+int __lxstat(int ver, const char *path, struct stat *st) {
+	if (hfs_path_managed(path)) {
+		if (hfs_lib_init() != 0) {
+			errno = ENODEV;
+			return -1;
+		}
+		return hfs_lib_stat(path + hfs_prefix_len, st);
+	}
+	return real___lxstat(ver, path, st);
+}
+
+/* Versioned fstat. */
+int __fxstat(int ver, int fd, struct stat *st) {
+	if (hfs_is_hfs_fd(fd)) {
+		return hfs_lib_fstat(fd, st);
+	}
+	return real___fxstat(ver, fd, st);
+}
+
+/* Versioned fstatat. */
+int __fxstatat(int ver, int dirfd, const char *path, struct stat *st, int flags) {
+	if (dirfd == AT_FDCWD && hfs_path_managed(path)) {
+		if (hfs_lib_init() != 0) {
+			errno = ENODEV;
+			return -1;
+		}
+		return hfs_lib_stat(path + hfs_prefix_len, st);
+	}
+	return real___fxstatat(ver, dirfd, path, st, flags);
+}
+
+/* Intercepted stat64(2): large-file variant of stat (same layout on x86-64). */
+int stat64(const char *path, struct stat64 *st) {
+	if (hfs_path_managed(path)) {
+		if (hfs_lib_init() != 0) {
+			errno = ENODEV;
+			return -1;
+		}
+		return hfs_lib_stat(path + hfs_prefix_len, (struct stat *)st);
+	}
+	return real_stat64(path, st);
+}
+
+/* Intercepted lstat64(2): large-file variant of lstat. */
+int lstat64(const char *path, struct stat64 *st) {
+	if (hfs_path_managed(path)) {
+		if (hfs_lib_init() != 0) {
+			errno = ENODEV;
+			return -1;
+		}
+		return hfs_lib_stat(path + hfs_prefix_len, (struct stat *)st);
+	}
+	return real_lstat64(path, st);
+}
+
+/* Intercepted fstat64(2): large-file variant of fstat. */
+int fstat64(int fd, struct stat64 *st) {
+	if (hfs_is_hfs_fd(fd)) {
+		return hfs_lib_fstat(fd, (struct stat *)st);
+	}
+	return real_fstat64(fd, st);
+}
+
+/* Intercepted fstatat64(2): large-file variant of fstatat. */
+int fstatat64(int dirfd, const char *path, struct stat64 *st, int flags) {
+	if (dirfd == AT_FDCWD && hfs_path_managed(path)) {
+		if (hfs_lib_init() != 0) {
+			errno = ENODEV;
+			return -1;
+		}
+		return hfs_lib_stat(path + hfs_prefix_len, (struct stat *)st);
+	}
+	return real_fstatat64(dirfd, path, st, flags);
+}
+
+/* Versioned large-file stat. */
+int __xstat64(int ver, const char *path, struct stat64 *st) {
+	if (hfs_path_managed(path)) {
+		if (hfs_lib_init() != 0) {
+			errno = ENODEV;
+			return -1;
+		}
+		return hfs_lib_stat(path + hfs_prefix_len, (struct stat *)st);
+	}
+	return real___xstat64(ver, path, st);
+}
+
+/* Versioned large-file lstat. */
+int __lxstat64(int ver, const char *path, struct stat64 *st) {
+	if (hfs_path_managed(path)) {
+		if (hfs_lib_init() != 0) {
+			errno = ENODEV;
+			return -1;
+		}
+		return hfs_lib_stat(path + hfs_prefix_len, (struct stat *)st);
+	}
+	return real___lxstat64(ver, path, st);
+}
+
+/* Versioned large-file fstat. */
+int __fxstat64(int ver, int fd, struct stat64 *st) {
+	if (hfs_is_hfs_fd(fd)) {
+		return hfs_lib_fstat(fd, (struct stat *)st);
+	}
+	return real___fxstat64(ver, fd, st);
+}
+
+/* Versioned large-file fstatat. */
+int __fxstatat64(int ver, int dirfd, const char *path, struct stat64 *st,
+		 int flags) {
+	if (dirfd == AT_FDCWD && hfs_path_managed(path)) {
+		if (hfs_lib_init() != 0) {
+			errno = ENODEV;
+			return -1;
+		}
+		return hfs_lib_stat(path + hfs_prefix_len, (struct stat *)st);
+	}
+	return real___fxstatat64(ver, dirfd, path, st, flags);
+}
+
+/* Intercepted access(2): managed paths have no permission model. */
+int access(const char *path, int mode) {
+	if (hfs_path_managed(path)) {
+		if (hfs_lib_init() != 0) {
+			errno = ENODEV;
+			return -1;
+		}
+		return hfs_lib_access(path + hfs_prefix_len, mode);
+	}
+	return real_access(path, mode);
+}
+
+/* Intercepted faccessat(2): AT_FDCWD with a managed path. */
+int faccessat(int dirfd, const char *path, int mode, int flags) {
+	if (dirfd == AT_FDCWD && hfs_path_managed(path)) {
+		if (hfs_lib_init() != 0) {
+			errno = ENODEV;
+			return -1;
+		}
+		return hfs_lib_access(path + hfs_prefix_len, mode);
+	}
+	return real_faccessat(dirfd, path, mode, flags);
+}
+
+/*
+ * Duplicate an HFS fd via F_DUPFD/F_DUPFD_CLOEXEC: reserve a kernel
+ * fd through the real fcntl, then copy the table slot.
+ */
+static int hfs_fcntl_dup(int fd, int cmd, uintptr_t arg) {
+	int nf = real_fcntl(fd, cmd, arg);
+	if (nf >= 0 && hfs_lib_fd_copy(fd, nf) != 0) {
+		real_close(nf);
+		return -1;
+	}
+	return nf;
+}
+
+/*
+ * Intercepted fcntl(2). HFS fd duplication (F_DUPFD/F_DUPFD_CLOEXEC)
+ * reserves a kernel fd via the real fcntl, then copies the table slot;
+ * other commands go through hfs_lib_fcntl.
+ */
+int fcntl(int fd, int cmd, ...) {
+	va_list ap;
+	uintptr_t arg = 0;
+
+	va_start(ap, cmd);
+	arg = va_arg(ap, uintptr_t);
+	va_end(ap);
+
+	if (hfs_is_hfs_fd(fd)) {
+		if (cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC) {
+			return hfs_fcntl_dup(fd, cmd, arg);
+		}
+		return hfs_lib_fcntl(fd, cmd, (long)arg);
+	}
+	return real_fcntl(fd, cmd, arg);
+}
+
+/*
+ * Intercepted fcntl64(2): glibc large-file variant, used by python
+ * for F_DUPFD_CLOEXEC among others.
+ */
+int fcntl64(int fd, int cmd, ...) {
+	va_list ap;
+	uintptr_t arg = 0;
+
+	va_start(ap, cmd);
+	arg = va_arg(ap, uintptr_t);
+	va_end(ap);
+
+	if (hfs_is_hfs_fd(fd)) {
+		if (cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC) {
+			return hfs_fcntl_dup(fd, cmd, arg);
+		}
+		return hfs_lib_fcntl(fd, cmd, (long)arg);
+	}
+	return real_fcntl64(fd, cmd, arg);
+}
+
 /*
  * Runs before main(): capture the real libc symbols and the mount
  * prefix. SPDK initialization is deferred to the first managed call:
@@ -475,6 +766,26 @@ static void hfs_preload_ctor(void) {
 	real_rmdir = hfs_real_sym("rmdir");
 	real_rename = hfs_real_sym("rename");
 	real_renameat = hfs_real_sym("renameat");
+	real_stat = hfs_real_sym("stat");
+	real_lstat = hfs_real_sym("lstat");
+	real_fstat = hfs_real_sym("fstat");
+	real_fstatat = hfs_real_sym("fstatat");
+	real_access = hfs_real_sym("access");
+	real_faccessat = hfs_real_sym("faccessat");
+	real_fcntl = hfs_real_sym("fcntl");
+	real_fcntl64 = hfs_real_sym("fcntl64");
+	real___xstat = hfs_real_sym("__xstat");
+	real___lxstat = hfs_real_sym("__lxstat");
+	real___fxstat = hfs_real_sym("__fxstat");
+	real___fxstatat = hfs_real_sym("__fxstatat");
+	real_stat64 = hfs_real_sym("stat64");
+	real_lstat64 = hfs_real_sym("lstat64");
+	real_fstat64 = hfs_real_sym("fstat64");
+	real_fstatat64 = hfs_real_sym("fstatat64");
+	real___xstat64 = hfs_real_sym("__xstat64");
+	real___lxstat64 = hfs_real_sym("__lxstat64");
+	real___fxstat64 = hfs_real_sym("__fxstat64");
+	real___fxstatat64 = hfs_real_sym("__fxstatat64");
 
 	if (getenv("_HFS_INIT_DONE") != NULL) {
 		hfs_inherited = true;

@@ -717,6 +717,67 @@ int hfs_lib_fstat(int fd, struct stat *st) {
 }
 
 /*
+ * Check access to a path under the HFS mount prefix. HFS has no
+ * permission model, so any existing path passes R/W/X; missing paths
+ * fail with ENOENT.
+ */
+int hfs_lib_access(const char *path, int mode) {
+	struct hfs_inode *in;
+
+	pthread_mutex_lock(&g_libLock);
+	if (g_fs == NULL) {
+		pthread_mutex_unlock(&g_libLock);
+		errno = ENODEV;
+		return -1;
+	}
+
+	in = hfsMetaResolvePath(g_fs, path);
+	if (in == NULL) {
+		pthread_mutex_unlock(&g_libLock);
+		return -1;	/* errno set by the resolver */
+	}
+	pthread_mutex_unlock(&g_libLock);
+	return 0;
+}
+
+/*
+ * fcntl for HFS fds: fd flags and file-status flags. Duplication
+ * (F_DUPFD/F_DUPFD_CLOEXEC) is handled by the interceptor, which needs
+ * the real fcntl to reserve a kernel fd.
+ */
+int hfs_lib_fcntl(int fd, int cmd, long arg) {
+	struct hfs_handle *h;
+
+	pthread_mutex_lock(&g_libLock);
+	if (fd < 0 || fd >= HFS_FD_TABLE_SIZE || g_fdTable[fd].file == NULL) {
+		pthread_mutex_unlock(&g_libLock);
+		errno = EBADF;
+		return -1;
+	}
+
+	h = &g_fdTable[fd];
+	switch (cmd) {
+	case F_GETFD:
+		pthread_mutex_unlock(&g_libLock);
+		return 0;
+	case F_SETFD:
+		pthread_mutex_unlock(&g_libLock);
+		return 0;
+	case F_GETFL:
+		pthread_mutex_unlock(&g_libLock);
+		return h->flags;
+	case F_SETFL:
+		h->flags = (int)arg;
+		pthread_mutex_unlock(&g_libLock);
+		return 0;
+	default:
+		pthread_mutex_unlock(&g_libLock);
+		errno = EINVAL;
+		return -1;
+	}
+}
+
+/*
  * Flush an HFS fd: persist the inode table so size/mtime changes made
  * in memory survive. Blob data itself is already written by
  * hfsWriteAt before it returns.

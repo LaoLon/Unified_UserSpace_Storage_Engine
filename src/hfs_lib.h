@@ -70,5 +70,9 @@ struct hfs_dirent *hfs_lib_readdir(struct hfs_dir *dir);
 int hfs_lib_closedir(struct hfs_dir *dir);
 /* Stat a path under the HFS mount prefix. */
 int hfs_lib_stat(const char *path, struct stat *st);
+/* Check access to a path under the HFS mount prefix (no permission model). */
+int hfs_lib_access(const char *path, int mode);
+/* fcntl for HFS fds: flags and fd duplication. */
+int hfs_lib_fcntl(int fd, int cmd, long arg);
 
 #endif /* HFS_LIB_H */
