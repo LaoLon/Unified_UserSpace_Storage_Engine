@@ -28,6 +28,18 @@ static int (*real_openat64)(int dirfd, const char *path, int flags, ...);
 static int (*real_close)(int fd);
 static ssize_t (*real_read)(int fd, void *buf, size_t count);
 static ssize_t (*real_write)(int fd, const void *buf, size_t count);
+static ssize_t (*real_readv)(int fd, const struct iovec *iov, int iovcnt);
+static ssize_t (*real_writev)(int fd, const struct iovec *iov, int iovcnt);
+static ssize_t (*real_preadv)(int fd, const struct iovec *iov, int iovcnt,
+			      off_t offset);
+static ssize_t (*real_pwritev)(int fd, const struct iovec *iov, int iovcnt,
+			       off_t offset);
+static ssize_t (*real_preadv2)(int fd, const struct iovec *iov, int iovcnt,
+			       off_t offset, int flags);
+static ssize_t (*real_pwritev2)(int fd, const struct iovec *iov, int iovcnt,
+				off_t offset, int flags);
+static ssize_t (*real___read)(int fd, void *buf, size_t count);
+static ssize_t (*real___write)(int fd, const void *buf, size_t count);
 static ssize_t (*real_pread)(int fd, void *buf, size_t count, off_t offset);
 static ssize_t (*real_pwrite)(int fd, const void *buf, size_t count, off_t offset);
 static ssize_t (*real_pread64)(int fd, void *buf, size_t count, off64_t offset);
@@ -39,6 +51,8 @@ static int (*real_dup2)(int oldfd, int newfd);
 static int (*real_dup3)(int oldfd, int newfd, int flags);
 static int (*real_fsync)(int fd);
 static int (*real_fdatasync)(int fd);
+static int (*real_sync_file_range)(int fd, off64_t offset, off64_t nbytes,
+				   unsigned int flags);
 static int (*real_ftruncate)(int fd, off_t length);
 static int (*real_ftruncate64)(int fd, off64_t length);
 static int (*real_fallocate)(int fd, int mode, off_t offset, off_t len);
@@ -287,12 +301,208 @@ ssize_t read(int fd, void *buf, size_t count) {
 	return real_read(fd, buf, count);
 }
 
+/* Intercepted __read: glibc internal symbol used by fopen/fread paths. */
+ssize_t __read(int fd, void *buf, size_t count) {
+	if (hfs_is_hfs_fd(fd)) {
+		return hfs_lib_read(fd, buf, count);
+	}
+	return real___read(fd, buf, count);
+}
+
+/* Intercepted __write: glibc internal symbol used by fwrite paths. */
+ssize_t __write(int fd, const void *buf, size_t count) {
+	if (hfs_is_hfs_fd(fd)) {
+		return hfs_lib_write(fd, buf, count);
+	}
+	return real___write(fd, buf, count);
+}
+
 /* Intercepted write(2). */
 ssize_t write(int fd, const void *buf, size_t count) {
 	if (hfs_is_hfs_fd(fd)) {
 		return hfs_lib_write(fd, buf, count);
 	}
 	return real_write(fd, buf, count);
+}
+
+/*
+ * Scatter/gather IO helpers. RocksDB reads CURRENT/MANIFEST with
+ * readv, which bypasses our read interceptor and hits the kernel
+ * /dev/null placeholder (returns 0 -> "CURRENT does not end with
+ * newline"). Route vector IO on HFS fds through the library.
+ */
+static ssize_t hfs_iovec_total(const struct iovec *iov, int iovcnt) {
+	size_t total = 0;
+	int i;
+
+	for (i = 0; i < iovcnt; i++) {
+		total += iov[i].iov_len;
+	}
+	return (ssize_t)total;
+}
+
+static ssize_t hfs_iovec_scatter(char *src, ssize_t n,
+				 const struct iovec *iov, int iovcnt) {
+	ssize_t done = 0;
+	int i;
+
+	for (i = 0; i < iovcnt && done < n; i++) {
+		size_t len = iov[i].iov_len;
+		if ((ssize_t)len > n - done) {
+			len = (size_t)(n - done);
+		}
+		memcpy(iov[i].iov_base, src + done, len);
+		done += (ssize_t)len;
+	}
+	return done;
+}
+
+static ssize_t hfs_iovec_gather(char *dst, size_t cap,
+				const struct iovec *iov, int iovcnt) {
+	size_t total = 0;
+	int i;
+
+	for (i = 0; i < iovcnt; i++) {
+		size_t len = iov[i].iov_len;
+		if (total + len > cap) {
+			len = cap - total;
+		}
+		if (len > 0) {
+			memcpy(dst + total, iov[i].iov_base, len);
+			total += len;
+		}
+	}
+	return (ssize_t)total;
+}
+
+/* Intercepted readv(2): HFS fds read via a temporary buffer. */
+ssize_t readv(int fd, const struct iovec *iov, int iovcnt) {
+	ssize_t total;
+	char *tmp;
+	ssize_t n;
+
+	if (!hfs_is_hfs_fd(fd)) {
+		return real_readv(fd, iov, iovcnt);
+	}
+	total = hfs_iovec_total(iov, iovcnt);
+	if (total == 0) {
+		return 0;
+	}
+	tmp = malloc((size_t)total);
+	if (tmp == NULL) {
+		errno = ENOMEM;
+		return -1;
+	}
+	n = hfs_lib_read(fd, tmp, (size_t)total);
+	if (n > 0) {
+		n = hfs_iovec_scatter(tmp, n, iov, iovcnt);
+	}
+	free(tmp);
+	return n;
+}
+
+/* Intercepted writev(2): HFS fds write from a temporary buffer. */
+ssize_t writev(int fd, const struct iovec *iov, int iovcnt) {
+	ssize_t total;
+	char *tmp;
+	ssize_t n;
+
+	if (!hfs_is_hfs_fd(fd)) {
+		return real_writev(fd, iov, iovcnt);
+	}
+	total = hfs_iovec_total(iov, iovcnt);
+	if (total == 0) {
+		return 0;
+	}
+	tmp = malloc((size_t)total);
+	if (tmp == NULL) {
+		errno = ENOMEM;
+		return -1;
+	}
+	n = hfs_iovec_gather(tmp, (size_t)total, iov, iovcnt);
+	if (n > 0) {
+		n = hfs_lib_write(fd, tmp, (size_t)n);
+	}
+	free(tmp);
+	return n;
+}
+
+/* Intercepted preadv(2): like readv at an explicit offset. */
+ssize_t preadv(int fd, const struct iovec *iov, int iovcnt, off_t offset) {
+	ssize_t total;
+	char *tmp;
+	ssize_t n;
+
+	if (!hfs_is_hfs_fd(fd)) {
+		return real_preadv(fd, iov, iovcnt, offset);
+	}
+	total = hfs_iovec_total(iov, iovcnt);
+	if (total == 0) {
+		return 0;
+	}
+	tmp = malloc((size_t)total);
+	if (tmp == NULL) {
+		errno = ENOMEM;
+		return -1;
+	}
+	n = hfs_lib_pread(fd, tmp, (size_t)total, offset);
+	if (n > 0) {
+		n = hfs_iovec_scatter(tmp, n, iov, iovcnt);
+	}
+	free(tmp);
+	return n;
+}
+
+/* Intercepted pwritev(2): like writev at an explicit offset. */
+ssize_t pwritev(int fd, const struct iovec *iov, int iovcnt, off_t offset) {
+	ssize_t total;
+	char *tmp;
+	ssize_t n;
+
+	if (!hfs_is_hfs_fd(fd)) {
+		return real_pwritev(fd, iov, iovcnt, offset);
+	}
+	total = hfs_iovec_total(iov, iovcnt);
+	if (total == 0) {
+		return 0;
+	}
+	tmp = malloc((size_t)total);
+	if (tmp == NULL) {
+		errno = ENOMEM;
+		return -1;
+	}
+	n = hfs_iovec_gather(tmp, (size_t)total, iov, iovcnt);
+	if (n > 0) {
+		n = hfs_lib_pwrite(fd, tmp, (size_t)n, offset);
+	}
+	free(tmp);
+	return n;
+}
+
+/* Intercepted preadv2(2): RocksDB uses it for reads with RWF flags. */
+ssize_t preadv2(int fd, const struct iovec *iov, int iovcnt, off_t offset,
+		int flags) {
+	if (!hfs_is_hfs_fd(fd)) {
+		return real_preadv2(fd, iov, iovcnt, offset, flags);
+	}
+	if (flags != 0) {
+		errno = EOPNOTSUPP;
+		return -1;
+	}
+	return preadv(fd, iov, iovcnt, offset);
+}
+
+/* Intercepted pwritev2(2): like pwritev with RWF flags. */
+ssize_t pwritev2(int fd, const struct iovec *iov, int iovcnt, off_t offset,
+		 int flags) {
+	if (!hfs_is_hfs_fd(fd)) {
+		return real_pwritev2(fd, iov, iovcnt, offset, flags);
+	}
+	if (flags != 0) {
+		errno = EOPNOTSUPP;
+		return -1;
+	}
+	return pwritev(fd, iov, iovcnt, offset);
 }
 
 /* Intercepted pread(2). */
@@ -398,6 +608,21 @@ int fdatasync(int fd) {
 		return hfs_lib_fsync(fd);
 	}
 	return real_fdatasync(fd);
+}
+
+/*
+ * Intercepted sync_file_range(2). RocksDB probes support with a zero
+ * range on a fresh fd; the kernel answers EBADF/EINVAL for our
+ * /dev/null placeholder, which trips its assertion. Report ENOSYS so
+ * RocksDB falls back to fsync.
+ */
+int sync_file_range(int fd, off64_t offset, off64_t nbytes,
+		    unsigned int flags) {
+	if (hfs_is_hfs_fd(fd)) {
+		errno = ENOSYS;
+		return -1;
+	}
+	return real_sync_file_range(fd, offset, nbytes, flags);
 }
 
 /* Intercepted ftruncate(2). */
@@ -1161,6 +1386,14 @@ static void hfs_preload_ctor(void) {
 	real_close = hfs_real_sym("close");
 	real_read = hfs_real_sym("read");
 	real_write = hfs_real_sym("write");
+	real___read = hfs_real_sym("__read");
+	real___write = hfs_real_sym("__write");
+	real_readv = hfs_real_sym("readv");
+	real_writev = hfs_real_sym("writev");
+	real_preadv = hfs_real_sym("preadv");
+	real_pwritev = hfs_real_sym("pwritev");
+	real_preadv2 = hfs_real_sym("preadv2");
+	real_pwritev2 = hfs_real_sym("pwritev2");
 	real_pread = hfs_real_sym("pread");
 	real_pwrite = hfs_real_sym("pwrite");
 	real_pread64 = hfs_real_sym("pread64");
@@ -1172,6 +1405,7 @@ static void hfs_preload_ctor(void) {
 	real_dup3 = hfs_real_sym("dup3");
 	real_fsync = hfs_real_sym("fsync");
 	real_fdatasync = hfs_real_sym("fdatasync");
+	real_sync_file_range = hfs_real_sym("sync_file_range");
 	real_ftruncate = hfs_real_sym("ftruncate");
 	real_ftruncate64 = hfs_real_sym("ftruncate64");
 	real_fallocate = hfs_real_sym("fallocate");
