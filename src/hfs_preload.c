@@ -42,6 +42,8 @@ static int (*real_fdatasync)(int fd);
 static int (*real_ftruncate)(int fd, off_t length);
 static int (*real_ftruncate64)(int fd, off64_t length);
 static int (*real_fallocate)(int fd, int mode, off_t offset, off_t len);
+static int (*real_fallocate64)(int fd, int mode, off64_t offset, off64_t len);
+static int (*real_posix_fallocate)(int fd, off_t offset, off_t len);
 static int (*real_unlink)(const char *path);
 static int (*real_unlinkat)(int dirfd, const char *path, int flags);
 static int (*real_mkdir)(const char *path, mode_t mode);
@@ -49,6 +51,9 @@ static int (*real_rmdir)(const char *path);
 static int (*real_rename)(const char *oldpath, const char *newpath);
 static int (*real_renameat)(int olddirfd, const char *oldpath,
 			    int newdirfd, const char *newpath);
+static int (*real_renameat2)(int olddirfd, const char *oldpath,
+			     int newdirfd, const char *newpath,
+			     unsigned int flags);
 static int (*real_stat)(const char *path, struct stat *st);
 static int (*real_lstat)(const char *path, struct stat *st);
 static int (*real_fstat)(int fd, struct stat *st);
@@ -62,6 +67,9 @@ static struct dirent *(*real_readdir)(DIR *dirp);
 static struct dirent64 *(*real_readdir64)(DIR *dirp);
 static int (*real_closedir)(DIR *dirp);
 static DIR *(*real_fdopendir)(int fd);
+static ssize_t (*real_readlink)(const char *path, char *buf, size_t bufsiz);
+static ssize_t (*real_readlinkat)(int dirfd, const char *path, char *buf,
+				  size_t bufsiz);
 /* glibc versioned stat family (__xstat/__fxstat/__lxstat/__fxstatat). */
 static int (*real___xstat)(int ver, const char *path, struct stat *st);
 static int (*real___lxstat)(int ver, const char *path, struct stat *st);
@@ -85,6 +93,18 @@ static const char *hfs_prefix;
 static size_t hfs_prefix_len;
 
 /*
+ * HFS working directory state: when the application chdir()s into a
+ * managed path, relative paths are resolved against it (mariadbd does
+ * chdir(datadir) then opens files by relative name). Stores the full
+ * path including the mount prefix.
+ */
+static char g_hfs_cwd[PATH_MAX] = "/";
+static bool g_hfs_cwd_active;
+
+static int (*real_chdir)(const char *path);
+static int (*real_fchdir)(int fd);
+
+/*
  * Set when this process inherited an initialized HFS environment from
  * its parent (fork+exec). Such children must NOT re-initialize SPDK:
  * a second DPDK primary conflicts with the parent and hangs. They run
@@ -104,6 +124,45 @@ static bool hfs_path_managed(const char *path) {
 	return strncmp(path, hfs_prefix, hfs_prefix_len) == 0;
 }
 
+/*
+ * Translate an application path into an HFS-relative path (prefix
+ * stripped). Absolute paths are checked directly; relative paths are
+ * resolved against the tracked HFS cwd (set by chdir). Returns NULL
+ * when the path is not managed. The result is written to 'buf' (caller
+ * provided, so two paths can be translated in one call without
+ * clobbering each other, e.g. rename(old, new)).
+ */
+static const char *hfs_view_path_buf(const char *path, char *buf,
+				     size_t size) {
+	if (path == NULL) {
+		return NULL;
+	}
+	if (path[0] == '/') {
+		if (!hfs_path_managed(path)) {
+			return NULL;
+		}
+		return path + hfs_prefix_len;
+	}
+	if (!g_hfs_cwd_active) {
+		return NULL;
+	}
+	if (snprintf(buf, size, "%s/%s", g_hfs_cwd, path)
+	    >= (int)size) {
+		return NULL;
+	}
+	if (!hfs_path_managed(buf)) {
+		return NULL;
+	}
+	return buf + hfs_prefix_len;
+}
+
+/* TLS convenience wrapper of hfs_view_path_buf. */
+static const char *hfs_view_path(const char *path) {
+	static __thread char buf[PATH_MAX];
+
+	return hfs_view_path_buf(path, buf, sizeof(buf));
+}
+
 /* Resolve a libc symbol once via dlsym(RTLD_NEXT). */
 static void *hfs_real_sym(const char *name) {
 	void *sym = dlsym(RTLD_NEXT, name);
@@ -115,13 +174,14 @@ static void *hfs_real_sym(const char *name) {
 
 /* Shared body of the open/open64 interception. */
 static int hfs_intercept_open(const char *path, int flags, mode_t mode) {
-	if (hfs_path_managed(path)) {
+	const char *vp = hfs_view_path(path);
+	if (vp != NULL) {
 		if (hfs_lib_init() != 0) {
 			errno = ENODEV;
 			return -1;
 		}
-		/* Strip the mount prefix; the library sees the inner path. */
-		return hfs_lib_open(path + hfs_prefix_len, flags, mode);
+		/* The library sees the inner (prefix-stripped) path. */
+		return hfs_lib_open(vp, flags, mode);
 	}
 	return -2;	/* not managed: caller falls through to real libc */
 }
@@ -364,14 +424,39 @@ int fallocate(int fd, int mode, off_t offset, off_t len) {
 	return real_fallocate(fd, mode, offset, len);
 }
 
+/* Intercepted fallocate64(2): large-file variant, used by mariadbd. */
+int fallocate64(int fd, int mode, off64_t offset, off64_t len) {
+	if (hfs_is_hfs_fd(fd)) {
+		return hfs_lib_fallocate(fd, mode, (off_t)offset, (off_t)len);
+	}
+	return real_fallocate64(fd, mode, offset, len);
+}
+
+/*
+ * Intercepted posix_fallocate(3). The glibc wrapper issues the
+ * fallocate syscall directly, bypassing our symbol interceptor, which
+ * would hit the kernel /dev/null placeholder fd (EBADF). Route HFS fds
+ * to the library; note posix_fallocate returns an errno, not -1.
+ */
+int posix_fallocate(int fd, off_t offset, off_t len) {
+	if (hfs_is_hfs_fd(fd)) {
+		if (hfs_lib_fallocate(fd, 0, offset, len) == 0) {
+			return 0;
+		}
+		return errno;
+	}
+	return real_posix_fallocate(fd, offset, len);
+}
+
 /* Intercepted unlink(2): managed paths remove an HFS file. */
 int unlink(const char *path) {
-	if (hfs_path_managed(path)) {
+	const char *vp = hfs_view_path(path);
+	if (vp != NULL) {
 		if (hfs_lib_init() != 0) {
 			errno = ENODEV;
 			return -1;
 		}
-		return hfs_lib_unlink(path + hfs_prefix_len);
+		return hfs_lib_unlink(vp);
 	}
 	return real_unlink(path);
 }
@@ -381,39 +466,42 @@ int unlink(const char *path) {
  * HFS (AT_REMOVEDIR maps to rmdir); everything else passes through.
  */
 int unlinkat(int dirfd, const char *path, int flags) {
-	if (dirfd == AT_FDCWD && hfs_path_managed(path)) {
+	const char *vp = hfs_view_path(path);
+	if (dirfd == AT_FDCWD && vp != NULL) {
 		if (hfs_lib_init() != 0) {
 			errno = ENODEV;
 			return -1;
 		}
 		if (flags & AT_REMOVEDIR) {
-			return hfs_lib_rmdir(path + hfs_prefix_len);
+			return hfs_lib_rmdir(vp);
 		}
-		return hfs_lib_unlink(path + hfs_prefix_len);
+		return hfs_lib_unlink(vp);
 	}
 	return real_unlinkat(dirfd, path, flags);
 }
 
 /* Intercepted mkdir(2): managed paths create an HFS directory. */
 int mkdir(const char *path, mode_t mode) {
-	if (hfs_path_managed(path)) {
+	const char *vp = hfs_view_path(path);
+	if (vp != NULL) {
 		if (hfs_lib_init() != 0) {
 			errno = ENODEV;
 			return -1;
 		}
-		return hfs_lib_mkdir(path + hfs_prefix_len, mode);
+		return hfs_lib_mkdir(vp, mode);
 	}
 	return real_mkdir(path, mode);
 }
 
 /* Intercepted rmdir(2): managed paths remove an HFS directory. */
 int rmdir(const char *path) {
-	if (hfs_path_managed(path)) {
+	const char *vp = hfs_view_path(path);
+	if (vp != NULL) {
 		if (hfs_lib_init() != 0) {
 			errno = ENODEV;
 			return -1;
 		}
-		return hfs_lib_rmdir(path + hfs_prefix_len);
+		return hfs_lib_rmdir(vp);
 	}
 	return real_rmdir(path);
 }
@@ -423,8 +511,12 @@ int rmdir(const char *path) {
  * outside); a mixed pair is rejected with EXDEV like a cross-fs move.
  */
 int rename(const char *oldpath, const char *newpath) {
-	bool oldManaged = hfs_path_managed(oldpath);
-	bool newManaged = hfs_path_managed(newpath);
+	char oldBuf[PATH_MAX];
+	char newBuf[PATH_MAX];
+	const char *oldvp = hfs_view_path_buf(oldpath, oldBuf, sizeof(oldBuf));
+	const char *newvp = hfs_view_path_buf(newpath, newBuf, sizeof(newBuf));
+	bool oldManaged = (oldvp != NULL);
+	bool newManaged = (newvp != NULL);
 
 	if (oldManaged || newManaged) {
 		if (oldManaged != newManaged) {
@@ -435,8 +527,7 @@ int rename(const char *oldpath, const char *newpath) {
 			errno = ENODEV;
 			return -1;
 		}
-		return hfs_lib_rename(oldpath + hfs_prefix_len,
-				      newpath + hfs_prefix_len);
+		return hfs_lib_rename(oldvp, newvp);
 	}
 	return real_rename(oldpath, newpath);
 }
@@ -444,8 +535,12 @@ int rename(const char *oldpath, const char *newpath) {
 /* Intercepted renameat(2): AT_FDCWD relative paths, same rules as rename. */
 int renameat(int olddirfd, const char *oldpath,
 	     int newdirfd, const char *newpath) {
-	bool oldManaged = (olddirfd == AT_FDCWD) && hfs_path_managed(oldpath);
-	bool newManaged = (newdirfd == AT_FDCWD) && hfs_path_managed(newpath);
+	char oldBuf[PATH_MAX];
+	char newBuf[PATH_MAX];
+	const char *oldvp = hfs_view_path_buf(oldpath, oldBuf, sizeof(oldBuf));
+	const char *newvp = hfs_view_path_buf(newpath, newBuf, sizeof(newBuf));
+	bool oldManaged = (olddirfd == AT_FDCWD) && (oldvp != NULL);
+	bool newManaged = (newdirfd == AT_FDCWD) && (newvp != NULL);
 
 	if (oldManaged || newManaged) {
 		if (oldManaged != newManaged) {
@@ -456,32 +551,96 @@ int renameat(int olddirfd, const char *oldpath,
 			errno = ENODEV;
 			return -1;
 		}
-		return hfs_lib_rename(oldpath + hfs_prefix_len,
-				      newpath + hfs_prefix_len);
+		return hfs_lib_rename(oldvp, newvp);
 	}
 	return real_renameat(olddirfd, oldpath, newdirfd, newpath);
 }
 
-/* Intercepted stat(2): managed paths stat an HFS inode. */
-int stat(const char *path, struct stat *st) {
-	if (hfs_path_managed(path)) {
+/* Intercepted renameat2(2): only flags=0 (plain rename) is supported. */
+int renameat2(int olddirfd, const char *oldpath,
+	      int newdirfd, const char *newpath, unsigned int flags) {
+	char oldBuf[PATH_MAX];
+	char newBuf[PATH_MAX];
+	const char *oldvp = hfs_view_path_buf(oldpath, oldBuf, sizeof(oldBuf));
+	const char *newvp = hfs_view_path_buf(newpath, newBuf, sizeof(newBuf));
+	bool oldManaged = (olddirfd == AT_FDCWD) && (oldvp != NULL);
+	bool newManaged = (newdirfd == AT_FDCWD) && (newvp != NULL);
+
+	if (oldManaged || newManaged) {
+		if (oldManaged != newManaged) {
+			errno = EXDEV;
+			return -1;
+		}
+		if (flags != 0) {
+			errno = EOPNOTSUPP;
+			return -1;
+		}
 		if (hfs_lib_init() != 0) {
 			errno = ENODEV;
 			return -1;
 		}
-		return hfs_lib_stat(path + hfs_prefix_len, st);
+		return hfs_lib_rename(oldvp, newvp);
+	}
+	return real_renameat2(olddirfd, oldpath, newdirfd, newpath, flags);
+}
+
+/* Intercepted chdir(2): managed paths switch the tracked HFS cwd. */
+int chdir(const char *path) {
+	const char *vp = hfs_view_path(path);
+	struct stat st;
+
+	if (vp != NULL) {
+		if (hfs_lib_init() != 0) {
+			errno = ENODEV;
+			return -1;
+		}
+		/* Must be an existing directory. */
+		if (hfs_lib_stat(vp, &st) != 0 || !S_ISDIR(st.st_mode)) {
+			errno = ENOTDIR;
+			return -1;
+		}
+		snprintf(g_hfs_cwd, sizeof(g_hfs_cwd), "%s", path);
+		g_hfs_cwd_active = true;
+		return 0;
+	}
+	if (g_hfs_cwd_active) {
+		/* Leaving the HFS tree: fall back to kernel cwd semantics. */
+		g_hfs_cwd_active = false;
+	}
+	return real_chdir(path);
+}
+
+/* Intercepted fchdir(2): HFS directory fds are not supported. */
+int fchdir(int fd) {
+	if (hfs_is_hfs_fd(fd)) {
+		errno = ENOTSUP;
+		return -1;
+	}
+	return real_fchdir(fd);
+}
+
+/* Intercepted stat(2): managed paths stat an HFS inode. */
+int stat(const char *path, struct stat *st) {
+	const char *vp = hfs_view_path(path);
+	if (vp != NULL) {
+		if (hfs_lib_init() != 0) {
+			errno = ENODEV;
+			return -1;
+		}
+		return hfs_lib_stat(vp, st);
 	}
 	return real_stat(path, st);
 }
 
 /* Intercepted lstat(2): HFS has no symlinks, same as stat. */
 int lstat(const char *path, struct stat *st) {
-	if (hfs_path_managed(path)) {
+	const char *vp = hfs_view_path(path);
+	if (vp != NULL) {
 		if (hfs_lib_init() != 0) {
 			errno = ENODEV;
 			return -1;
 		}
-		return hfs_lib_stat(path + hfs_prefix_len, st);
+		return hfs_lib_stat(vp, st);
 	}
 	return real_lstat(path, st);
 }
@@ -496,12 +655,13 @@ int fstat(int fd, struct stat *st) {
 
 /* Intercepted fstatat(2) / newfstatat: AT_FDCWD with a managed path. */
 int fstatat(int dirfd, const char *path, struct stat *st, int flags) {
-	if (dirfd == AT_FDCWD && hfs_path_managed(path)) {
+	const char *vp = hfs_view_path(path);
+	if (dirfd == AT_FDCWD && vp != NULL) {
 		if (hfs_lib_init() != 0) {
 			errno = ENODEV;
 			return -1;
 		}
-		return hfs_lib_stat(path + hfs_prefix_len, st);
+		return hfs_lib_stat(vp, st);
 	}
 	return real_fstatat(dirfd, path, st, flags);
 }
@@ -517,24 +677,26 @@ int newfstatat(int dirfd, const char *path, struct stat *st, int flags) {
  * The version argument is ignored; the routing matches stat/fstat.
  */
 int __xstat(int ver, const char *path, struct stat *st) {
-	if (hfs_path_managed(path)) {
+	const char *vp = hfs_view_path(path);
+	if (vp != NULL) {
 		if (hfs_lib_init() != 0) {
 			errno = ENODEV;
 			return -1;
 		}
-		return hfs_lib_stat(path + hfs_prefix_len, st);
+		return hfs_lib_stat(vp, st);
 	}
 	return real___xstat(ver, path, st);
 }
 
 /* Versioned lstat: HFS has no symlinks, same as stat. */
 int __lxstat(int ver, const char *path, struct stat *st) {
-	if (hfs_path_managed(path)) {
+	const char *vp = hfs_view_path(path);
+	if (vp != NULL) {
 		if (hfs_lib_init() != 0) {
 			errno = ENODEV;
 			return -1;
 		}
-		return hfs_lib_stat(path + hfs_prefix_len, st);
+		return hfs_lib_stat(vp, st);
 	}
 	return real___lxstat(ver, path, st);
 }
@@ -549,36 +711,39 @@ int __fxstat(int ver, int fd, struct stat *st) {
 
 /* Versioned fstatat. */
 int __fxstatat(int ver, int dirfd, const char *path, struct stat *st, int flags) {
-	if (dirfd == AT_FDCWD && hfs_path_managed(path)) {
+	const char *vp = hfs_view_path(path);
+	if (dirfd == AT_FDCWD && vp != NULL) {
 		if (hfs_lib_init() != 0) {
 			errno = ENODEV;
 			return -1;
 		}
-		return hfs_lib_stat(path + hfs_prefix_len, st);
+		return hfs_lib_stat(vp, st);
 	}
 	return real___fxstatat(ver, dirfd, path, st, flags);
 }
 
 /* Intercepted stat64(2): large-file variant of stat (same layout on x86-64). */
 int stat64(const char *path, struct stat64 *st) {
-	if (hfs_path_managed(path)) {
+	const char *vp = hfs_view_path(path);
+	if (vp != NULL) {
 		if (hfs_lib_init() != 0) {
 			errno = ENODEV;
 			return -1;
 		}
-		return hfs_lib_stat(path + hfs_prefix_len, (struct stat *)st);
+		return hfs_lib_stat(vp, (struct stat *)st);
 	}
 	return real_stat64(path, st);
 }
 
 /* Intercepted lstat64(2): large-file variant of lstat. */
 int lstat64(const char *path, struct stat64 *st) {
-	if (hfs_path_managed(path)) {
+	const char *vp = hfs_view_path(path);
+	if (vp != NULL) {
 		if (hfs_lib_init() != 0) {
 			errno = ENODEV;
 			return -1;
 		}
-		return hfs_lib_stat(path + hfs_prefix_len, (struct stat *)st);
+		return hfs_lib_stat(vp, (struct stat *)st);
 	}
 	return real_lstat64(path, st);
 }
@@ -593,36 +758,39 @@ int fstat64(int fd, struct stat64 *st) {
 
 /* Intercepted fstatat64(2): large-file variant of fstatat. */
 int fstatat64(int dirfd, const char *path, struct stat64 *st, int flags) {
-	if (dirfd == AT_FDCWD && hfs_path_managed(path)) {
+	const char *vp = hfs_view_path(path);
+	if (dirfd == AT_FDCWD && vp != NULL) {
 		if (hfs_lib_init() != 0) {
 			errno = ENODEV;
 			return -1;
 		}
-		return hfs_lib_stat(path + hfs_prefix_len, (struct stat *)st);
+		return hfs_lib_stat(vp, (struct stat *)st);
 	}
 	return real_fstatat64(dirfd, path, st, flags);
 }
 
 /* Versioned large-file stat. */
 int __xstat64(int ver, const char *path, struct stat64 *st) {
-	if (hfs_path_managed(path)) {
+	const char *vp = hfs_view_path(path);
+	if (vp != NULL) {
 		if (hfs_lib_init() != 0) {
 			errno = ENODEV;
 			return -1;
 		}
-		return hfs_lib_stat(path + hfs_prefix_len, (struct stat *)st);
+		return hfs_lib_stat(vp, (struct stat *)st);
 	}
 	return real___xstat64(ver, path, st);
 }
 
 /* Versioned large-file lstat. */
 int __lxstat64(int ver, const char *path, struct stat64 *st) {
-	if (hfs_path_managed(path)) {
+	const char *vp = hfs_view_path(path);
+	if (vp != NULL) {
 		if (hfs_lib_init() != 0) {
 			errno = ENODEV;
 			return -1;
 		}
-		return hfs_lib_stat(path + hfs_prefix_len, (struct stat *)st);
+		return hfs_lib_stat(vp, (struct stat *)st);
 	}
 	return real___lxstat64(ver, path, st);
 }
@@ -638,36 +806,39 @@ int __fxstat64(int ver, int fd, struct stat64 *st) {
 /* Versioned large-file fstatat. */
 int __fxstatat64(int ver, int dirfd, const char *path, struct stat64 *st,
 		 int flags) {
-	if (dirfd == AT_FDCWD && hfs_path_managed(path)) {
+	const char *vp = hfs_view_path(path);
+	if (dirfd == AT_FDCWD && vp != NULL) {
 		if (hfs_lib_init() != 0) {
 			errno = ENODEV;
 			return -1;
 		}
-		return hfs_lib_stat(path + hfs_prefix_len, (struct stat *)st);
+		return hfs_lib_stat(vp, (struct stat *)st);
 	}
 	return real___fxstatat64(ver, dirfd, path, st, flags);
 }
 
 /* Intercepted access(2): managed paths have no permission model. */
 int access(const char *path, int mode) {
-	if (hfs_path_managed(path)) {
+	const char *vp = hfs_view_path(path);
+	if (vp != NULL) {
 		if (hfs_lib_init() != 0) {
 			errno = ENODEV;
 			return -1;
 		}
-		return hfs_lib_access(path + hfs_prefix_len, mode);
+		return hfs_lib_access(vp, mode);
 	}
 	return real_access(path, mode);
 }
 
 /* Intercepted faccessat(2): AT_FDCWD with a managed path. */
 int faccessat(int dirfd, const char *path, int mode, int flags) {
-	if (dirfd == AT_FDCWD && hfs_path_managed(path)) {
+	const char *vp = hfs_view_path(path);
+	if (dirfd == AT_FDCWD && vp != NULL) {
 		if (hfs_lib_init() != 0) {
 			errno = ENODEV;
 			return -1;
 		}
-		return hfs_lib_access(path + hfs_prefix_len, mode);
+		return hfs_lib_access(vp, mode);
 	}
 	return real_faccessat(dirfd, path, mode, flags);
 }
@@ -792,7 +963,9 @@ static int (*hfs_real_closedir_get(void))(DIR *) {
 
 static DIR *(*hfs_real_fdopendir_get(void))(int) {
 	if (real_fdopendir == NULL) {
-		real_fdopendir = hfs_real_sym("fdopendir");
+real_fdopendir = hfs_real_sym("fdopendir");
+	real_readlink = hfs_real_sym("readlink");
+	real_readlinkat = hfs_real_sym("readlinkat");
 	}
 	return real_fdopendir;
 }
@@ -821,12 +994,13 @@ static struct dirent *hfs_readdir_impl(DIR *dirp,
 DIR *opendir(const char *path) {
 	struct hfs_dir *d;
 
-	if (hfs_path_managed(path)) {
+	const char *vp = hfs_view_path(path);
+	if (vp != NULL) {
 		if (hfs_lib_init() != 0) {
 			errno = ENODEV;
 			return NULL;
 		}
-		d = hfs_lib_opendir(path + hfs_prefix_len);
+		d = hfs_lib_opendir(vp);
 		if (d == NULL) {
 			return NULL;
 		}
@@ -895,6 +1069,75 @@ DIR *fdopendir(int fd) {
 	return hfs_real_fdopendir_get()(fd);
 }
 
+/* Lazy real-symbol resolution: interceptions may run before our ctor
+ * (dependency library constructors), so never trust a NULL pointer. */
+static ssize_t (*hfs_real_readlink_get(void))(const char *, char *, size_t) {
+	if (real_readlink == NULL) {
+		real_readlink = hfs_real_sym("readlink");
+	}
+	return real_readlink;
+}
+
+static ssize_t (*hfs_real_readlinkat_get(void))(int, const char *, char *,
+						size_t) {
+	if (real_readlinkat == NULL) {
+		real_readlinkat = hfs_real_sym("readlinkat");
+	}
+	return real_readlinkat;
+}
+
+/*
+ * Shared readlink routing: HFS has no symlinks, so an existing managed
+ * path yields EINVAL (not a link) and a missing one yields ENOENT.
+ * Without this, aria/mariadbd sees kernel ENOENT for files that exist
+ * in HFS and mis-handles its control files.
+ */
+static ssize_t hfs_readlink_impl(const char *path, char *buf, size_t bufsiz,
+				 ssize_t (*real_fn)(const char *, char *,
+						   size_t)) {
+	const char *vp = hfs_view_path(path);
+	struct stat st;
+
+	if (vp != NULL) {
+		if (hfs_lib_init() != 0) {
+			errno = ENODEV;
+			return -1;
+		}
+		if (hfs_lib_stat(vp, &st) != 0) {
+			errno = ENOENT;
+			return -1;
+		}
+		errno = EINVAL;	/* exists but is not a symlink */
+		return -1;
+	}
+	return real_fn(path, buf, bufsiz);
+}
+
+/* Intercepted readlink(2). */
+ssize_t readlink(const char *path, char *buf, size_t bufsiz) {
+	return hfs_readlink_impl(path, buf, bufsiz, hfs_real_readlink_get());
+}
+
+/* Intercepted readlinkat(2): AT_FDCWD with a managed path. */
+ssize_t readlinkat(int dirfd, const char *path, char *buf, size_t bufsiz) {
+	const char *vp = hfs_view_path(path);
+	struct stat st;
+
+	if (dirfd == AT_FDCWD && vp != NULL) {
+		if (hfs_lib_init() != 0) {
+			errno = ENODEV;
+			return -1;
+		}
+		if (hfs_lib_stat(vp, &st) != 0) {
+			errno = ENOENT;
+			return -1;
+		}
+		errno = EINVAL;	/* exists but is not a symlink */
+		return -1;
+	}
+	return hfs_real_readlinkat_get()(dirfd, path, buf, bufsiz);
+}
+
 /*
  * Runs before main(): capture the real libc symbols and the mount
  * prefix. SPDK initialization is deferred to the first managed call:
@@ -932,12 +1175,17 @@ static void hfs_preload_ctor(void) {
 	real_ftruncate = hfs_real_sym("ftruncate");
 	real_ftruncate64 = hfs_real_sym("ftruncate64");
 	real_fallocate = hfs_real_sym("fallocate");
+	real_fallocate64 = hfs_real_sym("fallocate64");
+	real_posix_fallocate = hfs_real_sym("posix_fallocate");
 	real_unlink = hfs_real_sym("unlink");
 	real_unlinkat = hfs_real_sym("unlinkat");
 	real_mkdir = hfs_real_sym("mkdir");
 	real_rmdir = hfs_real_sym("rmdir");
 	real_rename = hfs_real_sym("rename");
 	real_renameat = hfs_real_sym("renameat");
+	real_renameat2 = hfs_real_sym("renameat2");
+	real_chdir = hfs_real_sym("chdir");
+	real_fchdir = hfs_real_sym("fchdir");
 	real_stat = hfs_real_sym("stat");
 	real_lstat = hfs_real_sym("lstat");
 	real_fstat = hfs_real_sym("fstat");

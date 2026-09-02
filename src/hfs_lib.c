@@ -21,6 +21,63 @@ static pthread_mutex_t g_libLock = PTHREAD_MUTEX_INITIALIZER;
 static Hfs *g_fs;
 
 /*
+ * Create each directory in a relative path (mkdir -p semantics) inside
+ * HFS. Used by HFS_AUTO_MKDIRS so single-process servers (mariadbd etc.)
+ * get their datadir before they check for it.
+ */
+static void hfs_auto_mkdir_path(Hfs *fs, const char *rel) {
+	char path[PATH_MAX];
+	char *p;
+	struct hfs_inode *parent;
+	const char *leaf;
+
+	if (rel == NULL || rel[0] == '\0') {
+		return;
+	}
+	if (snprintf(path, sizeof(path), "/%s", rel) >= (int)sizeof(path)) {
+		return;
+	}
+
+	p = path + 1;
+	while (p != NULL && *p != '\0') {
+		char *slash = strchr(p, '/');
+		if (slash != NULL) {
+			*slash = '\0';
+		}
+		if (hfsMetaResolvePath(fs, path) == NULL &&
+		    hfsMetaResolveParent(fs, path, &parent, &leaf) == 0) {
+			hfsMetaMkdir(fs, parent, leaf);
+		}
+		if (slash != NULL) {
+			*slash = '/';
+			p = slash + 1;
+		} else {
+			break;
+		}
+	}
+}
+
+/* Create all comma-separated paths from the HFS_AUTO_MKDIRS env var. */
+static void hfs_auto_mkdirs(Hfs *fs) {
+	const char *s = getenv("HFS_AUTO_MKDIRS");
+	char *copy;
+	char *tok;
+
+	if (s == NULL || s[0] == '\0') {
+		return;
+	}
+	copy = strdup(s);
+	if (copy == NULL) {
+		return;
+	}
+	for (tok = strtok(copy, ","); tok != NULL;
+	     tok = strtok(NULL, ",")) {
+		hfs_auto_mkdir_path(fs, tok);
+	}
+	free(copy);
+}
+
+/*
  * Per-fd bookkeeping. isHfs=1 means the fd belongs to HFS; otherwise it
  * is a transparent (pass-through) fd handled by glibc.
  */
@@ -100,6 +157,9 @@ int hfs_lib_init(void) {
 
 	memset(g_fdTable, 0, sizeof(g_fdTable));
 	HFS_LOG_INFO("libhfs initialized");
+
+	/* Auto-create directories requested via HFS_AUTO_MKDIRS. */
+	hfs_auto_mkdirs(g_fs);
 
 	/*
 	 * Mark the environment so forked+exec'd children of this process
@@ -187,7 +247,39 @@ int hfs_lib_open(const char *path, int flags, mode_t mode) {
 			errno = ENOENT;
 			return -1;
 		}
-	} else if (in->type != HFS_INODE_FILE) {
+	}
+
+	if (in->type == HFS_INODE_DIR) {
+		/*
+		 * Directory fd: only read-only opens are allowed (used for
+		 * O_DIRECTORY probes and fsync on the datadir). There is no
+		 * data blob; read/write on it fails with EISDIR later.
+		 */
+		if ((flags & O_ACCMODE) != O_RDONLY) {
+			pthread_mutex_unlock(&g_libLock);
+			errno = EISDIR;
+			return -1;
+		}
+		fd = open("/dev/null", O_RDONLY);
+		if (fd < 0 || fd >= HFS_FD_TABLE_SIZE) {
+			if (fd >= 0) {
+				close(fd);
+			}
+			pthread_mutex_unlock(&g_libLock);
+			errno = EMFILE;
+			return -1;
+		}
+		g_fdTable[fd].fd = fd;
+		g_fdTable[fd].file = NULL;
+		g_fdTable[fd].inodeId = in->id;
+		g_fdTable[fd].offset = 0;
+		g_fdTable[fd].flags = flags;
+		g_fdTable[fd].isHfs = 1;
+		g_fdTable[fd].writable = false;
+		pthread_mutex_unlock(&g_libLock);
+		return fd;
+	}
+	if (in->type != HFS_INODE_FILE) {
 		pthread_mutex_unlock(&g_libLock);
 		errno = EISDIR;
 		return -1;
@@ -268,9 +360,14 @@ ssize_t hfs_lib_read(int fd, void *buf, size_t count) {
 		errno = ENODEV;
 		return -1;
 	}
-	if (fd < 0 || fd >= HFS_FD_TABLE_SIZE || g_fdTable[fd].file == NULL) {
+	if (fd < 0 || fd >= HFS_FD_TABLE_SIZE || g_fdTable[fd].inodeId == 0) {
 		pthread_mutex_unlock(&g_libLock);
 		errno = EBADF;
+		return -1;
+	}
+	if (g_fdTable[fd].file == NULL) {
+		pthread_mutex_unlock(&g_libLock);
+		errno = EISDIR;
 		return -1;
 	}
 
@@ -317,9 +414,14 @@ ssize_t hfs_lib_write(int fd, const void *buf, size_t count) {
 		errno = ENODEV;
 		return -1;
 	}
-	if (fd < 0 || fd >= HFS_FD_TABLE_SIZE || g_fdTable[fd].file == NULL) {
+	if (fd < 0 || fd >= HFS_FD_TABLE_SIZE || g_fdTable[fd].inodeId == 0) {
 		pthread_mutex_unlock(&g_libLock);
 		errno = EBADF;
+		return -1;
+	}
+	if (g_fdTable[fd].file == NULL) {
+		pthread_mutex_unlock(&g_libLock);
+		errno = EISDIR;
 		return -1;
 	}
 
@@ -369,9 +471,14 @@ ssize_t hfs_lib_pread(int fd, void *buf, size_t count, off_t offset) {
 		errno = ENODEV;
 		return -1;
 	}
-	if (fd < 0 || fd >= HFS_FD_TABLE_SIZE || g_fdTable[fd].file == NULL) {
+	if (fd < 0 || fd >= HFS_FD_TABLE_SIZE || g_fdTable[fd].inodeId == 0) {
 		pthread_mutex_unlock(&g_libLock);
 		errno = EBADF;
+		return -1;
+	}
+	if (g_fdTable[fd].file == NULL) {
+		pthread_mutex_unlock(&g_libLock);
+		errno = EISDIR;
 		return -1;
 	}
 
@@ -416,9 +523,14 @@ ssize_t hfs_lib_pwrite(int fd, const void *buf, size_t count, off_t offset) {
 		errno = ENODEV;
 		return -1;
 	}
-	if (fd < 0 || fd >= HFS_FD_TABLE_SIZE || g_fdTable[fd].file == NULL) {
+	if (fd < 0 || fd >= HFS_FD_TABLE_SIZE || g_fdTable[fd].inodeId == 0) {
 		pthread_mutex_unlock(&g_libLock);
 		errno = EBADF;
+		return -1;
+	}
+	if (g_fdTable[fd].file == NULL) {
+		pthread_mutex_unlock(&g_libLock);
+		errno = EISDIR;
 		return -1;
 	}
 
@@ -458,9 +570,14 @@ off_t hfs_lib_lseek(int fd, off_t offset, int whence) {
 		errno = ENODEV;
 		return -1;
 	}
-	if (fd < 0 || fd >= HFS_FD_TABLE_SIZE || g_fdTable[fd].file == NULL) {
+	if (fd < 0 || fd >= HFS_FD_TABLE_SIZE || g_fdTable[fd].inodeId == 0) {
 		pthread_mutex_unlock(&g_libLock);
 		errno = EBADF;
+		return -1;
+	}
+	if (g_fdTable[fd].file == NULL) {
+		pthread_mutex_unlock(&g_libLock);
+		errno = EISDIR;
 		return -1;
 	}
 
@@ -539,7 +656,7 @@ bool hfs_is_hfs_fd(int fd) {
 	if (fd < 0 || fd >= HFS_FD_TABLE_SIZE) {
 		return false;
 	}
-	return (g_fdTable[fd].file != NULL);
+	return (g_fdTable[fd].inodeId != 0);
 }
 
 /*
@@ -549,7 +666,6 @@ bool hfs_is_hfs_fd(int fd) {
 int hfs_lib_close(int fd) {
 	struct hfs_handle *h;
 	HfsFile *file;
-	bool lastRef;
 
 	pthread_mutex_lock(&g_libLock);
 	if (g_fs == NULL) {
@@ -557,7 +673,7 @@ int hfs_lib_close(int fd) {
 		errno = ENODEV;
 		return -1;
 	}
-	if (fd < 0 || fd >= HFS_FD_TABLE_SIZE || g_fdTable[fd].file == NULL) {
+	if (fd < 0 || fd >= HFS_FD_TABLE_SIZE || g_fdTable[fd].inodeId == 0) {
 		pthread_mutex_unlock(&g_libLock);
 		errno = EBADF;
 		return -1;
@@ -565,16 +681,15 @@ int hfs_lib_close(int fd) {
 
 	h = &g_fdTable[fd];
 	file = h->file;
-	lastRef = (--file->refCount == 0);
-
-	if (lastRef && !hfsClose(file)) {
-		pthread_mutex_unlock(&g_libLock);
-		errno = EIO;
-		return -1;
-	}
-
-	if (lastRef) {
-		free(file);
+	if (file != NULL) {
+		if (--file->refCount == 0) {
+			if (!hfsClose(file)) {
+				pthread_mutex_unlock(&g_libLock);
+				errno = EIO;
+				return -1;
+			}
+			free(file);
+		}
 	}
 	memset(h, 0, sizeof(*h));
 	pthread_mutex_unlock(&g_libLock);
@@ -650,9 +765,14 @@ int hfs_lib_ftruncate(int fd, off_t length) {
 		errno = ENODEV;
 		return -1;
 	}
-	if (fd < 0 || fd >= HFS_FD_TABLE_SIZE || g_fdTable[fd].file == NULL) {
+	if (fd < 0 || fd >= HFS_FD_TABLE_SIZE || g_fdTable[fd].inodeId == 0) {
 		pthread_mutex_unlock(&g_libLock);
 		errno = EBADF;
+		return -1;
+	}
+	if (g_fdTable[fd].file == NULL) {
+		pthread_mutex_unlock(&g_libLock);
+		errno = EISDIR;
 		return -1;
 	}
 
@@ -688,7 +808,7 @@ int hfs_lib_fstat(int fd, struct stat *st) {
 		errno = ENODEV;
 		return -1;
 	}
-	if (fd < 0 || fd >= HFS_FD_TABLE_SIZE || g_fdTable[fd].file == NULL) {
+	if (fd < 0 || fd >= HFS_FD_TABLE_SIZE || g_fdTable[fd].inodeId == 0) {
 		pthread_mutex_unlock(&g_libLock);
 		errno = EBADF;
 		return -1;
@@ -749,7 +869,7 @@ int hfs_lib_fcntl(int fd, int cmd, long arg) {
 	struct hfs_handle *h;
 
 	pthread_mutex_lock(&g_libLock);
-	if (fd < 0 || fd >= HFS_FD_TABLE_SIZE || g_fdTable[fd].file == NULL) {
+	if (fd < 0 || fd >= HFS_FD_TABLE_SIZE || g_fdTable[fd].inodeId == 0) {
 		pthread_mutex_unlock(&g_libLock);
 		errno = EBADF;
 		return -1;
@@ -768,6 +888,19 @@ int hfs_lib_fcntl(int fd, int cmd, long arg) {
 		return h->flags;
 	case F_SETFL:
 		h->flags = (int)arg;
+		pthread_mutex_unlock(&g_libLock);
+		return 0;
+	case F_SETLK:
+	case F_SETLKW:
+		/* No cross-process locking in HFS: accept the lock. */
+		pthread_mutex_unlock(&g_libLock);
+		return 0;
+	case F_GETLK:
+		/* Report the lock as free. */
+		if (arg != 0) {
+			memset((struct flock *)(uintptr_t)arg, 0,
+			       sizeof(struct flock));
+		}
 		pthread_mutex_unlock(&g_libLock);
 		return 0;
 	default:
@@ -791,7 +924,7 @@ int hfs_lib_fsync(int fd) {
 		errno = ENODEV;
 		return -1;
 	}
-	if (fd < 0 || fd >= HFS_FD_TABLE_SIZE || g_fdTable[fd].file == NULL) {
+	if (fd < 0 || fd >= HFS_FD_TABLE_SIZE || g_fdTable[fd].inodeId == 0) {
 		pthread_mutex_unlock(&g_libLock);
 		errno = EBADF;
 		return -1;
