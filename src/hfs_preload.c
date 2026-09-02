@@ -57,6 +57,11 @@ static int (*real_access)(const char *path, int mode);
 static int (*real_faccessat)(int dirfd, const char *path, int mode, int flags);
 static int (*real_fcntl)(int fd, int cmd, ...);
 static int (*real_fcntl64)(int fd, int cmd, ...);
+static DIR *(*real_opendir)(const char *path);
+static struct dirent *(*real_readdir)(DIR *dirp);
+static struct dirent64 *(*real_readdir64)(DIR *dirp);
+static int (*real_closedir)(DIR *dirp);
+static DIR *(*real_fdopendir)(int fd);
 /* glibc versioned stat family (__xstat/__fxstat/__lxstat/__fxstatat). */
 static int (*real___xstat)(int ver, const char *path, struct stat *st);
 static int (*real___lxstat)(int ver, const char *path, struct stat *st);
@@ -724,6 +729,173 @@ int fcntl64(int fd, int cmd, ...) {
 }
 
 /*
+ * Registered HFS directory handles. DIR is opaque to applications, so
+ * readdir/closedir resolve a pointer by scanning this table.
+ */
+#define HFS_MAX_OPEN_DIRS	512
+
+struct hfs_open_dir {
+	struct hfs_dir *hdir;
+};
+
+static struct hfs_open_dir g_hfsDirs[HFS_MAX_OPEN_DIRS];
+static int g_hfsDirCount;
+
+/* Returns true when 'dirp' is one of our HFS directory handles. */
+static bool hfs_is_hfs_dir(DIR *dirp) {
+	int i;
+
+	for (i = 0; i < g_hfsDirCount; i++) {
+		if (g_hfsDirs[i].hdir == (struct hfs_dir *)dirp) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/* TLS buffer converting an hfs_dirent into a struct dirent. */
+static __thread struct dirent hfs_dir_result;
+
+/*
+ * Lazy real-symbol resolution. Interceptions may run before our
+ * constructor (dependency library constructors call opendir/readdir
+ * while the loader is still starting), so the real pointer can be
+ * NULL; resolve it on first use instead of dereferencing a NULL.
+ */
+static DIR *(*hfs_real_opendir_get(void))(const char *) {
+	if (real_opendir == NULL) {
+		real_opendir = hfs_real_sym("opendir");
+	}
+	return real_opendir;
+}
+
+static struct dirent *(*hfs_real_readdir_get(void))(DIR *) {
+	if (real_readdir == NULL) {
+		real_readdir = hfs_real_sym("readdir");
+	}
+	return real_readdir;
+}
+
+static struct dirent64 *(*hfs_real_readdir64_get(void))(DIR *) {
+	if (real_readdir64 == NULL) {
+		real_readdir64 = hfs_real_sym("readdir64");
+	}
+	return real_readdir64;
+}
+
+static int (*hfs_real_closedir_get(void))(DIR *) {
+	if (real_closedir == NULL) {
+		real_closedir = hfs_real_sym("closedir");
+	}
+	return real_closedir;
+}
+
+static DIR *(*hfs_real_fdopendir_get(void))(int) {
+	if (real_fdopendir == NULL) {
+		real_fdopendir = hfs_real_sym("fdopendir");
+	}
+	return real_fdopendir;
+}
+
+/* Shared readdir logic: HFS handles return the next snapshot entry. */
+static struct dirent *hfs_readdir_impl(DIR *dirp,
+				       struct dirent *(*real_fn)(DIR *)) {
+	struct hfs_dirent *e;
+
+	if (hfs_is_hfs_dir(dirp)) {
+		e = hfs_lib_readdir((struct hfs_dir *)dirp);
+		if (e == NULL) {
+			return NULL;	/* end of directory */
+		}
+		memset(&hfs_dir_result, 0, sizeof(hfs_dir_result));
+		hfs_dir_result.d_ino = (ino_t)e->inodeId;
+		hfs_dir_result.d_type = e->d_type;
+		strncpy(hfs_dir_result.d_name, e->name,
+			sizeof(hfs_dir_result.d_name) - 1);
+		return &hfs_dir_result;
+	}
+	return real_fn(dirp);
+}
+
+/* Intercepted opendir(2): managed paths open an HFS directory. */
+DIR *opendir(const char *path) {
+	struct hfs_dir *d;
+
+	if (hfs_path_managed(path)) {
+		if (hfs_lib_init() != 0) {
+			errno = ENODEV;
+			return NULL;
+		}
+		d = hfs_lib_opendir(path + hfs_prefix_len);
+		if (d == NULL) {
+			return NULL;
+		}
+		if (g_hfsDirCount >= HFS_MAX_OPEN_DIRS) {
+			hfs_lib_closedir(d);
+			errno = EMFILE;
+			return NULL;
+		}
+		g_hfsDirs[g_hfsDirCount].hdir = d;
+		g_hfsDirCount++;
+		return (DIR *)d;
+	}
+	return hfs_real_opendir_get()(path);
+}
+
+/* Intercepted readdir(2). */
+struct dirent *readdir(DIR *dirp) {
+	return hfs_readdir_impl(dirp, hfs_real_readdir_get());
+}
+
+/* TLS buffer converting an hfs_dirent into a struct dirent64. */
+static __thread struct dirent64 hfs_dir64_result;
+
+/* Intercepted readdir64(2): large-file variant, same layout on x86-64. */
+struct dirent64 *readdir64(DIR *dirp) {
+	struct hfs_dirent *e;
+
+	if (hfs_is_hfs_dir(dirp)) {
+		e = hfs_lib_readdir((struct hfs_dir *)dirp);
+		if (e == NULL) {
+			return NULL;	/* end of directory */
+		}
+		memset(&hfs_dir64_result, 0, sizeof(hfs_dir64_result));
+		hfs_dir64_result.d_ino = (ino_t)e->inodeId;
+		hfs_dir64_result.d_type = e->d_type;
+		strncpy(hfs_dir64_result.d_name, e->name,
+			sizeof(hfs_dir64_result.d_name) - 1);
+		return &hfs_dir64_result;
+	}
+	return hfs_real_readdir64_get()(dirp);
+}
+
+/* Intercepted closedir(2): unregister and release HFS handles. */
+int closedir(DIR *dirp) {
+	int i;
+
+	if (hfs_is_hfs_dir(dirp)) {
+		for (i = 0; i < g_hfsDirCount; i++) {
+			if (g_hfsDirs[i].hdir == (struct hfs_dir *)dirp) {
+				g_hfsDirs[i] = g_hfsDirs[g_hfsDirCount - 1];
+				g_hfsDirCount--;
+				break;
+			}
+		}
+		return hfs_lib_closedir((struct hfs_dir *)dirp);
+	}
+	return hfs_real_closedir_get()(dirp);
+}
+
+/* Intercepted fdopendir(2): HFS fds have no directory backing store. */
+DIR *fdopendir(int fd) {
+	if (hfs_is_hfs_fd(fd)) {
+		errno = ENOTSUP;
+		return NULL;
+	}
+	return hfs_real_fdopendir_get()(fd);
+}
+
+/*
  * Runs before main(): capture the real libc symbols and the mount
  * prefix. SPDK initialization is deferred to the first managed call:
  * running it here would deadlock with glibc's loader lock. Children
@@ -774,6 +946,11 @@ static void hfs_preload_ctor(void) {
 	real_faccessat = hfs_real_sym("faccessat");
 	real_fcntl = hfs_real_sym("fcntl");
 	real_fcntl64 = hfs_real_sym("fcntl64");
+	real_opendir = hfs_real_sym("opendir");
+	real_readdir = hfs_real_sym("readdir");
+	real_readdir64 = hfs_real_sym("readdir64");
+	real_closedir = hfs_real_sym("closedir");
+	real_fdopendir = hfs_real_sym("fdopendir");
 	real___xstat = hfs_real_sym("__xstat");
 	real___lxstat = hfs_real_sym("__lxstat");
 	real___fxstat = hfs_real_sym("__fxstat");

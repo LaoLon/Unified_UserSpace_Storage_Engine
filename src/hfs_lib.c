@@ -883,22 +883,93 @@ int hfs_lib_rename(const char *oldPath, const char *newPath) {
 	return rc;
 }
 
-/* Stub: filled in by shard-19 (directory listing). */
+/*
+ * Open a directory under the HFS mount prefix: resolve the inode,
+ * snapshot its children (name + type) into the hfs_dir state, and
+ * hand it back for readdir iteration.
+ */
 struct hfs_dir *hfs_lib_opendir(const char *path) {
-	errno = ENOSYS;
-	return NULL;
+	struct hfs_inode *in;
+	struct hfs_dir *dir;
+	int i;
+	uint64_t n = 0;
+
+	pthread_mutex_lock(&g_libLock);
+	if (g_fs == NULL) {
+		pthread_mutex_unlock(&g_libLock);
+		errno = ENODEV;
+		return NULL;
+	}
+
+	in = hfsMetaResolvePath(g_fs, path);
+	if (in == NULL) {
+		pthread_mutex_unlock(&g_libLock);
+		return NULL;	/* errno set by the resolver */
+	}
+	if (in->type != HFS_INODE_DIR) {
+		pthread_mutex_unlock(&g_libLock);
+		errno = ENOTDIR;
+		return NULL;
+	}
+
+	dir = calloc(1, sizeof(*dir));
+	if (dir == NULL) {
+		pthread_mutex_unlock(&g_libLock);
+		errno = ENOMEM;
+		return NULL;
+	}
+	dir->inodeId = in->id;
+
+	for (i = 0; i < g_fs->inodeCount; i++) {
+		if (g_fs->inodes[i].parentId == in->id) {
+			n++;
+		}
+	}
+	dir->entries = calloc(n > 0 ? n : 1, sizeof(struct hfs_dirent));
+	if (dir->entries == NULL) {
+		free(dir);
+		pthread_mutex_unlock(&g_libLock);
+		errno = ENOMEM;
+		return NULL;
+	}
+
+	for (i = 0; i < g_fs->inodeCount; i++) {
+		if (g_fs->inodes[i].parentId == in->id) {
+			struct hfs_dirent *e = &dir->entries[dir->count];
+			strncpy(e->name, g_fs->inodes[i].name,
+				sizeof(e->name) - 1);
+			e->name[sizeof(e->name) - 1] = '\0';
+			e->inodeId = g_fs->inodes[i].id;
+			e->d_type = (g_fs->inodes[i].type == HFS_INODE_DIR)
+				     ? DT_DIR : DT_REG;
+			dir->count++;
+		}
+	}
+	pthread_mutex_unlock(&g_libLock);
+	return dir;
 }
 
-/* Stub: filled in by shard-19 (directory listing). */
+/* Return the next snapshot entry, or NULL when the listing is done. */
 struct hfs_dirent *hfs_lib_readdir(struct hfs_dir *dir) {
-	errno = ENOSYS;
-	return NULL;
+	if (dir == NULL) {
+		errno = EBADF;
+		return NULL;
+	}
+	if (dir->cursor >= dir->count) {
+		return NULL;	/* end of directory */
+	}
+	return &dir->entries[dir->cursor++];
 }
 
-/* Stub: filled in by shard-19 (directory listing). */
+/* Release the directory snapshot state. */
 int hfs_lib_closedir(struct hfs_dir *dir) {
-	errno = ENOSYS;
-	return -1;
+	if (dir == NULL) {
+		errno = EBADF;
+		return -1;
+	}
+	free(dir->entries);
+	free(dir);
+	return 0;
 }
 
 /*

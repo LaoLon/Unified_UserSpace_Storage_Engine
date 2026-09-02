@@ -17,6 +17,7 @@ struct hfs_dir;
 /* One entry returned by hfs_lib_readdir. */
 struct hfs_dirent {
 	uint64_t inodeId;		/* inode id of the entry */
+	unsigned char d_type;		/* DT_DIR / DT_REG */
 	char name[FILENAME_LENGTH];	/* entry name */
 };
 
