@@ -89,6 +89,7 @@ struct hfs_handle {
 	int flags;		/* open flags (O_APPEND etc.) */
 	int isHfs;		/* 1 = HFS handle, 0 = pass-through fd */
 	bool writable;		/* opened with write access */
+	char dirPath[PATH_MAX];	/* prefix-stripped path (directory fds) */
 };
 
 /* Fixed-size fd table shared by all library calls. */
@@ -276,6 +277,8 @@ int hfs_lib_open(const char *path, int flags, mode_t mode) {
 		g_fdTable[fd].flags = flags;
 		g_fdTable[fd].isHfs = 1;
 		g_fdTable[fd].writable = false;
+		snprintf(g_fdTable[fd].dirPath, sizeof(g_fdTable[fd].dirPath),
+			 "%s", path);
 		pthread_mutex_unlock(&g_libLock);
 		return fd;
 	}
@@ -339,6 +342,38 @@ int hfs_lib_open(const char *path, int flags, mode_t mode) {
 
 	pthread_mutex_unlock(&g_libLock);
 	return fd;
+}
+
+/*
+ * Open a file relative to an HFS directory fd (openat semantics).
+ * The relative name is resolved against the directory fd's path.
+ */
+int hfs_lib_openat(int dirfd, const char *path, int flags, mode_t mode) {
+	struct hfs_handle *h;
+	char buf[PATH_MAX];
+	const char *vp;
+
+	pthread_mutex_lock(&g_libLock);
+	if (dirfd < 0 || dirfd >= HFS_FD_TABLE_SIZE ||
+	    g_fdTable[dirfd].inodeId == 0 || g_fdTable[dirfd].file != NULL) {
+		pthread_mutex_unlock(&g_libLock);
+		errno = EBADF;
+		return -1;
+	}
+	h = &g_fdTable[dirfd];
+	if (path[0] == '/') {
+		vp = path;
+	} else {
+		if (snprintf(buf, sizeof(buf), "%s/%s", h->dirPath, path)
+		    >= (int)sizeof(buf)) {
+			pthread_mutex_unlock(&g_libLock);
+			errno = ENAMETOOLONG;
+			return -1;
+		}
+		vp = buf;
+	}
+	pthread_mutex_unlock(&g_libLock);
+	return hfs_lib_open(vp, flags, mode);
 }
 
 /*

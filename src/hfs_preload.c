@@ -261,6 +261,13 @@ int openat(int dirfd, const char *path, int flags, ...) {
 		if (rc != -2) {
 			return rc;
 		}
+	} else if (hfs_is_hfs_fd(dirfd)) {
+		/* Relative to an HFS directory fd (aria/InnoDB use this). */
+		if (hfs_lib_init() != 0) {
+			errno = ENODEV;
+			return -1;
+		}
+		return hfs_lib_openat(dirfd, path, flags, mode);
 	}
 	return real_openat(dirfd, path, flags, mode);
 }
@@ -281,6 +288,12 @@ int openat64(int dirfd, const char *path, int flags, ...) {
 		if (rc != -2) {
 			return rc;
 		}
+	} else if (hfs_is_hfs_fd(dirfd)) {
+		if (hfs_lib_init() != 0) {
+			errno = ENODEV;
+			return -1;
+		}
+		return hfs_lib_openat(dirfd, path, flags, mode);
 	}
 	return real_openat64(dirfd, path, flags, mode);
 }

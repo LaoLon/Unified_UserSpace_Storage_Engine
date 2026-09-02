@@ -5,8 +5,12 @@
 
 #include "hfs.h"
 
-/* Upper bound for waiter polling iterations (timeout guard). */
-#define WAITER_MAX_TIME 2000000000
+/*
+ * Upper bound for waiter polling iterations (timeout guard). Kept
+ * modest so a lost/starved SPDK message fails fast instead of
+ * stalling a process exit for ~110s (MariaDB signal-thread hang).
+ */
+#define WAITER_MAX_TIME 5000000
 
 /* Global SPDK thread that executes all blobstore operations. */
 extern struct spdk_thread *globalThread;

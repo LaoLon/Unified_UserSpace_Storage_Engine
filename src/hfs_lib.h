@@ -32,6 +32,8 @@ Hfs *hfs_lib_get_fs(void);
 
 /* Open a file/dir under the HFS mount prefix. */
 int hfs_lib_open(const char *path, int flags, mode_t mode);
+/* Open relative to an HFS directory fd (openat semantics). */
+int hfs_lib_openat(int dirfd, const char *path, int flags, mode_t mode);
 /* Read from the current offset of an HFS fd. */
 ssize_t hfs_lib_read(int fd, void *buf, size_t count);
 /* Write at the current offset of an HFS fd. */
