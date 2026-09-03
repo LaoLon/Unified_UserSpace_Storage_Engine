@@ -18,8 +18,10 @@
 #include "hfs_log.h"
 #include "hfs_meta.h"
 
-/* Serializes all public library entry points (init/fini today). */
-static pthread_mutex_t g_libLock = PTHREAD_MUTEX_INITIALIZER;
+/* Protects the mounted inode table and metadata snapshots. */
+static pthread_rwlock_t g_metaLock = PTHREAD_RWLOCK_INITIALIZER;
+/* Serializes append writes across independent open-file descriptions. */
+static pthread_mutex_t g_appendLock = PTHREAD_MUTEX_INITIALIZER;
 
 /* The single mounted filesystem instance (one per process). */
 static Hfs *g_fs;
@@ -163,6 +165,7 @@ struct hfs_dir {
 	uint64_t count;		/* number of entries in the snapshot */
 	uint64_t cursor;	/* current position in the snapshot */
 	struct hfs_dirent *entries;	/* snapshot array */
+	pthread_mutex_t lock;	/* protects the enumeration cursor */
 };
 
 /* Delete a deferred blob after every open description for its inode is gone. */
@@ -219,14 +222,14 @@ static HfsOpenFile *hfs_acquire_file(int fd, bool requireData) {
  * without re-initializing.
  */
 int hfs_lib_init(void) {
-	pthread_mutex_lock(&g_libLock);
+	pthread_rwlock_wrlock(&g_metaLock);
 	if (g_fs != NULL) {
-		pthread_mutex_unlock(&g_libLock);
+		pthread_rwlock_unlock(&g_metaLock);
 		return 0;
 	}
 
 	if (hfs_log_init() != 0) {
-		pthread_mutex_unlock(&g_libLock);
+		pthread_rwlock_unlock(&g_metaLock);
 		return -1;
 	}
 	HFS_LOG_DEBUG("hfs_log_init done");
@@ -235,7 +238,7 @@ int hfs_lib_init(void) {
 		HFS_LOG_ERROR("backend lock failed for %s: %s", hfs_backend_name(),
 			       strerror(errno));
 		hfs_log_fini();
-		pthread_mutex_unlock(&g_libLock);
+		pthread_rwlock_unlock(&g_metaLock);
 		return -1;
 	}
 
@@ -244,7 +247,7 @@ int hfs_lib_init(void) {
 		hfsRuntimeStop();
 		hfs_release_backend_lock();
 		hfs_log_fini();
-		pthread_mutex_unlock(&g_libLock);
+		pthread_rwlock_unlock(&g_metaLock);
 		return -1;
 	}
 
@@ -253,7 +256,7 @@ int hfs_lib_init(void) {
 		hfsRuntimeStop();
 		hfs_release_backend_lock();
 		hfs_log_fini();
-		pthread_mutex_unlock(&g_libLock);
+		pthread_rwlock_unlock(&g_metaLock);
 		return -1;
 	}
 
@@ -264,7 +267,7 @@ int hfs_lib_init(void) {
 		hfsRuntimeStop();
 		hfs_release_backend_lock();
 		hfs_log_fini();
-		pthread_mutex_unlock(&g_libLock);
+		pthread_rwlock_unlock(&g_metaLock);
 		return -1;
 	}
 
@@ -276,7 +279,7 @@ int hfs_lib_init(void) {
 		hfsRuntimeStop();
 		hfs_release_backend_lock();
 		hfs_log_fini();
-		pthread_mutex_unlock(&g_libLock);
+		pthread_rwlock_unlock(&g_metaLock);
 		return -1;
 	}
 
@@ -292,7 +295,7 @@ int hfs_lib_init(void) {
 	 * parent's DPDK state and hangs). They run in pass-through mode.
 	 */
 	setenv("_HFS_INIT_DONE", "1", 0);
-	pthread_mutex_unlock(&g_libLock);
+	pthread_rwlock_unlock(&g_metaLock);
 	return 0;
 }
 
@@ -319,9 +322,9 @@ void hfs_lib_fini(void) {
 	HfsOpenFile *openFile;
 	int fd;
 
-	pthread_mutex_lock(&g_libLock);
+	pthread_rwlock_wrlock(&g_metaLock);
 	if (g_fs == NULL) {
-		pthread_mutex_unlock(&g_libLock);
+		pthread_rwlock_unlock(&g_metaLock);
 		return;
 	}
 	/* Close every placeholder before unmounting the blobstore. */
@@ -340,7 +343,7 @@ void hfs_lib_fini(void) {
 	hfs_release_backend_lock();
 	HFS_LOG_DEBUG("libhfs finalized");
 	hfs_log_fini();
-	pthread_mutex_unlock(&g_libLock);
+	pthread_rwlock_unlock(&g_metaLock);
 }
 
 /*
@@ -356,12 +359,13 @@ int hfs_lib_open(const char *path, int flags, mode_t mode) {
 	HfsOpenFile *openFile = NULL;
 	int fd;
 	int rc;
+	bool created = false;
 
 	(void)mode;
 
-	pthread_mutex_lock(&g_libLock);
+	pthread_rwlock_wrlock(&g_metaLock);
 	if (g_fs == NULL) {
-		pthread_mutex_unlock(&g_libLock);
+		pthread_rwlock_unlock(&g_metaLock);
 		errno = ENODEV;
 		return -1;
 	}
@@ -369,25 +373,36 @@ int hfs_lib_open(const char *path, int flags, mode_t mode) {
 	in = hfsMetaResolvePath(g_fs, path);
 	if (in == NULL) {
 		if (errno != ENOENT || !(flags & O_CREAT)) {
-			pthread_mutex_unlock(&g_libLock);
+			pthread_rwlock_unlock(&g_metaLock);
 			return -1;
 		}
 		/* Create the file and re-resolve its inode. */
 		if (hfsMetaResolveParent(g_fs, path, &parent, &leaf) != 0) {
-			pthread_mutex_unlock(&g_libLock);
+			pthread_rwlock_unlock(&g_metaLock);
 			return -1;
 		}
 		rc = hfsMetaCreateFile(g_fs, parent, leaf);
 		if (rc != 0) {
-			pthread_mutex_unlock(&g_libLock);
+			pthread_rwlock_unlock(&g_metaLock);
 			return -1;
 		}
+		created = true;
 		in = hfsMetaFindByName(g_fs, parent->id, leaf);
 		if (in == NULL) {
-			pthread_mutex_unlock(&g_libLock);
+			pthread_rwlock_unlock(&g_metaLock);
 			errno = ENOENT;
 			return -1;
 		}
+	}
+	if (!created && (flags & O_CREAT) != 0 && (flags & O_EXCL) != 0) {
+		pthread_rwlock_unlock(&g_metaLock);
+		errno = EEXIST;
+		return -1;
+	}
+	if ((flags & O_DIRECTORY) != 0 && in->type != HFS_INODE_DIR) {
+		pthread_rwlock_unlock(&g_metaLock);
+		errno = ENOTDIR;
+		return -1;
 	}
 
 	if (in->type == HFS_INODE_DIR) {
@@ -397,7 +412,7 @@ int hfs_lib_open(const char *path, int flags, mode_t mode) {
 		 * data blob; read/write on it fails with EISDIR later.
 		 */
 		if ((flags & O_ACCMODE) != O_RDONLY) {
-			pthread_mutex_unlock(&g_libLock);
+			pthread_rwlock_unlock(&g_metaLock);
 			errno = EISDIR;
 			return -1;
 		}
@@ -406,7 +421,7 @@ int hfs_lib_open(const char *path, int flags, mode_t mode) {
 			if (fd >= 0) {
 				close(fd);
 			}
-			pthread_mutex_unlock(&g_libLock);
+			pthread_rwlock_unlock(&g_metaLock);
 			errno = EMFILE;
 			return -1;
 		}
@@ -416,25 +431,25 @@ int hfs_lib_open(const char *path, int flags, mode_t mode) {
 				hfsFdDestroy(openFile);
 			}
 			close(fd);
-			pthread_mutex_unlock(&g_libLock);
+			pthread_rwlock_unlock(&g_metaLock);
 			return -1;
 		}
 		openFile->ctimeNs = in->ctimeNs;
 		atomic_store_explicit(&openFile->mtimeNs, in->mtimeNs,
 				      memory_order_relaxed);
-		pthread_mutex_unlock(&g_libLock);
+		pthread_rwlock_unlock(&g_metaLock);
 		return fd;
 	}
 	if (in->type != HFS_INODE_FILE) {
-		pthread_mutex_unlock(&g_libLock);
+		pthread_rwlock_unlock(&g_metaLock);
 		errno = EISDIR;
 		return -1;
 	}
 
-	if ((flags & O_TRUNC) && in->size != 0) {
-		in->size = 0;
-		if (hfsMetaSaveAll(g_fs) != 0) {
-			pthread_mutex_unlock(&g_libLock);
+	if ((flags & O_TRUNC) != 0 &&
+	    (flags & O_ACCMODE) != O_RDONLY) {
+		if (hfsMetaSetSize(g_fs, in, 0) != 0) {
+			pthread_rwlock_unlock(&g_metaLock);
 			return -1;
 		}
 	}
@@ -447,20 +462,20 @@ int hfs_lib_open(const char *path, int flags, mode_t mode) {
 	 */
 	fd = open("/dev/null", O_RDONLY);
 	if (fd < 0) {
-		pthread_mutex_unlock(&g_libLock);
+		pthread_rwlock_unlock(&g_metaLock);
 		errno = EMFILE;
 		return -1;
 	}
 	if (fd >= HFS_FD_TABLE_SIZE) {
 		close(fd);
-		pthread_mutex_unlock(&g_libLock);
+		pthread_rwlock_unlock(&g_metaLock);
 		errno = EMFILE;
 		return -1;
 	}
 
 	file = calloc(1, sizeof(HfsFile));
 	if (file == NULL) {
-		pthread_mutex_unlock(&g_libLock);
+		pthread_rwlock_unlock(&g_metaLock);
 		errno = ENOMEM;
 		return -1;
 	}
@@ -470,7 +485,7 @@ int hfs_lib_open(const char *path, int flags, mode_t mode) {
 	if (!hfsOpenById(file)) {
 		close(fd);
 		free(file);
-		pthread_mutex_unlock(&g_libLock);
+		pthread_rwlock_unlock(&g_metaLock);
 		errno = EIO;
 		return -1;
 	}
@@ -483,15 +498,18 @@ int hfs_lib_open(const char *path, int flags, mode_t mode) {
 		hfsClose(file);
 		free(file);
 		close(fd);
-		pthread_mutex_unlock(&g_libLock);
+		pthread_rwlock_unlock(&g_metaLock);
 		return -1;
 	}
 	atomic_store_explicit(&openFile->size, in->size, memory_order_relaxed);
+	if ((flags & O_APPEND) != 0) {
+		openFile->offset = in->size;
+	}
 	openFile->ctimeNs = in->ctimeNs;
 	atomic_store_explicit(&openFile->mtimeNs, in->mtimeNs,
 			      memory_order_relaxed);
 
-	pthread_mutex_unlock(&g_libLock);
+	pthread_rwlock_unlock(&g_metaLock);
 	return fd;
 }
 
@@ -509,7 +527,7 @@ int hfs_lib_openat(int dirfd, const char *path, int flags, mode_t mode) {
 		if (openFile != NULL) {
 			hfsFdRelease(openFile, NULL);
 		}
-		errno = EBADF;
+		errno = openFile == NULL ? EBADF : ENOTDIR;
 		return -1;
 	}
 	if (path[0] == '/') {
@@ -525,6 +543,34 @@ int hfs_lib_openat(int dirfd, const char *path, int flags, mode_t mode) {
 	}
 	hfsFdRelease(openFile, NULL);
 	return hfs_lib_open(vp, flags, mode);
+}
+
+/* Copy the inner path of an open HFS directory for fchdir/fdopendir. */
+int hfs_lib_get_dir_path(int fd, char *pathOut, size_t pathSize) {
+	HfsOpenFile *openFile;
+
+	if (pathOut == NULL || pathSize == 0) {
+		errno = EINVAL;
+		return -1;
+	}
+	openFile = hfsFdAcquire(fd);
+	if (openFile == NULL) {
+		errno = EBADF;
+		return -1;
+	}
+	if (!openFile->isDirectory) {
+		hfs_release_open_file(openFile);
+		errno = ENOTDIR;
+		return -1;
+	}
+	if (snprintf(pathOut, pathSize, "%s", openFile->dirPath)
+	    >= (int)pathSize) {
+		hfs_release_open_file(openFile);
+		errno = ENAMETOOLONG;
+		return -1;
+	}
+	hfs_release_open_file(openFile);
+	return 0;
 }
 
 /*
@@ -546,17 +592,17 @@ ssize_t hfs_lib_read(int fd, void *buf, size_t count) {
 		return -1;
 	}
 	pthread_mutex_lock(&openFile->ioLock);
-	pthread_mutex_lock(&g_libLock);
+	pthread_rwlock_rdlock(&g_metaLock);
 	in = g_fs == NULL ? NULL : hfsMetaFindById(g_fs, openFile->inodeId);
 	if (g_fs == NULL) {
-		pthread_mutex_unlock(&g_libLock);
+		pthread_rwlock_unlock(&g_metaLock);
 		pthread_mutex_unlock(&openFile->ioLock);
 		hfs_release_open_file(openFile);
 		errno = ENODEV;
 		return -1;
 	}
 	if (in == NULL && !hfsFdGetOrphanInfo(openFile, &fileSize, NULL, NULL)) {
-		pthread_mutex_unlock(&g_libLock);
+		pthread_rwlock_unlock(&g_metaLock);
 		pthread_mutex_unlock(&openFile->ioLock);
 		hfs_release_open_file(openFile);
 		errno = ENOENT;
@@ -566,7 +612,7 @@ ssize_t hfs_lib_read(int fd, void *buf, size_t count) {
 		fileSize = in->size;
 	}
 	if (openFile->offset >= fileSize) {
-		pthread_mutex_unlock(&g_libLock);
+		pthread_rwlock_unlock(&g_metaLock);
 		pthread_mutex_unlock(&openFile->ioLock);
 		hfs_release_open_file(openFile);
 		return 0;	/* end of file */
@@ -574,7 +620,7 @@ ssize_t hfs_lib_read(int fd, void *buf, size_t count) {
 	if (openFile->offset + count > fileSize) {
 		count = (size_t)(fileSize - openFile->offset);
 	}
-	pthread_mutex_unlock(&g_libLock);
+	pthread_rwlock_unlock(&g_metaLock);
 	n = hfsReadAt(openFile->file, buf, count, openFile->offset);
 	if (n > 0) {
 		openFile->offset += (uint64_t)n;
@@ -591,6 +637,8 @@ ssize_t hfs_lib_read(int fd, void *buf, size_t count) {
 ssize_t hfs_lib_write(int fd, const void *buf, size_t count) {
 	HfsOpenFile *openFile;
 	struct hfs_inode *in;
+	uint64_t writeOffset;
+	bool append;
 	ssize_t n;
 
 	if (count == 0) {
@@ -607,15 +655,51 @@ ssize_t hfs_lib_write(int fd, const void *buf, size_t count) {
 		return -1;
 	}
 	pthread_mutex_lock(&openFile->ioLock);
-	n = hfsWriteAt(openFile->file, buf, count, openFile->offset);
+	append = (openFile->flags & O_APPEND) != 0;
+	if (append) {
+		/* Serialize EOF selection so independent append fds do not overlap. */
+		pthread_mutex_lock(&g_appendLock);
+	}
+	writeOffset = openFile->offset;
+	if (append) {
+		uint64_t appendSize;
+
+		pthread_rwlock_rdlock(&g_metaLock);
+		in = g_fs == NULL ? NULL : hfsMetaFindById(g_fs, openFile->inodeId);
+		if (g_fs == NULL) {
+			pthread_rwlock_unlock(&g_metaLock);
+			pthread_mutex_unlock(&openFile->ioLock);
+			pthread_mutex_unlock(&g_appendLock);
+			hfs_release_open_file(openFile);
+			errno = ENODEV;
+			return -1;
+		}
+		if (in != NULL) {
+			writeOffset = in->size;
+		} else if (hfsFdGetOrphanInfo(openFile, &appendSize, NULL, NULL)) {
+			writeOffset = appendSize;
+		} else {
+			pthread_rwlock_unlock(&g_metaLock);
+			pthread_mutex_unlock(&openFile->ioLock);
+			pthread_mutex_unlock(&g_appendLock);
+			hfs_release_open_file(openFile);
+			errno = ENOENT;
+			return -1;
+		}
+		pthread_rwlock_unlock(&g_metaLock);
+	}
+	n = hfsWriteAt(openFile->file, buf, count, writeOffset);
 	if (n <= 0) {
 		pthread_mutex_unlock(&openFile->ioLock);
+		if (append) {
+			pthread_mutex_unlock(&g_appendLock);
+		}
 		hfs_release_open_file(openFile);
 		errno = EIO;
 		return -1;
 	}
-	openFile->offset += (uint64_t)n;
-	pthread_mutex_lock(&g_libLock);
+	openFile->offset = writeOffset + (uint64_t)n;
+	pthread_rwlock_wrlock(&g_metaLock);
 	in = g_fs == NULL ? NULL : hfsMetaFindById(g_fs, openFile->inodeId);
 	if (in != NULL && openFile->offset > in->size) {
 		/* Update size/mtime in memory; persisted at fsync/close. */
@@ -636,8 +720,11 @@ ssize_t hfs_lib_write(int fd, const void *buf, size_t count) {
 		atomic_store_explicit(&openFile->mtimeNs, hfs_now_ns(),
 				      memory_order_relaxed);
 	}
-	pthread_mutex_unlock(&g_libLock);
+	pthread_rwlock_unlock(&g_metaLock);
 	pthread_mutex_unlock(&openFile->ioLock);
+	if (append) {
+		pthread_mutex_unlock(&g_appendLock);
+	}
 	hfs_release_open_file(openFile);
 	return n;
 }
@@ -662,17 +749,17 @@ ssize_t hfs_lib_pread(int fd, void *buf, size_t count, off_t offset) {
 		return -1;
 	}
 	pthread_mutex_lock(&openFile->ioLock);
-	pthread_mutex_lock(&g_libLock);
+	pthread_rwlock_rdlock(&g_metaLock);
 	in = g_fs == NULL ? NULL : hfsMetaFindById(g_fs, openFile->inodeId);
 	if (g_fs == NULL) {
-		pthread_mutex_unlock(&g_libLock);
+		pthread_rwlock_unlock(&g_metaLock);
 		pthread_mutex_unlock(&openFile->ioLock);
 		hfs_release_open_file(openFile);
 		errno = ENODEV;
 		return -1;
 	}
 	if (in == NULL && !hfsFdGetOrphanInfo(openFile, &fileSize, NULL, NULL)) {
-		pthread_mutex_unlock(&g_libLock);
+		pthread_rwlock_unlock(&g_metaLock);
 		pthread_mutex_unlock(&openFile->ioLock);
 		hfs_release_open_file(openFile);
 		errno = ENOENT;
@@ -682,7 +769,7 @@ ssize_t hfs_lib_pread(int fd, void *buf, size_t count, off_t offset) {
 		fileSize = in->size;
 	}
 	if ((uint64_t)offset >= fileSize) {
-		pthread_mutex_unlock(&g_libLock);
+		pthread_rwlock_unlock(&g_metaLock);
 		pthread_mutex_unlock(&openFile->ioLock);
 		hfs_release_open_file(openFile);
 		return 0;
@@ -691,7 +778,7 @@ ssize_t hfs_lib_pread(int fd, void *buf, size_t count, off_t offset) {
 		count = (size_t)(fileSize - (uint64_t)offset);
 	}
 
-	pthread_mutex_unlock(&g_libLock);
+	pthread_rwlock_unlock(&g_metaLock);
 	n = hfsReadAt(openFile->file, buf, count, (uint64_t)offset);
 	pthread_mutex_unlock(&openFile->ioLock);
 	hfs_release_open_file(openFile);
@@ -702,6 +789,8 @@ ssize_t hfs_lib_pread(int fd, void *buf, size_t count, off_t offset) {
 ssize_t hfs_lib_pwrite(int fd, const void *buf, size_t count, off_t offset) {
 	HfsOpenFile *openFile;
 	struct hfs_inode *in;
+	uint64_t writeOffset;
+	bool append;
 	ssize_t n;
 
 	if (count == 0) {
@@ -722,17 +811,53 @@ ssize_t hfs_lib_pwrite(int fd, const void *buf, size_t count, off_t offset) {
 		return -1;
 	}
 	pthread_mutex_lock(&openFile->ioLock);
-	n = hfsWriteAt(openFile->file, buf, count, (uint64_t)offset);
+	append = (openFile->flags & O_APPEND) != 0;
+	if (append) {
+		/* Linux honors O_APPEND for pwrite; serialize the EOF decision. */
+		pthread_mutex_lock(&g_appendLock);
+	}
+	writeOffset = (uint64_t)offset;
+	if (append) {
+		uint64_t appendSize;
+
+		pthread_rwlock_rdlock(&g_metaLock);
+		in = g_fs == NULL ? NULL : hfsMetaFindById(g_fs, openFile->inodeId);
+		if (g_fs == NULL) {
+			pthread_rwlock_unlock(&g_metaLock);
+			pthread_mutex_unlock(&openFile->ioLock);
+			pthread_mutex_unlock(&g_appendLock);
+			hfs_release_open_file(openFile);
+			errno = ENODEV;
+			return -1;
+		}
+		if (in != NULL) {
+			writeOffset = in->size;
+		} else if (hfsFdGetOrphanInfo(openFile, &appendSize, NULL, NULL)) {
+			writeOffset = appendSize;
+		} else {
+			pthread_rwlock_unlock(&g_metaLock);
+			pthread_mutex_unlock(&openFile->ioLock);
+			pthread_mutex_unlock(&g_appendLock);
+			hfs_release_open_file(openFile);
+			errno = ENOENT;
+			return -1;
+		}
+		pthread_rwlock_unlock(&g_metaLock);
+	}
+	n = hfsWriteAt(openFile->file, buf, count, writeOffset);
 	if (n <= 0) {
 		pthread_mutex_unlock(&openFile->ioLock);
+		if (append) {
+			pthread_mutex_unlock(&g_appendLock);
+		}
 		hfs_release_open_file(openFile);
 		errno = EIO;
 		return -1;
 	}
-	pthread_mutex_lock(&g_libLock);
+	pthread_rwlock_wrlock(&g_metaLock);
 	in = g_fs == NULL ? NULL : hfsMetaFindById(g_fs, openFile->inodeId);
-	if (in != NULL && (uint64_t)offset + (uint64_t)n > in->size) {
-		in->size = (uint64_t)offset + (uint64_t)n;
+	if (in != NULL && writeOffset + (uint64_t)n > in->size) {
+		in->size = writeOffset + (uint64_t)n;
 		in->mtimeNs = hfs_now_ns();
 		atomic_store_explicit(&openFile->size, in->size,
 				      memory_order_relaxed);
@@ -741,7 +866,7 @@ ssize_t hfs_lib_pwrite(int fd, const void *buf, size_t count, off_t offset) {
 	} else if (in == NULL && hfsFdGetOrphanInfo(openFile, NULL, NULL, NULL)) {
 		uint64_t size = atomic_load_explicit(&openFile->size,
 					     memory_order_relaxed);
-		uint64_t end = (uint64_t)offset + (uint64_t)n;
+		uint64_t end = writeOffset + (uint64_t)n;
 
 		if (end > size) {
 			atomic_store_explicit(&openFile->size, end,
@@ -750,8 +875,11 @@ ssize_t hfs_lib_pwrite(int fd, const void *buf, size_t count, off_t offset) {
 		atomic_store_explicit(&openFile->mtimeNs, hfs_now_ns(),
 				      memory_order_relaxed);
 	}
-	pthread_mutex_unlock(&g_libLock);
+	pthread_rwlock_unlock(&g_metaLock);
 	pthread_mutex_unlock(&openFile->ioLock);
+	if (append) {
+		pthread_mutex_unlock(&g_appendLock);
+	}
 	hfs_release_open_file(openFile);
 	return n;
 }
@@ -767,9 +895,9 @@ off_t hfs_lib_lseek(int fd, off_t offset, int whence) {
 		return -1;
 	}
 	pthread_mutex_lock(&openFile->ioLock);
-	pthread_mutex_lock(&g_libLock);
+	pthread_rwlock_rdlock(&g_metaLock);
 	if (g_fs == NULL) {
-		pthread_mutex_unlock(&g_libLock);
+		pthread_rwlock_unlock(&g_metaLock);
 		pthread_mutex_unlock(&openFile->ioLock);
 		hfs_release_open_file(openFile);
 		errno = ENODEV;
@@ -787,7 +915,7 @@ off_t hfs_lib_lseek(int fd, off_t offset, int whence) {
 		if (in != NULL) {
 			base = in->size;
 		} else if (!hfsFdGetOrphanInfo(openFile, &base, NULL, NULL)) {
-			pthread_mutex_unlock(&g_libLock);
+			pthread_rwlock_unlock(&g_metaLock);
 			pthread_mutex_unlock(&openFile->ioLock);
 			hfs_release_open_file(openFile);
 			errno = ENOENT;
@@ -795,7 +923,7 @@ off_t hfs_lib_lseek(int fd, off_t offset, int whence) {
 		}
 		break;
 	default:
-		pthread_mutex_unlock(&g_libLock);
+		pthread_rwlock_unlock(&g_metaLock);
 		pthread_mutex_unlock(&openFile->ioLock);
 		hfs_release_open_file(openFile);
 		errno = EINVAL;
@@ -803,7 +931,7 @@ off_t hfs_lib_lseek(int fd, off_t offset, int whence) {
 	}
 
 	if (offset < 0 && (uint64_t)(-(offset + 1)) + 1 > base) {
-		pthread_mutex_unlock(&g_libLock);
+		pthread_rwlock_unlock(&g_metaLock);
 		pthread_mutex_unlock(&openFile->ioLock);
 		hfs_release_open_file(openFile);
 		errno = EINVAL;
@@ -813,7 +941,7 @@ off_t hfs_lib_lseek(int fd, off_t offset, int whence) {
 	openFile->offset = offset < 0 ? base - (uint64_t)(-offset) :
 				       base + (uint64_t)offset;
 	offset = (off_t)openFile->offset;
-	pthread_mutex_unlock(&g_libLock);
+	pthread_rwlock_unlock(&g_metaLock);
 	pthread_mutex_unlock(&openFile->ioLock);
 	hfs_release_open_file(openFile);
 	return offset;
@@ -832,7 +960,7 @@ int hfs_lib_fd_copy(int oldfd, int newfd) {
 
 /*
  * Returns true when the fd belongs to HFS (interception helper).
- * The fd registry uses a short read lock and never takes g_libLock, so
+ * The fd registry uses a short read lock and never takes the metadata lock, so
  * close() can classify internal descriptors while initialization is active.
  */
 bool hfs_is_hfs_fd(int fd) {
@@ -873,34 +1001,34 @@ int hfs_lib_unlink(const char *path) {
 	HfsOrphan *orphan = NULL;
 	int rc;
 
-	pthread_mutex_lock(&g_libLock);
+	pthread_rwlock_wrlock(&g_metaLock);
 	if (g_fs == NULL) {
-		pthread_mutex_unlock(&g_libLock);
+		pthread_rwlock_unlock(&g_metaLock);
 		errno = ENODEV;
 		return -1;
 	}
 
 	rc = hfsMetaResolveParent(g_fs, path, &parent, &leaf);
 	if (rc != 0) {
-		pthread_mutex_unlock(&g_libLock);
+		pthread_rwlock_unlock(&g_metaLock);
 		return -1;
 	}
 	in = hfsMetaFindByName(g_fs, parent->id, leaf);
 	if (in == NULL || in->type != HFS_INODE_FILE) {
-		pthread_mutex_unlock(&g_libLock);
+		pthread_rwlock_unlock(&g_metaLock);
 		errno = in == NULL ? ENOENT : EISDIR;
 		return -1;
 	}
 	blobId = in->blobId;
 	if (hfsFdMarkOrphan(in->id, blobId, in->size, in->ctimeNs,
 			   in->mtimeNs, &orphan) != 0) {
-		pthread_mutex_unlock(&g_libLock);
+		pthread_rwlock_unlock(&g_metaLock);
 		return -1;
 	}
 
 	rc = hfsMetaRemoveFile(g_fs, parent, leaf, &blobId);
 	if (rc != 0) {
-		pthread_mutex_unlock(&g_libLock);
+		pthread_rwlock_unlock(&g_metaLock);
 		return -1;
 	}
 
@@ -910,14 +1038,14 @@ int hfs_lib_unlink(const char *path) {
 		file.fs = g_fs;
 		file.blobId = blobId;
 		if (!hfsDeleteBlobById(&file)) {
-			pthread_mutex_unlock(&g_libLock);
+			pthread_rwlock_unlock(&g_metaLock);
 			errno = EIO;
 			return -1;
 		}
 	}
 
 	rc = hfsMetaSaveAll(g_fs);
-	pthread_mutex_unlock(&g_libLock);
+	pthread_rwlock_unlock(&g_metaLock);
 	return rc;
 }
 
@@ -946,10 +1074,10 @@ int hfs_lib_ftruncate(int fd, off_t length) {
 		return -1;
 	}
 	pthread_mutex_lock(&openFile->ioLock);
-	pthread_mutex_lock(&g_libLock);
+	pthread_rwlock_rdlock(&g_metaLock);
 	in = g_fs == NULL ? NULL : hfsMetaFindById(g_fs, openFile->inodeId);
 	if (g_fs == NULL) {
-		pthread_mutex_unlock(&g_libLock);
+		pthread_rwlock_unlock(&g_metaLock);
 		pthread_mutex_unlock(&openFile->ioLock);
 		hfs_release_open_file(openFile);
 		errno = ENODEV;
@@ -958,35 +1086,35 @@ int hfs_lib_ftruncate(int fd, off_t length) {
 	if (in != NULL) {
 		currentSize = in->size;
 	} else if (!hfsFdGetOrphanInfo(openFile, &currentSize, NULL, NULL)) {
-		pthread_mutex_unlock(&g_libLock);
+		pthread_rwlock_unlock(&g_metaLock);
 		pthread_mutex_unlock(&openFile->ioLock);
 		hfs_release_open_file(openFile);
 		errno = ENOENT;
 		return -1;
 	}
 
+	pthread_rwlock_unlock(&g_metaLock);
+
 	/* Grow the blob first so the new size is backed by storage. */
 	if (length > (off_t)currentSize) {
-		pthread_mutex_unlock(&g_libLock);
 		if (hfsResizeTo(openFile->file, (uint64_t)length) != 0) {
 			pthread_mutex_unlock(&openFile->ioLock);
 			hfs_release_open_file(openFile);
 			errno = EIO;
 			return -1;
 		}
-		pthread_mutex_lock(&g_libLock);
-		in = hfsMetaFindById(g_fs, openFile->inodeId);
-		if (in != NULL) {
-			currentSize = in->size;
-		} else if (!hfsFdGetOrphanInfo(openFile, &currentSize, NULL, NULL)) {
-			pthread_mutex_unlock(&g_libLock);
-			pthread_mutex_unlock(&openFile->ioLock);
-			hfs_release_open_file(openFile);
-			errno = ENOENT;
-			return -1;
-		}
 	}
 
+	/* Upgrade to a writer only for the stable inode update. */
+	pthread_rwlock_wrlock(&g_metaLock);
+	in = g_fs == NULL ? NULL : hfsMetaFindById(g_fs, openFile->inodeId);
+	if (g_fs == NULL) {
+		pthread_rwlock_unlock(&g_metaLock);
+		pthread_mutex_unlock(&openFile->ioLock);
+		hfs_release_open_file(openFile);
+		errno = ENODEV;
+		return -1;
+	}
 	if (in != NULL) {
 		rc = hfsMetaSetSize(g_fs, in, (uint64_t)length);
 		if (rc == 0) {
@@ -995,14 +1123,20 @@ int hfs_lib_ftruncate(int fd, off_t length) {
 			atomic_store_explicit(&openFile->mtimeNs, in->mtimeNs,
 					      memory_order_relaxed);
 		}
-	} else {
+	} else if (hfsFdGetOrphanInfo(openFile, NULL, NULL, NULL)) {
 		atomic_store_explicit(&openFile->size, (uint64_t)length,
 				      memory_order_relaxed);
 		atomic_store_explicit(&openFile->mtimeNs, hfs_now_ns(),
 				      memory_order_relaxed);
 		rc = 0;
+	} else {
+		pthread_rwlock_unlock(&g_metaLock);
+		pthread_mutex_unlock(&openFile->ioLock);
+		hfs_release_open_file(openFile);
+		errno = ENOENT;
+		return -1;
 	}
-	pthread_mutex_unlock(&g_libLock);
+	pthread_rwlock_unlock(&g_metaLock);
 	pthread_mutex_unlock(&openFile->ioLock);
 	hfs_release_open_file(openFile);
 	return rc;
@@ -1022,11 +1156,11 @@ int hfs_lib_fstat(int fd, struct stat *st) {
 		errno = EBADF;
 		return -1;
 	}
-	pthread_mutex_lock(&g_libLock);
+	pthread_rwlock_rdlock(&g_metaLock);
 	in = g_fs == NULL ? NULL : hfsMetaFindById(g_fs, openFile->inodeId);
 	if (in == NULL && !hfsFdGetOrphanInfo(openFile, &orphanSize,
 					     &orphanCtimeNs, &orphanMtimeNs)) {
-		pthread_mutex_unlock(&g_libLock);
+		pthread_rwlock_unlock(&g_metaLock);
 		hfs_release_open_file(openFile);
 		errno = g_fs == NULL ? ENODEV : ENOENT;
 		return -1;
@@ -1041,7 +1175,7 @@ int hfs_lib_fstat(int fd, struct stat *st) {
 		snapshot.ctimeNs = orphanCtimeNs;
 		snapshot.mtimeNs = orphanMtimeNs;
 	}
-	pthread_mutex_unlock(&g_libLock);
+	pthread_rwlock_unlock(&g_metaLock);
 	hfs_release_open_file(openFile);
 	in = &snapshot;
 	memset(st, 0, sizeof(*st));
@@ -1067,19 +1201,19 @@ int hfs_lib_fstat(int fd, struct stat *st) {
 int hfs_lib_access(const char *path, int mode) {
 	struct hfs_inode *in;
 
-	pthread_mutex_lock(&g_libLock);
+	pthread_rwlock_rdlock(&g_metaLock);
 	if (g_fs == NULL) {
-		pthread_mutex_unlock(&g_libLock);
+		pthread_rwlock_unlock(&g_metaLock);
 		errno = ENODEV;
 		return -1;
 	}
 
 	in = hfsMetaResolvePath(g_fs, path);
 	if (in == NULL) {
-		pthread_mutex_unlock(&g_libLock);
+		pthread_rwlock_unlock(&g_metaLock);
 		return -1;	/* errno set by the resolver */
 	}
-	pthread_mutex_unlock(&g_libLock);
+	pthread_rwlock_unlock(&g_metaLock);
 	return 0;
 }
 
@@ -1148,22 +1282,22 @@ int hfs_lib_fsync(int fd) {
 		return -1;
 	}
 	pthread_mutex_lock(&openFile->ioLock);
-	pthread_mutex_lock(&g_libLock);
+	pthread_rwlock_wrlock(&g_metaLock);
 	if (g_fs == NULL) {
-		pthread_mutex_unlock(&g_libLock);
+		pthread_rwlock_unlock(&g_metaLock);
 		pthread_mutex_unlock(&openFile->ioLock);
 		hfs_release_open_file(openFile);
 		errno = ENODEV;
 		return -1;
 	}
 	if (hfsMetaSaveAll(g_fs) != 0) {
-		pthread_mutex_unlock(&g_libLock);
+		pthread_rwlock_unlock(&g_metaLock);
 		pthread_mutex_unlock(&openFile->ioLock);
 		hfs_release_open_file(openFile);
 		errno = EIO;
 		return -1;
 	}
-	pthread_mutex_unlock(&g_libLock);
+	pthread_rwlock_unlock(&g_metaLock);
 	pthread_mutex_unlock(&openFile->ioLock);
 	hfs_release_open_file(openFile);
 	return 0;
@@ -1195,21 +1329,21 @@ int hfs_lib_mkdir(const char *path, mode_t mode) {
 	const char *leaf;
 	int rc;
 
-	pthread_mutex_lock(&g_libLock);
+	pthread_rwlock_wrlock(&g_metaLock);
 	if (g_fs == NULL) {
-		pthread_mutex_unlock(&g_libLock);
+		pthread_rwlock_unlock(&g_metaLock);
 		errno = ENODEV;
 		return -1;
 	}
 
 	rc = hfsMetaResolveParent(g_fs, path, &parent, &leaf);
 	if (rc != 0) {
-		pthread_mutex_unlock(&g_libLock);
+		pthread_rwlock_unlock(&g_metaLock);
 		return -1;
 	}
 
 	rc = hfsMetaMkdir(g_fs, parent, leaf);
-	pthread_mutex_unlock(&g_libLock);
+	pthread_rwlock_unlock(&g_metaLock);
 	return rc;
 }
 
@@ -1217,15 +1351,15 @@ int hfs_lib_mkdir(const char *path, mode_t mode) {
 int hfs_lib_rmdir(const char *path) {
 	int rc;
 
-	pthread_mutex_lock(&g_libLock);
+	pthread_rwlock_wrlock(&g_metaLock);
 	if (g_fs == NULL) {
-		pthread_mutex_unlock(&g_libLock);
+		pthread_rwlock_unlock(&g_metaLock);
 		errno = ENODEV;
 		return -1;
 	}
 
 	rc = hfsMetaRmdir(g_fs, path);
-	pthread_mutex_unlock(&g_libLock);
+	pthread_rwlock_unlock(&g_metaLock);
 	return rc;
 }
 
@@ -1241,9 +1375,9 @@ int hfs_lib_rename(const char *oldPath, const char *newPath) {
 	HfsOrphan *orphan = NULL;
 	int rc;
 
-	pthread_mutex_lock(&g_libLock);
+	pthread_rwlock_wrlock(&g_metaLock);
 	if (g_fs == NULL) {
-		pthread_mutex_unlock(&g_libLock);
+		pthread_rwlock_unlock(&g_metaLock);
 		errno = ENODEV;
 		return -1;
 	}
@@ -1275,7 +1409,7 @@ int hfs_lib_rename(const char *oldPath, const char *newPath) {
 			}
 		}
 	}
-	pthread_mutex_unlock(&g_libLock);
+	pthread_rwlock_unlock(&g_metaLock);
 	return rc;
 }
 
@@ -1290,27 +1424,33 @@ struct hfs_dir *hfs_lib_opendir(const char *path) {
 	int i;
 	uint64_t n = 0;
 
-	pthread_mutex_lock(&g_libLock);
+	pthread_rwlock_rdlock(&g_metaLock);
 	if (g_fs == NULL) {
-		pthread_mutex_unlock(&g_libLock);
+		pthread_rwlock_unlock(&g_metaLock);
 		errno = ENODEV;
 		return NULL;
 	}
 
 	in = hfsMetaResolvePath(g_fs, path);
 	if (in == NULL) {
-		pthread_mutex_unlock(&g_libLock);
+		pthread_rwlock_unlock(&g_metaLock);
 		return NULL;	/* errno set by the resolver */
 	}
 	if (in->type != HFS_INODE_DIR) {
-		pthread_mutex_unlock(&g_libLock);
+		pthread_rwlock_unlock(&g_metaLock);
 		errno = ENOTDIR;
 		return NULL;
 	}
 
 	dir = calloc(1, sizeof(*dir));
 	if (dir == NULL) {
-		pthread_mutex_unlock(&g_libLock);
+		pthread_rwlock_unlock(&g_metaLock);
+		errno = ENOMEM;
+		return NULL;
+	}
+	if (pthread_mutex_init(&dir->lock, NULL) != 0) {
+		free(dir);
+		pthread_rwlock_unlock(&g_metaLock);
 		errno = ENOMEM;
 		return NULL;
 	}
@@ -1323,8 +1463,9 @@ struct hfs_dir *hfs_lib_opendir(const char *path) {
 	}
 	dir->entries = calloc(n > 0 ? n : 1, sizeof(struct hfs_dirent));
 	if (dir->entries == NULL) {
+		pthread_mutex_destroy(&dir->lock);
 		free(dir);
-		pthread_mutex_unlock(&g_libLock);
+		pthread_rwlock_unlock(&g_metaLock);
 		errno = ENOMEM;
 		return NULL;
 	}
@@ -1341,20 +1482,24 @@ struct hfs_dir *hfs_lib_opendir(const char *path) {
 			dir->count++;
 		}
 	}
-	pthread_mutex_unlock(&g_libLock);
+	pthread_rwlock_unlock(&g_metaLock);
 	return dir;
 }
 
 /* Return the next snapshot entry, or NULL when the listing is done. */
 struct hfs_dirent *hfs_lib_readdir(struct hfs_dir *dir) {
+	struct hfs_dirent *entry = NULL;
+
 	if (dir == NULL) {
 		errno = EBADF;
 		return NULL;
 	}
-	if (dir->cursor >= dir->count) {
-		return NULL;	/* end of directory */
+	pthread_mutex_lock(&dir->lock);
+	if (dir->cursor < dir->count) {
+		entry = &dir->entries[dir->cursor++];
 	}
-	return &dir->entries[dir->cursor++];
+	pthread_mutex_unlock(&dir->lock);
+	return entry;
 }
 
 /* Release the directory snapshot state. */
@@ -1363,6 +1508,7 @@ int hfs_lib_closedir(struct hfs_dir *dir) {
 		errno = EBADF;
 		return -1;
 	}
+	pthread_mutex_destroy(&dir->lock);
 	free(dir->entries);
 	free(dir);
 	return 0;
@@ -1375,20 +1521,20 @@ int hfs_lib_stat(const char *path, struct stat *st) {
 	struct hfs_inode *in;
 	struct hfs_inode snapshot;
 
-	pthread_mutex_lock(&g_libLock);
+	pthread_rwlock_rdlock(&g_metaLock);
 	if (g_fs == NULL) {
-		pthread_mutex_unlock(&g_libLock);
+		pthread_rwlock_unlock(&g_metaLock);
 		errno = ENODEV;
 		return -1;
 	}
 
 	in = hfsMetaResolvePath(g_fs, path);
 	if (in == NULL) {
-		pthread_mutex_unlock(&g_libLock);
+		pthread_rwlock_unlock(&g_metaLock);
 		return -1;
 	}
 	snapshot = *in;
-	pthread_mutex_unlock(&g_libLock);
+	pthread_rwlock_unlock(&g_metaLock);
 	in = &snapshot;
 
 	memset(st, 0, sizeof(*st));

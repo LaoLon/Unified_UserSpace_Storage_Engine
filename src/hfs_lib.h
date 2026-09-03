@@ -34,6 +34,8 @@ Hfs *hfs_lib_get_fs(void);
 int hfs_lib_open(const char *path, int flags, mode_t mode);
 /* Open relative to an HFS directory fd (openat semantics). */
 int hfs_lib_openat(int dirfd, const char *path, int flags, mode_t mode);
+/* Copy the inner path of an open HFS directory. */
+int hfs_lib_get_dir_path(int fd, char *pathOut, size_t pathSize);
 /* Read from the current offset of an HFS fd. */
 ssize_t hfs_lib_read(int fd, void *buf, size_t count);
 /* Write at the current offset of an HFS fd. */

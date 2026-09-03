@@ -8,6 +8,7 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -114,6 +115,7 @@ static size_t hfs_prefix_len;
  */
 static char g_hfs_cwd[PATH_MAX] = "/";
 static bool g_hfs_cwd_active;
+static pthread_rwlock_t g_hfs_cwd_lock = PTHREAD_RWLOCK_INITIALIZER;
 
 static int (*real_chdir)(const char *path);
 static int (*real_fchdir)(int fd);
@@ -127,15 +129,84 @@ static int (*real_fchdir)(int fd);
 static bool hfs_inherited;
 
 /*
- * Returns true when the given path lives under the HFS mount prefix.
- * A path equals to the prefix itself (without trailing slash) is not
- * managed, so the mount point directory can live on the real fs.
+ * Return true when the path equals or is below the HFS mount prefix.
+ * The exact mount point is managed as the HFS root directory.
  */
 static bool hfs_path_managed(const char *path) {
+	size_t mountLen;
+
 	if (hfs_prefix == NULL || path == NULL || hfs_inherited) {
 		return false;
 	}
-	return strncmp(path, hfs_prefix, hfs_prefix_len) == 0;
+	mountLen = hfs_prefix_len;
+	while (mountLen > 1 && hfs_prefix[mountLen - 1] == '/') {
+		mountLen--;
+	}
+	if (strncmp(path, hfs_prefix, mountLen) != 0) {
+		return false;
+	}
+	return path[mountLen] == '\0' || path[mountLen] == '/';
+}
+
+/* Return the prefix-stripped portion of a validated managed path. */
+static const char *hfs_inner_path(const char *path) {
+	size_t mountLen = hfs_prefix_len;
+
+	while (mountLen > 1 && hfs_prefix[mountLen - 1] == '/') {
+		mountLen--;
+	}
+	if (path[mountLen] == '/') {
+		mountLen++;
+	}
+	return path + mountLen;
+}
+
+/* Build a full managed path from the process HFS cwd and a user path. */
+static bool hfs_full_path_buf(const char *path, char *buf, size_t size) {
+	bool active;
+
+	if (path == NULL || path[0] == '\0' || buf == NULL || size == 0) {
+		return false;
+	}
+	if (path[0] == '/') {
+		if (!hfs_path_managed(path) ||
+		    snprintf(buf, size, "%s", path) >= (int)size) {
+			return false;
+		}
+		return true;
+	}
+	pthread_rwlock_rdlock(&g_hfs_cwd_lock);
+	active = g_hfs_cwd_active;
+	if (active && snprintf(buf, size, "%s/%s", g_hfs_cwd, path)
+	    >= (int)size) {
+		active = false;
+	}
+	pthread_rwlock_unlock(&g_hfs_cwd_lock);
+	return active && hfs_path_managed(buf);
+}
+
+/* Build a full managed path from a prefix-stripped directory path. */
+static bool hfs_inner_to_full_path(const char *inner, char *buf, size_t size) {
+	size_t prefixLen;
+	const char *component;
+
+	if (hfs_prefix == NULL || inner == NULL || buf == NULL || size == 0) {
+		return false;
+	}
+	prefixLen = hfs_prefix_len;
+	while (prefixLen > 1 && hfs_prefix[prefixLen - 1] == '/') {
+		prefixLen--;
+	}
+	component = inner;
+	while (*component == '/') {
+		component++;
+	}
+	if (*component == '\0') {
+		return snprintf(buf, size, "%.*s", (int)prefixLen, hfs_prefix)
+		       < (int)size;
+	}
+	return snprintf(buf, size, "%.*s/%s", (int)prefixLen, hfs_prefix,
+			component) < (int)size;
 }
 
 /*
@@ -148,6 +219,8 @@ static bool hfs_path_managed(const char *path) {
  */
 static const char *hfs_view_path_buf(const char *path, char *buf,
 				     size_t size) {
+	char fullPath[PATH_MAX];
+
 	if (path == NULL) {
 		return NULL;
 	}
@@ -155,19 +228,15 @@ static const char *hfs_view_path_buf(const char *path, char *buf,
 		if (!hfs_path_managed(path)) {
 			return NULL;
 		}
-		return path + hfs_prefix_len;
+		return hfs_inner_path(path);
 	}
-	if (!g_hfs_cwd_active) {
+	if (!hfs_full_path_buf(path, fullPath, sizeof(fullPath))) {
 		return NULL;
 	}
-	if (snprintf(buf, size, "%s/%s", g_hfs_cwd, path)
-	    >= (int)size) {
+	if (snprintf(buf, size, "%s", fullPath) >= (int)size) {
 		return NULL;
 	}
-	if (!hfs_path_managed(buf)) {
-		return NULL;
-	}
-	return buf + hfs_prefix_len;
+	return hfs_inner_path(buf);
 }
 
 /* TLS convenience wrapper of hfs_view_path_buf. */
@@ -200,6 +269,16 @@ static int hfs_intercept_open(const char *path, int flags, mode_t mode) {
 	return -2;	/* not managed: caller falls through to real libc */
 }
 
+/* Return whether open(2) is allowed to consume a variadic mode argument. */
+static bool hfs_open_has_mode(int flags) {
+	bool hasMode = (flags & O_CREAT) != 0;
+
+#ifdef O_TMPFILE
+	hasMode = hasMode || (flags & O_TMPFILE) != 0;
+#endif
+	return hasMode;
+}
+
 /*
  * Intercepted open(2): managed paths go to hfs_lib_open, everything
  * else is passed through to the real libc open.
@@ -212,15 +291,18 @@ int open(const char *path, int flags, ...) {
 	mode_t mode = 0;
 	int rc;
 
-	va_start(ap, flags);
-	mode = va_arg(ap, mode_t);
-	va_end(ap);
+	if (hfs_open_has_mode(flags)) {
+		va_start(ap, flags);
+		mode = va_arg(ap, mode_t);
+		va_end(ap);
+	}
 
 	rc = hfs_intercept_open(path, flags, mode);
 	if (rc != -2) {
 		return rc;
 	}
-	return real_open(path, flags, mode);
+	return hfs_open_has_mode(flags) ? real_open(path, flags, mode) :
+					      real_open(path, flags);
 }
 
 /*
@@ -232,15 +314,18 @@ int open64(const char *path, int flags, ...) {
 	mode_t mode = 0;
 	int rc;
 
-	va_start(ap, flags);
-	mode = va_arg(ap, mode_t);
-	va_end(ap);
+	if (hfs_open_has_mode(flags)) {
+		va_start(ap, flags);
+		mode = va_arg(ap, mode_t);
+		va_end(ap);
+	}
 
 	rc = hfs_intercept_open(path, flags, mode);
 	if (rc != -2) {
 		return rc;
 	}
-	return real_open64(path, flags, mode);
+	return hfs_open_has_mode(flags) ? real_open64(path, flags, mode) :
+						 real_open64(path, flags);
 }
 
 /*
@@ -252,9 +337,11 @@ int openat(int dirfd, const char *path, int flags, ...) {
 	va_list ap;
 	mode_t mode = 0;
 
-	va_start(ap, flags);
-	mode = va_arg(ap, mode_t);
-	va_end(ap);
+	if (hfs_open_has_mode(flags)) {
+		va_start(ap, flags);
+		mode = va_arg(ap, mode_t);
+		va_end(ap);
+	}
 
 	if (dirfd == AT_FDCWD) {
 		int rc = hfs_intercept_open(path, flags, mode);
@@ -269,7 +356,8 @@ int openat(int dirfd, const char *path, int flags, ...) {
 		}
 		return hfs_lib_openat(dirfd, path, flags, mode);
 	}
-	return real_openat(dirfd, path, flags, mode);
+	return hfs_open_has_mode(flags) ? real_openat(dirfd, path, flags, mode) :
+						 real_openat(dirfd, path, flags);
 }
 
 /*
@@ -279,9 +367,11 @@ int openat64(int dirfd, const char *path, int flags, ...) {
 	va_list ap;
 	mode_t mode = 0;
 
-	va_start(ap, flags);
-	mode = va_arg(ap, mode_t);
-	va_end(ap);
+	if (hfs_open_has_mode(flags)) {
+		va_start(ap, flags);
+		mode = va_arg(ap, mode_t);
+		va_end(ap);
+	}
 
 	if (dirfd == AT_FDCWD) {
 		int rc = hfs_intercept_open(path, flags, mode);
@@ -295,7 +385,8 @@ int openat64(int dirfd, const char *path, int flags, ...) {
 		}
 		return hfs_lib_openat(dirfd, path, flags, mode);
 	}
-	return real_openat64(dirfd, path, flags, mode);
+	return hfs_open_has_mode(flags) ? real_openat64(dirfd, path, flags, mode) :
+						   real_openat64(dirfd, path, flags);
 }
 
 /* Intercepted close(2): HFS fds are closed via hfs_lib_close. */
@@ -824,10 +915,12 @@ int renameat2(int olddirfd, const char *oldpath,
 
 /* Intercepted chdir(2): managed paths switch the tracked HFS cwd. */
 int chdir(const char *path) {
-	const char *vp = hfs_view_path(path);
+	char fullPath[PATH_MAX];
+	const char *vp;
 	struct stat st;
 
-	if (vp != NULL) {
+	if (hfs_full_path_buf(path, fullPath, sizeof(fullPath))) {
+		vp = hfs_inner_path(fullPath);
 		if (hfs_lib_init() != 0) {
 			errno = ENODEV;
 			return -1;
@@ -837,22 +930,40 @@ int chdir(const char *path) {
 			errno = ENOTDIR;
 			return -1;
 		}
-		snprintf(g_hfs_cwd, sizeof(g_hfs_cwd), "%s", path);
+		pthread_rwlock_wrlock(&g_hfs_cwd_lock);
+		snprintf(g_hfs_cwd, sizeof(g_hfs_cwd), "%s", fullPath);
 		g_hfs_cwd_active = true;
+		pthread_rwlock_unlock(&g_hfs_cwd_lock);
 		return 0;
 	}
-	if (g_hfs_cwd_active) {
-		/* Leaving the HFS tree: fall back to kernel cwd semantics. */
-		g_hfs_cwd_active = false;
+	/* Preserve the HFS cwd when the real chdir fails. */
+	if (real_chdir(path) != 0) {
+		return -1;
 	}
-	return real_chdir(path);
+	pthread_rwlock_wrlock(&g_hfs_cwd_lock);
+	g_hfs_cwd_active = false;
+	pthread_rwlock_unlock(&g_hfs_cwd_lock);
+	return 0;
 }
 
-/* Intercepted fchdir(2): HFS directory fds are not supported. */
+/* Intercepted fchdir(2): update the tracked cwd for an HFS directory fd. */
 int fchdir(int fd) {
+	char innerPath[PATH_MAX];
+	char fullPath[PATH_MAX];
+
 	if (hfs_is_hfs_fd(fd)) {
-		errno = ENOTSUP;
-		return -1;
+		if (hfs_lib_get_dir_path(fd, innerPath, sizeof(innerPath)) != 0) {
+			return -1;
+		}
+		if (!hfs_inner_to_full_path(innerPath, fullPath, sizeof(fullPath))) {
+			errno = ENAMETOOLONG;
+			return -1;
+		}
+		pthread_rwlock_wrlock(&g_hfs_cwd_lock);
+		snprintf(g_hfs_cwd, sizeof(g_hfs_cwd), "%s", fullPath);
+		g_hfs_cwd_active = true;
+		pthread_rwlock_unlock(&g_hfs_cwd_lock);
+		return 0;
 	}
 	return real_fchdir(fd);
 }
@@ -1157,21 +1268,23 @@ __asm__(".symver fcntl64, fcntl64@GLIBC_2.28");
 
 struct hfs_open_dir {
 	struct hfs_dir *hdir;
+	int ownedFd;
 };
 
 static struct hfs_open_dir g_hfsDirs[HFS_MAX_OPEN_DIRS];
 static int g_hfsDirCount;
+static pthread_rwlock_t g_hfsDirsLock = PTHREAD_RWLOCK_INITIALIZER;
 
-/* Returns true when 'dirp' is one of our HFS directory handles. */
-static bool hfs_is_hfs_dir(DIR *dirp) {
+/* Find a registered HFS directory; caller holds the registry lock. */
+static int hfs_find_dir_locked(DIR *dirp) {
 	int i;
 
 	for (i = 0; i < g_hfsDirCount; i++) {
 		if (g_hfsDirs[i].hdir == (struct hfs_dir *)dirp) {
-			return true;
+			return i;
 		}
 	}
-	return false;
+	return -1;
 }
 
 /* TLS buffer converting an hfs_dirent into a struct dirent. */
@@ -1213,9 +1326,7 @@ static int (*hfs_real_closedir_get(void))(DIR *) {
 
 static DIR *(*hfs_real_fdopendir_get(void))(int) {
 	if (real_fdopendir == NULL) {
-real_fdopendir = hfs_real_sym("fdopendir");
-	real_readlink = hfs_real_sym("readlink");
-	real_readlinkat = hfs_real_sym("readlinkat");
+		real_fdopendir = hfs_real_sym("fdopendir");
 	}
 	return real_fdopendir;
 }
@@ -1224,10 +1335,14 @@ real_fdopendir = hfs_real_sym("fdopendir");
 static struct dirent *hfs_readdir_impl(DIR *dirp,
 				       struct dirent *(*real_fn)(DIR *)) {
 	struct hfs_dirent *e;
+	int index;
 
-	if (hfs_is_hfs_dir(dirp)) {
-		e = hfs_lib_readdir((struct hfs_dir *)dirp);
+	pthread_rwlock_rdlock(&g_hfsDirsLock);
+	index = hfs_find_dir_locked(dirp);
+	if (index >= 0) {
+		e = hfs_lib_readdir(g_hfsDirs[index].hdir);
 		if (e == NULL) {
+			pthread_rwlock_unlock(&g_hfsDirsLock);
 			return NULL;	/* end of directory */
 		}
 		memset(&hfs_dir_result, 0, sizeof(hfs_dir_result));
@@ -1235,8 +1350,10 @@ static struct dirent *hfs_readdir_impl(DIR *dirp,
 		hfs_dir_result.d_type = e->d_type;
 		strncpy(hfs_dir_result.d_name, e->name,
 			sizeof(hfs_dir_result.d_name) - 1);
+		pthread_rwlock_unlock(&g_hfsDirsLock);
 		return &hfs_dir_result;
 	}
+	pthread_rwlock_unlock(&g_hfsDirsLock);
 	return real_fn(dirp);
 }
 
@@ -1254,13 +1371,17 @@ DIR *opendir(const char *path) {
 		if (d == NULL) {
 			return NULL;
 		}
+		pthread_rwlock_wrlock(&g_hfsDirsLock);
 		if (g_hfsDirCount >= HFS_MAX_OPEN_DIRS) {
+			pthread_rwlock_unlock(&g_hfsDirsLock);
 			hfs_lib_closedir(d);
 			errno = EMFILE;
 			return NULL;
 		}
 		g_hfsDirs[g_hfsDirCount].hdir = d;
+		g_hfsDirs[g_hfsDirCount].ownedFd = -1;
 		g_hfsDirCount++;
+		pthread_rwlock_unlock(&g_hfsDirsLock);
 		return (DIR *)d;
 	}
 	return hfs_real_opendir_get()(path);
@@ -1277,10 +1398,14 @@ static __thread struct dirent64 hfs_dir64_result;
 /* Intercepted readdir64(2): large-file variant, same layout on x86-64. */
 struct dirent64 *readdir64(DIR *dirp) {
 	struct hfs_dirent *e;
+	int index;
 
-	if (hfs_is_hfs_dir(dirp)) {
-		e = hfs_lib_readdir((struct hfs_dir *)dirp);
+	pthread_rwlock_rdlock(&g_hfsDirsLock);
+	index = hfs_find_dir_locked(dirp);
+	if (index >= 0) {
+		e = hfs_lib_readdir(g_hfsDirs[index].hdir);
 		if (e == NULL) {
+			pthread_rwlock_unlock(&g_hfsDirsLock);
 			return NULL;	/* end of directory */
 		}
 		memset(&hfs_dir64_result, 0, sizeof(hfs_dir64_result));
@@ -1288,33 +1413,62 @@ struct dirent64 *readdir64(DIR *dirp) {
 		hfs_dir64_result.d_type = e->d_type;
 		strncpy(hfs_dir64_result.d_name, e->name,
 			sizeof(hfs_dir64_result.d_name) - 1);
+		pthread_rwlock_unlock(&g_hfsDirsLock);
 		return &hfs_dir64_result;
 	}
+	pthread_rwlock_unlock(&g_hfsDirsLock);
 	return hfs_real_readdir64_get()(dirp);
 }
 
 /* Intercepted closedir(2): unregister and release HFS handles. */
 int closedir(DIR *dirp) {
-	int i;
+	int index;
+	int ownedFd;
+	int rc;
 
-	if (hfs_is_hfs_dir(dirp)) {
-		for (i = 0; i < g_hfsDirCount; i++) {
-			if (g_hfsDirs[i].hdir == (struct hfs_dir *)dirp) {
-				g_hfsDirs[i] = g_hfsDirs[g_hfsDirCount - 1];
-				g_hfsDirCount--;
-				break;
-			}
+	pthread_rwlock_wrlock(&g_hfsDirsLock);
+	index = hfs_find_dir_locked(dirp);
+	if (index >= 0) {
+		ownedFd = g_hfsDirs[index].ownedFd;
+		g_hfsDirs[index] = g_hfsDirs[g_hfsDirCount - 1];
+		g_hfsDirCount--;
+		rc = hfs_lib_closedir((struct hfs_dir *)dirp);
+		pthread_rwlock_unlock(&g_hfsDirsLock);
+		if (rc == 0 && ownedFd >= 0) {
+			rc = hfs_lib_close(ownedFd);
 		}
-		return hfs_lib_closedir((struct hfs_dir *)dirp);
+		return rc;
 	}
+	pthread_rwlock_unlock(&g_hfsDirsLock);
 	return hfs_real_closedir_get()(dirp);
 }
 
-/* Intercepted fdopendir(2): HFS fds have no directory backing store. */
+/* Intercepted fdopendir(2): turn an HFS directory fd into a snapshot handle. */
 DIR *fdopendir(int fd) {
+	char path[PATH_MAX];
+	struct hfs_dir *dir;
+	int index;
+
 	if (hfs_is_hfs_fd(fd)) {
-		errno = ENOTSUP;
-		return NULL;
+		if (hfs_lib_get_dir_path(fd, path, sizeof(path)) != 0) {
+			return NULL;
+		}
+		dir = hfs_lib_opendir(path);
+		if (dir == NULL) {
+			return NULL;
+		}
+		pthread_rwlock_wrlock(&g_hfsDirsLock);
+		if (g_hfsDirCount >= HFS_MAX_OPEN_DIRS) {
+			pthread_rwlock_unlock(&g_hfsDirsLock);
+			hfs_lib_closedir(dir);
+			errno = EMFILE;
+			return NULL;
+		}
+		index = g_hfsDirCount++;
+		g_hfsDirs[index].hdir = dir;
+		g_hfsDirs[index].ownedFd = fd;
+		pthread_rwlock_unlock(&g_hfsDirsLock);
+		return (DIR *)dir;
 	}
 	return hfs_real_fdopendir_get()(fd);
 }

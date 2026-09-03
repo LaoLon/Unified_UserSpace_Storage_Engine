@@ -10,6 +10,10 @@
 #include "hfs_internal.h"
 #include "hfs_meta.h"
 
+/* Versioned metadata header used to keep inode IDs stable across compaction. */
+#define HFS_META_MAGIC		0x32465348U
+#define HFS_META_VERSION	2U
+
 /* Return true only when the caller explicitly permits metadata formatting. */
 static bool hfs_format_requested(void) {
 	const char *format = getenv("HFS_FORMAT");
@@ -160,21 +164,33 @@ out:
 }
 
 /*
- * Serialize the inode table into the metadata blob.
- * Layout: [uint32 count][struct hfs_inode inodes[count]].
+ * Serialize the versioned metadata header and inode table into the blob.
+ * Layout: [magic][version][nextInodeId][count][inodes].
  */
 int hfsMetaSaveAll(Hfs *fs) {
+	const size_t headerSize = sizeof(uint32_t) * 2 + sizeof(uint64_t);
+	const uint32_t magic = HFS_META_MAGIC;
+	const uint32_t version = HFS_META_VERSION;
 	uint32_t count = fs->inodeCount;
-	size_t len = sizeof(count) + (size_t)count * sizeof(struct hfs_inode);
+	uint64_t nextInodeId = fs->nextInodeId;
+	size_t len = headerSize + (size_t)count * sizeof(struct hfs_inode);
 	uint8_t *buf;
 	int rc;
 
+	if (nextInodeId == 0) {
+		errno = EIO;
+		return -1;
+	}
 	buf = malloc(len);
 	if (buf == NULL) {
 		return -1;
 	}
-	memcpy(buf, &count, sizeof(count));
-	memcpy(buf + sizeof(count), fs->inodes,
+	memcpy(buf, &magic, sizeof(magic));
+	memcpy(buf + sizeof(magic), &version, sizeof(version));
+	memcpy(buf + sizeof(magic) + sizeof(version), &nextInodeId,
+	       sizeof(nextInodeId));
+	memcpy(buf + headerSize - sizeof(count), &count, sizeof(count));
+	memcpy(buf + headerSize, fs->inodes,
 	       (size_t)count * sizeof(struct hfs_inode));
 
 	rc = hfsMetaBlobWrite(fs, buf, len);
@@ -184,33 +200,77 @@ int hfsMetaSaveAll(Hfs *fs) {
 
 /* Rebuild the in-memory inode table from the metadata blob. */
 int hfsMetaLoadAll(Hfs *fs) {
+	const size_t legacyHeaderSize = sizeof(uint32_t);
+	const size_t headerSize = sizeof(uint32_t) * 2 + sizeof(uint64_t);
 	uint8_t *buf;
 	size_t len;
+	size_t inodeOffset;
+	uint32_t magic;
+	uint32_t version;
 	uint32_t count;
+	uint64_t nextInodeId = 0;
+	uint64_t maxInodeId = 0;
+	uint32_t i;
 
 	if (hfsMetaBlobRead(fs, (void **)&buf, &len) != 0) {
 		return -1;
 	}
-	if (len < sizeof(count)) {
+	if (len < legacyHeaderSize) {
 		spdk_free(buf);
 		return -1;
 	}
 	memcpy(&count, buf, sizeof(count));
-	if (count > HFS_MAX_INODES) {
+	inodeOffset = legacyHeaderSize;
+	if (count == HFS_META_MAGIC) {
+		if (len < headerSize) {
+			spdk_free(buf);
+			return -1;
+		}
+		memcpy(&magic, buf, sizeof(magic));
+		memcpy(&version, buf + sizeof(magic), sizeof(version));
+		memcpy(&nextInodeId, buf + sizeof(magic) + sizeof(version),
+		       sizeof(nextInodeId));
+		memcpy(&count, buf + headerSize - sizeof(count), sizeof(count));
+		if (magic != HFS_META_MAGIC || version != HFS_META_VERSION) {
+			spdk_free(buf);
+			errno = EINVAL;
+			return -1;
+		}
+		inodeOffset = headerSize;
+	}
+	if (count > HFS_MAX_INODES ||
+	    len < inodeOffset + (size_t)count * sizeof(struct hfs_inode)) {
 		spdk_free(buf);
 		return -1;
 	}
 
-	memcpy(fs->inodes, buf + sizeof(count),
+	memcpy(fs->inodes, buf + inodeOffset,
 	       (size_t)count * sizeof(struct hfs_inode));
 	fs->inodeCount = count;
+	for (i = 0; i < count; i++) {
+		if (fs->inodes[i].id > maxInodeId) {
+			maxInodeId = fs->inodes[i].id;
+		}
+	}
+	if (inodeOffset == headerSize) {
+		fs->nextInodeId = nextInodeId;
+	} else {
+		fs->nextInodeId = maxInodeId == UINT64_MAX ? 0 : maxInodeId + 1;
+	}
+	if (fs->nextInodeId == 0 || fs->nextInodeId <= maxInodeId) {
+		fs->nextInodeId = maxInodeId == UINT64_MAX ? 0 : maxInodeId + 1;
+	}
 	spdk_free(buf);
+	if (fs->nextInodeId == 0) {
+		errno = ENOSPC;
+		return -1;
+	}
 	return 0;
 }
 
 /*
  * Append a zeroed inode to the table and return a pointer to it.
- * The id is auto-assigned as count + 1. Returns NULL if the table is full.
+ * IDs are allocated monotonically so compacting the table cannot reuse one.
  */
 struct hfs_inode *hfsMetaAddInode(Hfs *fs) {
 	struct hfs_inode *inode;
@@ -218,9 +278,12 @@ struct hfs_inode *hfsMetaAddInode(Hfs *fs) {
 	if (fs->inodeCount >= HFS_MAX_INODES) {
 		return NULL;
 	}
+	if (fs->nextInodeId == 0 || fs->nextInodeId == UINT64_MAX) {
+		return NULL;
+	}
 	inode = &fs->inodes[fs->inodeCount];
 	memset(inode, 0, sizeof(*inode));
-	inode->id = (uint64_t)fs->inodeCount + 1;
+	inode->id = fs->nextInodeId++;
 	fs->inodeCount++;
 	return inode;
 }
@@ -288,16 +351,27 @@ struct hfs_inode *hfsMetaResolvePath(Hfs *fs, const char *path) {
 			p = hfsMetaSkipSlashes(p);
 			continue;
 		}
-		/* "." refers to the current directory (POSIX). */
-		if (strcmp(comp, ".") == 0) {
-			p = hfsMetaSkipSlashes(p);
-			continue;
-		}
-
 		/* Only directories can be descended into. */
 		if (cur->type != HFS_INODE_DIR) {
 			errno = ENOTDIR;
 			return NULL;
+		}
+		/* "." keeps the current directory (POSIX). */
+		if (strcmp(comp, ".") == 0) {
+			p = hfsMetaSkipSlashes(p);
+			continue;
+		}
+		/* ".." walks to the parent and clamps at the HFS root. */
+		if (strcmp(comp, "..") == 0) {
+			if (cur->id != HFS_ROOT_INODE_ID) {
+				cur = hfsMetaFindById(fs, cur->parentId);
+				if (cur == NULL) {
+					errno = EIO;
+					return NULL;
+				}
+			}
+			p = hfsMetaSkipSlashes(p);
+			continue;
 		}
 		cur = hfsMetaFindByName(fs, cur->id, comp);
 		if (cur == NULL) {
@@ -752,6 +826,7 @@ int hfsMetaInit(Hfs *fs) {
 
 	/* Create the root directory inode and persist the table. */
 	fs->inodeCount = 0;
+	fs->nextInodeId = 1;
 	root = hfsMetaAddInode(fs);
 	if (root == NULL) {
 		free(fs->inodes);

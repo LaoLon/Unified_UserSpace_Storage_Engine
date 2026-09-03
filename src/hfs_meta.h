@@ -60,7 +60,7 @@ int hfsMetaFormat(Hfs *fs);
 /* Persist the super block (currently a no-op stub). */
 int hfsMetaSave(Hfs *fs);
 
-/* Serialize the in-memory inode table into the metadata blob. */
+/* Serialize a versioned header and the in-memory inode table. */
 int hfsMetaSaveAll(Hfs *fs);
 
 /* Read the metadata blob and rebuild the in-memory inode table. */

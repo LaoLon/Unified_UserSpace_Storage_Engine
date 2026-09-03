@@ -36,6 +36,7 @@ typedef struct Hfs {
 	uint64_t rootInodeId;			/* inode id of the root directory */
 	struct hfs_inode *inodes;		/* in-memory inode table */
 	uint32_t inodeCount;			/* number of used inodes */
+	uint64_t nextInodeId;			/* next persistent inode id */
 
 	/* Scratch state for metadata blob I/O (waiter chain). */
 	struct spdk_blob *metaBlob;		/* opened metadata blob */
