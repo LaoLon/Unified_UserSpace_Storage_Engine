@@ -1,5 +1,4 @@
 #include <errno.h>
-#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,30 +14,28 @@
 #include "hfs_internal.h"
 #include "hfs_log.h"
 
-/* SPDK thread that runs all async blobstore operations. */
-struct spdk_thread *globalThread = NULL;
-
 /*
  * Turn an async SPDK operation into a synchronous call.
- * Posts startFn to the SPDK thread, then polls the thread until the
- * callback sets *finished, or until WAITER_MAX_TIME is exceeded.
- * Returns false on timeout.
+ * Posts startFn to the dedicated owner thread, then waits on the request
+ * completion without polling SPDK from the calling thread.
  */
-bool waiter(struct spdk_thread *thread, spdk_msg_fn startFn, void *ctx, bool *finished) {
-	spdk_thread_send_msg(thread, startFn, ctx);
 
-	int waiterCount = 0;
+bool waiter(struct spdk_thread *thread, spdk_msg_fn startFn, void *ctx,
+		HfsCompletion *completion) {
+	int rc;
 
-	do {
-		spdk_thread_poll(thread, 0, 0);
-		waiterCount ++;
-	} while(!(*finished) && waiterCount < WAITER_MAX_TIME);
-
-	if (!(*finished) && waiterCount >= WAITER_MAX_TIME) {
-		HFS_LOG_ERROR("waiter timed out (msg never completed)");
-		return false; /* timeout */
+	(void)thread;
+	hfsRuntimeCompletionReset(completion);
+	rc = hfsRuntimeSubmit(startFn, ctx);
+	if (rc != 0) {
+		errno = -rc;
+		return false;
 	}
 
+	if (!hfsRuntimeCompletionWait(completion, HFS_RUNTIME_TIMEOUT_MS)) {
+		HFS_LOG_ERROR("waiter timed out or runtime stopped");
+		return false;
+	}
 	return true;
 }
 
@@ -58,7 +55,7 @@ static const char *hfs_config_path(void) {
 
 /* Completion state for asynchronous subsystem configuration loading. */
 struct hfs_config_load_ctx {
-	bool done;
+	HfsCompletion completion;
 	int rc;
 };
 
@@ -66,9 +63,9 @@ struct hfs_config_load_ctx {
 static void jsonAppLoadDone(int rc, void *ctx) {
 	struct hfs_config_load_ctx *state = ctx;
 	state->rc = rc;
-	state->done = true;
 
 	SPDK_NOTICELOG("jsonAppLoadDone\n");
+	hfsRuntimeCompletionComplete(&state->completion);
 }
 
 /*
@@ -107,31 +104,22 @@ static void hfsJsonLoadFn(void *arg) {
 }
 
 /*
- * Set up the SPDK environment: DPDK env init, log levels, the global
- * SPDK thread, and subsystem/JSON config loading.
+ * Set up the SPDK owner runtime and load the subsystem/JSON configuration.
  */
 int hfsEnvSetup(void) {
-	struct spdk_env_opts opts;
-	spdk_env_opts_init(&opts);
+	struct hfs_config_load_ctx state = { .rc = -EINVAL };
 
-	if (0 != spdk_env_init(&opts)) {
+	if (hfsRuntimeStart() != 0) {
 		return -1;
 	}
-
-	spdk_log_set_print_level(SPDK_LOG_NOTICE);
-	spdk_log_set_level(SPDK_LOG_NOTICE);
-	spdk_log_open(NULL);
-
-	spdk_thread_lib_init(NULL, 0);
-	globalThread = spdk_thread_create("global", NULL);
-	spdk_set_thread(globalThread);
-
-	struct hfs_config_load_ctx state = { .done = false, .rc = -EINVAL };
-
-	if (!waiter(globalThread, hfsJsonLoadFn, &state, &state.done)) {
+	if (!waiter(globalThread, hfsJsonLoadFn, &state, &state.completion)) {
 		return -1;
 	}
 	SPDK_NOTICELOG("jsonAppLoadDone complete\n");
 
-	return state.rc == 0 ? 0 : -1;
+	if (state.rc != 0) {
+		return -1;
+	}
+	hfsRuntimeMarkSubsystemReady();
+	return 0;
 }

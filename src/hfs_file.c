@@ -16,7 +16,7 @@ static void hfsSpdkBlobDeleteCb(void *arg, int bserrno) {
 			      file->blobId, bserrno);
 	}
 	SPDK_NOTICELOG("blob deleted, id=%"PRIu64"\n", file->blobId);
-	file->finished = true;
+	hfsRuntimeCompletionComplete(&file->completion);
 }
 
 /* Completion callback for spdk_blob_close. */
@@ -28,7 +28,7 @@ static void hfsSpdkBlobCloseCb(void *arg, int bserrno) {
 			      file->blobId, bserrno);
 	}
 	SPDK_NOTICELOG("close complete\n");
-	file->finished = true;
+	hfsRuntimeCompletionComplete(&file->completion);
 }
 
 /* SPDK-thread task: close the data blob (handle only). */
@@ -55,16 +55,12 @@ static void hfsDoDeleteBlob(void *arg) {
  * Blob deletion is the responsibility of unlink (hfsDeleteBlobById).
  */
 int hfsClose(HfsFile *file) {
-	file->finished = false;
-
-	return waiter(globalThread, hfsDoClose, file, &file->finished);
+	return waiter(globalThread, hfsDoClose, file, &file->completion);
 }
 
 /* Delete the data blob by id (used by unlink). */
 int hfsDeleteBlobById(HfsFile *file) {
-	file->finished = false;
-
-	return waiter(globalThread, hfsDoDeleteBlob, file, &file->finished);
+	return waiter(globalThread, hfsDoDeleteBlob, file, &file->completion);
 }
 
 /* Completion callback for spdk_blob_io_read. */
@@ -75,7 +71,7 @@ static void hfsSpdkBlobReadCb(void *arg, int bserrno) {
 		HFS_LOG_ERROR("blob read failed unit=%"PRIu64" n=%"PRIu64
 			      " bserrno=%d", file->ioOffset, file->ioUnits, bserrno);
 	}
-	file->finished = true;
+	hfsRuntimeCompletionComplete(&file->completion);
 }
 
 /* SPDK-thread task: read ioUnits starting at ioOffset into readBuffer. */
@@ -94,7 +90,7 @@ static void hfsSpdkBlobWriteCb(void *arg, int bserrno) {
 		HFS_LOG_ERROR("blob write failed unit=%"PRIu64" n=%"PRIu64
 			      " bserrno=%d", file->ioOffset, file->ioUnits, bserrno);
 	}
-	file->finished = true;
+	hfsRuntimeCompletionComplete(&file->completion);
 }
 
 /* SPDK-thread task: write ioUnits at ioOffset from writeBuffer. */
@@ -114,7 +110,7 @@ static void hfsSpdkBlobSyncCb(void *arg, int bserrno) {
 	}
 	SPDK_NOTICELOG("open complete\n");
 
-	file->finished = true;
+	hfsRuntimeCompletionComplete(&file->completion);
 }
 
 /* Completion callback for spdk_blob_resize (open path): sync metadata. */
@@ -141,7 +137,7 @@ static void hfsSpdkBsOpenBlobCb(void *arg, struct spdk_blob *blb, int bserrno) {
 
 	if (bserrno != 0) {
 		HFS_LOG_ERROR("open blob failed bserrno=%d", bserrno);
-		file->finished = true;
+		hfsRuntimeCompletionComplete(&file->completion);
 		return;
 	}
 	file->blob = blb;
@@ -159,7 +155,7 @@ static void hfsSpdkBsCreateBlobCb(void *arg, spdk_blob_id blobId, int bserrno) {
 
 	if (bserrno != 0) {
 		HFS_LOG_ERROR("create blob failed bserrno=%d", bserrno);
-		file->finished = true;
+		hfsRuntimeCompletionComplete(&file->completion);
 		return;
 	}
 	file->blobId = blobId;
@@ -177,9 +173,7 @@ static void hfsDoOpen(void *arg) {
 
 /* Open a fresh file: create blob -> open -> grow -> sync. */
 int hfsOpen(HfsFile *file) {
-	file->finished = false;
-
-	return waiter(globalThread, hfsDoOpen, file, &file->finished);
+	return waiter(globalThread, hfsDoOpen, file, &file->completion);
 }
 
 /* Completion callback for spdk_bs_open_blob (open-by-id path). */
@@ -191,7 +185,7 @@ static void hfsSpdkBsOpenByIdCb(void *arg, struct spdk_blob *blb, int bserrno) {
 			      file->blobId, bserrno);
 	}
 	file->blob = blb;
-	file->finished = true;
+	hfsRuntimeCompletionComplete(&file->completion);
 }
 
 /* SPDK-thread task: open an existing blob by id (no create). */
@@ -203,9 +197,7 @@ static void hfsDoOpenById(void *arg) {
 
 /* Open an existing blob by id; used by the library open path. */
 int hfsOpenById(HfsFile *file) {
-	file->finished = false;
-
-	return waiter(globalThread, hfsDoOpenById, file, &file->finished);
+	return waiter(globalThread, hfsDoOpenById, file, &file->completion);
 }
 
 /* Completion callback for spdk_blob_resize (write path). */
@@ -215,7 +207,7 @@ static void hfsSpdkBlobResizeDoneCb(void *arg, int bserrno) {
 	if (bserrno != 0) {
 		HFS_LOG_ERROR("blob resize (write path) failed bserrno=%d", bserrno);
 	}
-	file->finished = true;
+	hfsRuntimeCompletionComplete(&file->completion);
 }
 
 /* SPDK-thread task: grow the blob to cover 'bytes'. */
@@ -235,8 +227,7 @@ static bool hfsEnsureSize(HfsFile *file, uint64_t bytes) {
 	}
 
 	file->resizeClusters = needClusters;
-	file->finished = false;
-	return waiter(globalThread, hfsDoResize, file, &file->finished);
+	return waiter(globalThread, hfsDoResize, file, &file->completion);
 }
 
 /* Resize the blob so it covers at least 'bytes' (grow only). */
@@ -249,8 +240,7 @@ int hfsResizeTo(HfsFile *file, uint64_t bytes) {
 	}
 
 	file->resizeClusters = needClusters;
-	file->finished = false;
-	if (!waiter(globalThread, hfsDoResize, file, &file->finished)) {
+	if (!waiter(globalThread, hfsDoResize, file, &file->completion)) {
 		return -1;
 	}
 	return 0;
@@ -280,9 +270,7 @@ ssize_t hfsReadAt(HfsFile *file, uint8_t *buffer, size_t count, uint64_t offset)
 	file->readBuffer = tmp;
 	file->ioOffset = startUnit;
 	file->ioUnits = units;
-	file->finished = false;
-
-	if (!waiter(globalThread, hfsDoRead, file, &file->finished)) {
+	if (!waiter(globalThread, hfsDoRead, file, &file->completion)) {
 		spdk_free(tmp);
 		return -1;
 	}
@@ -325,9 +313,7 @@ ssize_t hfsWriteAt(HfsFile *file, const uint8_t *buffer, size_t count, uint64_t 
 	file->writeBuffer = tmp;
 	file->ioOffset = startUnit;
 	file->ioUnits = units;
-	file->finished = false;
-
-	if (!waiter(globalThread, hfsDoRead, file, &file->finished)) {
+	if (!waiter(globalThread, hfsDoRead, file, &file->completion)) {
 		spdk_free(tmp);
 		return -1;
 	}
@@ -335,8 +321,7 @@ ssize_t hfsWriteAt(HfsFile *file, const uint8_t *buffer, size_t count, uint64_t 
 	/* Splice the user data into the buffer, then write it back. */
 	memcpy(tmp + skip, buffer, count);
 
-	file->finished = false;
-	if (!waiter(globalThread, hfsDoWrite, file, &file->finished)) {
+	if (!waiter(globalThread, hfsDoWrite, file, &file->completion)) {
 		spdk_free(tmp);
 		return -1;
 	}

@@ -21,7 +21,7 @@ static bool hfs_format_requested(void) {
 static void hfsMetaOpCb(void *arg, int bserrno) {
 	Hfs *fs = (Hfs *)arg;
 
-	fs->finished = true;
+	hfsRuntimeCompletionComplete(&fs->completion);
 }
 
 /* Completion callback for spdk_bs_open_blob: stores the opened blob. */
@@ -29,7 +29,7 @@ static void hfsMetaOpenBlobCb(void *arg, struct spdk_blob *blob, int bserrno) {
 	Hfs *fs = (Hfs *)arg;
 
 	fs->metaBlob = blob;
-	fs->finished = true;
+	hfsRuntimeCompletionComplete(&fs->completion);
 }
 
 /* SPDK-thread task: open the metadata blob. */
@@ -102,16 +102,11 @@ static int hfsMetaBlobWrite(Hfs *fs, const void *buf, size_t len) {
 	fs->metaUnits = needUnits;
 	fs->metaClusters = needClusters;
 
-	fs->finished = false;
-	if (!waiter(globalThread, hfsMetaDoOpenBlob, fs, &fs->finished)) goto out;
-	fs->finished = false;
-	if (!waiter(globalThread, hfsMetaDoResize, fs, &fs->finished)) goto out;
-	fs->finished = false;
-	if (!waiter(globalThread, hfsMetaDoWrite, fs, &fs->finished)) goto out;
-	fs->finished = false;
-	if (!waiter(globalThread, hfsMetaDoSync, fs, &fs->finished)) goto out;
-	fs->finished = false;
-	if (!waiter(globalThread, hfsMetaDoClose, fs, &fs->finished)) goto out;
+	if (!waiter(globalThread, hfsMetaDoOpenBlob, fs, &fs->completion)) goto out;
+	if (!waiter(globalThread, hfsMetaDoResize, fs, &fs->completion)) goto out;
+	if (!waiter(globalThread, hfsMetaDoWrite, fs, &fs->completion)) goto out;
+	if (!waiter(globalThread, hfsMetaDoSync, fs, &fs->completion)) goto out;
+	if (!waiter(globalThread, hfsMetaDoClose, fs, &fs->completion)) goto out;
 
 	rc = 0;
 out:
@@ -132,8 +127,7 @@ static int hfsMetaBlobRead(Hfs *fs, void **outBuf, size_t *outLen) {
 	void *tmp;
 	int rc = -1;
 
-	fs->finished = false;
-	if (!waiter(globalThread, hfsMetaDoOpenBlob, fs, &fs->finished)) {
+	if (!waiter(globalThread, hfsMetaDoOpenBlob, fs, &fs->completion)) {
 		return -1;
 	}
 
@@ -141,25 +135,21 @@ static int hfsMetaBlobRead(Hfs *fs, void **outBuf, size_t *outLen) {
 	clusters = spdk_blob_get_num_clusters(fs->metaBlob);
 	units = clusters * clusterSize / ioUnitSize;
 	if (units == 0) {
-		fs->finished = false;
-		waiter(globalThread, hfsMetaDoClose, fs, &fs->finished);
+		waiter(globalThread, hfsMetaDoClose, fs, &fs->completion);
 		return -1;
 	}
 
 	tmp = spdk_malloc(units * ioUnitSize, 0x1000, NULL,
 		SPDK_ENV_LCORE_ID_ANY, SPDK_MALLOC_DMA);
 	if (tmp == NULL) {
-		fs->finished = false;
-		waiter(globalThread, hfsMetaDoClose, fs, &fs->finished);
+		waiter(globalThread, hfsMetaDoClose, fs, &fs->completion);
 		return -1;
 	}
 
 	fs->metaBuf = tmp;
 	fs->metaUnits = units;
-	fs->finished = false;
-	if (!waiter(globalThread, hfsMetaDoRead, fs, &fs->finished)) goto out;
-	fs->finished = false;
-	if (!waiter(globalThread, hfsMetaDoClose, fs, &fs->finished)) goto out;
+	if (!waiter(globalThread, hfsMetaDoRead, fs, &fs->completion)) goto out;
+	if (!waiter(globalThread, hfsMetaDoClose, fs, &fs->completion)) goto out;
 
 	*outBuf = tmp;
 	*outLen = units * ioUnitSize;
@@ -443,7 +433,7 @@ int hfsMetaRmdir(Hfs *fs, const char *path) {
 /* Async context for hfsMetaCreateFile (blob creation waiter). */
 struct hfs_meta_create_ctx {
 	Hfs *fs;
-	bool finished;
+	HfsCompletion completion;
 	int rc;
 	spdk_blob_id blobId;
 };
@@ -454,7 +444,7 @@ static void hfsMetaCreateFileCb(void *arg, spdk_blob_id blobId, int bserrno) {
 
 	ctx->blobId = blobId;
 	ctx->rc = bserrno;
-	ctx->finished = true;
+	hfsRuntimeCompletionComplete(&ctx->completion);
 }
 
 /* SPDK-thread task: allocate a new data blob for a file. */
@@ -486,12 +476,11 @@ int hfsMetaCreateFile(Hfs *fs, struct hfs_inode *parent, const char *name) {
 		return -1;
 	}
 
-	ctx.finished = false;
 	ctx.rc = 0;
 	ctx.blobId = SPDK_BLOBID_INVALID;
 	ctx.fs = fs;
 
-	if (!waiter(globalThread, hfsMetaDoCreateFileBlob, &ctx, &ctx.finished)) {
+	if (!waiter(globalThread, hfsMetaDoCreateFileBlob, &ctx, &ctx.completion)) {
 		errno = ETIMEDOUT;
 		return -1;
 	}
@@ -638,19 +627,19 @@ static void hfsMetaGetSuperCb(void *arg, spdk_blob_id blobId, int bserrno) {
 
 	if (bserrno != 0) {
 		fs->metaBlobId = SPDK_BLOBID_INVALID;
-		fs->finished = true;
+		hfsRuntimeCompletionComplete(&fs->completion);
 		return;
 	}
 
 	fs->metaBlobId = blobId;
-	fs->finished = true;
+	hfsRuntimeCompletionComplete(&fs->completion);
 }
 
 /* Completion callback for spdk_bs_set_super. */
 static void hfsMetaSetSuperCb(void *arg, int bserrno) {
 	Hfs *fs = (Hfs *)arg;
 
-	fs->finished = true;
+	hfsRuntimeCompletionComplete(&fs->completion);
 }
 
 /* Completion callback for spdk_bs_create_blob: registers the new blob
@@ -659,7 +648,7 @@ static void hfsMetaCreateBlobCb(void *arg, spdk_blob_id blobId, int bserrno) {
 	Hfs *fs = (Hfs *)arg;
 
 	if (bserrno != 0) {
-		fs->finished = true;
+		hfsRuntimeCompletionComplete(&fs->completion);
 		return;
 	}
 
@@ -686,9 +675,7 @@ static void hfsMetaDoGetSuper(void *arg) {
  * Returns -1 with errno=ENOENT if the storage has never been formatted.
  */
 int hfsMetaLoad(Hfs *fs) {
-	fs->finished = false;
-
-	if (!waiter(globalThread, hfsMetaDoGetSuper, fs, &fs->finished)) {
+	if (!waiter(globalThread, hfsMetaDoGetSuper, fs, &fs->completion)) {
 		return -1;
 	}
 
@@ -706,9 +693,7 @@ int hfsMetaLoad(Hfs *fs) {
  * blobstore super blob so it can be found on the next mount.
  */
 int hfsMetaFormat(Hfs *fs) {
-	fs->finished = false;
-
-	if (!waiter(globalThread, hfsMetaDoFormat, fs, &fs->finished)) {
+	if (!waiter(globalThread, hfsMetaDoFormat, fs, &fs->completion)) {
 		return -1;
 	}
 

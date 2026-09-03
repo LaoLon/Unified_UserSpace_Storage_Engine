@@ -35,7 +35,7 @@ static void hfsSpdkBsUnloadCb(void *arg, int bserrno) {
 	}
 	fs->operationRc = bserrno;
 	fs->blobstore = NULL;
-	fs->finished = true;
+	hfsRuntimeCompletionComplete(&fs->completion);
 }
 
 /*
@@ -55,7 +55,7 @@ static void hfsDoUmount(void *arg) {
 		}
 		spdk_bs_unload(fs->blobstore, hfsSpdkBsUnloadCb, fs);
 	} else {
-		fs->finished = true;
+		hfsRuntimeCompletionComplete(&fs->completion);
 	}
 }
 
@@ -69,7 +69,7 @@ static void hfsSpdkBsInitCb(void *arg, struct spdk_blob_store *bs, int bserrno) 
 	if (bserrno != 0 || bs == NULL) {
 		HFS_LOG_ERROR("blobstore init failed bserrno=%d", bserrno);
 		fs->operationRc = bserrno != 0 ? bserrno : -EINVAL;
-		fs->finished = true;
+		hfsRuntimeCompletionComplete(&fs->completion);
 		return;
 	}
 
@@ -83,13 +83,12 @@ static void hfsSpdkBsInitCb(void *arg, struct spdk_blob_store *bs, int bserrno) 
 	if (fs->channel == NULL) {
 		HFS_LOG_ERROR("blobstore io channel allocation failed");
 		fs->operationRc = -ENOMEM;
-		fs->finished = true;
+		hfsRuntimeCompletionComplete(&fs->completion);
 		return;
 	}
 
-	fs->finished = true;
-
 	SPDK_NOTICELOG("mount finished\n");
+	hfsRuntimeCompletionComplete(&fs->completion);
 }
 
 /* Bdev event callback (informational, currently unused). */
@@ -112,7 +111,7 @@ static void hfsDoMount(void *arg) {
 	if (rc != 0) {
 		HFS_LOG_ERROR("create bs dev failed rc=%d", rc);
 		fs->operationRc = rc;
-		fs->finished = true;
+		hfsRuntimeCompletionComplete(&fs->completion);
 		return;
 	}
 
@@ -128,9 +127,8 @@ static void hfsDoMount(void *arg) {
 /* Mount the blobstore synchronously; return false on timeout or SPDK error. */
 int hfsMount(Hfs *fs) {
 	fs->operationRc = 0;
-	fs->finished = false;
 
-	if (!waiter(globalThread, hfsDoMount, fs, &fs->finished)) {
+	if (!waiter(globalThread, hfsDoMount, fs, &fs->completion)) {
 		return 0;
 	}
 	return fs->operationRc == 0 && fs->blobstore != NULL;
@@ -139,9 +137,8 @@ int hfsMount(Hfs *fs) {
 /* Unmount the blobstore synchronously; return false on timeout or SPDK error. */
 int hfsUmount(Hfs *fs) {
 	fs->operationRc = 0;
-	fs->finished = false;
 
-	if (!waiter(globalThread, hfsDoUmount, fs, &fs->finished)) {
+	if (!waiter(globalThread, hfsDoUmount, fs, &fs->completion)) {
 		return 0;
 	}
 	return fs->operationRc == 0 && fs->blobstore == NULL;

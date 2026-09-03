@@ -3,11 +3,17 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdatomic.h>
 #include <stdint.h>
 
 #include <spdk/blob.h>
 
 struct hfs_inode;
+
+/* Completion state shared by one asynchronous SPDK request. */
+typedef struct HfsCompletion {
+	atomic_int state;
+} HfsCompletion;
 
 /* Maximum size of a single I/O buffer (bytes). */
 #define BUFFER_SIZE		512
@@ -38,7 +44,7 @@ typedef struct Hfs {
 	uint64_t metaClusters;			/* target cluster count */
 
 	struct spdk_io_channel *channel;	/* blobstore I/O channel */
-	bool finished;				/* waiter completion flag */
+	HfsCompletion completion;			/* mount/metadata request completion */
 	int operationRc;			/* result of the current mount operation */
 } Hfs;
 
@@ -68,7 +74,7 @@ typedef struct HfsFile {
 	uint64_t resizeClusters;		/* target clusters for resize */
 	uint32_t refCount;			/* shared fd references (dup) */
 
-	bool finished;				/* waiter completion flag */
+	HfsCompletion completion;			/* current file request completion */
 } HfsFile;
 
 /* Operation table for file ops (reserved for future use). */

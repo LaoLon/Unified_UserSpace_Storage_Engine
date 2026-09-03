@@ -200,6 +200,7 @@ int hfs_lib_init(void) {
 
 	if (hfsEnvSetup() != 0) {
 		HFS_LOG_ERROR("hfsEnvSetup failed");
+		hfsRuntimeStop();
 		hfs_release_backend_lock();
 		hfs_log_fini();
 		pthread_mutex_unlock(&g_libLock);
@@ -208,6 +209,7 @@ int hfs_lib_init(void) {
 
 	g_fs = calloc(1, sizeof(Hfs));
 	if (g_fs == NULL) {
+		hfsRuntimeStop();
 		hfs_release_backend_lock();
 		hfs_log_fini();
 		pthread_mutex_unlock(&g_libLock);
@@ -218,6 +220,7 @@ int hfs_lib_init(void) {
 		HFS_LOG_ERROR("hfsMount failed");
 		free(g_fs);
 		g_fs = NULL;
+		hfsRuntimeStop();
 		hfs_release_backend_lock();
 		hfs_log_fini();
 		pthread_mutex_unlock(&g_libLock);
@@ -229,6 +232,7 @@ int hfs_lib_init(void) {
 		hfsUmount(g_fs);
 		free(g_fs);
 		g_fs = NULL;
+		hfsRuntimeStop();
 		hfs_release_backend_lock();
 		hfs_log_fini();
 		pthread_mutex_unlock(&g_libLock);
@@ -282,6 +286,7 @@ void hfs_lib_fini(void) {
 	}
 	free(g_fs);
 	g_fs = NULL;
+	hfsRuntimeStop();
 	hfs_release_backend_lock();
 	HFS_LOG_DEBUG("libhfs finalized");
 	hfs_log_fini();

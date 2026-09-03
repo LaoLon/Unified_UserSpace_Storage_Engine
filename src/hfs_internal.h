@@ -4,21 +4,16 @@
 #include <spdk/thread.h>
 
 #include "hfs.h"
+#include "hfs_runtime.h"
 
-/*
- * Upper bound for waiter polling iterations (timeout guard). Kept
- * modest so a lost/starved SPDK message fails fast instead of
- * stalling a process exit for ~110s (MariaDB signal-thread hang).
- */
-#define WAITER_MAX_TIME 5000000
-
-/* Global SPDK thread that executes all blobstore operations. */
+/* Global SPDK thread owned and polled by the runtime owner pthread. */
 extern struct spdk_thread *globalThread;
 
 /*
- * Synchronously run an async SPDK operation: post startFn to the SPDK
- * thread, poll until *finished is set, or timeout.
+ * Submit an async SPDK operation to the owner thread and wait for its
+ * request-level completion without polling from the caller thread.
  */
-bool waiter(struct spdk_thread *thread, spdk_msg_fn startFn, void *ctx, bool *finished);
+bool waiter(struct spdk_thread *thread, spdk_msg_fn startFn, void *ctx,
+		HfsCompletion *completion);
 
 #endif /* HFS_INTERNAL_H */
