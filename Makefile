@@ -70,7 +70,7 @@ run: all
 		echo "No hugepages configured, allocating 1024 x 2MB..."; \
 		echo 1024 > /proc/sys/vm/nr_hugepages; \
 	fi
-	$(APP)
+	HFS_FORMAT=1 $(APP)
 
 distclean: clean
 	$(MAKE) -C $(SPDK_ROOT_DIR) clean

@@ -236,10 +236,6 @@ int main(int argc, char *argv[]) {
 
 	SPDK_NOTICELOG("hfsEnvSetup success\n");
 
-	SPDK_NOTICELOG("\n\n hfs mount start \n\n");
-	HFS_LOG_INFO("hfs mount start");
-	hfsMount(fs);
-
 	SPDK_NOTICELOG("\n\n hfs open start \n\n");
 	HFS_LOG_INFO("hfs open start");
 	HfsFile *file = calloc(1, sizeof(HfsFile));
@@ -271,10 +267,6 @@ int main(int argc, char *argv[]) {
 	hfsClose(file);
 
 	free(file);
-
-	SPDK_NOTICELOG("\n\n hfs umount start \n\n");
-	HFS_LOG_INFO("hfs umount start");
-	hfsUmount(fs);
 
 	HFS_LOG_INFO("hfs exiting");
 	hfs_lib_fini();

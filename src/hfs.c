@@ -1,4 +1,5 @@
 #include <errno.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -48,10 +49,24 @@ static const char *jsonFile = HFS_DEFAULT_CONFIG;
 static const char *jsonFile = "config/hfs.json";
 #endif
 
+/* Return the runtime config path or the build-time default. */
+static const char *hfs_config_path(void) {
+	const char *path = getenv("HFS_CONFIG_PATH");
+
+	return (path != NULL && path[0] != '\0') ? path : jsonFile;
+}
+
+/* Completion state for asynchronous subsystem configuration loading. */
+struct hfs_config_load_ctx {
+	bool done;
+	int rc;
+};
+
 /* Completion callback for subsystem (JSON config) loading. */
 static void jsonAppLoadDone(int rc, void *ctx) {
-	bool *done = ctx;
-	*done = true;
+	struct hfs_config_load_ctx *state = ctx;
+	state->rc = rc;
+	state->done = true;
 
 	SPDK_NOTICELOG("jsonAppLoadDone\n");
 }
@@ -61,18 +76,21 @@ static void jsonAppLoadDone(int rc, void *ctx) {
  * (e.g. create the malloc bdev) through SPDK's JSON-RPC mechanism.
  */
 static void hfsSubsystemInitDone(int rc, void *arg) {
+	struct hfs_config_load_ctx *state = arg;
 	void *json;
 	size_t jsonSize;
 
 	if (rc != 0) {
-		jsonAppLoadDone(rc, arg);
+		jsonAppLoadDone(rc, state);
 		return;
 	}
 
-	json = spdk_posix_file_load_from_name(jsonFile, &jsonSize);
+	const char *configPath = hfs_config_path();
+
+	json = spdk_posix_file_load_from_name(configPath, &jsonSize);
 	if (json == NULL) {
-		SPDK_ERRLOG("Could not read JSON config file: %s\n", jsonFile);
-		jsonAppLoadDone(-EINVAL, arg);
+		SPDK_ERRLOG("Could not read JSON config file: %s\n", configPath);
+		jsonAppLoadDone(-EINVAL, state);
 		return;
 	}
 
@@ -108,10 +126,12 @@ int hfsEnvSetup(void) {
 	globalThread = spdk_thread_create("global", NULL);
 	spdk_set_thread(globalThread);
 
-	bool done = false;
+	struct hfs_config_load_ctx state = { .done = false, .rc = -EINVAL };
 
-	waiter(globalThread, hfsJsonLoadFn, &done, &done);
+	if (!waiter(globalThread, hfsJsonLoadFn, &state, &state.done)) {
+		return -1;
+	}
 	SPDK_NOTICELOG("jsonAppLoadDone complete\n");
 
-	return 0;
+	return state.rc == 0 ? 0 : -1;
 }

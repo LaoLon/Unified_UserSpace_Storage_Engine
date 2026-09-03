@@ -96,9 +96,9 @@ add_executable(spdk-hfs ${HFS_CORE_SRC} src/hfs_main.c)
 target_compile_definitions(spdk-hfs PRIVATE "HFS_DEFAULT_CONFIG=\"${HFS_CONFIG}\"")
 hfs_link_spdk(spdk-hfs)
 
-# run：检查 hugepages 后运行自测程序
+# run：使用显式格式化模式运行自测程序
 add_custom_target(run
-  COMMAND bash -c "if [ $$(cat /proc/sys/vm/nr_hugepages 2>/dev/null || echo 0) = 0 ]; then echo 'No hugepages configured, allocating 1024 x 2MB...'; echo 1024 > /proc/sys/vm/nr_hugepages; fi; $<TARGET_FILE:spdk-hfs>"
+  COMMAND ${CMAKE_COMMAND} -E env HFS_FORMAT=1 $<TARGET_FILE:spdk-hfs>
   DEPENDS spdk-hfs
   USES_TERMINAL
 )

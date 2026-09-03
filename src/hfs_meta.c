@@ -10,6 +10,13 @@
 #include "hfs_internal.h"
 #include "hfs_meta.h"
 
+/* Return true only when the caller explicitly permits metadata formatting. */
+static bool hfs_format_requested(void) {
+	const char *format = getenv("HFS_FORMAT");
+
+	return format != NULL && strcmp(format, "1") == 0;
+}
+
 /* Generic completion callback: marks the waiter as done. */
 static void hfsMetaOpCb(void *arg, int bserrno) {
 	Hfs *fs = (Hfs *)arg;
@@ -730,6 +737,11 @@ int hfsMetaInit(Hfs *fs) {
 		return hfsMetaLoadAll(fs);
 	}
 	if (errno != ENOENT) {
+		free(fs->inodes);
+		fs->inodes = NULL;
+		return -1;
+	}
+	if (!hfs_format_requested()) {
 		free(fs->inodes);
 		fs->inodes = NULL;
 		return -1;

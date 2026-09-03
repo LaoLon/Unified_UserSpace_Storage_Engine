@@ -51,11 +51,11 @@ PYEOF
 
 echo "-- randrw (4k, iodepth=32) --"
 run_one hfs-randrw scripts/fio/hfs_randrw.ini "$OUT/randrw.raw" \
-	LD_PRELOAD="$HFS_LIB"
+	LD_PRELOAD="$HFS_LIB" HFS_FORMAT=1
 
 echo "-- seq (128k, iodepth=32) --"
 run_one hfs-seq scripts/fio/hfs_seq.ini "$OUT/seq.raw" \
-	LD_PRELOAD="$HFS_LIB"
+	LD_PRELOAD="$HFS_LIB" HFS_FORMAT=1
 
 if [ -n "$EXT4_DIR" ]; then
 	mkdir -p "$EXT4_DIR"

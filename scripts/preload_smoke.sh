@@ -24,7 +24,7 @@ echo "== HFS preload smoke test =="
 echo "  lib:    $HFS_LIB"
 echo "  prefix: $PREFIX"
 
-timeout 60 env LD_PRELOAD="$HFS_LIB" python3 - "$PREFIX" <<'PYEOF'
+timeout 60 env LD_PRELOAD="$HFS_LIB" HFS_FORMAT=1 python3 - "$PREFIX" <<'PYEOF'
 import os
 import sys
 

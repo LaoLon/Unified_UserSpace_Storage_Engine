@@ -39,6 +39,7 @@ typedef struct Hfs {
 
 	struct spdk_io_channel *channel;	/* blobstore I/O channel */
 	bool finished;				/* waiter completion flag */
+	int operationRc;			/* result of the current mount operation */
 } Hfs;
 
 /* Operation table for mount/umount (reserved for future use). */

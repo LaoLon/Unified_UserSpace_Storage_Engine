@@ -1,3 +1,7 @@
+#include <errno.h>
+#include <stdlib.h>
+#include <string.h>
+
 #include <spdk/blob.h>
 #include <spdk/blob_bdev.h>
 #include <spdk/bdev.h>
@@ -7,6 +11,20 @@
 #include "hfs_internal.h"
 #include "hfs_log.h"
 
+/* Return the configured bdev name or the legacy in-memory default. */
+static const char *hfs_bdev_name(void) {
+	const char *name = getenv("HFS_BDEV_NAME");
+
+	return (name != NULL && name[0] != '\0') ? name : "Malloc0";
+}
+
+/* Return true only when the caller explicitly requests formatting. */
+static bool hfs_format_requested(void) {
+	const char *format = getenv("HFS_FORMAT");
+
+	return format != NULL && strcmp(format, "1") == 0;
+}
+
 /* Completion callback for spdk_bs_unload: clear the blobstore so a
  * second umount (e.g. from hfs_lib_fini) is a no-op. */
 static void hfsSpdkBsUnloadCb(void *arg, int bserrno) {
@@ -15,6 +33,7 @@ static void hfsSpdkBsUnloadCb(void *arg, int bserrno) {
 	if (bserrno != 0) {
 		HFS_LOG_ERROR("blobstore unload failed bserrno=%d", bserrno);
 	}
+	fs->operationRc = bserrno;
 	fs->blobstore = NULL;
 	fs->finished = true;
 }
@@ -41,14 +60,15 @@ static void hfsDoUmount(void *arg) {
 }
 
 /*
- * Completion callback for spdk_bs_init: record the blobstore, io unit
- * size and allocate the I/O channel used by all blob operations.
+ * Completion callback for spdk_bs_init/spdk_bs_load: record the blobstore,
+ * io unit size and allocate the I/O channel used by all blob operations.
  */
 static void hfsSpdkBsInitCb(void *arg, struct spdk_blob_store *bs, int bserrno) {
 	Hfs *fs = (Hfs *)arg;
 
 	if (bserrno != 0 || bs == NULL) {
 		HFS_LOG_ERROR("blobstore init failed bserrno=%d", bserrno);
+		fs->operationRc = bserrno != 0 ? bserrno : -EINVAL;
 		fs->finished = true;
 		return;
 	}
@@ -62,6 +82,7 @@ static void hfsSpdkBsInitCb(void *arg, struct spdk_blob_store *bs, int bserrno) 
 	fs->channel = spdk_bs_alloc_io_channel(fs->blobstore);
 	if (fs->channel == NULL) {
 		HFS_LOG_ERROR("blobstore io channel allocation failed");
+		fs->operationRc = -ENOMEM;
 		fs->finished = true;
 		return;
 	}
@@ -78,35 +99,50 @@ static void hfsSpdkBdevEventCb(enum spdk_bdev_event_type type, struct spdk_bdev 
 }
 
 /*
- * SPDK-thread task: wrap the "Malloc0" bdev as a blobstore device and
- * initialize the blobstore on it.
+ * SPDK-thread task: wrap the configured bdev as a blobstore device and
+ * initialize or load the blobstore according to the explicit format flag.
  */
 static void hfsDoMount(void *arg) {
 	Hfs *fs = (Hfs *)arg;
 
 	struct spdk_bs_dev *bsDev = NULL;
 
-	int rc = spdk_bdev_create_bs_dev_ext("Malloc0", hfsSpdkBdevEventCb, NULL, &bsDev);
+	int rc = spdk_bdev_create_bs_dev_ext(hfs_bdev_name(), hfsSpdkBdevEventCb,
+					     NULL, &bsDev);
 	if (rc != 0) {
 		HFS_LOG_ERROR("create bs dev failed rc=%d", rc);
-		spdk_app_stop(0);
+		fs->operationRc = rc;
+		fs->finished = true;
+		return;
 	}
 
-	spdk_bs_init(bsDev, NULL, hfsSpdkBsInitCb, fs);
+	if (hfs_format_requested()) {
+		spdk_bs_init(bsDev, NULL, hfsSpdkBsInitCb, fs);
+	} else {
+		spdk_bs_load(bsDev, NULL, hfsSpdkBsInitCb, fs);
+	}
 
 	SPDK_NOTICELOG("hfs_entry\n");
 }
 
-/* Mount the blobstore synchronously; returns waiter success. */
+/* Mount the blobstore synchronously; return false on timeout or SPDK error. */
 int hfsMount(Hfs *fs) {
+	fs->operationRc = 0;
 	fs->finished = false;
 
-	return waiter(globalThread, hfsDoMount, fs, &fs->finished);
+	if (!waiter(globalThread, hfsDoMount, fs, &fs->finished)) {
+		return 0;
+	}
+	return fs->operationRc == 0 && fs->blobstore != NULL;
 }
 
-/* Unmount the blobstore synchronously; returns waiter success. */
+/* Unmount the blobstore synchronously; return false on timeout or SPDK error. */
 int hfsUmount(Hfs *fs) {
+	fs->operationRc = 0;
 	fs->finished = false;
 
-	return waiter(globalThread, hfsDoUmount, fs, &fs->finished);
+	if (!waiter(globalThread, hfsDoUmount, fs, &fs->finished)) {
+		return 0;
+	}
+	return fs->operationRc == 0 && fs->blobstore == NULL;
 }

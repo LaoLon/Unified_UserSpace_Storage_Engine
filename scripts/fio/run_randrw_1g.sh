@@ -26,7 +26,7 @@ echo "  output: $OUT"
 for BS in 4k 8k 16k 32k 64k; do
 	echo "-- bs=$BS --"
 	# HFS (single process, fresh filesystem per run)
-	timeout 300 env LD_PRELOAD="$HFS_LIB" HFS_AUTO_MKDIRS=/fio \
+	timeout 300 env LD_PRELOAD="$HFS_LIB" HFS_FORMAT=1 HFS_AUTO_MKDIRS=/fio \
 		fio --name=rw --ioengine=psync --bs="$BS" --size=1g \
 		--rw=randrw --rwmixread=50 --filename=/hfs/fio/rw.dat \
 		--direct=1 --group_reporting=1 --time_based=1 --runtime=15 \

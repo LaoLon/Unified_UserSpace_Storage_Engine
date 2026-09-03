@@ -1,9 +1,12 @@
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/file.h>
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
@@ -19,6 +22,69 @@ static pthread_mutex_t g_libLock = PTHREAD_MUTEX_INITIALIZER;
 
 /* The single mounted filesystem instance (one per process). */
 static Hfs *g_fs;
+/* Exclusive host-side lock for the configured blobstore backend. */
+static int g_backendLockFd = -1;
+
+/* Return the configured backend name for lock naming and diagnostics. */
+static const char *hfs_backend_name(void) {
+	const char *name = getenv("HFS_BDEV_NAME");
+
+	return (name != NULL && name[0] != '\0') ? name : "Malloc0";
+}
+
+/* Acquire an external lock so two processes cannot mount one backend. */
+static int hfs_acquire_backend_lock(void) {
+	const char *configured = getenv("HFS_LOCK_PATH");
+	const char *backendName = hfs_backend_name();
+	char defaultPath[PATH_MAX];
+	char safeName[128];
+	size_t i;
+	size_t safeLen = 0;
+	int fd;
+	int savedErrno;
+
+	if (configured != NULL && configured[0] != '\0') {
+		if (snprintf(defaultPath, sizeof(defaultPath), "%s", configured)
+		    >= (int)sizeof(defaultPath)) {
+			errno = ENAMETOOLONG;
+			return -1;
+		}
+	} else {
+		for (i = 0; backendName[i] != '\0' && safeLen + 1 < sizeof(safeName); i++) {
+			unsigned char ch = (unsigned char)backendName[i];
+			safeName[safeLen++] = isalnum(ch) ? (char)ch : '_';
+		}
+		safeName[safeLen] = '\0';
+		if (snprintf(defaultPath, sizeof(defaultPath), "/tmp/hfs-%s.lock",
+			     safeName) >= (int)sizeof(defaultPath)) {
+			errno = ENAMETOOLONG;
+			return -1;
+		}
+	}
+
+	fd = open(defaultPath, O_CREAT | O_RDWR | O_CLOEXEC, 0644);
+	if (fd < 0) {
+		return -1;
+	}
+	if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+		savedErrno = errno;
+		close(fd);
+		errno = savedErrno == EWOULDBLOCK ? EBUSY : savedErrno;
+		return -1;
+	}
+
+	g_backendLockFd = fd;
+	return 0;
+}
+
+/* Release the backend lock after the blobstore is fully unmounted. */
+static void hfs_release_backend_lock(void) {
+	if (g_backendLockFd >= 0) {
+		flock(g_backendLockFd, LOCK_UN);
+		close(g_backendLockFd);
+		g_backendLockFd = -1;
+	}
+}
 
 /*
  * Create each directory in a relative path (mkdir -p semantics) inside
@@ -124,8 +190,17 @@ int hfs_lib_init(void) {
 	}
 	HFS_LOG_DEBUG("hfs_log_init done");
 
+	if (hfs_acquire_backend_lock() != 0) {
+		HFS_LOG_ERROR("backend lock failed for %s: %s", hfs_backend_name(),
+			       strerror(errno));
+		hfs_log_fini();
+		pthread_mutex_unlock(&g_libLock);
+		return -1;
+	}
+
 	if (hfsEnvSetup() != 0) {
 		HFS_LOG_ERROR("hfsEnvSetup failed");
+		hfs_release_backend_lock();
 		hfs_log_fini();
 		pthread_mutex_unlock(&g_libLock);
 		return -1;
@@ -133,6 +208,7 @@ int hfs_lib_init(void) {
 
 	g_fs = calloc(1, sizeof(Hfs));
 	if (g_fs == NULL) {
+		hfs_release_backend_lock();
 		hfs_log_fini();
 		pthread_mutex_unlock(&g_libLock);
 		return -1;
@@ -142,6 +218,7 @@ int hfs_lib_init(void) {
 		HFS_LOG_ERROR("hfsMount failed");
 		free(g_fs);
 		g_fs = NULL;
+		hfs_release_backend_lock();
 		hfs_log_fini();
 		pthread_mutex_unlock(&g_libLock);
 		return -1;
@@ -149,8 +226,10 @@ int hfs_lib_init(void) {
 
 	if (hfsMetaInit(g_fs) != 0) {
 		HFS_LOG_ERROR("hfsMetaInit failed");
+		hfsUmount(g_fs);
 		free(g_fs);
 		g_fs = NULL;
+		hfs_release_backend_lock();
 		hfs_log_fini();
 		pthread_mutex_unlock(&g_libLock);
 		return -1;
@@ -198,11 +277,14 @@ void hfs_lib_fini(void) {
 		return;
 	}
 
-	hfsUmount(g_fs);
+	if (!hfsUmount(g_fs)) {
+		HFS_LOG_ERROR("hfsUmount failed");
+	}
 	free(g_fs);
 	g_fs = NULL;
-	hfs_log_fini();
+	hfs_release_backend_lock();
 	HFS_LOG_DEBUG("libhfs finalized");
+	hfs_log_fini();
 	pthread_mutex_unlock(&g_libLock);
 }
 
