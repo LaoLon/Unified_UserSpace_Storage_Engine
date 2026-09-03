@@ -1081,6 +1081,11 @@ int faccessat(int dirfd, const char *path, int mode, int flags) {
 	return real_faccessat(dirfd, path, mode, flags);
 }
 
+/* Return whether a fcntl command consumes the optional third argument. */
+static bool hfs_fcntl_requires_arg(int cmd) {
+	return cmd != F_GETFD && cmd != F_GETFL;
+}
+
 /*
  * Duplicate an HFS fd via F_DUPFD/F_DUPFD_CLOEXEC: reserve a kernel
  * fd through the real fcntl, then copy the table slot.
@@ -1104,7 +1109,9 @@ int fcntl(int fd, int cmd, ...) {
 	uintptr_t arg = 0;
 
 	va_start(ap, cmd);
-	arg = va_arg(ap, uintptr_t);
+	if (hfs_fcntl_requires_arg(cmd)) {
+		arg = va_arg(ap, uintptr_t);
+	}
 	va_end(ap);
 
 	if (hfs_is_hfs_fd(fd)) {
@@ -1125,7 +1132,9 @@ int fcntl64(int fd, int cmd, ...) {
 	uintptr_t arg = 0;
 
 	va_start(ap, cmd);
-	arg = va_arg(ap, uintptr_t);
+	if (hfs_fcntl_requires_arg(cmd)) {
+		arg = va_arg(ap, uintptr_t);
+	}
 	va_end(ap);
 
 	if (hfs_is_hfs_fd(fd)) {
@@ -1136,6 +1145,9 @@ int fcntl64(int fd, int cmd, ...) {
 	}
 	return real_fcntl64(fd, cmd, arg);
 }
+
+/* Export the glibc version used by Python's internal fcntl64 reference. */
+__asm__(".symver fcntl64, fcntl64@GLIBC_2.28");
 
 /*
  * Registered HFS directory handles. DIR is opaque to applications, so

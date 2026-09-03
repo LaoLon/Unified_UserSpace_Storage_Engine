@@ -72,7 +72,6 @@ typedef struct HfsFile {
 	uint64_t ioOffset;			/* starting io unit for the current op */
 	uint64_t ioUnits;			/* io unit count for the current op */
 	uint64_t resizeClusters;		/* target clusters for resize */
-	uint32_t refCount;			/* shared fd references (dup) */
 
 	HfsCompletion completion;			/* current file request completion */
 } HfsFile;

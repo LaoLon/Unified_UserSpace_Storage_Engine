@@ -549,6 +549,8 @@ int hfsMetaRename(Hfs *fs, const char *oldPath, const char *newPath) {
 	struct hfs_inode *src;
 	struct hfs_inode *dst;
 	struct hfs_inode *newParent;
+	uint64_t srcId;
+	uint64_t newParentId;
 	const char *newLeaf;
 	uint32_t i;
 
@@ -556,18 +558,20 @@ int hfsMetaRename(Hfs *fs, const char *oldPath, const char *newPath) {
 	if (src == NULL) {
 		return -1;
 	}
+	srcId = src->id;
 
 	/* Resolve the destination parent directory and leaf name. */
 	if (hfsMetaResolveParent(fs, newPath, &newParent, &newLeaf) != 0) {
 		return -1;
 	}
+	newParentId = newParent->id;
 	if (strlen(newLeaf) >= FILENAME_LENGTH) {
 		errno = ENAMETOOLONG;
 		return -1;
 	}
 
 	/* A rename onto itself is a no-op. */
-	if (src->parentId == newParent->id &&
+	if (src->parentId == newParentId &&
 	    strcmp(src->name, newLeaf) == 0) {
 		return 0;
 	}
@@ -601,6 +605,14 @@ int hfsMetaRename(Hfs *fs, const char *oldPath, const char *newPath) {
 				break;
 			}
 		}
+	}
+
+	/* Re-resolve moved entries after compacting the inode array. */
+	src = hfsMetaFindById(fs, srcId);
+	newParent = hfsMetaFindById(fs, newParentId);
+	if (src == NULL || newParent == NULL) {
+		errno = EIO;
+		return -1;
 	}
 
 	/* Move the source inode into the destination slot. */

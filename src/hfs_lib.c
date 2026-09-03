@@ -12,6 +12,7 @@
 #include <unistd.h>
 
 #include "hfs.h"
+#include "hfs_fd.h"
 #include "hfs_internal.h"
 #include "hfs_lib.h"
 #include "hfs_log.h"
@@ -30,6 +31,16 @@ static const char *hfs_backend_name(void) {
 	const char *name = getenv("HFS_BDEV_NAME");
 
 	return (name != NULL && name[0] != '\0') ? name : "Malloc0";
+}
+
+/* Return the current realtime timestamp in nanoseconds for inode metadata. */
+static uint64_t hfs_now_ns(void) {
+	struct timespec ts;
+
+	if (clock_gettime(CLOCK_REALTIME, &ts) != 0) {
+		return 0;
+	}
+	return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
 
 /* Acquire an external lock so two processes cannot mount one backend. */
@@ -144,24 +155,6 @@ static void hfs_auto_mkdirs(Hfs *fs) {
 }
 
 /*
- * Per-fd bookkeeping. isHfs=1 means the fd belongs to HFS; otherwise it
- * is a transparent (pass-through) fd handled by glibc.
- */
-struct hfs_handle {
-	int fd;			/* application-visible fd */
-	HfsFile *file;		/* open HFS file handle */
-	uint64_t inodeId;	/* inode id backing this fd */
-	uint64_t offset;	/* current file offset */
-	int flags;		/* open flags (O_APPEND etc.) */
-	int isHfs;		/* 1 = HFS handle, 0 = pass-through fd */
-	bool writable;		/* opened with write access */
-	char dirPath[PATH_MAX];	/* prefix-stripped path (directory fds) */
-};
-
-/* Fixed-size fd table shared by all library calls. */
-static struct hfs_handle g_fdTable[HFS_FD_TABLE_SIZE];
-
-/*
  * Directory enumeration state: a snapshot of child inodes taken at
  * opendir time, plus a read cursor.
  */
@@ -171,6 +164,54 @@ struct hfs_dir {
 	uint64_t cursor;	/* current position in the snapshot */
 	struct hfs_dirent *entries;	/* snapshot array */
 };
+
+/* Delete a deferred blob after every open description for its inode is gone. */
+static void hfs_delete_orphan(HfsOrphan *orphan) {
+	HfsFile file;
+
+	if (orphan == NULL) {
+		return;
+	}
+	memset(&file, 0, sizeof(file));
+	file.fs = g_fs;
+	file.blobId = orphan->blobId;
+	if (g_fs != NULL && !hfsDeleteBlobById(&file)) {
+		HFS_LOG_ERROR("deferred blob delete failed inode=%"PRIu64,
+			      orphan->inodeId);
+	}
+	hfsFdOrphanDestroy(orphan);
+}
+
+/* Release an acquired description and close its blob at the final reference. */
+static void hfs_release_open_file(HfsOpenFile *openFile) {
+	HfsOrphan *readyOrphan = NULL;
+
+	if (openFile == NULL || !hfsFdRelease(openFile, &readyOrphan)) {
+		return;
+	}
+	if (openFile->file != NULL) {
+		(void)hfsClose(openFile->file);
+		free(openFile->file);
+	}
+	hfsFdDestroy(openFile);
+	hfs_delete_orphan(readyOrphan);
+}
+
+/* Acquire an HFS description and enforce file-vs-directory operation rules. */
+static HfsOpenFile *hfs_acquire_file(int fd, bool requireData) {
+	HfsOpenFile *openFile = hfsFdAcquire(fd);
+
+	if (openFile == NULL) {
+		errno = EBADF;
+		return NULL;
+	}
+	if (requireData && openFile->file == NULL) {
+		hfs_release_open_file(openFile);
+		errno = EISDIR;
+		return NULL;
+	}
+	return openFile;
+}
 
 /*
  * Initialize the library: logging, SPDK environment, mount and metadata.
@@ -239,7 +280,7 @@ int hfs_lib_init(void) {
 		return -1;
 	}
 
-	memset(g_fdTable, 0, sizeof(g_fdTable));
+	hfsFdReset();
 	HFS_LOG_INFO("libhfs initialized");
 
 	/* Auto-create directories requested via HFS_AUTO_MKDIRS. */
@@ -275,11 +316,20 @@ static void hfs_preload_dtor(void) {
 
 /* Tear down: unmount, free the instance and stop logging. */
 void hfs_lib_fini(void) {
+	HfsOpenFile *openFile;
+	int fd;
+
 	pthread_mutex_lock(&g_libLock);
 	if (g_fs == NULL) {
 		pthread_mutex_unlock(&g_libLock);
 		return;
 	}
+	/* Close every placeholder before unmounting the blobstore. */
+	while ((openFile = hfsFdDetachAny(&fd)) != NULL) {
+		hfs_release_open_file(openFile);
+		(void)close(fd);
+	}
+	hfsFdReset();
 
 	if (!hfsUmount(g_fs)) {
 		HFS_LOG_ERROR("hfsUmount failed");
@@ -303,8 +353,11 @@ int hfs_lib_open(const char *path, int flags, mode_t mode) {
 	struct hfs_inode *parent;
 	const char *leaf;
 	HfsFile *file;
+	HfsOpenFile *openFile = NULL;
 	int fd;
 	int rc;
+
+	(void)mode;
 
 	pthread_mutex_lock(&g_libLock);
 	if (g_fs == NULL) {
@@ -357,15 +410,18 @@ int hfs_lib_open(const char *path, int flags, mode_t mode) {
 			errno = EMFILE;
 			return -1;
 		}
-		g_fdTable[fd].fd = fd;
-		g_fdTable[fd].file = NULL;
-		g_fdTable[fd].inodeId = in->id;
-		g_fdTable[fd].offset = 0;
-		g_fdTable[fd].flags = flags;
-		g_fdTable[fd].isHfs = 1;
-		g_fdTable[fd].writable = false;
-		snprintf(g_fdTable[fd].dirPath, sizeof(g_fdTable[fd].dirPath),
-			 "%s", path);
+		if (hfsFdCreate(&openFile, NULL, in->id, flags, false, true,
+				path) != 0 || hfsFdRegister(fd, openFile) != 0) {
+			if (openFile != NULL) {
+				hfsFdDestroy(openFile);
+			}
+			close(fd);
+			pthread_mutex_unlock(&g_libLock);
+			return -1;
+		}
+		openFile->ctimeNs = in->ctimeNs;
+		atomic_store_explicit(&openFile->mtimeNs, in->mtimeNs,
+				      memory_order_relaxed);
 		pthread_mutex_unlock(&g_libLock);
 		return fd;
 	}
@@ -410,22 +466,30 @@ int hfs_lib_open(const char *path, int flags, mode_t mode) {
 	}
 	file->fs = g_fs;
 	file->blobId = in->blobId;
-	file->refCount = 1;
 
 	if (!hfsOpenById(file)) {
+		close(fd);
 		free(file);
 		pthread_mutex_unlock(&g_libLock);
 		errno = EIO;
 		return -1;
 	}
-
-	g_fdTable[fd].fd = fd;
-	g_fdTable[fd].file = file;
-	g_fdTable[fd].inodeId = in->id;
-	g_fdTable[fd].offset = 0;
-	g_fdTable[fd].flags = flags;
-	g_fdTable[fd].isHfs = 1;
-	g_fdTable[fd].writable = ((flags & O_ACCMODE) != O_RDONLY);
+	if (hfsFdCreate(&openFile, file, in->id, flags,
+			((flags & O_ACCMODE) != O_RDONLY), false, NULL) != 0 ||
+	    hfsFdRegister(fd, openFile) != 0) {
+		if (openFile != NULL) {
+			hfsFdDestroy(openFile);
+		}
+		hfsClose(file);
+		free(file);
+		close(fd);
+		pthread_mutex_unlock(&g_libLock);
+		return -1;
+	}
+	atomic_store_explicit(&openFile->size, in->size, memory_order_relaxed);
+	openFile->ctimeNs = in->ctimeNs;
+	atomic_store_explicit(&openFile->mtimeNs, in->mtimeNs,
+			      memory_order_relaxed);
 
 	pthread_mutex_unlock(&g_libLock);
 	return fd;
@@ -436,30 +500,30 @@ int hfs_lib_open(const char *path, int flags, mode_t mode) {
  * The relative name is resolved against the directory fd's path.
  */
 int hfs_lib_openat(int dirfd, const char *path, int flags, mode_t mode) {
-	struct hfs_handle *h;
+	HfsOpenFile *openFile;
 	char buf[PATH_MAX];
 	const char *vp;
 
-	pthread_mutex_lock(&g_libLock);
-	if (dirfd < 0 || dirfd >= HFS_FD_TABLE_SIZE ||
-	    g_fdTable[dirfd].inodeId == 0 || g_fdTable[dirfd].file != NULL) {
-		pthread_mutex_unlock(&g_libLock);
+	openFile = hfsFdAcquire(dirfd);
+	if (openFile == NULL || !openFile->isDirectory) {
+		if (openFile != NULL) {
+			hfsFdRelease(openFile, NULL);
+		}
 		errno = EBADF;
 		return -1;
 	}
-	h = &g_fdTable[dirfd];
 	if (path[0] == '/') {
 		vp = path;
 	} else {
-		if (snprintf(buf, sizeof(buf), "%s/%s", h->dirPath, path)
+		if (snprintf(buf, sizeof(buf), "%s/%s", openFile->dirPath, path)
 		    >= (int)sizeof(buf)) {
-			pthread_mutex_unlock(&g_libLock);
+			hfsFdRelease(openFile, NULL);
 			errno = ENAMETOOLONG;
 			return -1;
 		}
 		vp = buf;
 	}
-	pthread_mutex_unlock(&g_libLock);
+	hfsFdRelease(openFile, NULL);
 	return hfs_lib_open(vp, flags, mode);
 }
 
@@ -468,51 +532,55 @@ int hfs_lib_openat(int dirfd, const char *path, int flags, mode_t mode) {
  * Returns 0 at end of file; updates the fd offset.
  */
 ssize_t hfs_lib_read(int fd, void *buf, size_t count) {
-	struct hfs_handle *h;
+	HfsOpenFile *openFile;
 	struct hfs_inode *in;
+	uint64_t fileSize;
 	ssize_t n;
 
 	if (count == 0) {
 		return 0;
 	}
 
+	openFile = hfs_acquire_file(fd, true);
+	if (openFile == NULL) {
+		return -1;
+	}
+	pthread_mutex_lock(&openFile->ioLock);
 	pthread_mutex_lock(&g_libLock);
+	in = g_fs == NULL ? NULL : hfsMetaFindById(g_fs, openFile->inodeId);
 	if (g_fs == NULL) {
 		pthread_mutex_unlock(&g_libLock);
+		pthread_mutex_unlock(&openFile->ioLock);
+		hfs_release_open_file(openFile);
 		errno = ENODEV;
 		return -1;
 	}
-	if (fd < 0 || fd >= HFS_FD_TABLE_SIZE || g_fdTable[fd].inodeId == 0) {
+	if (in == NULL && !hfsFdGetOrphanInfo(openFile, &fileSize, NULL, NULL)) {
 		pthread_mutex_unlock(&g_libLock);
-		errno = EBADF;
-		return -1;
-	}
-	if (g_fdTable[fd].file == NULL) {
-		pthread_mutex_unlock(&g_libLock);
-		errno = EISDIR;
-		return -1;
-	}
-
-	h = &g_fdTable[fd];
-	in = hfsMetaFindById(g_fs, h->inodeId);
-	if (in == NULL) {
-		pthread_mutex_unlock(&g_libLock);
+		pthread_mutex_unlock(&openFile->ioLock);
+		hfs_release_open_file(openFile);
 		errno = ENOENT;
 		return -1;
 	}
-	if (h->offset >= in->size) {
+	if (in != NULL) {
+		fileSize = in->size;
+	}
+	if (openFile->offset >= fileSize) {
 		pthread_mutex_unlock(&g_libLock);
+		pthread_mutex_unlock(&openFile->ioLock);
+		hfs_release_open_file(openFile);
 		return 0;	/* end of file */
 	}
-	if (h->offset + count > in->size) {
-		count = (size_t)(in->size - h->offset);
-	}
-
-	n = hfsReadAt(h->file, buf, count, h->offset);
-	if (n > 0) {
-		h->offset += (uint64_t)n;
+	if (openFile->offset + count > fileSize) {
+		count = (size_t)(fileSize - openFile->offset);
 	}
 	pthread_mutex_unlock(&g_libLock);
+	n = hfsReadAt(openFile->file, buf, count, openFile->offset);
+	if (n > 0) {
+		openFile->offset += (uint64_t)n;
+	}
+	pthread_mutex_unlock(&openFile->ioLock);
+	hfs_release_open_file(openFile);
 	return n;
 }
 
@@ -521,62 +589,64 @@ ssize_t hfs_lib_read(int fd, void *buf, size_t count) {
  * Grows the file size when writing past the end.
  */
 ssize_t hfs_lib_write(int fd, const void *buf, size_t count) {
-	struct hfs_handle *h;
+	HfsOpenFile *openFile;
 	struct hfs_inode *in;
-	struct timespec ts;
 	ssize_t n;
 
 	if (count == 0) {
 		return 0;
 	}
 
-	pthread_mutex_lock(&g_libLock);
-	if (g_fs == NULL) {
-		pthread_mutex_unlock(&g_libLock);
-		errno = ENODEV;
+	openFile = hfs_acquire_file(fd, true);
+	if (openFile == NULL) {
 		return -1;
 	}
-	if (fd < 0 || fd >= HFS_FD_TABLE_SIZE || g_fdTable[fd].inodeId == 0) {
-		pthread_mutex_unlock(&g_libLock);
+	if (!openFile->writable) {
+		hfs_release_open_file(openFile);
 		errno = EBADF;
 		return -1;
 	}
-	if (g_fdTable[fd].file == NULL) {
-		pthread_mutex_unlock(&g_libLock);
-		errno = EISDIR;
-		return -1;
-	}
-
-	h = &g_fdTable[fd];
-	if (!h->writable) {
-		pthread_mutex_unlock(&g_libLock);
-		errno = EBADF;
-		return -1;
-	}
-
-	n = hfsWriteAt(h->file, buf, count, h->offset);
+	pthread_mutex_lock(&openFile->ioLock);
+	n = hfsWriteAt(openFile->file, buf, count, openFile->offset);
 	if (n <= 0) {
-		pthread_mutex_unlock(&g_libLock);
+		pthread_mutex_unlock(&openFile->ioLock);
+		hfs_release_open_file(openFile);
 		errno = EIO;
 		return -1;
 	}
-
-	h->offset += (uint64_t)n;
-	in = hfsMetaFindById(g_fs, h->inodeId);
-	if (in != NULL && h->offset > in->size) {
+	openFile->offset += (uint64_t)n;
+	pthread_mutex_lock(&g_libLock);
+	in = g_fs == NULL ? NULL : hfsMetaFindById(g_fs, openFile->inodeId);
+	if (in != NULL && openFile->offset > in->size) {
 		/* Update size/mtime in memory; persisted at fsync/close. */
-		clock_gettime(CLOCK_REALTIME, &ts);
-		in->size = h->offset;
-		in->mtimeNs = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+		in->size = openFile->offset;
+		in->mtimeNs = hfs_now_ns();
+		atomic_store_explicit(&openFile->size, in->size,
+				      memory_order_relaxed);
+		atomic_store_explicit(&openFile->mtimeNs, in->mtimeNs,
+				      memory_order_relaxed);
+	} else if (in == NULL && hfsFdGetOrphanInfo(openFile, NULL, NULL, NULL)) {
+		uint64_t size = atomic_load_explicit(&openFile->size,
+					     memory_order_relaxed);
+
+		if (openFile->offset > size) {
+			atomic_store_explicit(&openFile->size, openFile->offset,
+					      memory_order_relaxed);
+		}
+		atomic_store_explicit(&openFile->mtimeNs, hfs_now_ns(),
+				      memory_order_relaxed);
 	}
 	pthread_mutex_unlock(&g_libLock);
+	pthread_mutex_unlock(&openFile->ioLock);
+	hfs_release_open_file(openFile);
 	return n;
 }
 
 /* Read at an explicit offset without moving the fd offset. */
 ssize_t hfs_lib_pread(int fd, void *buf, size_t count, off_t offset) {
-	struct hfs_handle *h;
+	HfsOpenFile *openFile;
 	struct hfs_inode *in;
+	uint64_t fileSize;
 	ssize_t n;
 
 	if (count == 0) {
@@ -587,48 +657,51 @@ ssize_t hfs_lib_pread(int fd, void *buf, size_t count, off_t offset) {
 		return -1;
 	}
 
+	openFile = hfs_acquire_file(fd, true);
+	if (openFile == NULL) {
+		return -1;
+	}
+	pthread_mutex_lock(&openFile->ioLock);
 	pthread_mutex_lock(&g_libLock);
+	in = g_fs == NULL ? NULL : hfsMetaFindById(g_fs, openFile->inodeId);
 	if (g_fs == NULL) {
 		pthread_mutex_unlock(&g_libLock);
+		pthread_mutex_unlock(&openFile->ioLock);
+		hfs_release_open_file(openFile);
 		errno = ENODEV;
 		return -1;
 	}
-	if (fd < 0 || fd >= HFS_FD_TABLE_SIZE || g_fdTable[fd].inodeId == 0) {
+	if (in == NULL && !hfsFdGetOrphanInfo(openFile, &fileSize, NULL, NULL)) {
 		pthread_mutex_unlock(&g_libLock);
-		errno = EBADF;
-		return -1;
-	}
-	if (g_fdTable[fd].file == NULL) {
-		pthread_mutex_unlock(&g_libLock);
-		errno = EISDIR;
-		return -1;
-	}
-
-	h = &g_fdTable[fd];
-	in = hfsMetaFindById(g_fs, h->inodeId);
-	if (in == NULL) {
-		pthread_mutex_unlock(&g_libLock);
+		pthread_mutex_unlock(&openFile->ioLock);
+		hfs_release_open_file(openFile);
 		errno = ENOENT;
 		return -1;
 	}
-	if ((uint64_t)offset >= in->size) {
+	if (in != NULL) {
+		fileSize = in->size;
+	}
+	if ((uint64_t)offset >= fileSize) {
 		pthread_mutex_unlock(&g_libLock);
+		pthread_mutex_unlock(&openFile->ioLock);
+		hfs_release_open_file(openFile);
 		return 0;
 	}
-	if ((uint64_t)offset + count > in->size) {
-		count = (size_t)(in->size - (uint64_t)offset);
+	if ((uint64_t)offset + count > fileSize) {
+		count = (size_t)(fileSize - (uint64_t)offset);
 	}
 
-	n = hfsReadAt(h->file, buf, count, (uint64_t)offset);
 	pthread_mutex_unlock(&g_libLock);
+	n = hfsReadAt(openFile->file, buf, count, (uint64_t)offset);
+	pthread_mutex_unlock(&openFile->ioLock);
+	hfs_release_open_file(openFile);
 	return n;
 }
 
 /* Write at an explicit offset without moving the fd offset. */
 ssize_t hfs_lib_pwrite(int fd, const void *buf, size_t count, off_t offset) {
-	struct hfs_handle *h;
+	HfsOpenFile *openFile;
 	struct hfs_inode *in;
-	struct timespec ts;
 	ssize_t n;
 
 	if (count == 0) {
@@ -639,146 +712,131 @@ ssize_t hfs_lib_pwrite(int fd, const void *buf, size_t count, off_t offset) {
 		return -1;
 	}
 
-	pthread_mutex_lock(&g_libLock);
-	if (g_fs == NULL) {
-		pthread_mutex_unlock(&g_libLock);
-		errno = ENODEV;
+	openFile = hfs_acquire_file(fd, true);
+	if (openFile == NULL) {
 		return -1;
 	}
-	if (fd < 0 || fd >= HFS_FD_TABLE_SIZE || g_fdTable[fd].inodeId == 0) {
-		pthread_mutex_unlock(&g_libLock);
+	if (!openFile->writable) {
+		hfs_release_open_file(openFile);
 		errno = EBADF;
 		return -1;
 	}
-	if (g_fdTable[fd].file == NULL) {
-		pthread_mutex_unlock(&g_libLock);
-		errno = EISDIR;
-		return -1;
-	}
-
-	h = &g_fdTable[fd];
-	if (!h->writable) {
-		pthread_mutex_unlock(&g_libLock);
-		errno = EBADF;
-		return -1;
-	}
-
-	n = hfsWriteAt(h->file, buf, count, (uint64_t)offset);
+	pthread_mutex_lock(&openFile->ioLock);
+	n = hfsWriteAt(openFile->file, buf, count, (uint64_t)offset);
 	if (n <= 0) {
-		pthread_mutex_unlock(&g_libLock);
+		pthread_mutex_unlock(&openFile->ioLock);
+		hfs_release_open_file(openFile);
 		errno = EIO;
 		return -1;
 	}
-
-	in = hfsMetaFindById(g_fs, h->inodeId);
+	pthread_mutex_lock(&g_libLock);
+	in = g_fs == NULL ? NULL : hfsMetaFindById(g_fs, openFile->inodeId);
 	if (in != NULL && (uint64_t)offset + (uint64_t)n > in->size) {
-		clock_gettime(CLOCK_REALTIME, &ts);
 		in->size = (uint64_t)offset + (uint64_t)n;
-		in->mtimeNs = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+		in->mtimeNs = hfs_now_ns();
+		atomic_store_explicit(&openFile->size, in->size,
+				      memory_order_relaxed);
+		atomic_store_explicit(&openFile->mtimeNs, in->mtimeNs,
+				      memory_order_relaxed);
+	} else if (in == NULL && hfsFdGetOrphanInfo(openFile, NULL, NULL, NULL)) {
+		uint64_t size = atomic_load_explicit(&openFile->size,
+					     memory_order_relaxed);
+		uint64_t end = (uint64_t)offset + (uint64_t)n;
+
+		if (end > size) {
+			atomic_store_explicit(&openFile->size, end,
+					      memory_order_relaxed);
+		}
+		atomic_store_explicit(&openFile->mtimeNs, hfs_now_ns(),
+				      memory_order_relaxed);
 	}
 	pthread_mutex_unlock(&g_libLock);
+	pthread_mutex_unlock(&openFile->ioLock);
+	hfs_release_open_file(openFile);
 	return n;
 }
 
 /* Change the current offset of an HFS fd (SEEK_SET/CUR/END). */
 off_t hfs_lib_lseek(int fd, off_t offset, int whence) {
-	struct hfs_handle *h;
+	HfsOpenFile *openFile;
 	struct hfs_inode *in;
 	uint64_t base;
 
+	openFile = hfs_acquire_file(fd, true);
+	if (openFile == NULL) {
+		return -1;
+	}
+	pthread_mutex_lock(&openFile->ioLock);
 	pthread_mutex_lock(&g_libLock);
 	if (g_fs == NULL) {
 		pthread_mutex_unlock(&g_libLock);
+		pthread_mutex_unlock(&openFile->ioLock);
+		hfs_release_open_file(openFile);
 		errno = ENODEV;
 		return -1;
 	}
-	if (fd < 0 || fd >= HFS_FD_TABLE_SIZE || g_fdTable[fd].inodeId == 0) {
-		pthread_mutex_unlock(&g_libLock);
-		errno = EBADF;
-		return -1;
-	}
-	if (g_fdTable[fd].file == NULL) {
-		pthread_mutex_unlock(&g_libLock);
-		errno = EISDIR;
-		return -1;
-	}
-
-	h = &g_fdTable[fd];
 	switch (whence) {
 	case SEEK_SET:
 		base = 0;
 		break;
 	case SEEK_CUR:
-		base = h->offset;
+		base = openFile->offset;
 		break;
 	case SEEK_END:
-		in = hfsMetaFindById(g_fs, h->inodeId);
-		if (in == NULL) {
+		in = hfsMetaFindById(g_fs, openFile->inodeId);
+		if (in != NULL) {
+			base = in->size;
+		} else if (!hfsFdGetOrphanInfo(openFile, &base, NULL, NULL)) {
 			pthread_mutex_unlock(&g_libLock);
+			pthread_mutex_unlock(&openFile->ioLock);
+			hfs_release_open_file(openFile);
 			errno = ENOENT;
 			return -1;
 		}
-		base = in->size;
 		break;
 	default:
 		pthread_mutex_unlock(&g_libLock);
+		pthread_mutex_unlock(&openFile->ioLock);
+		hfs_release_open_file(openFile);
 		errno = EINVAL;
 		return -1;
 	}
 
-	if (offset < 0 && (uint64_t)(-offset) > base) {
+	if (offset < 0 && (uint64_t)(-(offset + 1)) + 1 > base) {
 		pthread_mutex_unlock(&g_libLock);
+		pthread_mutex_unlock(&openFile->ioLock);
+		hfs_release_open_file(openFile);
 		errno = EINVAL;
 		return -1;
 	}
 
-	h->offset = base + (uint64_t)offset;
-	offset = (off_t)h->offset;
+	openFile->offset = offset < 0 ? base - (uint64_t)(-offset) :
+				       base + (uint64_t)offset;
+	offset = (off_t)openFile->offset;
 	pthread_mutex_unlock(&g_libLock);
+	pthread_mutex_unlock(&openFile->ioLock);
+	hfs_release_open_file(openFile);
 	return offset;
 }
 
 /* Copy the HFS fd table slot to another fd (dup/dup2 interceptor helper). */
 int hfs_lib_fd_copy(int oldfd, int newfd) {
-	pthread_mutex_lock(&g_libLock);
-	if (oldfd < 0 || oldfd >= HFS_FD_TABLE_SIZE ||
-	    g_fdTable[oldfd].file == NULL) {
-		pthread_mutex_unlock(&g_libLock);
-		errno = EBADF;
-		return -1;
+	HfsOpenFile *replaced = NULL;
+	int rc = hfsFdCopy(oldfd, newfd, &replaced);
+
+	if (replaced != NULL) {
+		hfs_release_open_file(replaced);
 	}
-	if (newfd < 0 || newfd >= HFS_FD_TABLE_SIZE) {
-		pthread_mutex_unlock(&g_libLock);
-		errno = EBADF;
-		return -1;
-	}
-	/* dup2 overwrites the target: drop any existing HFS slot first. */
-	if (g_fdTable[newfd].file != NULL) {
-		HfsFile *f = g_fdTable[newfd].file;
-		if (--f->refCount == 0) {
-			hfsClose(f);
-			free(f);
-		}
-	}
-	g_fdTable[newfd] = g_fdTable[oldfd];
-	g_fdTable[newfd].file->refCount++;
-	pthread_mutex_unlock(&g_libLock);
-	return 0;
+	return rc;
 }
 
 /*
  * Returns true when the fd belongs to HFS (interception helper).
- * Lock-free on purpose: this is a fast path called by the close()
- * interceptor, which may run while hfs_lib_init already holds
- * g_libLock (e.g. hfsLogTrimTail closes its fd during init). Taking
- * the lock there would self-deadlock. The fd table is a fixed-size
- * array whose slots are only written by hfs_lib_open/hfs_lib_close.
+ * The fd registry uses a short read lock and never takes g_libLock, so
+ * close() can classify internal descriptors while initialization is active.
  */
 bool hfs_is_hfs_fd(int fd) {
-	if (fd < 0 || fd >= HFS_FD_TABLE_SIZE) {
-		return false;
-	}
-	return (g_fdTable[fd].inodeId != 0);
+	return hfsFdIsHfs(fd);
 }
 
 /*
@@ -786,39 +844,19 @@ bool hfs_is_hfs_fd(int fd) {
  * the file only when the last reference (dup shares) goes away.
  */
 int hfs_lib_close(int fd) {
-	struct hfs_handle *h;
-	HfsFile *file;
+	HfsOpenFile *openFile = hfsFdDetach(fd);
 
-	pthread_mutex_lock(&g_libLock);
-	if (g_fs == NULL) {
-		pthread_mutex_unlock(&g_libLock);
-		errno = ENODEV;
-		return -1;
-	}
-	if (fd < 0 || fd >= HFS_FD_TABLE_SIZE || g_fdTable[fd].inodeId == 0) {
-		pthread_mutex_unlock(&g_libLock);
+	if (openFile == NULL) {
 		errno = EBADF;
 		return -1;
 	}
-
-	h = &g_fdTable[fd];
-	file = h->file;
-	if (file != NULL) {
-		if (--file->refCount == 0) {
-			if (!hfsClose(file)) {
-				pthread_mutex_unlock(&g_libLock);
-				errno = EIO;
-				return -1;
-			}
-			free(file);
-		}
-	}
-	memset(h, 0, sizeof(*h));
-	pthread_mutex_unlock(&g_libLock);
+	hfs_release_open_file(openFile);
 
 	/* Release the kernel placeholder fd. The table slot is already
 	 * cleared, so the close interceptor passes this through. */
-	close(fd);
+	if (close(fd) != 0) {
+		return -1;
+	}
 	return 0;
 }
 
@@ -828,9 +866,11 @@ int hfs_lib_close(int fd) {
  */
 int hfs_lib_unlink(const char *path) {
 	struct hfs_inode *parent;
+	struct hfs_inode *in;
 	const char *leaf;
 	uint64_t blobId;
 	HfsFile file;
+	HfsOrphan *orphan = NULL;
 	int rc;
 
 	pthread_mutex_lock(&g_libLock);
@@ -845,6 +885,18 @@ int hfs_lib_unlink(const char *path) {
 		pthread_mutex_unlock(&g_libLock);
 		return -1;
 	}
+	in = hfsMetaFindByName(g_fs, parent->id, leaf);
+	if (in == NULL || in->type != HFS_INODE_FILE) {
+		pthread_mutex_unlock(&g_libLock);
+		errno = in == NULL ? ENOENT : EISDIR;
+		return -1;
+	}
+	blobId = in->blobId;
+	if (hfsFdMarkOrphan(in->id, blobId, in->size, in->ctimeNs,
+			   in->mtimeNs, &orphan) != 0) {
+		pthread_mutex_unlock(&g_libLock);
+		return -1;
+	}
 
 	rc = hfsMetaRemoveFile(g_fs, parent, leaf, &blobId);
 	if (rc != 0) {
@@ -853,13 +905,15 @@ int hfs_lib_unlink(const char *path) {
 	}
 
 	/* Delete the data blob via the waiter chain. */
-	memset(&file, 0, sizeof(file));
-	file.fs = g_fs;
-	file.blobId = blobId;
-	if (!hfsDeleteBlobById(&file)) {
-		pthread_mutex_unlock(&g_libLock);
-		errno = EIO;
-		return -1;
+	if (orphan == NULL) {
+		memset(&file, 0, sizeof(file));
+		file.fs = g_fs;
+		file.blobId = blobId;
+		if (!hfsDeleteBlobById(&file)) {
+			pthread_mutex_unlock(&g_libLock);
+			errno = EIO;
+			return -1;
+		}
 	}
 
 	rc = hfsMetaSaveAll(g_fs);
@@ -872,8 +926,9 @@ int hfs_lib_unlink(const char *path) {
  * Updates the inode size and grows the data blob as needed.
  */
 int hfs_lib_ftruncate(int fd, off_t length) {
-	struct hfs_handle *h;
+	HfsOpenFile *openFile;
 	struct hfs_inode *in;
+	uint64_t currentSize;
 	int rc;
 
 	if (length < 0) {
@@ -881,68 +936,114 @@ int hfs_lib_ftruncate(int fd, off_t length) {
 		return -1;
 	}
 
-	pthread_mutex_lock(&g_libLock);
-	if (g_fs == NULL) {
-		pthread_mutex_unlock(&g_libLock);
-		errno = ENODEV;
+	openFile = hfs_acquire_file(fd, true);
+	if (openFile == NULL) {
 		return -1;
 	}
-	if (fd < 0 || fd >= HFS_FD_TABLE_SIZE || g_fdTable[fd].inodeId == 0) {
-		pthread_mutex_unlock(&g_libLock);
+	if (!openFile->writable) {
+		hfs_release_open_file(openFile);
 		errno = EBADF;
 		return -1;
 	}
-	if (g_fdTable[fd].file == NULL) {
+	pthread_mutex_lock(&openFile->ioLock);
+	pthread_mutex_lock(&g_libLock);
+	in = g_fs == NULL ? NULL : hfsMetaFindById(g_fs, openFile->inodeId);
+	if (g_fs == NULL) {
 		pthread_mutex_unlock(&g_libLock);
-		errno = EISDIR;
+		pthread_mutex_unlock(&openFile->ioLock);
+		hfs_release_open_file(openFile);
+		errno = ENODEV;
 		return -1;
 	}
-
-	h = &g_fdTable[fd];
-	in = hfsMetaFindById(g_fs, h->inodeId);
-	if (in == NULL) {
+	if (in != NULL) {
+		currentSize = in->size;
+	} else if (!hfsFdGetOrphanInfo(openFile, &currentSize, NULL, NULL)) {
 		pthread_mutex_unlock(&g_libLock);
+		pthread_mutex_unlock(&openFile->ioLock);
+		hfs_release_open_file(openFile);
 		errno = ENOENT;
 		return -1;
 	}
 
 	/* Grow the blob first so the new size is backed by storage. */
-	if (length > (off_t)in->size) {
-		if (hfsResizeTo(h->file, (uint64_t)length) != 0) {
-			pthread_mutex_unlock(&g_libLock);
+	if (length > (off_t)currentSize) {
+		pthread_mutex_unlock(&g_libLock);
+		if (hfsResizeTo(openFile->file, (uint64_t)length) != 0) {
+			pthread_mutex_unlock(&openFile->ioLock);
+			hfs_release_open_file(openFile);
 			errno = EIO;
+			return -1;
+		}
+		pthread_mutex_lock(&g_libLock);
+		in = hfsMetaFindById(g_fs, openFile->inodeId);
+		if (in != NULL) {
+			currentSize = in->size;
+		} else if (!hfsFdGetOrphanInfo(openFile, &currentSize, NULL, NULL)) {
+			pthread_mutex_unlock(&g_libLock);
+			pthread_mutex_unlock(&openFile->ioLock);
+			hfs_release_open_file(openFile);
+			errno = ENOENT;
 			return -1;
 		}
 	}
 
-	rc = hfsMetaSetSize(g_fs, in, (uint64_t)length);
+	if (in != NULL) {
+		rc = hfsMetaSetSize(g_fs, in, (uint64_t)length);
+		if (rc == 0) {
+			atomic_store_explicit(&openFile->size, (uint64_t)length,
+					      memory_order_relaxed);
+			atomic_store_explicit(&openFile->mtimeNs, in->mtimeNs,
+					      memory_order_relaxed);
+		}
+	} else {
+		atomic_store_explicit(&openFile->size, (uint64_t)length,
+				      memory_order_relaxed);
+		atomic_store_explicit(&openFile->mtimeNs, hfs_now_ns(),
+				      memory_order_relaxed);
+		rc = 0;
+	}
 	pthread_mutex_unlock(&g_libLock);
+	pthread_mutex_unlock(&openFile->ioLock);
+	hfs_release_open_file(openFile);
 	return rc;
 }
 
 /* Stat the file behind 'fd' (filled from the inode table). */
 int hfs_lib_fstat(int fd, struct stat *st) {
 	struct hfs_inode *in;
+	HfsOpenFile *openFile;
+	struct hfs_inode snapshot;
+	uint64_t orphanSize;
+	uint64_t orphanCtimeNs;
+	uint64_t orphanMtimeNs;
 
-	pthread_mutex_lock(&g_libLock);
-	if (g_fs == NULL) {
-		pthread_mutex_unlock(&g_libLock);
-		errno = ENODEV;
-		return -1;
-	}
-	if (fd < 0 || fd >= HFS_FD_TABLE_SIZE || g_fdTable[fd].inodeId == 0) {
-		pthread_mutex_unlock(&g_libLock);
+	openFile = hfsFdAcquire(fd);
+	if (openFile == NULL) {
 		errno = EBADF;
 		return -1;
 	}
-
-	in = hfsMetaFindById(g_fs, g_fdTable[fd].inodeId);
-	pthread_mutex_unlock(&g_libLock);
-	if (in == NULL) {
-		errno = ENOENT;
+	pthread_mutex_lock(&g_libLock);
+	in = g_fs == NULL ? NULL : hfsMetaFindById(g_fs, openFile->inodeId);
+	if (in == NULL && !hfsFdGetOrphanInfo(openFile, &orphanSize,
+					     &orphanCtimeNs, &orphanMtimeNs)) {
+		pthread_mutex_unlock(&g_libLock);
+		hfs_release_open_file(openFile);
+		errno = g_fs == NULL ? ENODEV : ENOENT;
 		return -1;
 	}
-
+	if (in != NULL) {
+		snapshot = *in;
+	} else {
+		memset(&snapshot, 0, sizeof(snapshot));
+		snapshot.id = openFile->inodeId;
+		snapshot.type = HFS_INODE_FILE;
+		snapshot.size = orphanSize;
+		snapshot.ctimeNs = orphanCtimeNs;
+		snapshot.mtimeNs = orphanMtimeNs;
+	}
+	pthread_mutex_unlock(&g_libLock);
+	hfs_release_open_file(openFile);
+	in = &snapshot;
 	memset(st, 0, sizeof(*st));
 	st->st_ino = (ino_t)in->id;
 	st->st_mode = (in->type == HFS_INODE_DIR) ? (S_IFDIR | 0755) : (S_IFREG | 0644);
@@ -988,48 +1089,50 @@ int hfs_lib_access(const char *path, int mode) {
  * the real fcntl to reserve a kernel fd.
  */
 int hfs_lib_fcntl(int fd, int cmd, long arg) {
-	struct hfs_handle *h;
+	HfsOpenFile *openFile = hfsFdAcquire(fd);
 
-	pthread_mutex_lock(&g_libLock);
-	if (fd < 0 || fd >= HFS_FD_TABLE_SIZE || g_fdTable[fd].inodeId == 0) {
-		pthread_mutex_unlock(&g_libLock);
+	if (openFile == NULL) {
 		errno = EBADF;
 		return -1;
 	}
-
-	h = &g_fdTable[fd];
+	pthread_mutex_lock(&openFile->ioLock);
 	switch (cmd) {
 	case F_GETFD:
-		pthread_mutex_unlock(&g_libLock);
+		pthread_mutex_unlock(&openFile->ioLock);
+		hfs_release_open_file(openFile);
 		return 0;
 	case F_SETFD:
-		pthread_mutex_unlock(&g_libLock);
+		pthread_mutex_unlock(&openFile->ioLock);
+		hfs_release_open_file(openFile);
 		return 0;
 	case F_GETFL:
-		pthread_mutex_unlock(&g_libLock);
-		return h->flags;
+		arg = openFile->flags;
+		break;
 	case F_SETFL:
-		h->flags = (int)arg;
-		pthread_mutex_unlock(&g_libLock);
-		return 0;
+		openFile->flags = (int)arg;
+		break;
 	case F_SETLK:
 	case F_SETLKW:
 		/* No cross-process locking in HFS: accept the lock. */
-		pthread_mutex_unlock(&g_libLock);
-		return 0;
+		arg = 0;
+		break;
 	case F_GETLK:
 		/* Report the lock as free. */
 		if (arg != 0) {
 			memset((struct flock *)(uintptr_t)arg, 0,
 			       sizeof(struct flock));
 		}
-		pthread_mutex_unlock(&g_libLock);
-		return 0;
+		arg = 0;
+		break;
 	default:
-		pthread_mutex_unlock(&g_libLock);
+		pthread_mutex_unlock(&openFile->ioLock);
+		hfs_release_open_file(openFile);
 		errno = EINVAL;
 		return -1;
 	}
+	pthread_mutex_unlock(&openFile->ioLock);
+	hfs_release_open_file(openFile);
+	return (cmd == F_GETFL) ? (int)arg : 0;
 }
 
 /*
@@ -1038,27 +1141,31 @@ int hfs_lib_fcntl(int fd, int cmd, long arg) {
  * hfsWriteAt before it returns.
  */
 int hfs_lib_fsync(int fd) {
-	struct hfs_handle *h;
+	HfsOpenFile *openFile = hfsFdAcquire(fd);
 
-	pthread_mutex_lock(&g_libLock);
-	if (g_fs == NULL) {
-		pthread_mutex_unlock(&g_libLock);
-		errno = ENODEV;
-		return -1;
-	}
-	if (fd < 0 || fd >= HFS_FD_TABLE_SIZE || g_fdTable[fd].inodeId == 0) {
-		pthread_mutex_unlock(&g_libLock);
+	if (openFile == NULL) {
 		errno = EBADF;
 		return -1;
 	}
-
-	h = &g_fdTable[fd];
+	pthread_mutex_lock(&openFile->ioLock);
+	pthread_mutex_lock(&g_libLock);
+	if (g_fs == NULL) {
+		pthread_mutex_unlock(&g_libLock);
+		pthread_mutex_unlock(&openFile->ioLock);
+		hfs_release_open_file(openFile);
+		errno = ENODEV;
+		return -1;
+	}
 	if (hfsMetaSaveAll(g_fs) != 0) {
 		pthread_mutex_unlock(&g_libLock);
+		pthread_mutex_unlock(&openFile->ioLock);
+		hfs_release_open_file(openFile);
 		errno = EIO;
 		return -1;
 	}
 	pthread_mutex_unlock(&g_libLock);
+	pthread_mutex_unlock(&openFile->ioLock);
+	hfs_release_open_file(openFile);
 	return 0;
 }
 
@@ -1124,6 +1231,14 @@ int hfs_lib_rmdir(const char *path) {
 
 /* Rename a path under the HFS mount prefix (same or cross-directory). */
 int hfs_lib_rename(const char *oldPath, const char *newPath) {
+	struct hfs_inode *src;
+	struct hfs_inode *dst;
+	uint64_t replacedId = 0;
+	uint64_t replacedBlobId = 0;
+	uint64_t replacedSize = 0;
+	uint64_t replacedCtimeNs = 0;
+	uint64_t replacedMtimeNs = 0;
+	HfsOrphan *orphan = NULL;
 	int rc;
 
 	pthread_mutex_lock(&g_libLock);
@@ -1133,7 +1248,33 @@ int hfs_lib_rename(const char *oldPath, const char *newPath) {
 		return -1;
 	}
 
+	/* Save destination identity before the metadata table may compact. */
+	src = hfsMetaResolvePath(g_fs, oldPath);
+	dst = hfsMetaResolvePath(g_fs, newPath);
+	if (dst != NULL && dst->type == HFS_INODE_FILE &&
+	    (src == NULL || src->id != dst->id)) {
+		replacedId = dst->id;
+		replacedBlobId = dst->blobId;
+		replacedSize = dst->size;
+		replacedCtimeNs = dst->ctimeNs;
+		replacedMtimeNs = dst->mtimeNs;
+	}
 	rc = hfsMetaRename(g_fs, oldPath, newPath);
+	if (rc == 0 && replacedId != 0) {
+		if (hfsFdMarkOrphan(replacedId, replacedBlobId, replacedSize,
+				    replacedCtimeNs, replacedMtimeNs,
+				    &orphan) == 0 && orphan == NULL) {
+			HfsFile file;
+
+			memset(&file, 0, sizeof(file));
+			file.fs = g_fs;
+			file.blobId = replacedBlobId;
+			if (!hfsDeleteBlobById(&file)) {
+				HFS_LOG_ERROR("rename target blob delete failed inode=%"PRIu64,
+					      replacedId);
+			}
+		}
+	}
 	pthread_mutex_unlock(&g_libLock);
 	return rc;
 }
@@ -1232,6 +1373,7 @@ int hfs_lib_closedir(struct hfs_dir *dir) {
  */
 int hfs_lib_stat(const char *path, struct stat *st) {
 	struct hfs_inode *in;
+	struct hfs_inode snapshot;
 
 	pthread_mutex_lock(&g_libLock);
 	if (g_fs == NULL) {
@@ -1241,10 +1383,13 @@ int hfs_lib_stat(const char *path, struct stat *st) {
 	}
 
 	in = hfsMetaResolvePath(g_fs, path);
-	pthread_mutex_unlock(&g_libLock);
 	if (in == NULL) {
+		pthread_mutex_unlock(&g_libLock);
 		return -1;
 	}
+	snapshot = *in;
+	pthread_mutex_unlock(&g_libLock);
+	in = &snapshot;
 
 	memset(st, 0, sizeof(*st));
 	st->st_ino = (ino_t)in->id;

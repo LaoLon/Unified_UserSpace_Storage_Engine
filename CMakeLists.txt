@@ -43,6 +43,7 @@ set(HFS_CORE_SRC
   src/hfs_meta.c
   src/hfs_preload.c
   src/hfs_runtime.c
+  src/hfs_fd.c
 )
 
 # SPDK 模块库列表（与 Makefile 的 ALL_MODULES_LIST + event + event_bdev 一致）
@@ -90,6 +91,7 @@ endfunction()
 add_library(hfs SHARED ${HFS_CORE_SRC})
 set_target_properties(hfs PROPERTIES OUTPUT_NAME "hfs" VERSION 0.1 SOVERSION 0)
 target_compile_definitions(hfs PRIVATE "HFS_DEFAULT_CONFIG=\"${HFS_CONFIG}\"")
+target_link_options(hfs PRIVATE "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/src/hfs_preload.map")
 hfs_link_spdk(hfs)
 
 # spdk-hfs：自测可执行（含 main）

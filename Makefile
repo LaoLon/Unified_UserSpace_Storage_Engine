@@ -3,7 +3,7 @@ SPDK_ROOT_DIR ?= $(PROJECT_ROOT)/spdk
 BUILD_DIR ?= $(PROJECT_ROOT)/build
 APP := $(BUILD_DIR)/bin/spdk-hfs
 LIB := $(BUILD_DIR)/lib/libhfs.so
-CORE_SRC := $(PROJECT_ROOT)/src/hfs.c $(PROJECT_ROOT)/src/hfs_mount.c $(PROJECT_ROOT)/src/hfs_file.c $(PROJECT_ROOT)/src/hfs_log.c $(PROJECT_ROOT)/src/hfs_lib.c $(PROJECT_ROOT)/src/hfs_meta.c $(PROJECT_ROOT)/src/hfs_preload.c $(PROJECT_ROOT)/src/hfs_runtime.c
+CORE_SRC := $(PROJECT_ROOT)/src/hfs.c $(PROJECT_ROOT)/src/hfs_mount.c $(PROJECT_ROOT)/src/hfs_file.c $(PROJECT_ROOT)/src/hfs_log.c $(PROJECT_ROOT)/src/hfs_lib.c $(PROJECT_ROOT)/src/hfs_meta.c $(PROJECT_ROOT)/src/hfs_preload.c $(PROJECT_ROOT)/src/hfs_runtime.c $(PROJECT_ROOT)/src/hfs_fd.c
 APP_SRC := $(CORE_SRC) $(PROJECT_ROOT)/src/hfs_main.c
 LIB_SRC := $(CORE_SRC)
 APP_OBJ := $(patsubst $(PROJECT_ROOT)/src/%.c,$(BUILD_DIR)/obj/%.o,$(APP_SRC))
@@ -32,6 +32,7 @@ $(APP): $(OBJS) | $(BUILD_DIR)/bin
 $(LIB): $(LIB_OBJ) | $(BUILD_DIR)/lib
 	$(CC) -o $@ -shared $(CFLAGS) $(LDFLAGS) \
 		-Wl,-soname,libhfs.so \
+		-Wl,--version-script=$(PROJECT_ROOT)/src/hfs_preload.map \
 		$(LIB_OBJ) $(SPDK_LIB_LINKER_ARGS) $(ENV_LDFLAGS) $(SYS_LIBS)
 
 .PHONY: all app lib spdk spdk-configure check-spdk compile-commands run clean distclean
