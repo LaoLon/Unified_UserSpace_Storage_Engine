@@ -60,7 +60,7 @@ int hfsMetaFormat(Hfs *fs);
 /* Persist the super block (currently a no-op stub). */
 int hfsMetaSave(Hfs *fs);
 
-/* Serialize a versioned header and the in-memory inode table. */
+/* Serialize a stable versioned image and clear any intent record. */
 int hfsMetaSaveAll(Hfs *fs);
 
 /* Read the metadata blob and rebuild the in-memory inode table. */
@@ -131,5 +131,8 @@ int hfsMetaRename(Hfs *fs, const char *oldPath, const char *newPath);
  * Update the size of 'in' and its mtime, then persist the table.
  */
 int hfsMetaSetSize(Hfs *fs, struct hfs_inode *in, uint64_t size);
+
+/* Commit metadata changes for the inode identified by 'inodeId'. */
+int hfsMetaCommitInode(Hfs *fs, uint64_t inodeId);
 
 #endif /* HFS_META_H */

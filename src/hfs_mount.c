@@ -35,6 +35,7 @@ static void hfsSpdkBsUnloadCb(void *arg, int bserrno) {
 	}
 	fs->operationRc = bserrno;
 	fs->blobstore = NULL;
+	fs->bsDev = NULL;
 	hfsRuntimeCompletionComplete(&fs->completion);
 }
 
@@ -53,8 +54,24 @@ static void hfsDoUmount(void *arg) {
 			spdk_bs_free_io_channel(fs->channel);
 			fs->channel = NULL;
 		}
+		if (fs->bdevChannel) {
+			spdk_put_io_channel(fs->bdevChannel);
+			fs->bdevChannel = NULL;
+		}
+		if (fs->bdevDesc) {
+			spdk_bdev_close(fs->bdevDesc);
+			fs->bdevDesc = NULL;
+		}
 		spdk_bs_unload(fs->blobstore, hfsSpdkBsUnloadCb, fs);
 	} else {
+		if (fs->bdevChannel) {
+			spdk_put_io_channel(fs->bdevChannel);
+			fs->bdevChannel = NULL;
+		}
+		if (fs->bdevDesc) {
+			spdk_bdev_close(fs->bdevDesc);
+			fs->bdevDesc = NULL;
+		}
 		hfsRuntimeCompletionComplete(&fs->completion);
 	}
 }
@@ -69,6 +86,15 @@ static void hfsSpdkBsInitCb(void *arg, struct spdk_blob_store *bs, int bserrno) 
 	if (bserrno != 0 || bs == NULL) {
 		HFS_LOG_ERROR("blobstore init failed bserrno=%d", bserrno);
 		fs->operationRc = bserrno != 0 ? bserrno : -EINVAL;
+		if (fs->bdevChannel) {
+			spdk_put_io_channel(fs->bdevChannel);
+			fs->bdevChannel = NULL;
+		}
+		if (fs->bdevDesc) {
+			spdk_bdev_close(fs->bdevDesc);
+			fs->bdevDesc = NULL;
+		}
+		fs->bsDev = NULL;
 		hfsRuntimeCompletionComplete(&fs->completion);
 		return;
 	}
@@ -83,6 +109,15 @@ static void hfsSpdkBsInitCb(void *arg, struct spdk_blob_store *bs, int bserrno) 
 	if (fs->channel == NULL) {
 		HFS_LOG_ERROR("blobstore io channel allocation failed");
 		fs->operationRc = -ENOMEM;
+		if (fs->bdevChannel) {
+			spdk_put_io_channel(fs->bdevChannel);
+			fs->bdevChannel = NULL;
+		}
+		if (fs->bdevDesc) {
+			spdk_bdev_close(fs->bdevDesc);
+			fs->bdevDesc = NULL;
+		}
+		fs->bsDev = NULL;
 		hfsRuntimeCompletionComplete(&fs->completion);
 		return;
 	}
@@ -95,6 +130,38 @@ static void hfsSpdkBsInitCb(void *arg, struct spdk_blob_store *bs, int bserrno) 
 static void hfsSpdkBdevEventCb(enum spdk_bdev_event_type type, struct spdk_bdev *bdev,
 				void *event_ctx) {
 	SPDK_NOTICELOG("hfsSpdkBdevEventCb\n");
+}
+
+/* Open a durable-flush descriptor for the base bdev on the SPDK owner thread. */
+static int hfsOpenBdevFlushHandle(Hfs *fs, struct spdk_bs_dev *bsDev) {
+	struct spdk_bdev *baseBdev;
+	const char *bdevName;
+	int rc;
+
+	if (bsDev == NULL || bsDev->get_base_bdev == NULL) {
+		return -EINVAL;
+	}
+	baseBdev = bsDev->get_base_bdev(bsDev);
+	if (baseBdev == NULL) {
+		return -ENODEV;
+	}
+	bdevName = spdk_bdev_get_name(baseBdev);
+	if (bdevName == NULL) {
+		return -ENODEV;
+	}
+
+	rc = spdk_bdev_open_ext(bdevName, true, hfsSpdkBdevEventCb, NULL,
+				&fs->bdevDesc);
+	if (rc != 0) {
+		return rc;
+	}
+	fs->bdevChannel = spdk_bdev_get_io_channel(fs->bdevDesc);
+	if (fs->bdevChannel == NULL) {
+		spdk_bdev_close(fs->bdevDesc);
+		fs->bdevDesc = NULL;
+		return -ENOMEM;
+	}
+	return 0;
 }
 
 /*
@@ -110,6 +177,16 @@ static void hfsDoMount(void *arg) {
 					     NULL, &bsDev);
 	if (rc != 0) {
 		HFS_LOG_ERROR("create bs dev failed rc=%d", rc);
+		fs->operationRc = rc;
+		hfsRuntimeCompletionComplete(&fs->completion);
+		return;
+	}
+	fs->bsDev = bsDev;
+	rc = hfsOpenBdevFlushHandle(fs, bsDev);
+	if (rc != 0) {
+		HFS_LOG_ERROR("open bdev flush handle failed rc=%d", rc);
+		bsDev->destroy(bsDev);
+		fs->bsDev = NULL;
 		fs->operationRc = rc;
 		hfsRuntimeCompletionComplete(&fs->completion);
 		return;

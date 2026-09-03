@@ -327,6 +327,10 @@ void hfs_lib_fini(void) {
 		pthread_rwlock_unlock(&g_metaLock);
 		return;
 	}
+	/* Persist dirty inode sizes before closing the last open descriptions. */
+	if (g_fs->metaDirty && hfsMetaSaveAll(g_fs) != 0) {
+		HFS_LOG_ERROR("final metadata save failed");
+	}
 	/* Close every placeholder before unmounting the blobstore. */
 	while ((openFile = hfsFdDetachAny(&fd)) != NULL) {
 		hfs_release_open_file(openFile);
@@ -705,6 +709,7 @@ ssize_t hfs_lib_write(int fd, const void *buf, size_t count) {
 		/* Update size/mtime in memory; persisted at fsync/close. */
 		in->size = openFile->offset;
 		in->mtimeNs = hfs_now_ns();
+		g_fs->metaDirty = true;
 		atomic_store_explicit(&openFile->size, in->size,
 				      memory_order_relaxed);
 		atomic_store_explicit(&openFile->mtimeNs, in->mtimeNs,
@@ -859,6 +864,7 @@ ssize_t hfs_lib_pwrite(int fd, const void *buf, size_t count, off_t offset) {
 	if (in != NULL && writeOffset + (uint64_t)n > in->size) {
 		in->size = writeOffset + (uint64_t)n;
 		in->mtimeNs = hfs_now_ns();
+		g_fs->metaDirty = true;
 		atomic_store_explicit(&openFile->size, in->size,
 				      memory_order_relaxed);
 		atomic_store_explicit(&openFile->mtimeNs, in->mtimeNs,
@@ -1044,9 +1050,8 @@ int hfs_lib_unlink(const char *path) {
 		}
 	}
 
-	rc = hfsMetaSaveAll(g_fs);
 	pthread_rwlock_unlock(&g_metaLock);
-	return rc;
+	return 0;
 }
 
 /*
@@ -1270,9 +1275,8 @@ int hfs_lib_fcntl(int fd, int cmd, long arg) {
 }
 
 /*
- * Flush an HFS fd: persist the inode table so size/mtime changes made
- * in memory survive. Blob data itself is already written by
- * hfsWriteAt before it returns.
+ * Flush an HFS fd: persist written data and the dirty inode size/mtime
+ * so both survive an abrupt process exit.
  */
 int hfs_lib_fsync(int fd) {
 	HfsOpenFile *openFile = hfsFdAcquire(fd);
@@ -1282,6 +1286,11 @@ int hfs_lib_fsync(int fd) {
 		return -1;
 	}
 	pthread_mutex_lock(&openFile->ioLock);
+	if (openFile->file != NULL && hfsSync(openFile->file) != 0) {
+		pthread_mutex_unlock(&openFile->ioLock);
+		hfs_release_open_file(openFile);
+		return -1;
+	}
 	pthread_rwlock_wrlock(&g_metaLock);
 	if (g_fs == NULL) {
 		pthread_rwlock_unlock(&g_metaLock);
@@ -1290,7 +1299,14 @@ int hfs_lib_fsync(int fd) {
 		errno = ENODEV;
 		return -1;
 	}
-	if (hfsMetaSaveAll(g_fs) != 0) {
+	if (!g_fs->metaDirty) {
+		pthread_rwlock_unlock(&g_metaLock);
+		pthread_mutex_unlock(&openFile->ioLock);
+		hfs_release_open_file(openFile);
+		return 0;
+	}
+	if (hfsMetaFindById(g_fs, openFile->inodeId) != NULL &&
+	    hfsMetaCommitInode(g_fs, openFile->inodeId) != 0) {
 		pthread_rwlock_unlock(&g_metaLock);
 		pthread_mutex_unlock(&openFile->ioLock);
 		hfs_release_open_file(openFile);

@@ -1,5 +1,7 @@
+#include <errno.h>
 #include <string.h>
 
+#include <spdk/bdev.h>
 #include <spdk/blob.h>
 #include <spdk/env.h>
 #include <spdk/log.h>
@@ -50,6 +52,79 @@ static void hfsDoDeleteBlob(void *arg) {
 	spdk_bs_delete_blob(file->fs->blobstore, file->blobId, hfsSpdkBsDeleteDoneCb, file);
 }
 
+/* Complete the device flush used by file fsync. */
+static void hfsSpdkFsyncFlushCb(struct spdk_io_channel *channel, void *arg,
+					int bserrno) {
+	HfsFile *file = (HfsFile *)arg;
+
+	file->operationRc = bserrno;
+	if (bserrno != 0) {
+		HFS_LOG_ERROR("bdev flush failed bserrno=%d", bserrno);
+	}
+	hfsRuntimeCompletionComplete(&file->completion);
+}
+
+/* Complete a direct bdev flush and release the SPDK I/O object. */
+static void hfsSpdkBdevFlushCb(struct spdk_bdev_io *bdevIo, bool success, void *arg) {
+	HfsFile *file = (HfsFile *)arg;
+
+	file->operationRc = success ? 0 : -EIO;
+	if (!success) {
+		HFS_LOG_ERROR("bdev flush failed");
+	}
+	spdk_bdev_free_io(bdevIo);
+	hfsRuntimeCompletionComplete(&file->completion);
+}
+
+/* Submit a direct bdev flush, with a blobstore-device fallback for custom devices. */
+static void hfsSubmitFsyncFlush(HfsFile *file) {
+	int rc;
+
+	if (file->fs->bdevDesc != NULL && file->fs->bdevChannel != NULL) {
+		rc = spdk_bdev_flush(file->fs->bdevDesc, file->fs->bdevChannel, 0, 0,
+				      hfsSpdkBdevFlushCb, file);
+		if (rc != 0) {
+			file->operationRc = rc;
+			hfsRuntimeCompletionComplete(&file->completion);
+		}
+		return;
+	}
+	if (file->fs->bsDev == NULL || file->fs->bsDev->flush == NULL) {
+		file->operationRc = -EOPNOTSUPP;
+		hfsRuntimeCompletionComplete(&file->completion);
+		return;
+	}
+	memset(&file->flushArgs, 0, sizeof(file->flushArgs));
+	file->flushArgs.cb_fn = hfsSpdkFsyncFlushCb;
+	file->flushArgs.channel = file->fs->channel;
+	file->flushArgs.cb_arg = file;
+	file->fs->bsDev->flush(file->fs->bsDev, file->fs->channel,
+				      &file->flushArgs);
+}
+
+/* Flush blob metadata before flushing the backing device. */
+static void hfsSpdkFsyncBlobCb(void *arg, int bserrno) {
+	HfsFile *file = (HfsFile *)arg;
+
+	if (bserrno != 0) {
+		file->operationRc = bserrno;
+		hfsRuntimeCompletionComplete(&file->completion);
+		return;
+	}
+	hfsSubmitFsyncFlush(file);
+}
+
+/* SPDK-thread task: start the file metadata and device flush chain. */
+static void hfsDoSync(void *arg) {
+	HfsFile *file = (HfsFile *)arg;
+
+	if (file->blob == NULL) {
+		hfsSubmitFsyncFlush(file);
+		return;
+	}
+	spdk_blob_sync_md(file->blob, hfsSpdkFsyncBlobCb, file);
+}
+
 /*
  * Close the file handle only; the blob is kept.
  * Blob deletion is the responsibility of unlink (hfsDeleteBlobById).
@@ -61,6 +136,24 @@ int hfsClose(HfsFile *file) {
 /* Delete the data blob by id (used by unlink). */
 int hfsDeleteBlobById(HfsFile *file) {
 	return waiter(globalThread, hfsDoDeleteBlob, file, &file->completion);
+}
+
+/* Flush one open file and its backing bdev for POSIX fsync semantics. */
+int hfsSync(HfsFile *file) {
+	if (file == NULL || file->fs == NULL) {
+		errno = EINVAL;
+		return -1;
+	}
+	file->operationRc = 0;
+	if (!waiter(globalThread, hfsDoSync, file, &file->completion)) {
+		errno = ETIMEDOUT;
+		return -1;
+	}
+	if (file->operationRc != 0) {
+		errno = -file->operationRc;
+		return -1;
+	}
+	return 0;
 }
 
 /* Completion callback for spdk_blob_io_read. */

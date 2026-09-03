@@ -9,6 +9,7 @@
 #include <spdk/blob.h>
 
 struct hfs_inode;
+struct spdk_bdev_desc;
 
 /* Completion state shared by one asynchronous SPDK request. */
 typedef struct HfsCompletion {
@@ -27,6 +28,9 @@ typedef struct HfsCompletion {
  */
 typedef struct Hfs {
 	struct spdk_blob_store *blobstore;	/* underlying blobstore */
+	struct spdk_bs_dev *bsDev;		/* underlying blobstore device */
+	struct spdk_bdev_desc *bdevDesc;	/* descriptor used for durable flush */
+	struct spdk_io_channel *bdevChannel;	/* bdev channel used for durable flush */
 	uint64_t unitSize;			/* blobstore io unit size (bytes) */
 	uint64_t freeClusterCount;		/* free clusters at mount time */
 	uint64_t numCluster;			/* cluster count of the data blob */
@@ -37,6 +41,9 @@ typedef struct Hfs {
 	struct hfs_inode *inodes;		/* in-memory inode table */
 	uint32_t inodeCount;			/* number of used inodes */
 	uint64_t nextInodeId;			/* next persistent inode id */
+	uint64_t metaGeneration;			/* committed metadata generation */
+	bool metaNeedsMigration;			/* old metadata layout needs upgrade */
+	bool metaDirty;			/* in-memory inode fields need commit */
 
 	/* Scratch state for metadata blob I/O (waiter chain). */
 	struct spdk_blob *metaBlob;		/* opened metadata blob */
@@ -75,6 +82,8 @@ typedef struct HfsFile {
 	uint64_t resizeClusters;		/* target clusters for resize */
 
 	HfsCompletion completion;			/* current file request completion */
+	struct spdk_bs_dev_cb_args flushArgs;	/* fallback blobstore flush arguments */
+	int operationRc;			/* result of the current file operation */
 } HfsFile;
 
 /* Operation table for file ops (reserved for future use). */
@@ -111,5 +120,7 @@ ssize_t hfsWriteAt(HfsFile *file, const uint8_t *buffer, size_t count, uint64_t 
 int hfsClose(HfsFile *file);
 /* Delete the data blob by id (used by unlink). */
 int hfsDeleteBlobById(HfsFile *file);
+/* Flush file metadata and the backing bdev for fsync semantics. */
+int hfsSync(HfsFile *file);
 
 #endif /* HFS_H */

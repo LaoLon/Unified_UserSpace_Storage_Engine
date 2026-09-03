@@ -213,7 +213,7 @@ shard-32～35，当前阶段不宣称已支持。
 改动：
 
 - 元数据格式升级，加入 generation、checksum 和固定大小 intent record。
-- 当前基线没有可保留的持久数据库数据，因此不实现 v1 在线迁移；遇到旧格式应明确失败，由测试环境显式重新格式化。
+- 兼容 shard-29 的 v2 版本头和更早的 `[count][inodes]` 布局；首次修改时升级为 v3，不静默重新格式化。
 - 每次命名空间事务只记录受影响 inode 的 after-image：先持久化 intent，再写脏页，最后清除 intent。
 - mount 时校验 checksum；发现有效 intent 时幂等重放，禁止静默重新格式化。
 - inode 表分页，仅写脏页；普通数据写只更新内存 size，fsync/close 按需提交。
@@ -227,6 +227,18 @@ shard-32～35，当前阶段不宣称已支持。
 - 10000 次无新增修改的 fsync 不产生 inode 全表写回；日志/计数器能证明写入页数。
 
 提交：`shard-30: recoverable metadata transactions`
+
+实现状态（2026-09-04）：核心实现已完成。元数据升级为固定 v3 header + generation/checksum +
+固定大小 intent record；create/unlink/rename/size 事务按 intent → stable image →
+clear intent 顺序提交，mount 时校验并幂等重放。兼容 v2/legacy 元数据并在首次写入时迁移。
+`fsync` 先等待 blob 数据和 metadata sync，再提交独立可写 bdev descriptor 的设备 flush，
+最后提交 inode size/mtime。新增 `scripts/db/metadata_transaction_smoke.sh`，覆盖 create、
+source-last rename 覆盖、size after-image 的三个崩溃边界，并校验恢复后的数据内容；VM 上
+Make 构建、事务恢复、元数据路径并发和持久化 smoke 全部通过。
+
+当前实现为保持事务路径简单，stable image 仍按完整元数据 blob 写入；“仅写脏页”、写放大
+计数和 10000 次 fsync 性能验收移至 shard-31 的 request-local/page 优化，不在本 shard
+提前宣称完成。
 
 ---
 

@@ -1,7 +1,9 @@
 #include <errno.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #include <spdk/blob.h>
 #include <spdk/env.h>
@@ -12,7 +14,94 @@
 
 /* Versioned metadata header used to keep inode IDs stable across compaction. */
 #define HFS_META_MAGIC		0x32465348U
-#define HFS_META_VERSION	2U
+#define HFS_META_VERSION	3U
+#define HFS_META_INTENT_MAGIC	0x544e4948U
+#define HFS_META_INTENT_VERSION	1U
+#define HFS_META_INTENT_ACTIVE	1U
+#define HFS_META_INTENT_MAX_SLOTS	4U
+
+/* Fixed on-disk header for the committed metadata image. */
+typedef struct HfsMetaHeaderDisk {
+	uint32_t magic;
+	uint32_t version;
+	uint64_t generation;
+	uint64_t nextInodeId;
+	uint32_t count;
+	uint32_t checksum;
+} HfsMetaHeaderDisk;
+
+/* One after-image entry in the fixed-size metadata intent record. */
+typedef struct HfsMetaIntentSlotDisk {
+	uint32_t index;
+	uint32_t reserved;
+	struct hfs_inode inode;
+} HfsMetaIntentSlotDisk;
+
+/* Fixed-size intent record for namespace and inode-size transactions. */
+typedef struct HfsMetaIntentDisk {
+	uint32_t magic;
+	uint32_t version;
+	uint32_t state;
+	uint32_t slotCount;
+	uint64_t baseGeneration;
+	uint64_t generation;
+	uint64_t nextInodeId;
+	uint32_t baseCount;
+	uint32_t count;
+	uint32_t checksum;
+	uint32_t reserved;
+	HfsMetaIntentSlotDisk slots[HFS_META_INTENT_MAX_SLOTS];
+} HfsMetaIntentDisk;
+
+#define HFS_META_HEADER_SIZE	(sizeof(HfsMetaHeaderDisk))
+#define HFS_META_INTENT_SIZE	(sizeof(HfsMetaIntentDisk))
+#define HFS_META_INODE_OFFSET	(HFS_META_HEADER_SIZE + HFS_META_INTENT_SIZE)
+
+_Static_assert(sizeof(HfsMetaHeaderDisk) == 32,
+	       "metadata header layout must remain fixed");
+
+/* Continue an FNV-1a checksum over one byte range. */
+static uint32_t hfsMetaChecksumUpdate(uint32_t checksum, const void *data,
+					      size_t len) {
+	const uint8_t *bytes = (const uint8_t *)data;
+	size_t i;
+
+	for (i = 0; i < len; i++) {
+		checksum ^= bytes[i];
+		checksum *= 16777619U;
+	}
+	return checksum;
+}
+
+/* Compute the checksum of a metadata image with the checksum field cleared. */
+static uint32_t hfsMetaImageChecksum(const HfsMetaHeaderDisk *header,
+					     const struct hfs_inode *inodes,
+					     uint32_t count) {
+	HfsMetaHeaderDisk copy = *header;
+	uint32_t checksum = 2166136261U;
+
+	copy.checksum = 0;
+	checksum = hfsMetaChecksumUpdate(checksum, &copy, sizeof(copy));
+	return hfsMetaChecksumUpdate(checksum, inodes,
+				     (size_t)count * sizeof(*inodes));
+}
+
+/* Compute the checksum of a fixed-size intent record. */
+static uint32_t hfsMetaIntentChecksum(const HfsMetaIntentDisk *intent) {
+	HfsMetaIntentDisk copy = *intent;
+
+	copy.checksum = 0;
+	return hfsMetaChecksumUpdate(2166136261U, &copy, sizeof(copy));
+}
+
+/* Stop at a requested persistence boundary to simulate an abrupt crash. */
+static void hfsMetaCrashPoint(int point) {
+	const char *step = getenv("HFS_META_CRASH_STEP");
+
+	if (step != NULL && atoi(step) == point) {
+		_exit(200 + point);
+	}
+}
 
 /* Return true only when the caller explicitly permits metadata formatting. */
 static bool hfs_format_requested(void) {
@@ -163,84 +252,272 @@ out:
 	return rc;
 }
 
-/*
- * Serialize the versioned metadata header and inode table into the blob.
- * Layout: [magic][version][nextInodeId][count][inodes].
- */
-int hfsMetaSaveAll(Hfs *fs) {
-	const size_t headerSize = sizeof(uint32_t) * 2 + sizeof(uint64_t);
-	const uint32_t magic = HFS_META_MAGIC;
-	const uint32_t version = HFS_META_VERSION;
-	uint32_t count = fs->inodeCount;
-	uint64_t nextInodeId = fs->nextInodeId;
-	size_t len = headerSize + (size_t)count * sizeof(struct hfs_inode);
+/* Build a stable metadata image for one generation. */
+static int hfsMetaBuildStableImage(Hfs *fs, uint64_t generation,
+					   uint8_t **outBuf, size_t *outLen) {
+	HfsMetaHeaderDisk header;
+	size_t inodeBytes;
+	size_t len;
 	uint8_t *buf;
-	int rc;
 
-	if (nextInodeId == 0) {
+	if (fs->nextInodeId == 0 || generation == 0 ||
+	    fs->inodeCount > HFS_MAX_INODES) {
 		errno = EIO;
 		return -1;
 	}
-	buf = malloc(len);
+	inodeBytes = (size_t)fs->inodeCount * sizeof(struct hfs_inode);
+	if (inodeBytes > SIZE_MAX - HFS_META_INODE_OFFSET) {
+		errno = EOVERFLOW;
+		return -1;
+	}
+	len = HFS_META_INODE_OFFSET + inodeBytes;
+	buf = calloc(1, len);
 	if (buf == NULL) {
 		return -1;
 	}
-	memcpy(buf, &magic, sizeof(magic));
-	memcpy(buf + sizeof(magic), &version, sizeof(version));
-	memcpy(buf + sizeof(magic) + sizeof(version), &nextInodeId,
-	       sizeof(nextInodeId));
-	memcpy(buf + headerSize - sizeof(count), &count, sizeof(count));
-	memcpy(buf + headerSize, fs->inodes,
-	       (size_t)count * sizeof(struct hfs_inode));
+	memset(&header, 0, sizeof(header));
+	header.magic = HFS_META_MAGIC;
+	header.version = HFS_META_VERSION;
+	header.generation = generation;
+	header.nextInodeId = fs->nextInodeId;
+	header.count = fs->inodeCount;
+	header.checksum = hfsMetaImageChecksum(&header, fs->inodes,
+						fs->inodeCount);
+	memcpy(buf, &header, sizeof(header));
+	memcpy(buf + HFS_META_INODE_OFFSET, fs->inodes, inodeBytes);
+	*outBuf = buf;
+	*outLen = len;
+	return 0;
+}
 
-	rc = hfsMetaBlobWrite(fs, buf, len);
-	free(buf);
+/* Build the fixed-size intent after-image for a metadata transaction. */
+static void hfsMetaBuildIntent(Hfs *fs, uint64_t baseGeneration,
+				       uint64_t generation, uint32_t baseCount,
+				       const uint32_t *indices, uint32_t indexCount,
+				       HfsMetaIntentDisk *intent) {
+	uint32_t i;
+
+	memset(intent, 0, sizeof(*intent));
+	intent->magic = HFS_META_INTENT_MAGIC;
+	intent->version = HFS_META_INTENT_VERSION;
+	intent->state = HFS_META_INTENT_ACTIVE;
+	intent->baseGeneration = baseGeneration;
+	intent->generation = generation;
+	intent->nextInodeId = fs->nextInodeId;
+	intent->baseCount = baseCount;
+	intent->count = fs->inodeCount;
+	for (i = 0; i < indexCount && intent->slotCount < HFS_META_INTENT_MAX_SLOTS;
+	     i++) {
+		uint32_t index = indices[i];
+
+		if (index >= fs->inodeCount) {
+			continue;
+		}
+		intent->slots[intent->slotCount].index = index;
+		intent->slots[intent->slotCount].inode = fs->inodes[index];
+		intent->slotCount++;
+	}
+	intent->checksum = hfsMetaIntentChecksum(intent);
+}
+
+/* Commit a metadata image with intent-before-data ordering. */
+static int hfsMetaCommit(Hfs *fs, const uint32_t *indices,
+				 uint32_t indexCount) {
+	HfsMetaHeaderDisk oldHeader;
+	HfsMetaIntentDisk intent;
+	uint8_t *oldBuf = NULL;
+	uint8_t *pendingBuf = NULL;
+	uint8_t *committedBuf = NULL;
+	uint8_t *stableBuf = NULL;
+	size_t oldLen;
+	size_t newLen;
+	size_t pendingLen;
+	uint64_t generation;
+	int rc = -1;
+
+	if (indexCount > HFS_META_INTENT_MAX_SLOTS) {
+		errno = E2BIG;
+		return -1;
+	}
+	if (fs->metaNeedsMigration && hfsMetaSaveAll(fs) != 0) {
+		return -1;
+	}
+	if (fs->metaGeneration == UINT64_MAX) {
+		errno = EOVERFLOW;
+		return -1;
+	}
+	generation = fs->metaGeneration == 0 ? 1 : fs->metaGeneration + 1;
+
+	if (hfsMetaBlobRead(fs, (void **)&oldBuf, &oldLen) != 0 ||
+	    oldLen < HFS_META_INODE_OFFSET) {
+		errno = EIO;
+		goto out;
+	}
+	memcpy(&oldHeader, oldBuf, sizeof(oldHeader));
+	if (oldHeader.magic != HFS_META_MAGIC ||
+	    oldHeader.version != HFS_META_VERSION) {
+		errno = EINVAL;
+		goto out;
+	}
+	if (hfsMetaBuildStableImage(fs, generation, &stableBuf, &newLen) != 0) {
+		goto out;
+	}
+	pendingLen = oldLen > newLen ? oldLen : newLen;
+	pendingBuf = calloc(1, pendingLen);
+	if (pendingBuf == NULL) {
+		goto out;
+	}
+	memcpy(pendingBuf, oldBuf, oldLen);
+	hfsMetaBuildIntent(fs, oldHeader.generation, generation,
+				   oldHeader.count, indices, indexCount, &intent);
+	memcpy(pendingBuf + HFS_META_HEADER_SIZE, &intent, sizeof(intent));
+	if (hfsMetaBlobWrite(fs, pendingBuf, pendingLen) != 0) {
+		goto out;
+	}
+	hfsMetaCrashPoint(1);
+
+	memcpy(stableBuf + HFS_META_HEADER_SIZE, &intent, sizeof(intent));
+	committedBuf = stableBuf;
+	if (hfsMetaBlobWrite(fs, committedBuf, newLen) != 0) {
+		goto out;
+	}
+	hfsMetaCrashPoint(2);
+
+	memset(stableBuf + HFS_META_HEADER_SIZE, 0, sizeof(intent));
+	hfsMetaCrashPoint(3);
+	if (hfsMetaBlobWrite(fs, stableBuf, newLen) != 0) {
+		goto out;
+	}
+	fs->metaGeneration = generation;
+	fs->metaNeedsMigration = false;
+	fs->metaDirty = false;
+	rc = 0;
+out:
+	if (oldBuf != NULL) {
+		spdk_free(oldBuf);
+	}
+	free(pendingBuf);
+	free(stableBuf);
 	return rc;
 }
 
-/* Rebuild the in-memory inode table from the metadata blob. */
+/* Serialize a stable versioned image and clear any intent record. */
+int hfsMetaSaveAll(Hfs *fs) {
+	uint8_t *buf;
+	size_t len;
+	uint64_t generation = fs->metaGeneration == 0 ? 1 : fs->metaGeneration;
+	int rc;
+
+	if (hfsMetaBuildStableImage(fs, generation, &buf, &len) != 0) {
+		return -1;
+	}
+	rc = hfsMetaBlobWrite(fs, buf, len);
+	free(buf);
+	if (rc == 0) {
+		fs->metaGeneration = generation;
+		fs->metaNeedsMigration = false;
+		fs->metaDirty = false;
+	}
+	return rc;
+}
+
+/* Validate one fixed-size intent record before applying its after-images. */
+static bool hfsMetaIntentValid(const HfsMetaIntentDisk *intent) {
+	uint32_t i;
+
+	if (intent->magic != HFS_META_INTENT_MAGIC ||
+	    intent->version != HFS_META_INTENT_VERSION ||
+	    intent->state != HFS_META_INTENT_ACTIVE ||
+	    intent->slotCount > HFS_META_INTENT_MAX_SLOTS ||
+	    intent->baseCount > HFS_MAX_INODES || intent->count > HFS_MAX_INODES ||
+	    intent->nextInodeId == 0 ||
+	    intent->generation <= intent->baseGeneration ||
+	    intent->checksum != hfsMetaIntentChecksum(intent)) {
+		return false;
+	}
+	for (i = 0; i < intent->slotCount; i++) {
+		if (intent->slots[i].index >= intent->count) {
+			return false;
+		}
+	}
+	return true;
+}
+
+/* Rebuild the in-memory inode table and replay a valid intent if present. */
 int hfsMetaLoadAll(Hfs *fs) {
 	const size_t legacyHeaderSize = sizeof(uint32_t);
-	const size_t headerSize = sizeof(uint32_t) * 2 + sizeof(uint64_t);
+	const size_t oldHeaderSize = sizeof(uint32_t) * 2 + sizeof(uint64_t);
+	HfsMetaHeaderDisk header;
+	HfsMetaIntentDisk intent;
 	uint8_t *buf;
 	size_t len;
 	size_t inodeOffset;
-	uint32_t magic;
-	uint32_t version;
+	uint32_t first;
+	uint32_t version = 0;
 	uint32_t count;
 	uint64_t nextInodeId = 0;
 	uint64_t maxInodeId = 0;
 	uint32_t i;
+	bool currentFormat = false;
 
 	if (hfsMetaBlobRead(fs, (void **)&buf, &len) != 0) {
 		return -1;
 	}
 	if (len < legacyHeaderSize) {
 		spdk_free(buf);
+		errno = EIO;
 		return -1;
 	}
-	memcpy(&count, buf, sizeof(count));
+	memcpy(&first, buf, sizeof(first));
 	inodeOffset = legacyHeaderSize;
-	if (count == HFS_META_MAGIC) {
-		if (len < headerSize) {
+	if (first == HFS_META_MAGIC) {
+		if (len < sizeof(uint32_t) * 2) {
 			spdk_free(buf);
+			errno = EIO;
 			return -1;
 		}
-		memcpy(&magic, buf, sizeof(magic));
-		memcpy(&version, buf + sizeof(magic), sizeof(version));
-		memcpy(&nextInodeId, buf + sizeof(magic) + sizeof(version),
-		       sizeof(nextInodeId));
-		memcpy(&count, buf + headerSize - sizeof(count), sizeof(count));
-		if (magic != HFS_META_MAGIC || version != HFS_META_VERSION) {
+		memcpy(&version, buf + sizeof(first), sizeof(version));
+		if (version == HFS_META_VERSION) {
+			if (len < HFS_META_INODE_OFFSET) {
+				spdk_free(buf);
+				errno = EIO;
+				return -1;
+			}
+			memcpy(&header, buf, sizeof(header));
+			count = header.count;
+			inodeOffset = HFS_META_INODE_OFFSET;
+			currentFormat = true;
+		} else if (version == 2U) {
+			if (len < oldHeaderSize) {
+				spdk_free(buf);
+				errno = EIO;
+				return -1;
+			}
+			memcpy(&nextInodeId, buf + sizeof(first) + sizeof(version),
+			       sizeof(nextInodeId));
+			memcpy(&count, buf + oldHeaderSize - sizeof(count),
+			       sizeof(count));
+			inodeOffset = oldHeaderSize;
+		} else {
 			spdk_free(buf);
 			errno = EINVAL;
 			return -1;
 		}
-		inodeOffset = headerSize;
+	} else {
+		count = first;
 	}
 	if (count > HFS_MAX_INODES ||
 	    len < inodeOffset + (size_t)count * sizeof(struct hfs_inode)) {
 		spdk_free(buf);
+		errno = EIO;
+		return -1;
+	}
+	if (currentFormat &&
+	    (header.generation == 0 ||
+	     header.checksum != hfsMetaImageChecksum(&header,
+						(const struct hfs_inode *)(buf + inodeOffset), count))) {
+		spdk_free(buf);
+		errno = EIO;
 		return -1;
 	}
 
@@ -252,13 +529,46 @@ int hfsMetaLoadAll(Hfs *fs) {
 			maxInodeId = fs->inodes[i].id;
 		}
 	}
-	if (inodeOffset == headerSize) {
-		fs->nextInodeId = nextInodeId;
+	if (currentFormat) {
+		nextInodeId = header.nextInodeId;
+		fs->metaGeneration = header.generation;
+		fs->metaNeedsMigration = false;
+	} else if (nextInodeId == 0) {
+		nextInodeId = maxInodeId == UINT64_MAX ? 0 : maxInodeId + 1;
+		fs->metaGeneration = 1;
+		fs->metaNeedsMigration = true;
 	} else {
-		fs->nextInodeId = maxInodeId == UINT64_MAX ? 0 : maxInodeId + 1;
+		fs->metaGeneration = 1;
+		fs->metaNeedsMigration = true;
 	}
-	if (fs->nextInodeId == 0 || fs->nextInodeId <= maxInodeId) {
-		fs->nextInodeId = maxInodeId == UINT64_MAX ? 0 : maxInodeId + 1;
+	if (nextInodeId == 0 || nextInodeId <= maxInodeId) {
+		nextInodeId = maxInodeId == UINT64_MAX ? 0 : maxInodeId + 1;
+		fs->metaNeedsMigration = true;
+	}
+	fs->nextInodeId = nextInodeId;
+	fs->metaDirty = false;
+
+	if (currentFormat && len >= HFS_META_INODE_OFFSET + sizeof(intent)) {
+		bool matchesPendingImage;
+		bool matchesCommittedImage;
+
+		memcpy(&intent, buf + HFS_META_HEADER_SIZE, sizeof(intent));
+		matchesPendingImage = intent.baseGeneration == header.generation &&
+				      intent.baseCount == header.count;
+		matchesCommittedImage = intent.generation == header.generation &&
+					intent.count == header.count;
+		if (hfsMetaIntentValid(&intent) &&
+		    (matchesPendingImage || matchesCommittedImage)) {
+			for (i = 0; i < intent.slotCount; i++) {
+				fs->inodes[intent.slots[i].index] =
+					intent.slots[i].inode;
+			}
+			fs->inodeCount = intent.count;
+			fs->nextInodeId = intent.nextInodeId;
+			fs->metaGeneration = intent.generation;
+			spdk_free(buf);
+			return hfsMetaSaveAll(fs);
+		}
 	}
 	spdk_free(buf);
 	if (fs->nextInodeId == 0) {
@@ -436,6 +746,7 @@ int hfsMetaResolveParent(Hfs *fs, const char *path,
 int hfsMetaMkdir(Hfs *fs, struct hfs_inode *parent, const char *name) {
 	struct hfs_inode *dir;
 	struct timespec ts;
+	uint32_t index;
 
 	if (parent->type != HFS_INODE_DIR) {
 		errno = ENOTDIR;
@@ -463,8 +774,9 @@ int hfsMetaMkdir(Hfs *fs, struct hfs_inode *parent, const char *name) {
 	dir->ctimeNs = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 	dir->mtimeNs = dir->ctimeNs;
 	snprintf(dir->name, sizeof(dir->name), "%s", name);
+	index = fs->inodeCount - 1;
 
-	return hfsMetaSaveAll(fs);
+	return hfsMetaCommit(fs, &index, 1);
 }
 
 /*
@@ -473,6 +785,7 @@ int hfsMetaMkdir(Hfs *fs, struct hfs_inode *parent, const char *name) {
  */
 int hfsMetaRmdir(Hfs *fs, const char *path) {
 	struct hfs_inode *dir;
+	uint32_t removedIndex = 0;
 	uint32_t i;
 
 	dir = hfsMetaResolvePath(fs, path);
@@ -495,13 +808,16 @@ int hfsMetaRmdir(Hfs *fs, const char *path) {
 	/* Remove by shifting the tail of the table over the entry. */
 	for (i = 0; i < fs->inodeCount; i++) {
 		if (fs->inodes[i].id == dir->id) {
+			removedIndex = i;
 			fs->inodes[i] = fs->inodes[fs->inodeCount - 1];
 			fs->inodeCount--;
 			break;
 		}
 	}
 
-	return hfsMetaSaveAll(fs);
+	return removedIndex < fs->inodeCount
+		? hfsMetaCommit(fs, &removedIndex, 1)
+		: hfsMetaCommit(fs, NULL, 0);
 }
 
 /* Async context for hfsMetaCreateFile (blob creation waiter). */
@@ -536,6 +852,7 @@ int hfsMetaCreateFile(Hfs *fs, struct hfs_inode *parent, const char *name) {
 	struct hfs_meta_create_ctx ctx;
 	struct hfs_inode *in;
 	struct timespec ts;
+	uint32_t index;
 
 	if (parent->type != HFS_INODE_DIR) {
 		errno = ENOTDIR;
@@ -577,8 +894,9 @@ int hfsMetaCreateFile(Hfs *fs, struct hfs_inode *parent, const char *name) {
 	in->ctimeNs = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 	in->mtimeNs = in->ctimeNs;
 	snprintf(in->name, sizeof(in->name), "%s", name);
+	index = fs->inodeCount - 1;
 
-	return hfsMetaSaveAll(fs);
+	return hfsMetaCommit(fs, &index, 1);
 }
 
 /*
@@ -588,6 +906,7 @@ int hfsMetaCreateFile(Hfs *fs, struct hfs_inode *parent, const char *name) {
 int hfsMetaRemoveFile(Hfs *fs, struct hfs_inode *parent, const char *name,
 		      uint64_t *blobId) {
 	struct hfs_inode *in;
+	uint32_t removedIndex = 0;
 	uint32_t i;
 
 	in = hfsMetaFindByName(fs, parent->id, name);
@@ -605,13 +924,16 @@ int hfsMetaRemoveFile(Hfs *fs, struct hfs_inode *parent, const char *name,
 	/* Remove by shifting the tail of the table over the entry. */
 	for (i = 0; i < fs->inodeCount; i++) {
 		if (fs->inodes[i].id == in->id) {
+			removedIndex = i;
 			fs->inodes[i] = fs->inodes[fs->inodeCount - 1];
 			fs->inodeCount--;
 			break;
 		}
 	}
 
-	return 0;
+	return removedIndex < fs->inodeCount
+		? hfsMetaCommit(fs, &removedIndex, 1)
+		: hfsMetaCommit(fs, NULL, 0);
 }
 
 /*
@@ -623,6 +945,9 @@ int hfsMetaRename(Hfs *fs, const char *oldPath, const char *newPath) {
 	struct hfs_inode *src;
 	struct hfs_inode *dst;
 	struct hfs_inode *newParent;
+	uint32_t changedIndices[2];
+	uint32_t changedCount = 0;
+	uint32_t dstIndex = 0;
 	uint64_t srcId;
 	uint64_t newParentId;
 	const char *newLeaf;
@@ -652,6 +977,7 @@ int hfsMetaRename(Hfs *fs, const char *oldPath, const char *newPath) {
 
 	dst = hfsMetaFindByName(fs, newParent->id, newLeaf);
 	if (dst != NULL) {
+		dstIndex = (uint32_t)(dst - fs->inodes);
 		/* Type mismatches between file and directory. */
 		if (src->type == HFS_INODE_DIR && dst->type != HFS_INODE_DIR) {
 			errno = ENOTDIR;
@@ -692,19 +1018,39 @@ int hfsMetaRename(Hfs *fs, const char *oldPath, const char *newPath) {
 	/* Move the source inode into the destination slot. */
 	src->parentId = newParent->id;
 	snprintf(src->name, sizeof(src->name), "%s", newLeaf);
+	/* Record final positions after compaction, never pre-delete offsets. */
+	changedIndices[changedCount++] = (uint32_t)(src - fs->inodes);
+	if (dst != NULL && dstIndex < fs->inodeCount &&
+	    dstIndex != changedIndices[0]) {
+		changedIndices[changedCount++] = dstIndex;
+	}
 
-	return hfsMetaSaveAll(fs);
+	return hfsMetaCommit(fs, changedIndices, changedCount);
 }
 
 /* Update an inode's size and mtime, then persist the table. */
 int hfsMetaSetSize(Hfs *fs, struct hfs_inode *in, uint64_t size) {
 	struct timespec ts;
+	uint32_t index = (uint32_t)(in - fs->inodes);
 
 	clock_gettime(CLOCK_REALTIME, &ts);
 	in->size = size;
 	in->mtimeNs = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 
-	return hfsMetaSaveAll(fs);
+	return hfsMetaCommit(fs, &index, 1);
+}
+
+/* Commit metadata changes for an inode selected by its stable id. */
+int hfsMetaCommitInode(Hfs *fs, uint64_t inodeId) {
+	struct hfs_inode *in = hfsMetaFindById(fs, inodeId);
+	uint32_t index;
+
+	if (in == NULL) {
+		errno = ENOENT;
+		return -1;
+	}
+	index = (uint32_t)(in - fs->inodes);
+	return hfsMetaCommit(fs, &index, 1);
 }
 
 /* Completion callback for spdk_bs_get_super: records the super blob id. */
