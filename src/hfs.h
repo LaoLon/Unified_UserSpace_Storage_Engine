@@ -3,12 +3,14 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdint.h>
 
 #include <spdk/blob.h>
 
 struct hfs_inode;
+struct hfs_io_pool;
 struct spdk_bdev_desc;
 
 /* Completion state shared by one asynchronous SPDK request. */
@@ -45,6 +47,11 @@ typedef struct Hfs {
 	bool metaNeedsMigration;			/* old metadata layout needs upgrade */
 	bool metaDirty;			/* in-memory inode fields need commit */
 
+	/* Request-local data I/O synchronization and DMA buffer pool. */
+	pthread_rwlock_t ioLock;		/* shared aligned I/O/RMW lock */
+	pthread_mutex_t resizeLock;		/* serializes blob growth decisions */
+	struct hfs_io_pool *ioPool;		/* bounded DMA buffer pool */
+
 	/* Scratch state for metadata blob I/O (waiter chain). */
 	struct spdk_blob *metaBlob;		/* opened metadata blob */
 	void *metaBuf;				/* DMA buffer for read/write */
@@ -65,7 +72,7 @@ typedef struct HfsOperation {
 /*
  * HfsFile: an open file handle.
  * 'offset' is the current read/write position for the sequential
- * hfsRead/hfsWrite calls; ioOffset/ioUnits carry per-I/O parameters.
+ * hfsRead/hfsWrite calls. Positioned I/O uses request-local state.
  */
 typedef struct HfsFile {
 	uint8_t filename[FILENAME_LENGTH];	/* file name */
@@ -73,15 +80,10 @@ typedef struct HfsFile {
 	struct spdk_blob *blob;			/* opened data blob */
 	Hfs *fs;				/* owning filesystem */
 
-	uint8_t *writeBuffer;			/* write staging buffer */
-	uint8_t *readBuffer;			/* read staging buffer */
 
 	uint64_t offset;			/* sequential I/O position */
-	uint64_t ioOffset;			/* starting io unit for the current op */
-	uint64_t ioUnits;			/* io unit count for the current op */
-	uint64_t resizeClusters;		/* target clusters for resize */
 
-	HfsCompletion completion;			/* current file request completion */
+	HfsCompletion completion;			/* open/close/flush request completion */
 	struct spdk_bs_dev_cb_args flushArgs;	/* fallback blobstore flush arguments */
 	int operationRc;			/* result of the current file operation */
 } HfsFile;

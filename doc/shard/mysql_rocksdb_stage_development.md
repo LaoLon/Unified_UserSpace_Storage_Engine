@@ -263,6 +263,26 @@ Make 构建、事务恢复、元数据路径并发和持久化 smoke 全部通�
 
 提交：`shard-31: request-local fast IO path`
 
+实现状态（2026-09-04）：核心实现已完成并在 VM 上验证。新增 `hfs_io.[ch]`，使用固定大小
+DMA pool 和请求级上下文；对齐 I/O 直接提交，非对齐写只对首尾 unit 做 RMW；pread/pwrite
+和 readv/writev 不再使用 `HfsFile` 共享 scratch buffer，positioned I/O 可并发。`KEEP_SIZE`
+和 `PUNCH_HOLE|KEEP_SIZE` 已实现，punch 的对齐范围在 unmap 后补 zeroes/固定池写零，避免
+后端 unmap 成功但读回旧数据。fio 精确挂载点、根目录 `mkdir` 语义及 fork 子进程边界已收口：
+runtime 记录 owner PID，fork child 不提交 SPDK message、不识别继承的 HFS fd，基准显式使用
+`thread=1`。
+
+VM 回归通过：Make 强制重编译、CMake Release、请求级 fast I/O（含向量 I/O、稀疏间隙、
+KEEP_SIZE、PUNCH 和 8 路 positioned write）、元数据事务恢复、元数据路径并发、fd 生命周期、
+持久化 bdev。fio 使用 malloc bdev、O_DIRECT、iodepth=32、10s，结果如下（延迟单位 ns）：
+
+| 场景 | read IOPS | write IOPS | read BW | write BW | read p50/p99 | write p50/p99 |
+|---|---:|---:|---:|---:|---:|---:|
+| randrw 4K | 6839.52 | 6806.22 | 28.01 MB/s | 27.88 MB/s | 58112 / 120320 | 58112 / 119296 |
+| seq 128K | 5772.32 | 5750.12 | 756.59 MB/s | 753.68 MB/s | 73216 / 142336 | 73216 / 142336 |
+
+阶段口径仍为：fio 使用单进程 `thread=1`，不宣称通用 fork 后共享 HFS 状态；MySQL/RocksDB
+真实数据库验收仍留在 shard-32～35，当前只能表述为“兼容性开发中”。
+
 ---
 
 ### shard-32：数据库 POSIX 契约收口

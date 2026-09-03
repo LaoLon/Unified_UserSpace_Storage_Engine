@@ -1,4 +1,5 @@
 #include <errno.h>
+#include <inttypes.h>
 #include <string.h>
 
 #include <spdk/bdev.h>
@@ -7,6 +8,7 @@
 #include <spdk/log.h>
 
 #include "hfs_internal.h"
+#include "hfs_io.h"
 #include "hfs_log.h"
 
 /* Completion callback for spdk_bs_delete_blob. */
@@ -156,44 +158,6 @@ int hfsSync(HfsFile *file) {
 	return 0;
 }
 
-/* Completion callback for spdk_blob_io_read. */
-static void hfsSpdkBlobReadCb(void *arg, int bserrno) {
-	HfsFile *file = (HfsFile *)arg;
-
-	if (bserrno != 0) {
-		HFS_LOG_ERROR("blob read failed unit=%"PRIu64" n=%"PRIu64
-			      " bserrno=%d", file->ioOffset, file->ioUnits, bserrno);
-	}
-	hfsRuntimeCompletionComplete(&file->completion);
-}
-
-/* SPDK-thread task: read ioUnits starting at ioOffset into readBuffer. */
-static void hfsDoRead(void *arg) {
-	HfsFile *file = (HfsFile *)arg;
-
-	spdk_blob_io_read(file->blob, file->fs->channel, file->readBuffer,
-		file->ioOffset, file->ioUnits, hfsSpdkBlobReadCb, file);
-}
-
-/* Completion callback for spdk_blob_io_write. */
-static void hfsSpdkBlobWriteCb(void *arg, int bserrno) {
-	HfsFile *file = (HfsFile *)arg;
-
-	if (bserrno != 0) {
-		HFS_LOG_ERROR("blob write failed unit=%"PRIu64" n=%"PRIu64
-			      " bserrno=%d", file->ioOffset, file->ioUnits, bserrno);
-	}
-	hfsRuntimeCompletionComplete(&file->completion);
-}
-
-/* SPDK-thread task: write ioUnits at ioOffset from writeBuffer. */
-static void hfsDoWrite(void *arg) {
-	HfsFile *file = (HfsFile *)arg;
-
-	spdk_blob_io_write(file->blob, file->fs->channel, file->writeBuffer,
-		file->ioOffset, file->ioUnits, hfsSpdkBlobWriteCb, file);
-}
-
 /* Completion callback for spdk_blob_sync_md (open path). */
 static void hfsSpdkBlobSyncCb(void *arg, int bserrno) {
 	HfsFile *file = (HfsFile *)arg;
@@ -293,136 +257,90 @@ int hfsOpenById(HfsFile *file) {
 	return waiter(globalThread, hfsDoOpenById, file, &file->completion);
 }
 
-/* Completion callback for spdk_blob_resize (write path). */
+/* Per-request state for a blob resize operation. */
+typedef struct HfsResizeRequest {
+	HfsFile *file;
+	uint64_t clusters;
+	int operationRc;
+	HfsCompletion completion;
+} HfsResizeRequest;
+
+/* Complete one request-local blob resize. */
 static void hfsSpdkBlobResizeDoneCb(void *arg, int bserrno) {
-	HfsFile *file = (HfsFile *)arg;
+	HfsResizeRequest *request = arg;
 
-	if (bserrno != 0) {
-		HFS_LOG_ERROR("blob resize (write path) failed bserrno=%d", bserrno);
+	request->operationRc = bserrno;
+	if (bserrno == 0) {
+		request->file->fs->numCluster =
+			spdk_blob_get_num_clusters(request->file->blob);
 	}
-	hfsRuntimeCompletionComplete(&file->completion);
+	hfsRuntimeCompletionComplete(&request->completion);
 }
 
-/* SPDK-thread task: grow the blob to cover 'bytes'. */
+/* SPDK-thread task: grow the blob to the request's cluster count. */
 static void hfsDoResize(void *arg) {
-	HfsFile *file = (HfsFile *)arg;
+	HfsResizeRequest *request = arg;
 
-	spdk_blob_resize(file->blob, file->resizeClusters, hfsSpdkBlobResizeDoneCb, file);
+	spdk_blob_resize(request->file->blob, request->clusters,
+			 hfsSpdkBlobResizeDoneCb, request);
 }
 
-/* Grow the blob if needed so that offset+bytes fits; returns success. */
-static bool hfsEnsureSize(HfsFile *file, uint64_t bytes) {
-	uint64_t clusterSize = spdk_bs_get_cluster_size(file->fs->blobstore);
-	uint64_t needClusters = (bytes + clusterSize - 1) / clusterSize;
-
-	if (spdk_blob_get_num_clusters(file->blob) >= needClusters) {
-		return true;
-	}
-
-	file->resizeClusters = needClusters;
-	return waiter(globalThread, hfsDoResize, file, &file->completion);
+/* Convert an SPDK result into a public errno and return failure. */
+static int hfsResizeError(int rc) {
+	errno = rc < 0 ? -rc : (rc == 0 ? EIO : rc);
+	return -1;
 }
 
 /* Resize the blob so it covers at least 'bytes' (grow only). */
 int hfsResizeTo(HfsFile *file, uint64_t bytes) {
-	uint64_t clusterSize = spdk_bs_get_cluster_size(file->fs->blobstore);
-	uint64_t needClusters = (bytes + clusterSize - 1) / clusterSize;
+	uint64_t clusterSize;
+	uint64_t needClusters;
+	HfsResizeRequest request;
+	int rc;
 
+	if (file == NULL || file->fs == NULL || file->blob == NULL) {
+		errno = EINVAL;
+		return -1;
+	}
+	clusterSize = spdk_bs_get_cluster_size(file->fs->blobstore);
+	if (clusterSize == 0) {
+		errno = EINVAL;
+		return -1;
+	}
+	needClusters = bytes == 0 ? 0 : (bytes - 1) / clusterSize + 1;
+
+	pthread_mutex_lock(&file->fs->resizeLock);
 	if (spdk_blob_get_num_clusters(file->blob) >= needClusters) {
+		pthread_mutex_unlock(&file->fs->resizeLock);
 		return 0;
 	}
 
-	file->resizeClusters = needClusters;
-	if (!waiter(globalThread, hfsDoResize, file, &file->completion)) {
+	memset(&request, 0, sizeof(request));
+	request.file = file;
+	request.clusters = needClusters;
+	request.operationRc = -EIO;
+	if (!waiter(globalThread, hfsDoResize, &request, &request.completion)) {
+		pthread_mutex_unlock(&file->fs->resizeLock);
 		return -1;
+	}
+	rc = request.operationRc;
+	pthread_mutex_unlock(&file->fs->resizeLock);
+	if (rc != 0) {
+		HFS_LOG_ERROR("blob resize failed clusters=%"PRIu64" bserrno=%d",
+			      needClusters, rc);
+		return hfsResizeError(rc);
 	}
 	return 0;
 }
 
-/*
- * Read 'count' bytes at an explicit byte offset.
- * Reads whole io units into a DMA buffer, then copies the requested
- * window back to the caller.
- */
+/* Read a byte range at an explicit offset through the request-local I/O path. */
 ssize_t hfsReadAt(HfsFile *file, uint8_t *buffer, size_t count, uint64_t offset) {
-	uint64_t unitSize = file->fs->unitSize;
-	uint64_t startUnit = offset / unitSize;
-	uint64_t endByte = offset + count;
-	uint64_t endUnit = (endByte + unitSize - 1) / unitSize;
-	uint64_t units = endUnit - startUnit;
-	size_t bufSize = (size_t)(units * unitSize);
-	size_t skip = (size_t)(offset - startUnit * unitSize);
-	size_t toCopy;
-	uint8_t *tmp;
-
-	tmp = spdk_malloc(bufSize, 0x1000, NULL, SPDK_ENV_LCORE_ID_ANY, SPDK_MALLOC_DMA);
-	if (tmp == NULL) {
-		return -1;
-	}
-
-	file->readBuffer = tmp;
-	file->ioOffset = startUnit;
-	file->ioUnits = units;
-	if (!waiter(globalThread, hfsDoRead, file, &file->completion)) {
-		spdk_free(tmp);
-		return -1;
-	}
-
-	toCopy = (bufSize > skip && count > bufSize - skip) ? (bufSize - skip) : count;
-	memcpy(buffer, tmp + skip, toCopy);
-
-	spdk_free(tmp);
-	file->readBuffer = NULL;
-	return (ssize_t)toCopy;
+	return hfsIoReadAt(file, buffer, count, offset);
 }
 
-/*
- * Write 'count' bytes at an explicit byte offset.
- * Uses read-modify-write on the covering io units so that
- * unaligned writes do not clobber surrounding data. Grows the blob
- * first if the write extends beyond the current size.
- */
+/* Write a byte range at an explicit offset through the request-local I/O path. */
 ssize_t hfsWriteAt(HfsFile *file, const uint8_t *buffer, size_t count, uint64_t offset) {
-	uint64_t unitSize = file->fs->unitSize;
-	uint64_t startUnit = offset / unitSize;
-	uint64_t endByte = offset + count;
-	uint64_t endUnit = (endByte + unitSize - 1) / unitSize;
-	uint64_t units = endUnit - startUnit;
-	size_t bufSize = (size_t)(units * unitSize);
-	size_t skip = (size_t)(offset - startUnit * unitSize);
-	uint8_t *tmp;
-
-	if (!hfsEnsureSize(file, endByte)) {
-		return -1;
-	}
-
-	tmp = spdk_malloc(bufSize, 0x1000, NULL, SPDK_ENV_LCORE_ID_ANY, SPDK_MALLOC_DMA);
-	if (tmp == NULL) {
-		return -1;
-	}
-
-	/* Read the covering units first (modify-in-place below). */
-	file->readBuffer = tmp;
-	file->writeBuffer = tmp;
-	file->ioOffset = startUnit;
-	file->ioUnits = units;
-	if (!waiter(globalThread, hfsDoRead, file, &file->completion)) {
-		spdk_free(tmp);
-		return -1;
-	}
-
-	/* Splice the user data into the buffer, then write it back. */
-	memcpy(tmp + skip, buffer, count);
-
-	if (!waiter(globalThread, hfsDoWrite, file, &file->completion)) {
-		spdk_free(tmp);
-		return -1;
-	}
-
-	spdk_free(tmp);
-	file->readBuffer = NULL;
-	file->writeBuffer = NULL;
-	return (ssize_t)count;
+	return hfsIoWriteAt(file, buffer, count, offset);
 }
 
 /* Sequential read at file->offset; advances the offset. */

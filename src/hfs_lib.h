@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/uio.h>
 
 #include "hfs.h"
 
@@ -25,6 +26,8 @@ struct hfs_dirent {
 int hfs_lib_init(void);
 /* Returns true when the fd belongs to HFS (interception helper). */
 bool hfs_is_hfs_fd(int fd);
+/* Return true when the caller inherited HFS state across fork. */
+bool hfs_lib_is_fork_child(void);
 /* Tear down the library (unmount, stop logging). */
 void hfs_lib_fini(void);
 /* Return the mounted filesystem instance, or NULL before init. */
@@ -44,6 +47,16 @@ ssize_t hfs_lib_write(int fd, const void *buf, size_t count);
 ssize_t hfs_lib_pread(int fd, void *buf, size_t count, off_t offset);
 /* Write at an explicit offset without moving the fd offset. */
 ssize_t hfs_lib_pwrite(int fd, const void *buf, size_t count, off_t offset);
+/* Read from the current file offset using caller-provided iovec segments. */
+ssize_t hfs_lib_readv(int fd, const struct iovec *iov, int iovcnt);
+/* Write at the current file offset using caller-provided iovec segments. */
+ssize_t hfs_lib_writev(int fd, const struct iovec *iov, int iovcnt);
+/* Read at an explicit offset using caller-provided iovec segments. */
+ssize_t hfs_lib_preadv(int fd, const struct iovec *iov, int iovcnt,
+		       off_t offset);
+/* Write at an explicit offset using caller-provided iovec segments. */
+ssize_t hfs_lib_pwritev(int fd, const struct iovec *iov, int iovcnt,
+			 off_t offset);
 /* Change the current offset of an HFS fd. */
 off_t hfs_lib_lseek(int fd, off_t offset, int whence);
 /* Close an HFS fd. */
@@ -56,7 +69,7 @@ int hfs_lib_unlink(const char *path);
 int hfs_lib_ftruncate(int fd, off_t length);
 /* Flush data and metadata of an HFS fd. */
 int hfs_lib_fsync(int fd);
-/* Preallocate space for an HFS fd (KEEP_SIZE is a no-op). */
+/* Preallocate space for an HFS fd, preserving size when KEEP_SIZE is set. */
 int hfs_lib_fallocate(int fd, int mode, off_t offset, off_t len);
 /* Stat an open HFS fd. */
 int hfs_lib_fstat(int fd, struct stat *st);

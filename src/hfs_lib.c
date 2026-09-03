@@ -2,6 +2,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <linux/falloc.h>
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,9 +15,11 @@
 #include "hfs.h"
 #include "hfs_fd.h"
 #include "hfs_internal.h"
+#include "hfs_io.h"
 #include "hfs_lib.h"
 #include "hfs_log.h"
 #include "hfs_meta.h"
+#include "hfs_runtime.h"
 
 /* Protects the mounted inode table and metadata snapshots. */
 static pthread_rwlock_t g_metaLock = PTHREAD_RWLOCK_INITIALIZER;
@@ -216,12 +219,161 @@ static HfsOpenFile *hfs_acquire_file(int fd, bool requireData) {
 	return openFile;
 }
 
+/* Validate an iovec array and return its total length without allocating. */
+static int hfsIovTotal(const struct iovec *iov, int iovcnt, size_t *totalOut) {
+	size_t total = 0;
+	int i;
+
+	if (iovcnt < 0 || (iovcnt != 0 && iov == NULL)) {
+		errno = EINVAL;
+		return -1;
+	}
+#ifdef IOV_MAX
+	if (iovcnt > IOV_MAX) {
+		errno = EINVAL;
+		return -1;
+	}
+#endif
+	for (i = 0; i < iovcnt; i++) {
+		if (iov[i].iov_len != 0 && iov[i].iov_base == NULL) {
+			errno = EFAULT;
+			return -1;
+		}
+		if (iov[i].iov_len > SIZE_MAX - total) {
+			errno = EOVERFLOW;
+			return -1;
+		}
+		total += iov[i].iov_len;
+	}
+	if (total > (size_t)SSIZE_MAX) {
+		errno = EOVERFLOW;
+		return -1;
+	}
+	*totalOut = total;
+	return 0;
+}
+
+/* Snapshot one inode size while keeping metadata lock scope short. */
+static int hfsSnapshotFileSize(HfsOpenFile *openFile, uint64_t *sizeOut) {
+	struct hfs_inode *in;
+	uint64_t size;
+
+	pthread_rwlock_rdlock(&g_metaLock);
+	if (g_fs == NULL) {
+		pthread_rwlock_unlock(&g_metaLock);
+		errno = ENODEV;
+		return -1;
+	}
+	in = hfsMetaFindById(g_fs, openFile->inodeId);
+	if (in != NULL) {
+		size = in->size;
+	} else if (!hfsFdGetOrphanInfo(openFile, &size, NULL, NULL)) {
+		pthread_rwlock_unlock(&g_metaLock);
+		errno = ENOENT;
+		return -1;
+	}
+	pthread_rwlock_unlock(&g_metaLock);
+	*sizeOut = size;
+	return 0;
+}
+
+/* Read iovec segments directly into caller buffers through request-local DMA. */
+static ssize_t hfsReadvAt(HfsOpenFile *openFile, const struct iovec *iov,
+			  int iovcnt, size_t total, uint64_t offset,
+			  uint64_t fileSize) {
+	size_t done = 0;
+	int i;
+
+	for (i = 0; i < iovcnt && done < total; i++) {
+		size_t want = iov[i].iov_len;
+		ssize_t n;
+
+		if (want == 0) {
+			continue;
+		}
+		if (offset >= fileSize) {
+			break;
+		}
+		if ((uint64_t)want > fileSize - offset) {
+			want = (size_t)(fileSize - offset);
+		}
+		n = hfsReadAt(openFile->file, iov[i].iov_base, want, offset);
+		if (n < 0) {
+			return done != 0 ? (ssize_t)done : -1;
+		}
+		done += (size_t)n;
+		offset += (uint64_t)n;
+		if ((size_t)n != want) {
+			break;
+		}
+	}
+	return (ssize_t)done;
+}
+
+/* Write iovec segments directly from caller buffers through request-local DMA. */
+static ssize_t hfsWritevAt(HfsOpenFile *openFile, const struct iovec *iov,
+			   int iovcnt, size_t total, uint64_t offset) {
+	size_t done = 0;
+	int i;
+
+	for (i = 0; i < iovcnt && done < total; i++) {
+		size_t want = iov[i].iov_len;
+		ssize_t n;
+
+		if (want == 0) {
+			continue;
+		}
+		n = hfsWriteAt(openFile->file, iov[i].iov_base, want, offset);
+		if (n < 0) {
+			return done != 0 ? (ssize_t)done : -1;
+		}
+		done += (size_t)n;
+		offset += (uint64_t)n;
+		if ((size_t)n != want) {
+			break;
+		}
+	}
+	return (ssize_t)done;
+}
+
+/* Publish a successful write end for both linked and unlinked open files. */
+static void hfsPublishWriteEnd(HfsOpenFile *openFile, uint64_t end) {
+	struct hfs_inode *in;
+
+	pthread_rwlock_wrlock(&g_metaLock);
+	in = g_fs == NULL ? NULL : hfsMetaFindById(g_fs, openFile->inodeId);
+	if (in != NULL && end > in->size) {
+		in->size = end;
+		in->mtimeNs = hfs_now_ns();
+		g_fs->metaDirty = true;
+		atomic_store_explicit(&openFile->size, in->size,
+				      memory_order_relaxed);
+		atomic_store_explicit(&openFile->mtimeNs, in->mtimeNs,
+				      memory_order_relaxed);
+	} else if (in == NULL && hfsFdGetOrphanInfo(openFile, NULL, NULL, NULL)) {
+		uint64_t size = atomic_load_explicit(&openFile->size,
+					     memory_order_relaxed);
+
+		if (end > size) {
+			atomic_store_explicit(&openFile->size, end,
+					      memory_order_relaxed);
+		}
+		atomic_store_explicit(&openFile->mtimeNs, hfs_now_ns(),
+				      memory_order_relaxed);
+	}
+	pthread_rwlock_unlock(&g_metaLock);
+}
+
 /*
  * Initialize the library: logging, SPDK environment, mount and metadata.
  * Each step rolls back on failure. Idempotent: a second call returns 0
  * without re-initializing.
  */
 int hfs_lib_init(void) {
+	if (hfs_lib_is_fork_child()) {
+		errno = ECHILD;
+		return -1;
+	}
 	pthread_rwlock_wrlock(&g_metaLock);
 	if (g_fs != NULL) {
 		pthread_rwlock_unlock(&g_metaLock);
@@ -271,8 +423,21 @@ int hfs_lib_init(void) {
 		return -1;
 	}
 
+	if (hfsIoInit(g_fs) != 0) {
+		HFS_LOG_ERROR("hfsIoInit failed");
+		hfsUmount(g_fs);
+		free(g_fs);
+		g_fs = NULL;
+		hfsRuntimeStop();
+		hfs_release_backend_lock();
+		hfs_log_fini();
+		pthread_rwlock_unlock(&g_metaLock);
+		return -1;
+	}
+
 	if (hfsMetaInit(g_fs) != 0) {
 		HFS_LOG_ERROR("hfsMetaInit failed");
+		hfsIoFini(g_fs);
 		hfsUmount(g_fs);
 		free(g_fs);
 		g_fs = NULL;
@@ -322,6 +487,10 @@ void hfs_lib_fini(void) {
 	HfsOpenFile *openFile;
 	int fd;
 
+	/* Inherited pthread/SPDK state cannot be safely finalized after fork. */
+	if (hfs_lib_is_fork_child()) {
+		return;
+	}
 	pthread_rwlock_wrlock(&g_metaLock);
 	if (g_fs == NULL) {
 		pthread_rwlock_unlock(&g_metaLock);
@@ -338,6 +507,7 @@ void hfs_lib_fini(void) {
 	}
 	hfsFdReset();
 
+	hfsIoFini(g_fs);
 	if (!hfsUmount(g_fs)) {
 		HFS_LOG_ERROR("hfsUmount failed");
 	}
@@ -644,6 +814,7 @@ ssize_t hfs_lib_write(int fd, const void *buf, size_t count) {
 	uint64_t writeOffset;
 	bool append;
 	ssize_t n;
+	int savedErrno;
 
 	if (count == 0) {
 		return 0;
@@ -694,12 +865,14 @@ ssize_t hfs_lib_write(int fd, const void *buf, size_t count) {
 	}
 	n = hfsWriteAt(openFile->file, buf, count, writeOffset);
 	if (n <= 0) {
+		savedErrno = errno;
+		HFS_LOG_ERROR("sequential write failed n=%zd errno=%d", n, savedErrno);
 		pthread_mutex_unlock(&openFile->ioLock);
 		if (append) {
 			pthread_mutex_unlock(&g_appendLock);
 		}
 		hfs_release_open_file(openFile);
-		errno = EIO;
+		errno = n < 0 ? savedErrno : EIO;
 		return -1;
 	}
 	openFile->offset = writeOffset + (uint64_t)n;
@@ -753,19 +926,16 @@ ssize_t hfs_lib_pread(int fd, void *buf, size_t count, off_t offset) {
 	if (openFile == NULL) {
 		return -1;
 	}
-	pthread_mutex_lock(&openFile->ioLock);
 	pthread_rwlock_rdlock(&g_metaLock);
 	in = g_fs == NULL ? NULL : hfsMetaFindById(g_fs, openFile->inodeId);
 	if (g_fs == NULL) {
 		pthread_rwlock_unlock(&g_metaLock);
-		pthread_mutex_unlock(&openFile->ioLock);
 		hfs_release_open_file(openFile);
 		errno = ENODEV;
 		return -1;
 	}
 	if (in == NULL && !hfsFdGetOrphanInfo(openFile, &fileSize, NULL, NULL)) {
 		pthread_rwlock_unlock(&g_metaLock);
-		pthread_mutex_unlock(&openFile->ioLock);
 		hfs_release_open_file(openFile);
 		errno = ENOENT;
 		return -1;
@@ -775,7 +945,6 @@ ssize_t hfs_lib_pread(int fd, void *buf, size_t count, off_t offset) {
 	}
 	if ((uint64_t)offset >= fileSize) {
 		pthread_rwlock_unlock(&g_metaLock);
-		pthread_mutex_unlock(&openFile->ioLock);
 		hfs_release_open_file(openFile);
 		return 0;
 	}
@@ -785,7 +954,6 @@ ssize_t hfs_lib_pread(int fd, void *buf, size_t count, off_t offset) {
 
 	pthread_rwlock_unlock(&g_metaLock);
 	n = hfsReadAt(openFile->file, buf, count, (uint64_t)offset);
-	pthread_mutex_unlock(&openFile->ioLock);
 	hfs_release_open_file(openFile);
 	return n;
 }
@@ -797,6 +965,7 @@ ssize_t hfs_lib_pwrite(int fd, const void *buf, size_t count, off_t offset) {
 	uint64_t writeOffset;
 	bool append;
 	ssize_t n;
+	int savedErrno;
 
 	if (count == 0) {
 		return 0;
@@ -815,7 +984,6 @@ ssize_t hfs_lib_pwrite(int fd, const void *buf, size_t count, off_t offset) {
 		errno = EBADF;
 		return -1;
 	}
-	pthread_mutex_lock(&openFile->ioLock);
 	append = (openFile->flags & O_APPEND) != 0;
 	if (append) {
 		/* Linux honors O_APPEND for pwrite; serialize the EOF decision. */
@@ -829,7 +997,6 @@ ssize_t hfs_lib_pwrite(int fd, const void *buf, size_t count, off_t offset) {
 		in = g_fs == NULL ? NULL : hfsMetaFindById(g_fs, openFile->inodeId);
 		if (g_fs == NULL) {
 			pthread_rwlock_unlock(&g_metaLock);
-			pthread_mutex_unlock(&openFile->ioLock);
 			pthread_mutex_unlock(&g_appendLock);
 			hfs_release_open_file(openFile);
 			errno = ENODEV;
@@ -841,7 +1008,6 @@ ssize_t hfs_lib_pwrite(int fd, const void *buf, size_t count, off_t offset) {
 			writeOffset = appendSize;
 		} else {
 			pthread_rwlock_unlock(&g_metaLock);
-			pthread_mutex_unlock(&openFile->ioLock);
 			pthread_mutex_unlock(&g_appendLock);
 			hfs_release_open_file(openFile);
 			errno = ENOENT;
@@ -851,12 +1017,13 @@ ssize_t hfs_lib_pwrite(int fd, const void *buf, size_t count, off_t offset) {
 	}
 	n = hfsWriteAt(openFile->file, buf, count, writeOffset);
 	if (n <= 0) {
-		pthread_mutex_unlock(&openFile->ioLock);
+		savedErrno = errno;
+		HFS_LOG_ERROR("positioned write failed n=%zd errno=%d", n, savedErrno);
 		if (append) {
 			pthread_mutex_unlock(&g_appendLock);
 		}
 		hfs_release_open_file(openFile);
-		errno = EIO;
+		errno = n < 0 ? savedErrno : EIO;
 		return -1;
 	}
 	pthread_rwlock_wrlock(&g_metaLock);
@@ -882,7 +1049,179 @@ ssize_t hfs_lib_pwrite(int fd, const void *buf, size_t count, off_t offset) {
 				      memory_order_relaxed);
 	}
 	pthread_rwlock_unlock(&g_metaLock);
+	if (append) {
+		pthread_mutex_unlock(&g_appendLock);
+	}
+	hfs_release_open_file(openFile);
+	return n;
+}
+
+/* Read an iovec array from the current file offset without a large temporary buffer. */
+ssize_t hfs_lib_readv(int fd, const struct iovec *iov, int iovcnt) {
+	HfsOpenFile *openFile;
+	uint64_t fileSize;
+	ssize_t n;
+	size_t total;
+
+	if (hfsIovTotal(iov, iovcnt, &total) != 0) {
+		return -1;
+	}
+	if (total == 0) {
+		return 0;
+	}
+	openFile = hfs_acquire_file(fd, true);
+	if (openFile == NULL) {
+		return -1;
+	}
+	pthread_mutex_lock(&openFile->ioLock);
+	if (hfsSnapshotFileSize(openFile, &fileSize) != 0) {
+		pthread_mutex_unlock(&openFile->ioLock);
+		hfs_release_open_file(openFile);
+		return -1;
+	}
+	if (openFile->offset >= fileSize) {
+		pthread_mutex_unlock(&openFile->ioLock);
+		hfs_release_open_file(openFile);
+		return 0;
+	}
+	n = hfsReadvAt(openFile, iov, iovcnt, total, openFile->offset,
+		       fileSize);
+	if (n > 0) {
+		openFile->offset += (uint64_t)n;
+	}
 	pthread_mutex_unlock(&openFile->ioLock);
+	hfs_release_open_file(openFile);
+	return n;
+}
+
+/* Write an iovec array at the current file offset without a large temporary buffer. */
+ssize_t hfs_lib_writev(int fd, const struct iovec *iov, int iovcnt) {
+	HfsOpenFile *openFile;
+	uint64_t writeOffset;
+	ssize_t n;
+	size_t total;
+	bool append;
+
+	if (hfsIovTotal(iov, iovcnt, &total) != 0) {
+		return -1;
+	}
+	if (total == 0) {
+		return 0;
+	}
+	openFile = hfs_acquire_file(fd, true);
+	if (openFile == NULL) {
+		return -1;
+	}
+	if (!openFile->writable) {
+		hfs_release_open_file(openFile);
+		errno = EBADF;
+		return -1;
+	}
+	pthread_mutex_lock(&openFile->ioLock);
+	append = (openFile->flags & O_APPEND) != 0;
+	if (append) {
+		pthread_mutex_lock(&g_appendLock);
+	}
+	writeOffset = openFile->offset;
+	if (append && hfsSnapshotFileSize(openFile, &writeOffset) != 0) {
+		if (append) {
+			pthread_mutex_unlock(&g_appendLock);
+		}
+		pthread_mutex_unlock(&openFile->ioLock);
+		hfs_release_open_file(openFile);
+		return -1;
+	}
+	n = hfsWritevAt(openFile, iov, iovcnt, total, writeOffset);
+	if (n > 0) {
+		openFile->offset = writeOffset + (uint64_t)n;
+		hfsPublishWriteEnd(openFile, openFile->offset);
+	}
+	if (append) {
+		pthread_mutex_unlock(&g_appendLock);
+	}
+	pthread_mutex_unlock(&openFile->ioLock);
+	hfs_release_open_file(openFile);
+	return n;
+}
+
+/* Read an iovec array at an explicit offset without moving the file offset. */
+ssize_t hfs_lib_preadv(int fd, const struct iovec *iov, int iovcnt,
+		       off_t offset) {
+	HfsOpenFile *openFile;
+	uint64_t fileSize;
+	ssize_t n;
+	size_t total;
+
+	if (offset < 0 || hfsIovTotal(iov, iovcnt, &total) != 0) {
+		if (offset < 0) {
+			errno = EINVAL;
+		}
+		return -1;
+	}
+	if (total == 0) {
+		return 0;
+	}
+	openFile = hfs_acquire_file(fd, true);
+	if (openFile == NULL) {
+		return -1;
+	}
+	if (hfsSnapshotFileSize(openFile, &fileSize) != 0) {
+		hfs_release_open_file(openFile);
+		return -1;
+	}
+	if ((uint64_t)offset >= fileSize) {
+		hfs_release_open_file(openFile);
+		return 0;
+	}
+	n = hfsReadvAt(openFile, iov, iovcnt, total, (uint64_t)offset,
+		       fileSize);
+	hfs_release_open_file(openFile);
+	return n;
+}
+
+/* Write an iovec array at an explicit offset without moving the file offset. */
+ssize_t hfs_lib_pwritev(int fd, const struct iovec *iov, int iovcnt,
+			 off_t offset) {
+	HfsOpenFile *openFile;
+	uint64_t writeOffset;
+	ssize_t n;
+	size_t total;
+	bool append;
+
+	if (offset < 0 || hfsIovTotal(iov, iovcnt, &total) != 0) {
+		if (offset < 0) {
+			errno = EINVAL;
+		}
+		return -1;
+	}
+	if (total == 0) {
+		return 0;
+	}
+	openFile = hfs_acquire_file(fd, true);
+	if (openFile == NULL) {
+		return -1;
+	}
+	if (!openFile->writable) {
+		hfs_release_open_file(openFile);
+		errno = EBADF;
+		return -1;
+	}
+	append = (openFile->flags & O_APPEND) != 0;
+	if (append) {
+		pthread_mutex_lock(&g_appendLock);
+	}
+	writeOffset = (uint64_t)offset;
+	if (append && hfsSnapshotFileSize(openFile, &writeOffset) != 0) {
+		if (append) {
+			pthread_mutex_unlock(&g_appendLock);
+		}
+		hfs_release_open_file(openFile);
+		return -1;
+	}
+	n = hfsWritevAt(openFile, iov, iovcnt, total, writeOffset);
+	if (n > 0) {
+		hfsPublishWriteEnd(openFile, writeOffset + (uint64_t)n);
+	}
 	if (append) {
 		pthread_mutex_unlock(&g_appendLock);
 	}
@@ -970,7 +1309,15 @@ int hfs_lib_fd_copy(int oldfd, int newfd) {
  * close() can classify internal descriptors while initialization is active.
  */
 bool hfs_is_hfs_fd(int fd) {
+	if (hfs_lib_is_fork_child()) {
+		return false;
+	}
 	return hfsFdIsHfs(fd);
+}
+
+/* Return true when the process inherited the active runtime across fork. */
+bool hfs_lib_is_fork_child(void) {
+	return hfsRuntimeIsForkChild();
 }
 
 /*
@@ -1280,13 +1627,21 @@ int hfs_lib_fcntl(int fd, int cmd, long arg) {
  */
 int hfs_lib_fsync(int fd) {
 	HfsOpenFile *openFile = hfsFdAcquire(fd);
+	bool ioLocked = false;
 
 	if (openFile == NULL) {
 		errno = EBADF;
 		return -1;
 	}
 	pthread_mutex_lock(&openFile->ioLock);
+	if (openFile->file != NULL) {
+		pthread_rwlock_wrlock(&openFile->file->fs->ioLock);
+		ioLocked = true;
+	}
 	if (openFile->file != NULL && hfsSync(openFile->file) != 0) {
+		if (ioLocked) {
+			pthread_rwlock_unlock(&openFile->file->fs->ioLock);
+		}
 		pthread_mutex_unlock(&openFile->ioLock);
 		hfs_release_open_file(openFile);
 		return -1;
@@ -1294,6 +1649,9 @@ int hfs_lib_fsync(int fd) {
 	pthread_rwlock_wrlock(&g_metaLock);
 	if (g_fs == NULL) {
 		pthread_rwlock_unlock(&g_metaLock);
+		if (ioLocked) {
+			pthread_rwlock_unlock(&openFile->file->fs->ioLock);
+		}
 		pthread_mutex_unlock(&openFile->ioLock);
 		hfs_release_open_file(openFile);
 		errno = ENODEV;
@@ -1301,6 +1659,9 @@ int hfs_lib_fsync(int fd) {
 	}
 	if (!g_fs->metaDirty) {
 		pthread_rwlock_unlock(&g_metaLock);
+		if (ioLocked) {
+			pthread_rwlock_unlock(&openFile->file->fs->ioLock);
+		}
 		pthread_mutex_unlock(&openFile->ioLock);
 		hfs_release_open_file(openFile);
 		return 0;
@@ -1308,31 +1669,114 @@ int hfs_lib_fsync(int fd) {
 	if (hfsMetaFindById(g_fs, openFile->inodeId) != NULL &&
 	    hfsMetaCommitInode(g_fs, openFile->inodeId) != 0) {
 		pthread_rwlock_unlock(&g_metaLock);
+		if (ioLocked) {
+			pthread_rwlock_unlock(&openFile->file->fs->ioLock);
+		}
 		pthread_mutex_unlock(&openFile->ioLock);
 		hfs_release_open_file(openFile);
 		errno = EIO;
 		return -1;
 	}
 	pthread_rwlock_unlock(&g_metaLock);
+	if (ioLocked) {
+		pthread_rwlock_unlock(&openFile->file->fs->ioLock);
+	}
 	pthread_mutex_unlock(&openFile->ioLock);
 	hfs_release_open_file(openFile);
 	return 0;
 }
 
-/*
- * Preallocate space for an HFS fd. The blobstore grows on demand, so
- * KEEP_SIZE is a no-op; the default mode extends the file size like
- * ftruncate.
- */
+/* Preallocate or punch a range while preserving Linux fallocate semantics. */
 int hfs_lib_fallocate(int fd, int mode, off_t offset, off_t len) {
-	if (mode & FALLOC_FL_KEEP_SIZE) {
-		return 0;
+	HfsOpenFile *openFile;
+	uint64_t fileSize;
+	uint64_t end;
+	uint64_t punchLength;
+	int punchMode = FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE;
+
+	if (offset < 0 || len < 0) {
+		errno = EINVAL;
+		return -1;
 	}
-	if (mode != 0) {
+	if (mode != 0 && mode != FALLOC_FL_KEEP_SIZE && mode != punchMode) {
 		errno = EOPNOTSUPP;
 		return -1;
 	}
-	return hfs_lib_ftruncate(fd, offset + len);
+	if ((uint64_t)offset > UINT64_MAX - (uint64_t)len) {
+		errno = EOVERFLOW;
+		return -1;
+	}
+	end = (uint64_t)offset + (uint64_t)len;
+	if (mode == 0) {
+		if (end > (uint64_t)INT64_MAX) {
+			errno = EOVERFLOW;
+			return -1;
+		}
+		openFile = hfs_acquire_file(fd, true);
+		if (openFile == NULL) {
+			return -1;
+		}
+		if (hfsSnapshotFileSize(openFile, &fileSize) != 0) {
+			hfs_release_open_file(openFile);
+			return -1;
+		}
+		hfs_release_open_file(openFile);
+		/* Fallocate must not shrink a file when the range is already covered. */
+		if (end <= fileSize) {
+			return 0;
+		}
+		return hfs_lib_ftruncate(fd, (off_t)end);
+	}
+
+	openFile = hfs_acquire_file(fd, true);
+	if (openFile == NULL) {
+		return -1;
+	}
+	if (!openFile->writable) {
+		hfs_release_open_file(openFile);
+		errno = EBADF;
+		return -1;
+	}
+	if (mode == punchMode) {
+		pthread_mutex_lock(&openFile->ioLock);
+		if (hfsSnapshotFileSize(openFile, &fileSize) != 0) {
+			pthread_mutex_unlock(&openFile->ioLock);
+			hfs_release_open_file(openFile);
+			return -1;
+		}
+		if ((uint64_t)offset >= fileSize) {
+			pthread_mutex_unlock(&openFile->ioLock);
+			hfs_release_open_file(openFile);
+			return 0;
+		}
+		punchLength = end - (uint64_t)offset;
+		if (punchLength > fileSize - (uint64_t)offset) {
+			punchLength = fileSize - (uint64_t)offset;
+		}
+		if (hfsIoPunchHole(openFile->file, (uint64_t)offset,
+				   punchLength) != 0) {
+			pthread_mutex_unlock(&openFile->ioLock);
+			hfs_release_open_file(openFile);
+			return -1;
+		}
+		pthread_mutex_unlock(&openFile->ioLock);
+		hfs_release_open_file(openFile);
+		return 0;
+	}
+
+	/* KEEP_SIZE reserves backing clusters but does not change inode size. */
+	pthread_mutex_lock(&openFile->ioLock);
+	pthread_rwlock_wrlock(&openFile->file->fs->ioLock);
+	if (hfsResizeTo(openFile->file, end) != 0) {
+		pthread_rwlock_unlock(&openFile->file->fs->ioLock);
+		pthread_mutex_unlock(&openFile->ioLock);
+		hfs_release_open_file(openFile);
+		return -1;
+	}
+	pthread_rwlock_unlock(&openFile->file->fs->ioLock);
+	pthread_mutex_unlock(&openFile->ioLock);
+	hfs_release_open_file(openFile);
+	return 0;
 }
 
 /*
@@ -1349,6 +1793,12 @@ int hfs_lib_mkdir(const char *path, mode_t mode) {
 	if (g_fs == NULL) {
 		pthread_rwlock_unlock(&g_metaLock);
 		errno = ENODEV;
+		return -1;
+	}
+	if (path != NULL && strcmp(path, "/") == 0) {
+		/* The virtual HFS root already exists as the mount point. */
+		pthread_rwlock_unlock(&g_metaLock);
+		errno = EEXIST;
 		return -1;
 	}
 

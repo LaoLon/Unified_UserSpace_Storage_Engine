@@ -38,6 +38,7 @@ set(HFS_CORE_SRC
   src/hfs.c
   src/hfs_mount.c
   src/hfs_file.c
+  src/hfs_io.c
   src/hfs_log.c
   src/hfs_lib.c
   src/hfs_meta.c

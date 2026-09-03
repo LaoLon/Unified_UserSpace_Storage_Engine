@@ -32,6 +32,7 @@ struct hfs_runtime_state {
 	bool stopSubmitted;
 	bool subsystemsReady;
 	int initRc;
+	_Atomic pid_t ownerPid;
 };
 
 static struct hfs_runtime_state g_runtime = {
@@ -146,6 +147,7 @@ static void *hfsRuntimeOwnerMain(void *arg) {
 	g_runtime.spdkThread = thread;
 	globalThread = thread;
 	g_runtime.threadCreated = true;
+	atomic_store_explicit(&g_runtime.ownerPid, getpid(), memory_order_release);
 	pthread_mutex_unlock(&g_runtime.lock);
 	spdk_set_thread(thread);
 	hfsRuntimePublishReady(0);
@@ -163,6 +165,7 @@ static void *hfsRuntimeOwnerMain(void *arg) {
 	globalThread = NULL;
 	g_runtime.spdkThread = NULL;
 	g_runtime.accepting = false;
+	atomic_store_explicit(&g_runtime.ownerPid, 0, memory_order_release);
 	pthread_cond_broadcast(&g_runtime.stateChanged);
 	pthread_mutex_unlock(&g_runtime.lock);
 	return NULL;
@@ -203,8 +206,14 @@ int hfsRuntimeStart(void) {
 int hfsRuntimeSubmit(spdk_msg_fn fn, void *ctx) {
 	int rc = 0;
 
+	/* A fork child must never enqueue a pointer into the parent's SPDK queue. */
+	if (hfsRuntimeIsForkChild()) {
+		return -ECHILD;
+	}
 	pthread_mutex_lock(&g_runtime.lock);
-	if (!g_runtime.accepting || g_runtime.spdkThread == NULL) {
+	if (hfsRuntimeIsForkChild()) {
+		rc = -ECHILD;
+	} else if (!g_runtime.accepting || g_runtime.spdkThread == NULL) {
 		rc = -ESHUTDOWN;
 	} else {
 		spdk_thread_send_msg(g_runtime.spdkThread, fn, ctx);
@@ -224,14 +233,28 @@ void hfsRuntimeMarkSubsystemReady(void) {
 bool hfsRuntimeIsOwnerThread(void) {
 	bool owner;
 
+	if (hfsRuntimeIsForkChild()) {
+		return false;
+	}
 	pthread_mutex_lock(&g_runtime.lock);
 	owner = g_runtime.threadCreated && pthread_equal(pthread_self(), g_runtime.owner);
 	pthread_mutex_unlock(&g_runtime.lock);
 	return owner;
 }
 
+/* Return true when this process inherited the runtime from a different PID. */
+bool hfsRuntimeIsForkChild(void) {
+	pid_t ownerPid;
+
+	ownerPid = atomic_load_explicit(&g_runtime.ownerPid, memory_order_acquire);
+	return ownerPid != 0 && ownerPid != getpid();
+}
+
 /* Stop the runtime after callers have released all HFS resources. */
 int hfsRuntimeStop(void) {
+	if (hfsRuntimeIsForkChild()) {
+		return -ECHILD;
+	}
 	pthread_mutex_lock(&g_runtime.lock);
 	if (!g_runtime.threadCreated) {
 		pthread_mutex_unlock(&g_runtime.lock);

@@ -21,6 +21,8 @@ int hfsRuntimeStop(void);
 void hfsRuntimeMarkSubsystemReady(void);
 /* Check whether the caller is the dedicated SPDK owner pthread. */
 bool hfsRuntimeIsOwnerThread(void);
+/* Return true when the caller is a fork child of the runtime owner process. */
+bool hfsRuntimeIsForkChild(void);
 
 /* Reset a request completion before submitting a new operation. */
 void hfsRuntimeCompletionReset(HfsCompletion *completion);

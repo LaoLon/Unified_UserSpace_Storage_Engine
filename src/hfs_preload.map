@@ -1,3 +1,11 @@
+GLIBC_2.10 {
+    global: preadv; pwritev;
+};
+
+GLIBC_2.26 {
+    global: preadv2; pwritev2; preadv64v2; pwritev64v2;
+};
+
 GLIBC_2.28 {
     global: fcntl64;
 };

@@ -43,9 +43,16 @@ except ValueError:
     print("%s raw output missing JSON: %s" % (tag, path))
     sys.exit(1)
 for j in data["jobs"]:
+    read_percentile = j["read"].get("clat_ns", {}).get("percentile", {})
+    write_percentile = j["write"].get("clat_ns", {}).get("percentile", {})
     print("%s err=%s read_iops=%s write_iops=%s read_bw=%s write_bw=%s" % (
         tag, j["error"], j["read"]["iops"], j["write"]["iops"],
         j["read"]["bw_bytes"], j["write"]["bw_bytes"]))
+    print("%s read_p50_ns=%s read_p99_ns=%s write_p50_ns=%s write_p99_ns=%s" % (
+        tag, read_percentile.get("50.000000", "n/a"),
+        read_percentile.get("99.000000", "n/a"),
+        write_percentile.get("50.000000", "n/a"),
+        write_percentile.get("99.000000", "n/a")))
 PYEOF
 }
 

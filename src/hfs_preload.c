@@ -135,7 +135,8 @@ static bool hfs_inherited;
 static bool hfs_path_managed(const char *path) {
 	size_t mountLen;
 
-	if (hfs_prefix == NULL || path == NULL || hfs_inherited) {
+	if (hfs_prefix == NULL || path == NULL || hfs_inherited ||
+	    hfs_lib_is_fork_child()) {
 		return false;
 	}
 	mountLen = hfs_prefix_len;
@@ -155,6 +156,10 @@ static const char *hfs_inner_path(const char *path) {
 	while (mountLen > 1 && hfs_prefix[mountLen - 1] == '/') {
 		mountLen--;
 	}
+	if (path[mountLen] == '\0' ||
+	    (path[mountLen] == '/' && path[mountLen + 1] == '\0')) {
+		return "/";
+	}
 	if (path[mountLen] == '/') {
 		mountLen++;
 	}
@@ -165,7 +170,8 @@ static const char *hfs_inner_path(const char *path) {
 static bool hfs_full_path_buf(const char *path, char *buf, size_t size) {
 	bool active;
 
-	if (path == NULL || path[0] == '\0' || buf == NULL || size == 0) {
+	if (hfs_lib_is_fork_child() || path == NULL || path[0] == '\0' ||
+	    buf == NULL || size == 0) {
 		return false;
 	}
 	if (path[0] == '/') {
@@ -429,158 +435,36 @@ ssize_t write(int fd, const void *buf, size_t count) {
 	return real_write(fd, buf, count);
 }
 
-/*
- * Scatter/gather IO helpers. RocksDB reads CURRENT/MANIFEST with
- * readv, which bypasses our read interceptor and hits the kernel
- * /dev/null placeholder (returns 0 -> "CURRENT does not end with
- * newline"). Route vector IO on HFS fds through the library.
- */
-static ssize_t hfs_iovec_total(const struct iovec *iov, int iovcnt) {
-	size_t total = 0;
-	int i;
-
-	for (i = 0; i < iovcnt; i++) {
-		total += iov[i].iov_len;
-	}
-	return (ssize_t)total;
-}
-
-static ssize_t hfs_iovec_scatter(char *src, ssize_t n,
-				 const struct iovec *iov, int iovcnt) {
-	ssize_t done = 0;
-	int i;
-
-	for (i = 0; i < iovcnt && done < n; i++) {
-		size_t len = iov[i].iov_len;
-		if ((ssize_t)len > n - done) {
-			len = (size_t)(n - done);
-		}
-		memcpy(iov[i].iov_base, src + done, len);
-		done += (ssize_t)len;
-	}
-	return done;
-}
-
-static ssize_t hfs_iovec_gather(char *dst, size_t cap,
-				const struct iovec *iov, int iovcnt) {
-	size_t total = 0;
-	int i;
-
-	for (i = 0; i < iovcnt; i++) {
-		size_t len = iov[i].iov_len;
-		if (total + len > cap) {
-			len = cap - total;
-		}
-		if (len > 0) {
-			memcpy(dst + total, iov[i].iov_base, len);
-			total += len;
-		}
-	}
-	return (ssize_t)total;
-}
-
-/* Intercepted readv(2): HFS fds read via a temporary buffer. */
+/* Intercepted readv(2): HFS fds use bounded request-local DMA buffers. */
 ssize_t readv(int fd, const struct iovec *iov, int iovcnt) {
-	ssize_t total;
-	char *tmp;
-	ssize_t n;
-
 	if (!hfs_is_hfs_fd(fd)) {
 		return real_readv(fd, iov, iovcnt);
 	}
-	total = hfs_iovec_total(iov, iovcnt);
-	if (total == 0) {
-		return 0;
-	}
-	tmp = malloc((size_t)total);
-	if (tmp == NULL) {
-		errno = ENOMEM;
-		return -1;
-	}
-	n = hfs_lib_read(fd, tmp, (size_t)total);
-	if (n > 0) {
-		n = hfs_iovec_scatter(tmp, n, iov, iovcnt);
-	}
-	free(tmp);
-	return n;
+	return hfs_lib_readv(fd, iov, iovcnt);
 }
 
-/* Intercepted writev(2): HFS fds write from a temporary buffer. */
+/* Intercepted writev(2): HFS fds use bounded request-local DMA buffers. */
 ssize_t writev(int fd, const struct iovec *iov, int iovcnt) {
-	ssize_t total;
-	char *tmp;
-	ssize_t n;
-
 	if (!hfs_is_hfs_fd(fd)) {
 		return real_writev(fd, iov, iovcnt);
 	}
-	total = hfs_iovec_total(iov, iovcnt);
-	if (total == 0) {
-		return 0;
-	}
-	tmp = malloc((size_t)total);
-	if (tmp == NULL) {
-		errno = ENOMEM;
-		return -1;
-	}
-	n = hfs_iovec_gather(tmp, (size_t)total, iov, iovcnt);
-	if (n > 0) {
-		n = hfs_lib_write(fd, tmp, (size_t)n);
-	}
-	free(tmp);
-	return n;
+	return hfs_lib_writev(fd, iov, iovcnt);
 }
 
-/* Intercepted preadv(2): like readv at an explicit offset. */
+/* Intercepted preadv(2): positioned vector reads stay request-local. */
 ssize_t preadv(int fd, const struct iovec *iov, int iovcnt, off_t offset) {
-	ssize_t total;
-	char *tmp;
-	ssize_t n;
-
 	if (!hfs_is_hfs_fd(fd)) {
 		return real_preadv(fd, iov, iovcnt, offset);
 	}
-	total = hfs_iovec_total(iov, iovcnt);
-	if (total == 0) {
-		return 0;
-	}
-	tmp = malloc((size_t)total);
-	if (tmp == NULL) {
-		errno = ENOMEM;
-		return -1;
-	}
-	n = hfs_lib_pread(fd, tmp, (size_t)total, offset);
-	if (n > 0) {
-		n = hfs_iovec_scatter(tmp, n, iov, iovcnt);
-	}
-	free(tmp);
-	return n;
+	return hfs_lib_preadv(fd, iov, iovcnt, offset);
 }
 
-/* Intercepted pwritev(2): like writev at an explicit offset. */
+/* Intercepted pwritev(2): positioned vector writes stay request-local. */
 ssize_t pwritev(int fd, const struct iovec *iov, int iovcnt, off_t offset) {
-	ssize_t total;
-	char *tmp;
-	ssize_t n;
-
 	if (!hfs_is_hfs_fd(fd)) {
 		return real_pwritev(fd, iov, iovcnt, offset);
 	}
-	total = hfs_iovec_total(iov, iovcnt);
-	if (total == 0) {
-		return 0;
-	}
-	tmp = malloc((size_t)total);
-	if (tmp == NULL) {
-		errno = ENOMEM;
-		return -1;
-	}
-	n = hfs_iovec_gather(tmp, (size_t)total, iov, iovcnt);
-	if (n > 0) {
-		n = hfs_lib_pwrite(fd, tmp, (size_t)n, offset);
-	}
-	free(tmp);
-	return n;
+	return hfs_lib_pwritev(fd, iov, iovcnt, offset);
 }
 
 /* Intercepted preadv2(2): RocksDB uses it for reads with RWF flags. */
@@ -593,7 +477,7 @@ ssize_t preadv2(int fd, const struct iovec *iov, int iovcnt, off_t offset,
 		errno = EOPNOTSUPP;
 		return -1;
 	}
-	return preadv(fd, iov, iovcnt, offset);
+	return hfs_lib_preadv(fd, iov, iovcnt, offset);
 }
 
 /* Intercepted pwritev2(2): like pwritev with RWF flags. */
@@ -606,7 +490,19 @@ ssize_t pwritev2(int fd, const struct iovec *iov, int iovcnt, off_t offset,
 		errno = EOPNOTSUPP;
 		return -1;
 	}
-	return pwritev(fd, iov, iovcnt, offset);
+	return hfs_lib_pwritev(fd, iov, iovcnt, offset);
+}
+
+/* Intercepted glibc large-file pwritev2 alias used by Python and databases. */
+ssize_t pwritev64v2(int fd, const struct iovec *iov, int iovcnt,
+		    off64_t offset, int flags) {
+	return pwritev2(fd, iov, iovcnt, (off_t)offset, flags);
+}
+
+/* Intercepted glibc large-file preadv2 alias used by Python and databases. */
+ssize_t preadv64v2(int fd, const struct iovec *iov, int iovcnt,
+		   off64_t offset, int flags) {
+	return preadv2(fd, iov, iovcnt, (off_t)offset, flags);
 }
 
 /* Intercepted pread(2). */
@@ -745,7 +641,7 @@ int ftruncate64(int fd, off64_t length) {
 	return real_ftruncate64(fd, length);
 }
 
-/* Intercepted fallocate(2): HFS grows on demand, so KEEP_SIZE is free. */
+/* Intercepted fallocate(2): HFS reserves storage and supports KEEP_SIZE/punch. */
 int fallocate(int fd, int mode, off_t offset, off_t len) {
 	if (hfs_is_hfs_fd(fd)) {
 		return hfs_lib_fallocate(fd, mode, offset, len);
