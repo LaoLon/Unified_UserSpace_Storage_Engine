@@ -37,6 +37,15 @@ static int (*real___openat_2)(int dirfd, const char *path, int flags);
 static int (*real___openat64_2)(int dirfd, const char *path, int flags);
 static int (*real_close)(int fd);
 static ssize_t (*real_read)(int fd, void *buf, size_t count);
+static size_t (*real_fread)(void *ptr, size_t size, size_t nmemb,
+				   FILE *stream);
+static size_t (*real_fread_unlocked)(void *ptr, size_t size, size_t nmemb,
+					     FILE *stream);
+static int (*real_fileno)(FILE *stream);
+static int (*real_feof)(FILE *stream);
+static int (*real_ferror)(FILE *stream);
+static void (*real_clearerr)(FILE *stream);
+static int (*real_fclose)(FILE *stream);
 static ssize_t (*real_write)(int fd, const void *buf, size_t count);
 static ssize_t (*real_readv)(int fd, const struct iovec *iov, int iovcnt);
 static ssize_t (*real_writev)(int fd, const struct iovec *iov, int iovcnt);
@@ -155,6 +164,17 @@ static size_t hfs_prefix_len;
 static char g_hfs_cwd[PATH_MAX] = "/";
 static bool g_hfs_cwd_active;
 static pthread_rwlock_t g_hfs_cwd_lock = PTHREAD_RWLOCK_INITIALIZER;
+
+/* Track stdio EOF/error state for HFS streams without touching glibc FILE. */
+#define HFS_MAX_STDIO_STREAMS 256
+#define HFS_STDIO_EOF 0x1
+#define HFS_STDIO_ERROR 0x2
+struct hfs_stdio_state {
+	FILE *stream;
+	unsigned int flags;
+};
+static struct hfs_stdio_state g_hfs_stdio_states[HFS_MAX_STDIO_STREAMS];
+static pthread_mutex_t g_hfs_stdio_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static int (*real_chdir)(const char *path);
 static int (*real_fchdir)(int fd);
@@ -354,6 +374,135 @@ static void *hfs_real_sym(const char *name) {
 		fprintf(stderr, "libhfs: dlsym(%s) failed: %s\n", name, dlerror());
 	}
 	return sym;
+}
+
+/* Return the tracked state slot for a stream, creating it when requested. */
+static struct hfs_stdio_state *hfs_stdio_state_get(FILE *stream, bool create) {
+	struct hfs_stdio_state *freeState = NULL;
+	int i;
+
+	for (i = 0; i < HFS_MAX_STDIO_STREAMS; i++) {
+		if (g_hfs_stdio_states[i].stream == stream) {
+			return &g_hfs_stdio_states[i];
+		}
+		if (freeState == NULL && g_hfs_stdio_states[i].stream == NULL) {
+			freeState = &g_hfs_stdio_states[i];
+		}
+	}
+	if (create && freeState != NULL) {
+		freeState->stream = stream;
+		freeState->flags = 0;
+	}
+	return freeState;
+}
+
+/* Update the emulated EOF/error flags for an HFS stdio stream. */
+static void hfs_stdio_mark(FILE *stream, unsigned int flags) {
+	struct hfs_stdio_state *state;
+
+	pthread_mutex_lock(&g_hfs_stdio_lock);
+	state = hfs_stdio_state_get(stream, true);
+	if (state != NULL) {
+		state->flags |= flags;
+	}
+	pthread_mutex_unlock(&g_hfs_stdio_lock);
+}
+
+/* Return one emulated stdio flag while keeping stream lookup synchronized. */
+static int hfs_stdio_has(FILE *stream, unsigned int flag) {
+	struct hfs_stdio_state *state;
+	int result = 0;
+
+	pthread_mutex_lock(&g_hfs_stdio_lock);
+	state = hfs_stdio_state_get(stream, false);
+	if (state != NULL) {
+		result = (state->flags & flag) != 0;
+	}
+	pthread_mutex_unlock(&g_hfs_stdio_lock);
+	return result;
+}
+
+/* Clear the emulated stdio flags, matching clearerr(3). */
+static void hfs_stdio_clear(FILE *stream) {
+	struct hfs_stdio_state *state;
+
+	pthread_mutex_lock(&g_hfs_stdio_lock);
+	state = hfs_stdio_state_get(stream, false);
+	if (state != NULL) {
+		state->flags = 0;
+	}
+	pthread_mutex_unlock(&g_hfs_stdio_lock);
+}
+
+/* Release a stream state slot after fclose(3) closes the underlying fd. */
+static void hfs_stdio_forget(FILE *stream) {
+	struct hfs_stdio_state *state;
+
+	pthread_mutex_lock(&g_hfs_stdio_lock);
+	state = hfs_stdio_state_get(stream, false);
+	if (state != NULL) {
+		state->stream = NULL;
+		state->flags = 0;
+	}
+	pthread_mutex_unlock(&g_hfs_stdio_lock);
+}
+
+/* Resolve stdio symbols lazily for constructors that run before our ctor. */
+static int hfs_real_fileno_call(FILE *stream) {
+	if (real_fileno == NULL) {
+		real_fileno = hfs_real_sym("fileno");
+	}
+	return real_fileno != NULL ? real_fileno(stream) : -1;
+}
+
+/* Resolve fread lazily before forwarding non-HFS streams. */
+static size_t hfs_real_fread_call(void *ptr, size_t size, size_t nmemb,
+					  FILE *stream) {
+	if (real_fread == NULL) {
+		real_fread = hfs_real_sym("fread");
+	}
+	return real_fread != NULL ? real_fread(ptr, size, nmemb, stream) : 0;
+}
+
+/* Resolve fread_unlocked lazily before forwarding regular streams. */
+static size_t hfs_real_fread_unlocked_call(void *ptr, size_t size,
+						   size_t nmemb, FILE *stream) {
+	if (real_fread_unlocked == NULL) {
+		real_fread_unlocked = hfs_real_sym("fread_unlocked");
+	}
+	return real_fread_unlocked != NULL ?
+		real_fread_unlocked(ptr, size, nmemb, stream) : 0;
+}
+
+/* Resolve the remaining stdio status functions on their first use. */
+static int hfs_real_feof_call(FILE *stream) {
+	if (real_feof == NULL) {
+		real_feof = hfs_real_sym("feof");
+	}
+	return real_feof != NULL ? real_feof(stream) : 0;
+}
+
+static int hfs_real_ferror_call(FILE *stream) {
+	if (real_ferror == NULL) {
+		real_ferror = hfs_real_sym("ferror");
+	}
+	return real_ferror != NULL ? real_ferror(stream) : 0;
+}
+
+static void hfs_real_clearerr_call(FILE *stream) {
+	if (real_clearerr == NULL) {
+		real_clearerr = hfs_real_sym("clearerr");
+	}
+	if (real_clearerr != NULL) {
+		real_clearerr(stream);
+	}
+}
+
+static int hfs_real_fclose_call(FILE *stream) {
+	if (real_fclose == NULL) {
+		real_fclose = hfs_real_sym("fclose");
+	}
+	return real_fclose != NULL ? real_fclose(stream) : EOF;
 }
 
 /* Resolve statfs64 lazily because dependency constructors can call it first. */
@@ -657,6 +806,113 @@ ssize_t read(int fd, void *buf, size_t count) {
 		return hfs_lib_read(fd, buf, count);
 	}
 	return real_read(fd, buf, count);
+}
+
+/* Intercept stdio reads because glibc may issue its internal read syscall. */
+size_t fread(void *ptr, size_t size, size_t nmemb, FILE *stream) {
+	int fd;
+	ssize_t n;
+	size_t total;
+
+	if (size == 0 || nmemb == 0) {
+		return 0;
+	}
+	if (nmemb > SIZE_MAX / size) {
+		errno = EOVERFLOW;
+		return 0;
+	}
+	fd = hfs_real_fileno_call(stream);
+	if (!hfs_is_hfs_fd(fd)) {
+		return hfs_real_fread_call(ptr, size, nmemb, stream);
+	}
+	total = size * nmemb;
+	n = hfs_lib_read(fd, ptr, total);
+	if (n < 0) {
+		hfs_stdio_mark(stream, HFS_STDIO_ERROR);
+		return 0;
+	}
+	if ((size_t)n < total) {
+		hfs_stdio_mark(stream, HFS_STDIO_EOF);
+	}
+	return (size_t)n / size;
+}
+
+/* Intercept RocksDB's unlocked stdio read path for HFS streams. */
+size_t fread_unlocked(void *ptr, size_t size, size_t nmemb, FILE *stream) {
+	int fd;
+	ssize_t n;
+	size_t total;
+
+	if (size == 0 || nmemb == 0) {
+		return 0;
+	}
+	if (nmemb > SIZE_MAX / size) {
+		errno = EOVERFLOW;
+		return 0;
+	}
+	fd = hfs_real_fileno_call(stream);
+	if (!hfs_is_hfs_fd(fd)) {
+		return hfs_real_fread_unlocked_call(ptr, size, nmemb, stream);
+	}
+	total = size * nmemb;
+	n = hfs_lib_read(fd, ptr, total);
+	if (n < 0) {
+		hfs_stdio_mark(stream, HFS_STDIO_ERROR);
+		return 0;
+	}
+	if ((size_t)n < total) {
+		hfs_stdio_mark(stream, HFS_STDIO_EOF);
+	}
+	return (size_t)n / size;
+}
+
+/* Intercept feof(3) for HFS streams whose reads bypass glibc FILE buffers. */
+int feof(FILE *stream) {
+	int fd = hfs_real_fileno_call(stream);
+
+	if (hfs_is_hfs_fd(fd)) {
+		return hfs_stdio_has(stream, HFS_STDIO_EOF);
+	}
+	return hfs_real_feof_call(stream);
+}
+
+/* Intercept ferror(3) for HFS streams. */
+int ferror(FILE *stream) {
+	int fd = hfs_real_fileno_call(stream);
+
+	if (hfs_is_hfs_fd(fd)) {
+		return hfs_stdio_has(stream, HFS_STDIO_ERROR);
+	}
+	return hfs_real_ferror_call(stream);
+}
+
+/* Intercept clearerr(3) and reset the emulated HFS stream state. */
+void clearerr(FILE *stream) {
+	int fd = hfs_real_fileno_call(stream);
+
+	if (hfs_is_hfs_fd(fd)) {
+		hfs_stdio_clear(stream);
+		return;
+	}
+	hfs_real_clearerr_call(stream);
+}
+
+/* Intercept fclose(3) so recycled FILE pointers cannot reuse stale state. */
+int fclose(FILE *stream) {
+	int fd = hfs_real_fileno_call(stream);
+	bool managed = hfs_is_hfs_fd(fd);
+	int rc;
+
+	/* Detach first so libc's internal close cannot leave a stale HFS slot. */
+	if (managed && hfs_lib_release_fd(fd) != 0) {
+		hfs_stdio_forget(stream);
+		return -1;
+	}
+	rc = hfs_real_fclose_call(stream);
+	if (managed) {
+		hfs_stdio_forget(stream);
+	}
+	return rc;
 }
 
 /* Intercepted __read: glibc internal symbol used by fopen/fread paths. */
@@ -2380,6 +2636,13 @@ static void hfs_preload_ctor(void) {
 	real___openat64_2 = hfs_real_sym("__openat64_2");
 	real_close = hfs_real_sym("close");
 	real_read = hfs_real_sym("read");
+	real_fread = hfs_real_sym("fread");
+	real_fread_unlocked = hfs_real_sym("fread_unlocked");
+	real_fileno = hfs_real_sym("fileno");
+	real_feof = hfs_real_sym("feof");
+	real_ferror = hfs_real_sym("ferror");
+	real_clearerr = hfs_real_sym("clearerr");
+	real_fclose = hfs_real_sym("fclose");
 	real_write = hfs_real_sym("write");
 	real___read = hfs_real_sym("__read");
 	real___write = hfs_real_sym("__write");

@@ -1,5 +1,5 @@
 GLIBC_2.2.5 {
-    global: access; getcwd; get_current_dir_name; open64; readlink; realpath; statfs64; fstatfs64; statvfs64; fstatvfs64;
+    global: __read; access; clearerr; fclose; feof; ferror; fread; fread_unlocked; getcwd; get_current_dir_name; open64; read; readlink; realpath; statfs64; fstatfs64; statvfs64; fstatvfs64;
 };
 
 GLIBC_2.4 {
