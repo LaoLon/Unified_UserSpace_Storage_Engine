@@ -1333,7 +1333,8 @@ bool hfs_lib_is_fork_child(void) {
  * Close an HFS fd: drop one reference; close the blob handle and free
  * the file only when the last reference (dup shares) goes away.
  */
-int hfs_lib_close(int fd) {
+/* Detach one HFS fd slot and release its open-file description. */
+int hfs_lib_release_fd(int fd) {
 	HfsOpenFile *openFile = hfsFdDetach(fd);
 
 	if (openFile == NULL) {
@@ -1341,6 +1342,14 @@ int hfs_lib_close(int fd) {
 		return -1;
 	}
 	hfs_release_open_file(openFile);
+	return 0;
+}
+
+/* Close an HFS fd and then release its kernel placeholder. */
+int hfs_lib_close(int fd) {
+	if (hfs_lib_release_fd(fd) != 0) {
+		return -1;
+	}
 
 	/* Release the kernel placeholder fd. The table slot is already
 	 * cleared, so the close interceptor passes this through. */

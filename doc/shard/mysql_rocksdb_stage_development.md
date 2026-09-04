@@ -385,6 +385,20 @@ VM 验收通过：系统表初始化、数据库/表/索引创建、CRUD、事�
 
 提交：`shard-34: RocksDB persistent and recovery validation`
 
+实现状态（2026-09-05）：RocksDB 端到端验收已完成。重写后的 smoke 使用持久化 Aio bdev
+和独立运行目录，首个 fill 进程格式化，后续进程跨进程重开同一镜像；WAL 保持开启，mmap
+关闭，并通过 `use_direct_reads` 与 `use_direct_io_for_flush_and_compaction` 覆盖 direct
+I/O 路径。preload 补齐 RocksDB 实际绑定的 GLIBC_2.2.5 `read`/`__read`、`fread`/
+`fread_unlocked` 及 stdio 状态接口；`fclose` 先摘除 HFS fd slot，再关闭 libc 占位 fd，避免
+数据库流关闭后留下不可复用的 fd 描述。
+
+VM 上 `make -B app lib`、CMake Release 均通过。RocksDB 完整流程连续 3 轮通过，每轮包含
+20,000 条 fillseq、跨进程 readrandom、direct I/O 重开、overwrite、flush/compact、8 线程
+60 秒 readwhilewriting、SIGKILL 后 WAL recovery 以及 `ldb checkconsistency`，每轮输出
+`ROCKSDB PERSISTENT RECOVERY OK`，总验收输出 `SHARD34_ACCEPTANCE_OK`。RocksDB 的阶段验收
+已完成，但性能汇总和两种数据库的最终支持口径仍留给 shard-35；在 shard-35 完成前仍统一
+称为“兼容性开发中”。
+
 ---
 
 ### shard-35：性能回归与阶段收口
