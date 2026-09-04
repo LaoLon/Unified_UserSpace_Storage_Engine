@@ -13,6 +13,7 @@
 #include "hfs_internal.h"
 #include "hfs_io.h"
 #include "hfs_log.h"
+#include "hfs_stats.h"
 
 /* Keep the hot path bounded while covering the largest common database I/O. */
 #define HFS_IO_POOL_COUNT	16U
@@ -76,8 +77,12 @@ static uint64_t hfsIoMaxUnits(const Hfs *fs) {
 static int hfsIoAcquire(Hfs *fs, HfsIoLease *lease) {
 	struct hfs_io_pool *pool = fs->ioPool;
 
+	HFS_STATS_DMA_ACQUIRE();
 	memset(lease, 0, sizeof(*lease));
 	pthread_mutex_lock(&pool->lock);
+	if (pool->freeTop == 0 && !pool->closing) {
+		HFS_STATS_DMA_WAIT();
+	}
 	while (pool->freeTop == 0 && !pool->closing) {
 		pthread_cond_wait(&pool->available, &pool->lock);
 	}
@@ -91,6 +96,7 @@ static int hfsIoAcquire(Hfs *fs, HfsIoLease *lease) {
 	lease->buffer = pool->storage +
 		(size_t)lease->slot * pool->bufferBytes;
 	pool->active++;
+	HFS_STATS_DMA_ACTIVE(pool->active);
 	pthread_mutex_unlock(&pool->lock);
 	return 0;
 }
@@ -108,6 +114,7 @@ static void hfsIoRelease(HfsIoLease *lease) {
 	if (pool->active > 0) {
 		pool->active--;
 	}
+	HFS_STATS_DMA_RELEASE();
 	pthread_cond_broadcast(&pool->available);
 	pthread_mutex_unlock(&pool->lock);
 	memset(lease, 0, sizeof(*lease));
@@ -147,6 +154,7 @@ static void hfsIoDone(void *arg, int bserrno) {
 
 	request->operationRc = bserrno;
 	if (bserrno != 0) {
+		HFS_STATS_ERROR();
 		HFS_LOG_ERROR("data I/O failed operation=%d offset=%"PRIu64
 			      " units=%"PRIu64" bserrno=%d",
 			      request->operation, request->offset, request->units,
@@ -170,12 +178,14 @@ static int hfsIoSubmit(HfsFile *file, void *buffer, uint64_t offset,
 	/* The callback owns only this request, so the HfsFile has no I/O scratch state. */
 	hfsRuntimeCompletionReset(&request.completion);
 	if (hfsRuntimeSubmit(hfsIoStart, &request) != 0) {
+		HFS_STATS_ERROR();
 		HFS_LOG_ERROR("data I/O submission rejected operation=%d", operation);
 		errno = ESHUTDOWN;
 		return -1;
 	}
 	if (!hfsRuntimeCompletionWait(&request.completion,
 				      HFS_RUNTIME_TIMEOUT_MS)) {
+		HFS_STATS_ERROR();
 		HFS_LOG_ERROR("data I/O wait failed operation=%d errno=%d",
 			      operation, errno);
 		return -1;

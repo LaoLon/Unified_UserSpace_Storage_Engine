@@ -15,6 +15,7 @@
 
 #include "hfs_log.h"
 #include "hfs_runtime.h"
+#include "hfs_stats.h"
 
 /* Completion states are intentionally simple for one-shot requests. */
 #define HFS_COMPLETION_PENDING 0
@@ -241,6 +242,7 @@ int hfsRuntimeSubmit(spdk_msg_fn fn, void *ctx) {
 
 	/* A fork child must never enqueue a pointer into the parent's SPDK queue. */
 	if (hfsRuntimeIsForkChild()) {
+		HFS_STATS_SPDK_REJECT();
 		return -ECHILD;
 	}
 	pthread_mutex_lock(&g_runtime.lock);
@@ -249,7 +251,11 @@ int hfsRuntimeSubmit(spdk_msg_fn fn, void *ctx) {
 	} else if (!g_runtime.accepting || g_runtime.spdkThread == NULL) {
 		rc = -ESHUTDOWN;
 	} else {
+		HFS_STATS_SPDK_SUBMIT();
 		spdk_thread_send_msg(g_runtime.spdkThread, fn, ctx);
+	}
+	if (rc != 0) {
+		HFS_STATS_SPDK_REJECT();
 	}
 	pthread_mutex_unlock(&g_runtime.lock);
 	return rc;
@@ -319,6 +325,7 @@ void hfsRuntimeCompletionReset(HfsCompletion *completion) {
 
 /* Complete one request and wake any blocked business thread. */
 void hfsRuntimeCompletionComplete(HfsCompletion *completion) {
+	HFS_STATS_SPDK_COMPLETE();
 	if (!hfsRuntimeIsOwnerThread() &&
 	    !atomic_exchange_explicit(&g_ownerViolationLogged, true, memory_order_relaxed)) {
 		HFS_LOG_ERROR("SPDK completion arrived outside owner thread");

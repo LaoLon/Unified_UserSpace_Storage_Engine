@@ -40,6 +40,7 @@ set(HFS_CORE_SRC
   src/hfs_file.c
   src/hfs_io.c
   src/hfs_log.c
+  src/hfs_stats.c
   src/hfs_lib.c
   src/hfs_meta.c
   src/hfs_preload.c
