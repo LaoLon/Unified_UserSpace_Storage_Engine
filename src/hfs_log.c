@@ -65,6 +65,19 @@ static FILE *g_logFile;
 static uint64_t g_fileSize;
 static uint64_t g_reopenAfterMs;
 
+/* Keep the writer out of signals reserved for the host signal thread. */
+static void hfsLogBlockManagedSignals(void) {
+	sigset_t managedSignals;
+
+	sigemptyset(&managedSignals);
+	sigaddset(&managedSignals, SIGHUP);
+	sigaddset(&managedSignals, SIGQUIT);
+	sigaddset(&managedSignals, SIGALRM);
+	sigaddset(&managedSignals, SIGTERM);
+	sigaddset(&managedSignals, SIGTSTP);
+	pthread_sigmask(SIG_BLOCK, &managedSignals, NULL);
+}
+
 /* Monotonic clock in milliseconds (scheduling/flush timing). */
 static uint64_t hfsLogNowMs(void) {
 	struct timespec ts;
@@ -521,6 +534,9 @@ static void *hfsLogThread(void *arg) {
 	uint64_t lastFlush = hfsLogNowMs();
 	uint64_t lastDropReport = lastFlush;
 	uint64_t lastDropped = 0;
+
+	(void)arg;
+	hfsLogBlockManagedSignals();
 
 	while (atomic_load(&g_running)) {
 		uint32_t n = 0;

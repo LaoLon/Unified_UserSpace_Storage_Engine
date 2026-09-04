@@ -348,6 +348,20 @@ fio。最近一次 fio（4K randrw / 128K seq，iodepth=32，10s）分别为 628
 
 提交：`shard-33: MySQL persistent and recovery validation`
 
+实现状态（2026-09-04）：MariaDB 端到端验收已完成。新增的 smoke 使用持久化 Aio bdev
+和独立运行目录，初始化阶段通过 bootstrap wrapper 将 `mariadb-install-db` 的真实
+`mariadbd` 放入单个 HFS 进程；服务阶段每次重新挂载同一镜像，显式关闭 native AIO，
+使用 POSIX `fsync`。preload 已补齐 MariaDB 实际使用的 `open64/openat64`、fortify
+open、`readlink`、`realpath`、64 位 stat ABI，以及绝对路径和 HFS 目录 fd 的 `*at`
+路由；HFS owner/log 线程屏蔽 MariaDB 使用的终止信号，保留宿主进程的信号管理线程。
+
+VM 验收通过：系统表初始化、数据库/表/索引创建、CRUD、事务提交与回滚、LONGTEXT、
+临时表、正常重启、SIGKILL 后 committed/uncommitted 数据恢复，以及 4/16 并发客户端
+负载。当前 VM 未安装 sysbench，因此并发验收使用 `mysqlslap` 4/16、每档 3 轮；完整
+脚本输出 `MYSQL PERSISTENT RECOVERY OK`。这只完成 MariaDB/MySQL 兼容性验收，RocksDB
+仍待 shard-34，性能汇总和两种数据库连续三轮验收仍待 shard-35，阶段总口径继续保持
+“兼容性开发中”。
+
 ---
 
 ### shard-34：RocksDB 完整验收

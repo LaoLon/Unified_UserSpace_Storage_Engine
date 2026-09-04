@@ -1,6 +1,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdatomic.h>
 #include <sys/syscall.h>
 #include <linux/futex.h>
@@ -108,18 +109,41 @@ static void hfsRuntimePublishReady(int rc) {
 	pthread_mutex_unlock(&g_runtime.lock);
 }
 
+/* Block signals reserved for the host process signal-management thread. */
+static int hfsRuntimeBlockManagedSignals(sigset_t *previousMask) {
+	sigset_t managedSignals;
+
+	sigemptyset(&managedSignals);
+	sigaddset(&managedSignals, SIGHUP);
+	sigaddset(&managedSignals, SIGQUIT);
+	sigaddset(&managedSignals, SIGALRM);
+	sigaddset(&managedSignals, SIGTERM);
+	sigaddset(&managedSignals, SIGTSTP);
+	return pthread_sigmask(SIG_BLOCK, &managedSignals, previousMask);
+}
+
 /* Initialize SPDK and poll one SPDK thread until the runtime is stopped. */
 static void *hfsRuntimeOwnerMain(void *arg) {
 	struct spdk_env_opts opts = {
 		.opts_size = sizeof(struct spdk_env_opts),
 	};
 	struct spdk_thread *thread;
+	sigset_t previousSignalMask;
+	bool signalMaskSaved = false;
 	int rc;
 
 	(void)arg;
+	rc = hfsRuntimeBlockManagedSignals(&previousSignalMask);
+	if (rc != 0) {
+		HFS_LOG_ERROR("failed to block managed signals rc=%d", rc);
+		hfsRuntimePublishReady(-rc);
+		return NULL;
+	}
+	signalMaskSaved = true;
 	spdk_env_opts_init(&opts);
 	rc = spdk_env_init(&opts);
 	if (rc != 0) {
+		pthread_sigmask(SIG_SETMASK, &previousSignalMask, NULL);
 		hfsRuntimePublishReady(rc);
 		return NULL;
 	}
@@ -131,6 +155,9 @@ static void *hfsRuntimeOwnerMain(void *arg) {
 	rc = spdk_thread_lib_init(NULL, 0);
 	if (rc != 0) {
 		spdk_env_fini();
+		if (signalMaskSaved) {
+			pthread_sigmask(SIG_SETMASK, &previousSignalMask, NULL);
+		}
 		hfsRuntimePublishReady(rc);
 		return NULL;
 	}
@@ -139,6 +166,9 @@ static void *hfsRuntimeOwnerMain(void *arg) {
 	if (thread == NULL) {
 		spdk_thread_lib_fini();
 		spdk_env_fini();
+		if (signalMaskSaved) {
+			pthread_sigmask(SIG_SETMASK, &previousSignalMask, NULL);
+		}
 		hfsRuntimePublishReady(-ENOMEM);
 		return NULL;
 	}
@@ -160,6 +190,9 @@ static void *hfsRuntimeOwnerMain(void *arg) {
 	spdk_thread_destroy(thread);
 	spdk_thread_lib_fini();
 	spdk_env_fini();
+	if (signalMaskSaved) {
+		pthread_sigmask(SIG_SETMASK, &previousSignalMask, NULL);
+	}
 
 	pthread_mutex_lock(&g_runtime.lock);
 	globalThread = NULL;
