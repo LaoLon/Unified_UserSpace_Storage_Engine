@@ -14,9 +14,11 @@
 
 /* Versioned metadata header used to keep inode IDs stable across compaction. */
 #define HFS_META_MAGIC		0x32465348U
-#define HFS_META_VERSION	3U
+#define HFS_META_VERSION	4U
+#define HFS_META_VERSION_V3	3U
 #define HFS_META_INTENT_MAGIC	0x544e4948U
-#define HFS_META_INTENT_VERSION	1U
+#define HFS_META_INTENT_VERSION	2U
+#define HFS_META_INTENT_VERSION_V1	1U
 #define HFS_META_INTENT_ACTIVE	1U
 #define HFS_META_INTENT_MAX_SLOTS	4U
 
@@ -29,6 +31,18 @@ typedef struct HfsMetaHeaderDisk {
 	uint32_t count;
 	uint32_t checksum;
 } HfsMetaHeaderDisk;
+
+/* Inode layout used by the shard-30 metadata image. */
+typedef struct HfsMetaInodeV3Disk {
+	uint64_t id;
+	uint8_t type;
+	uint64_t parentId;
+	uint64_t blobId;
+	uint64_t size;
+	uint64_t mtimeNs;
+	uint64_t ctimeNs;
+	char name[FILENAME_LENGTH];
+} HfsMetaInodeV3Disk;
 
 /* One after-image entry in the fixed-size metadata intent record. */
 typedef struct HfsMetaIntentSlotDisk {
@@ -53,9 +67,33 @@ typedef struct HfsMetaIntentDisk {
 	HfsMetaIntentSlotDisk slots[HFS_META_INTENT_MAX_SLOTS];
 } HfsMetaIntentDisk;
 
+/* Version-one intent layout kept for crash recovery of shard-30 images. */
+typedef struct HfsMetaIntentSlotV1Disk {
+	uint32_t index;
+	uint32_t reserved;
+	HfsMetaInodeV3Disk inode;
+} HfsMetaIntentSlotV1Disk;
+
+typedef struct HfsMetaIntentV1Disk {
+	uint32_t magic;
+	uint32_t version;
+	uint32_t state;
+	uint32_t slotCount;
+	uint64_t baseGeneration;
+	uint64_t generation;
+	uint64_t nextInodeId;
+	uint32_t baseCount;
+	uint32_t count;
+	uint32_t checksum;
+	uint32_t reserved;
+	HfsMetaIntentSlotV1Disk slots[HFS_META_INTENT_MAX_SLOTS];
+} HfsMetaIntentV1Disk;
+
 #define HFS_META_HEADER_SIZE	(sizeof(HfsMetaHeaderDisk))
 #define HFS_META_INTENT_SIZE	(sizeof(HfsMetaIntentDisk))
+#define HFS_META_INTENT_V1_SIZE	(sizeof(HfsMetaIntentV1Disk))
 #define HFS_META_INODE_OFFSET	(HFS_META_HEADER_SIZE + HFS_META_INTENT_SIZE)
+#define HFS_META_INODE_OFFSET_V3	(HFS_META_HEADER_SIZE + HFS_META_INTENT_V1_SIZE)
 
 _Static_assert(sizeof(HfsMetaHeaderDisk) == 32,
 	       "metadata header layout must remain fixed");
@@ -83,12 +121,33 @@ static uint32_t hfsMetaImageChecksum(const HfsMetaHeaderDisk *header,
 	copy.checksum = 0;
 	checksum = hfsMetaChecksumUpdate(checksum, &copy, sizeof(copy));
 	return hfsMetaChecksumUpdate(checksum, inodes,
-				     (size_t)count * sizeof(*inodes));
+					     (size_t)count * sizeof(*inodes));
+}
+
+/* Compute the checksum of a shard-30 metadata image. */
+static uint32_t hfsMetaImageChecksumV3(const HfsMetaHeaderDisk *header,
+					       const HfsMetaInodeV3Disk *inodes,
+					       uint32_t count) {
+	HfsMetaHeaderDisk copy = *header;
+	uint32_t checksum = 2166136261U;
+
+	copy.checksum = 0;
+	checksum = hfsMetaChecksumUpdate(checksum, &copy, sizeof(copy));
+	return hfsMetaChecksumUpdate(checksum, inodes,
+					     (size_t)count * sizeof(*inodes));
 }
 
 /* Compute the checksum of a fixed-size intent record. */
 static uint32_t hfsMetaIntentChecksum(const HfsMetaIntentDisk *intent) {
 	HfsMetaIntentDisk copy = *intent;
+
+	copy.checksum = 0;
+	return hfsMetaChecksumUpdate(2166136261U, &copy, sizeof(copy));
+}
+
+/* Compute the checksum of a version-one metadata intent record. */
+static uint32_t hfsMetaIntentChecksumV1(const HfsMetaIntentV1Disk *intent) {
+	HfsMetaIntentV1Disk copy = *intent;
 
 	copy.checksum = 0;
 	return hfsMetaChecksumUpdate(2166136261U, &copy, sizeof(copy));
@@ -101,6 +160,47 @@ static void hfsMetaCrashPoint(int point) {
 	if (step != NULL && atoi(step) == point) {
 		_exit(200 + point);
 	}
+}
+
+/* Return the current realtime clock as nanoseconds since the epoch. */
+static uint64_t hfsMetaNowNs(void) {
+	struct timespec ts;
+
+	if (clock_gettime(CLOCK_REALTIME, &ts) != 0) {
+		return 0;
+	}
+	return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+/* Initialize the minimal POSIX attributes for a newly created inode. */
+static void hfsMetaInitAttributes(struct hfs_inode *inode, uint8_t type,
+					  uint64_t nowNs) {
+	inode->mode = type == HFS_INODE_DIR ? 0755U : 0644U;
+	inode->uid = (uint32_t)getuid();
+	inode->gid = (uint32_t)getgid();
+	inode->atimeNs = nowNs;
+	inode->mtimeNs = nowNs;
+	inode->ctimeNs = nowNs;
+}
+
+/* Convert the pre-shard-32 inode layout and supply compatible defaults. */
+static void hfsMetaConvertV3Inode(struct hfs_inode *dst,
+					  const HfsMetaInodeV3Disk *src) {
+	uint64_t nowNs = src->ctimeNs != 0 ? src->ctimeNs : hfsMetaNowNs();
+
+	memset(dst, 0, sizeof(*dst));
+	dst->id = src->id;
+	dst->type = src->type;
+	dst->parentId = src->parentId;
+	dst->blobId = src->blobId;
+	dst->size = src->size;
+	dst->atimeNs = src->mtimeNs != 0 ? src->mtimeNs : nowNs;
+	dst->mtimeNs = src->mtimeNs != 0 ? src->mtimeNs : nowNs;
+	dst->ctimeNs = src->ctimeNs != 0 ? src->ctimeNs : nowNs;
+	dst->mode = src->type == HFS_INODE_DIR ? 0755U : 0644U;
+	dst->uid = (uint32_t)getuid();
+	dst->gid = (uint32_t)getgid();
+	memcpy(dst->name, src->name, sizeof(dst->name));
 }
 
 /* Return true only when the caller explicitly permits metadata formatting. */
@@ -443,15 +543,39 @@ static bool hfsMetaIntentValid(const HfsMetaIntentDisk *intent) {
 	return true;
 }
 
+/* Validate a shard-30 intent before applying its legacy after-images. */
+static bool hfsMetaIntentV1Valid(const HfsMetaIntentV1Disk *intent) {
+	uint32_t i;
+
+	if (intent->magic != HFS_META_INTENT_MAGIC ||
+	    intent->version != HFS_META_INTENT_VERSION_V1 ||
+	    intent->state != HFS_META_INTENT_ACTIVE ||
+	    intent->slotCount > HFS_META_INTENT_MAX_SLOTS ||
+	    intent->baseCount > HFS_MAX_INODES || intent->count > HFS_MAX_INODES ||
+	    intent->nextInodeId == 0 ||
+	    intent->generation <= intent->baseGeneration ||
+	    intent->checksum != hfsMetaIntentChecksumV1(intent)) {
+		return false;
+	}
+	for (i = 0; i < intent->slotCount; i++) {
+		if (intent->slots[i].index >= intent->count) {
+			return false;
+		}
+	}
+	return true;
+}
+
 /* Rebuild the in-memory inode table and replay a valid intent if present. */
 int hfsMetaLoadAll(Hfs *fs) {
 	const size_t legacyHeaderSize = sizeof(uint32_t);
 	const size_t oldHeaderSize = sizeof(uint32_t) * 2 + sizeof(uint64_t);
 	HfsMetaHeaderDisk header;
 	HfsMetaIntentDisk intent;
+	HfsMetaIntentV1Disk intentV1;
 	uint8_t *buf;
 	size_t len;
 	size_t inodeOffset;
+	size_t inodeSize;
 	uint32_t first;
 	uint32_t version = 0;
 	uint32_t count;
@@ -459,6 +583,7 @@ int hfsMetaLoadAll(Hfs *fs) {
 	uint64_t maxInodeId = 0;
 	uint32_t i;
 	bool currentFormat = false;
+	bool v3Format = false;
 
 	if (hfsMetaBlobRead(fs, (void **)&buf, &len) != 0) {
 		return -1;
@@ -487,6 +612,16 @@ int hfsMetaLoadAll(Hfs *fs) {
 			count = header.count;
 			inodeOffset = HFS_META_INODE_OFFSET;
 			currentFormat = true;
+		} else if (version == HFS_META_VERSION_V3) {
+			if (len < HFS_META_INODE_OFFSET_V3) {
+				spdk_free(buf);
+				errno = EIO;
+				return -1;
+			}
+			memcpy(&header, buf, sizeof(header));
+			count = header.count;
+			inodeOffset = HFS_META_INODE_OFFSET_V3;
+			v3Format = true;
 		} else if (version == 2U) {
 			if (len < oldHeaderSize) {
 				spdk_free(buf);
@@ -506,8 +641,10 @@ int hfsMetaLoadAll(Hfs *fs) {
 	} else {
 		count = first;
 	}
-	if (count > HFS_MAX_INODES ||
-	    len < inodeOffset + (size_t)count * sizeof(struct hfs_inode)) {
+	inodeSize = currentFormat ? sizeof(struct hfs_inode) :
+				    sizeof(HfsMetaInodeV3Disk);
+	if (count > HFS_MAX_INODES || inodeOffset > len ||
+	    (size_t)count > (len - inodeOffset) / inodeSize) {
 		spdk_free(buf);
 		errno = EIO;
 		return -1;
@@ -520,9 +657,26 @@ int hfsMetaLoadAll(Hfs *fs) {
 		errno = EIO;
 		return -1;
 	}
+	if (v3Format &&
+	    (header.generation == 0 ||
+	     header.checksum != hfsMetaImageChecksumV3(&header,
+					(const HfsMetaInodeV3Disk *)(buf + inodeOffset), count))) {
+		spdk_free(buf);
+		errno = EIO;
+		return -1;
+	}
 
-	memcpy(fs->inodes, buf + inodeOffset,
-	       (size_t)count * sizeof(struct hfs_inode));
+	if (currentFormat) {
+		memcpy(fs->inodes, buf + inodeOffset,
+		       (size_t)count * sizeof(struct hfs_inode));
+	} else {
+		for (i = 0; i < count; i++) {
+			const HfsMetaInodeV3Disk *oldInode =
+				(const HfsMetaInodeV3Disk *)(buf + inodeOffset) + i;
+
+			hfsMetaConvertV3Inode(&fs->inodes[i], oldInode);
+		}
+	}
 	fs->inodeCount = count;
 	for (i = 0; i < count; i++) {
 		if (fs->inodes[i].id > maxInodeId) {
@@ -566,6 +720,30 @@ int hfsMetaLoadAll(Hfs *fs) {
 			fs->inodeCount = intent.count;
 			fs->nextInodeId = intent.nextInodeId;
 			fs->metaGeneration = intent.generation;
+			spdk_free(buf);
+			return hfsMetaSaveAll(fs);
+		}
+	}
+	if (v3Format && len >= HFS_META_INODE_OFFSET_V3 + sizeof(intentV1)) {
+		bool matchesPendingImage;
+		bool matchesCommittedImage;
+
+		memcpy(&intentV1, buf + HFS_META_HEADER_SIZE, sizeof(intentV1));
+		matchesPendingImage = intentV1.baseGeneration == header.generation &&
+					      intentV1.baseCount == header.count;
+		matchesCommittedImage = intentV1.generation == header.generation &&
+						intentV1.count == header.count;
+		if (hfsMetaIntentV1Valid(&intentV1) &&
+		    (matchesPendingImage || matchesCommittedImage)) {
+			for (i = 0; i < intentV1.slotCount; i++) {
+				HfsMetaInodeV3Disk *oldInode = &intentV1.slots[i].inode;
+
+				hfsMetaConvertV3Inode(
+					&fs->inodes[intentV1.slots[i].index], oldInode);
+			}
+			fs->inodeCount = intentV1.count;
+			fs->nextInodeId = intentV1.nextInodeId;
+			fs->metaGeneration = intentV1.generation;
 			spdk_free(buf);
 			return hfsMetaSaveAll(fs);
 		}
@@ -643,6 +821,10 @@ struct hfs_inode *hfsMetaResolvePath(Hfs *fs, const char *path) {
 	char comp[FILENAME_LENGTH];
 	size_t len;
 
+	if (path == NULL || path[0] == '\0') {
+		errno = ENOENT;
+		return NULL;
+	}
 	cur = hfsMetaFindById(fs, HFS_ROOT_INODE_ID);
 	if (cur == NULL) {
 		errno = ENOENT;
@@ -743,7 +925,8 @@ int hfsMetaResolveParent(Hfs *fs, const char *path,
  * Create a new directory inode under 'parent'.
  * Rejects duplicate names with EEXIST; persists the inode table.
  */
-int hfsMetaMkdir(Hfs *fs, struct hfs_inode *parent, const char *name) {
+int hfsMetaMkdir(Hfs *fs, struct hfs_inode *parent, const char *name,
+			 uint32_t mode) {
 	struct hfs_inode *dir;
 	struct timespec ts;
 	uint32_t index;
@@ -771,8 +954,10 @@ int hfsMetaMkdir(Hfs *fs, struct hfs_inode *parent, const char *name) {
 	dir->type = HFS_INODE_DIR;
 	dir->parentId = parent->id;
 	dir->blobId = SPDK_BLOBID_INVALID;
-	dir->ctimeNs = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
-	dir->mtimeNs = dir->ctimeNs;
+	hfsMetaInitAttributes(dir, HFS_INODE_DIR,
+			       (uint64_t)ts.tv_sec * 1000000000ULL +
+			       (uint64_t)ts.tv_nsec);
+	dir->mode = mode & 07777U;
 	snprintf(dir->name, sizeof(dir->name), "%s", name);
 	index = fs->inodeCount - 1;
 
@@ -848,7 +1033,8 @@ static void hfsMetaDoCreateFileBlob(void *arg) {
  * Create a new file: allocate a data blob, add a FILE inode under
  * 'parent' and persist the table. Fails with EEXIST if the name is taken.
  */
-int hfsMetaCreateFile(Hfs *fs, struct hfs_inode *parent, const char *name) {
+int hfsMetaCreateFile(Hfs *fs, struct hfs_inode *parent, const char *name,
+			      uint32_t mode) {
 	struct hfs_meta_create_ctx ctx;
 	struct hfs_inode *in;
 	struct timespec ts;
@@ -891,8 +1077,10 @@ int hfsMetaCreateFile(Hfs *fs, struct hfs_inode *parent, const char *name) {
 	in->parentId = parent->id;
 	in->blobId = ctx.blobId;
 	in->size = 0;
-	in->ctimeNs = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
-	in->mtimeNs = in->ctimeNs;
+	hfsMetaInitAttributes(in, HFS_INODE_FILE,
+			       (uint64_t)ts.tv_sec * 1000000000ULL +
+			       (uint64_t)ts.tv_nsec);
+	in->mode = mode & 07777U;
 	snprintf(in->name, sizeof(in->name), "%s", name);
 	index = fs->inodeCount - 1;
 
@@ -1036,7 +1224,53 @@ int hfsMetaSetSize(Hfs *fs, struct hfs_inode *in, uint64_t size) {
 	clock_gettime(CLOCK_REALTIME, &ts);
 	in->size = size;
 	in->mtimeNs = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+	in->ctimeNs = in->mtimeNs;
 
+	return hfsMetaCommit(fs, &index, 1);
+}
+
+/* Persist a permission-bit change and refresh ctime. */
+int hfsMetaSetMode(Hfs *fs, struct hfs_inode *in, uint32_t mode) {
+	uint32_t index = (uint32_t)(in - fs->inodes);
+
+	in->mode = mode & 07777U;
+	in->ctimeNs = hfsMetaNowNs();
+	return hfsMetaCommit(fs, &index, 1);
+}
+
+/* Persist one or both owner-id changes and refresh ctime. */
+int hfsMetaSetOwner(Hfs *fs, struct hfs_inode *in, uint32_t uid,
+			    uint32_t gid, bool setUid, bool setGid) {
+	uint32_t index = (uint32_t)(in - fs->inodes);
+
+	if (!setUid && !setGid) {
+		return 0;
+	}
+	if (setUid) {
+		in->uid = uid;
+	}
+	if (setGid) {
+		in->gid = gid;
+	}
+	in->ctimeNs = hfsMetaNowNs();
+	return hfsMetaCommit(fs, &index, 1);
+}
+
+/* Persist selected timestamps and refresh ctime for a metadata change. */
+int hfsMetaSetTimes(Hfs *fs, struct hfs_inode *in, uint64_t atimeNs,
+			    uint64_t mtimeNs, bool setAtime, bool setMtime) {
+	uint32_t index = (uint32_t)(in - fs->inodes);
+
+	if (!setAtime && !setMtime) {
+		return 0;
+	}
+	if (setAtime) {
+		in->atimeNs = atimeNs;
+	}
+	if (setMtime) {
+		in->mtimeNs = mtimeNs;
+	}
+	in->ctimeNs = hfsMetaNowNs();
 	return hfsMetaCommit(fs, &index, 1);
 }
 
@@ -1182,6 +1416,7 @@ int hfsMetaInit(Hfs *fs) {
 	root->type = HFS_INODE_DIR;
 	root->parentId = 0;
 	root->blobId = SPDK_BLOBID_INVALID;
+	hfsMetaInitAttributes(root, HFS_INODE_DIR, hfsMetaNowNs());
 	snprintf(root->name, sizeof(root->name), "/");
 	fs->rootInodeId = root->id;
 	return hfsMetaSaveAll(fs);

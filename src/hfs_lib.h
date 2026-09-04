@@ -5,8 +5,11 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/types.h>
 #include <sys/uio.h>
+#include <sys/vfs.h>
+#include <time.h>
 
 #include "hfs.h"
 
@@ -88,8 +91,30 @@ struct hfs_dirent *hfs_lib_readdir(struct hfs_dir *dir);
 int hfs_lib_closedir(struct hfs_dir *dir);
 /* Stat a path under the HFS mount prefix. */
 int hfs_lib_stat(const char *path, struct stat *st);
+/* Return HFS capacity information for a managed path. */
+int hfs_lib_statvfs(const char *path, struct statvfs *st);
+/* Return HFS capacity information for an HFS fd. */
+int hfs_lib_fstatvfs(int fd, struct statvfs *st);
+/* Return Linux statfs information for a managed path. */
+int hfs_lib_statfs(const char *path, struct statfs *st);
+/* Return Linux statfs information for an HFS fd. */
+int hfs_lib_fstatfs(int fd, struct statfs *st);
 /* Check access to a path under the HFS mount prefix (no permission model). */
 int hfs_lib_access(const char *path, int mode);
+/* Update permission bits on a managed path. */
+int hfs_lib_chmod(const char *path, mode_t mode);
+/* Update permission bits on an HFS fd. */
+int hfs_lib_fchmod(int fd, mode_t mode);
+/* Update ownership on a managed path. */
+int hfs_lib_chown(const char *path, uid_t uid, gid_t gid);
+/* Update ownership on an HFS fd. */
+int hfs_lib_fchown(int fd, uid_t uid, gid_t gid);
+/* Update selected timestamps on a managed path. */
+int hfs_lib_utimens(const char *path, const struct timespec times[2]);
+/* Update selected timestamps on an HFS fd. */
+int hfs_lib_futimens(int fd, const struct timespec times[2]);
+/* Validate an advisory I/O hint for an HFS fd. */
+int hfs_lib_posix_fadvise(int fd, off_t offset, off_t len, int advice);
 /* fcntl for HFS fds: flags and fd duplication. */
 int hfs_lib_fcntl(int fd, int cmd, long arg);
 

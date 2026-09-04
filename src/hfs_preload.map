@@ -1,3 +1,7 @@
+GLIBC_2.2.5 {
+    global: statfs64; fstatfs64; statvfs64; fstatvfs64;
+};
+
 GLIBC_2.10 {
     global: preadv; pwritev;
 };

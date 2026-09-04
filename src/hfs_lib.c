@@ -128,7 +128,7 @@ static void hfs_auto_mkdir_path(Hfs *fs, const char *rel) {
 		}
 		if (hfsMetaResolvePath(fs, path) == NULL &&
 		    hfsMetaResolveParent(fs, path, &parent, &leaf) == 0) {
-			hfsMetaMkdir(fs, parent, leaf);
+			hfsMetaMkdir(fs, parent, leaf, 0755U);
 		}
 		if (slash != NULL) {
 			*slash = '/';
@@ -422,6 +422,9 @@ int hfs_lib_init(void) {
 		pthread_rwlock_unlock(&g_metaLock);
 		return -1;
 	}
+	/* Cache blobstore capacity for lock-free statfs/statvfs reporting. */
+	g_fs->numCluster = spdk_bs_total_data_cluster_count(g_fs->blobstore);
+	g_fs->freeClusterCount = spdk_bs_free_cluster_count(g_fs->blobstore);
 
 	if (hfsIoInit(g_fs) != 0) {
 		HFS_LOG_ERROR("hfsIoInit failed");
@@ -535,8 +538,6 @@ int hfs_lib_open(const char *path, int flags, mode_t mode) {
 	int rc;
 	bool created = false;
 
-	(void)mode;
-
 	pthread_rwlock_wrlock(&g_metaLock);
 	if (g_fs == NULL) {
 		pthread_rwlock_unlock(&g_metaLock);
@@ -555,7 +556,7 @@ int hfs_lib_open(const char *path, int flags, mode_t mode) {
 			pthread_rwlock_unlock(&g_metaLock);
 			return -1;
 		}
-		rc = hfsMetaCreateFile(g_fs, parent, leaf);
+		rc = hfsMetaCreateFile(g_fs, parent, leaf, (uint32_t)mode);
 		if (rc != 0) {
 			pthread_rwlock_unlock(&g_metaLock);
 			return -1;
@@ -609,6 +610,10 @@ int hfs_lib_open(const char *path, int flags, mode_t mode) {
 			return -1;
 		}
 		openFile->ctimeNs = in->ctimeNs;
+		openFile->mode = in->mode;
+		openFile->uid = in->uid;
+		openFile->gid = in->gid;
+		openFile->atimeNs = in->atimeNs;
 		atomic_store_explicit(&openFile->mtimeNs, in->mtimeNs,
 				      memory_order_relaxed);
 		pthread_rwlock_unlock(&g_metaLock);
@@ -680,6 +685,10 @@ int hfs_lib_open(const char *path, int flags, mode_t mode) {
 		openFile->offset = in->size;
 	}
 	openFile->ctimeNs = in->ctimeNs;
+	openFile->mode = in->mode;
+	openFile->uid = in->uid;
+	openFile->gid = in->gid;
+	openFile->atimeNs = in->atimeNs;
 	atomic_store_explicit(&openFile->mtimeNs, in->mtimeNs,
 			      memory_order_relaxed);
 
@@ -1503,6 +1512,11 @@ int hfs_lib_fstat(int fd, struct stat *st) {
 	uint64_t orphanCtimeNs;
 	uint64_t orphanMtimeNs;
 
+	if (st == NULL) {
+		errno = EFAULT;
+		return -1;
+	}
+
 	openFile = hfsFdAcquire(fd);
 	if (openFile == NULL) {
 		errno = EBADF;
@@ -1523,7 +1537,11 @@ int hfs_lib_fstat(int fd, struct stat *st) {
 		memset(&snapshot, 0, sizeof(snapshot));
 		snapshot.id = openFile->inodeId;
 		snapshot.type = HFS_INODE_FILE;
+		snapshot.mode = openFile->mode;
+		snapshot.uid = openFile->uid;
+		snapshot.gid = openFile->gid;
 		snapshot.size = orphanSize;
+	snapshot.atimeNs = openFile->atimeNs;
 		snapshot.ctimeNs = orphanCtimeNs;
 		snapshot.mtimeNs = orphanMtimeNs;
 	}
@@ -1532,16 +1550,21 @@ int hfs_lib_fstat(int fd, struct stat *st) {
 	in = &snapshot;
 	memset(st, 0, sizeof(*st));
 	st->st_ino = (ino_t)in->id;
-	st->st_mode = (in->type == HFS_INODE_DIR) ? (S_IFDIR | 0755) : (S_IFREG | 0644);
+	st->st_mode = (in->type == HFS_INODE_DIR ? S_IFDIR : S_IFREG) |
+			     (in->mode & 07777U);
 	st->st_size = (off_t)in->size;
+	st->st_atim.tv_sec = (time_t)(in->atimeNs / 1000000000ULL);
+	st->st_atim.tv_nsec = (long)(in->atimeNs % 1000000000ULL);
 	st->st_mtim.tv_sec = (time_t)(in->mtimeNs / 1000000000ULL);
 	st->st_mtim.tv_nsec = (long)(in->mtimeNs % 1000000000ULL);
 	st->st_ctim.tv_sec = (time_t)(in->ctimeNs / 1000000000ULL);
 	st->st_ctim.tv_nsec = (long)(in->ctimeNs % 1000000000ULL);
-	st->st_uid = getuid();
-	st->st_gid = getgid();
+	st->st_uid = (uid_t)in->uid;
+	st->st_gid = (gid_t)in->gid;
 	st->st_nlink = 1;
-	st->st_blksize = 4096;
+	st->st_blksize = (blksize_t)(g_fs != NULL && g_fs->unitSize != 0 ?
+					g_fs->unitSize : 4096);
+	st->st_blocks = (blkcnt_t)((in->size + 511U) / 512U);
 	return 0;
 }
 
@@ -1566,6 +1589,289 @@ int hfs_lib_access(const char *path, int mode) {
 		return -1;	/* errno set by the resolver */
 	}
 	pthread_rwlock_unlock(&g_metaLock);
+	return 0;
+}
+
+/* Decode POSIX timestamp arguments into nanosecond values. */
+static int hfs_decode_times(const struct timespec times[2],
+				    uint64_t *atimeNs, uint64_t *mtimeNs,
+				    bool *setAtime, bool *setMtime) {
+	uint64_t nowNs = hfs_now_ns();
+	int i;
+
+	*atimeNs = 0;
+	*mtimeNs = 0;
+	*setAtime = false;
+	*setMtime = false;
+	if (times == NULL) {
+		*atimeNs = nowNs;
+		*mtimeNs = nowNs;
+		*setAtime = true;
+		*setMtime = true;
+		return 0;
+	}
+	for (i = 0; i < 2; i++) {
+		const struct timespec *value = &times[i];
+		uint64_t *result = i == 0 ? atimeNs : mtimeNs;
+		bool *setValue = i == 0 ? setAtime : setMtime;
+
+		if (value->tv_nsec == UTIME_OMIT) {
+			continue;
+		}
+		if (value->tv_nsec == UTIME_NOW) {
+			*result = nowNs;
+			*setValue = true;
+			continue;
+		}
+		if (value->tv_sec < 0 || value->tv_nsec < 0 ||
+		    value->tv_nsec >= 1000000000L) {
+			return EINVAL;
+		}
+		*result = (uint64_t)value->tv_sec * 1000000000ULL +
+			  (uint64_t)value->tv_nsec;
+		*setValue = true;
+	}
+	return 0;
+}
+
+/* Update one path attribute while holding the metadata write lock. */
+static int hfs_update_path_attribute(const char *path, int attribute,
+					     mode_t mode, uid_t uid, gid_t gid,
+					     const struct timespec times[2]) {
+	struct hfs_inode *in;
+	uint64_t atimeNs = 0;
+	uint64_t mtimeNs = 0;
+	bool setAtime = false;
+	bool setMtime = false;
+	int rc = 0;
+
+	pthread_rwlock_wrlock(&g_metaLock);
+	if (g_fs == NULL) {
+		pthread_rwlock_unlock(&g_metaLock);
+		errno = ENODEV;
+		return -1;
+	}
+	in = hfsMetaResolvePath(g_fs, path);
+	if (in == NULL) {
+		pthread_rwlock_unlock(&g_metaLock);
+		return -1;
+	}
+	switch (attribute) {
+	case 1:
+		rc = hfsMetaSetMode(g_fs, in, (uint32_t)mode);
+		break;
+	case 2:
+		rc = hfsMetaSetOwner(g_fs, in, (uint32_t)uid, (uint32_t)gid,
+					      uid != (uid_t)-1, gid != (gid_t)-1);
+		break;
+	case 3:
+		rc = hfs_decode_times(times, &atimeNs, &mtimeNs,
+				       &setAtime, &setMtime);
+		if (rc == 0) {
+			rc = hfsMetaSetTimes(g_fs, in, atimeNs, mtimeNs,
+					       setAtime, setMtime);
+		}
+		break;
+	default:
+		rc = EINVAL;
+		break;
+	}
+	pthread_rwlock_unlock(&g_metaLock);
+	if (rc != 0) {
+		if (rc > 0) {
+			errno = rc;
+		}
+		return -1;
+	}
+	return 0;
+}
+
+/* Change permission bits on a managed path. */
+int hfs_lib_chmod(const char *path, mode_t mode) {
+	return hfs_update_path_attribute(path, 1, mode, 0, 0, NULL);
+}
+
+/* Change owner ids on a managed path. */
+int hfs_lib_chown(const char *path, uid_t uid, gid_t gid) {
+	if (uid == (uid_t)-1 && gid == (gid_t)-1) {
+		return 0;
+	}
+	return hfs_update_path_attribute(path, 2, 0, uid, gid, NULL);
+}
+
+/* Update timestamps on a managed path. */
+int hfs_lib_utimens(const char *path, const struct timespec times[2]) {
+	return hfs_update_path_attribute(path, 3, 0, 0, 0, times);
+}
+
+/* Change permission bits on an HFS fd, including an already unlinked file. */
+int hfs_lib_fchmod(int fd, mode_t mode) {
+	HfsOpenFile *openFile = hfsFdAcquire(fd);
+	struct hfs_inode *in;
+	int rc;
+
+	if (openFile == NULL) {
+		errno = EBADF;
+		return -1;
+	}
+	pthread_mutex_lock(&openFile->ioLock);
+	pthread_rwlock_wrlock(&g_metaLock);
+	in = g_fs == NULL ? NULL : hfsMetaFindById(g_fs, openFile->inodeId);
+	if (g_fs == NULL) {
+		rc = ENODEV;
+	} else if (in != NULL) {
+		rc = hfsMetaSetMode(g_fs, in, (uint32_t)mode) == 0 ? 0 : errno;
+		if (rc == 0) {
+			openFile->mode = in->mode;
+		}
+	} else if (hfsFdGetOrphanInfo(openFile, NULL, NULL, NULL)) {
+		openFile->mode = (uint32_t)mode & 07777U;
+		rc = 0;
+	} else {
+		rc = ENOENT;
+	}
+	pthread_rwlock_unlock(&g_metaLock);
+	pthread_mutex_unlock(&openFile->ioLock);
+	hfs_release_open_file(openFile);
+	if (rc != 0) {
+		errno = rc;
+		return -1;
+	}
+	return 0;
+}
+
+/* Change owner ids on an HFS fd, including an already unlinked file. */
+int hfs_lib_fchown(int fd, uid_t uid, gid_t gid) {
+	HfsOpenFile *openFile = hfsFdAcquire(fd);
+	struct hfs_inode *in;
+	int rc;
+
+	if (openFile == NULL) {
+		errno = EBADF;
+		return -1;
+	}
+	pthread_mutex_lock(&openFile->ioLock);
+	pthread_rwlock_wrlock(&g_metaLock);
+	in = g_fs == NULL ? NULL : hfsMetaFindById(g_fs, openFile->inodeId);
+	if (g_fs == NULL) {
+		rc = ENODEV;
+	} else if (in != NULL) {
+		rc = hfsMetaSetOwner(g_fs, in, (uint32_t)uid, (uint32_t)gid,
+					      uid != (uid_t)-1, gid != (gid_t)-1) == 0 ?
+			  0 : errno;
+		if (rc == 0) {
+			openFile->uid = in->uid;
+			openFile->gid = in->gid;
+		}
+	} else if (hfsFdGetOrphanInfo(openFile, NULL, NULL, NULL)) {
+		if (uid != (uid_t)-1) {
+			openFile->uid = (uint32_t)uid;
+		}
+		if (gid != (gid_t)-1) {
+			openFile->gid = (uint32_t)gid;
+		}
+		rc = 0;
+	} else {
+		rc = ENOENT;
+	}
+	pthread_rwlock_unlock(&g_metaLock);
+	pthread_mutex_unlock(&openFile->ioLock);
+	hfs_release_open_file(openFile);
+	if (rc != 0) {
+		errno = rc;
+		return -1;
+	}
+	return 0;
+}
+
+/* Update timestamps on an HFS fd, including an already unlinked file. */
+int hfs_lib_futimens(int fd, const struct timespec times[2]) {
+	HfsOpenFile *openFile = hfsFdAcquire(fd);
+	struct hfs_inode *in;
+	uint64_t atimeNs;
+	uint64_t mtimeNs;
+	bool setAtime;
+	bool setMtime;
+	int rc;
+
+	if (openFile == NULL) {
+		errno = EBADF;
+		return -1;
+	}
+	rc = hfs_decode_times(times, &atimeNs, &mtimeNs, &setAtime, &setMtime);
+	if (rc != 0) {
+		hfs_release_open_file(openFile);
+		errno = rc;
+		return -1;
+	}
+	pthread_mutex_lock(&openFile->ioLock);
+	pthread_rwlock_wrlock(&g_metaLock);
+	in = g_fs == NULL ? NULL : hfsMetaFindById(g_fs, openFile->inodeId);
+	if (g_fs == NULL) {
+		rc = ENODEV;
+	} else if (in != NULL) {
+		rc = hfsMetaSetTimes(g_fs, in, atimeNs, mtimeNs,
+					  setAtime, setMtime) == 0 ? 0 : errno;
+		if (rc == 0) {
+			if (setAtime) {
+				openFile->atimeNs = in->atimeNs;
+			}
+			if (setMtime) {
+				atomic_store_explicit(&openFile->mtimeNs, in->mtimeNs,
+						      memory_order_relaxed);
+			}
+			openFile->ctimeNs = in->ctimeNs;
+		}
+	} else if (hfsFdGetOrphanInfo(openFile, NULL, NULL, NULL)) {
+		if (setAtime) {
+			openFile->atimeNs = atimeNs;
+		}
+		if (setMtime) {
+			atomic_store_explicit(&openFile->mtimeNs, mtimeNs,
+					      memory_order_relaxed);
+		}
+		if (setAtime || setMtime) {
+			openFile->ctimeNs = hfs_now_ns();
+		}
+		rc = 0;
+	} else {
+		rc = ENOENT;
+	}
+	pthread_rwlock_unlock(&g_metaLock);
+	pthread_mutex_unlock(&openFile->ioLock);
+	hfs_release_open_file(openFile);
+	if (rc != 0) {
+		errno = rc;
+		return -1;
+	}
+	return 0;
+}
+
+/* Validate a POSIX advisory hint without disturbing the HFS data path. */
+int hfs_lib_posix_fadvise(int fd, off_t offset, off_t len, int advice) {
+	HfsOpenFile *openFile;
+
+	if (offset < 0 || len < 0) {
+		return EINVAL;
+	}
+	switch (advice) {
+	case POSIX_FADV_NORMAL:
+	case POSIX_FADV_RANDOM:
+	case POSIX_FADV_SEQUENTIAL:
+	case POSIX_FADV_WILLNEED:
+	case POSIX_FADV_DONTNEED:
+#ifdef POSIX_FADV_NOREUSE
+	case POSIX_FADV_NOREUSE:
+#endif
+		break;
+	default:
+		return EINVAL;
+	}
+	openFile = hfsFdAcquire(fd);
+	if (openFile == NULL) {
+		return EBADF;
+	}
+	hfs_release_open_file(openFile);
 	return 0;
 }
 
@@ -1808,7 +2114,7 @@ int hfs_lib_mkdir(const char *path, mode_t mode) {
 		return -1;
 	}
 
-	rc = hfsMetaMkdir(g_fs, parent, leaf);
+	rc = hfsMetaMkdir(g_fs, parent, leaf, (uint32_t)mode);
 	pthread_rwlock_unlock(&g_metaLock);
 	return rc;
 }
@@ -1987,6 +2293,11 @@ int hfs_lib_stat(const char *path, struct stat *st) {
 	struct hfs_inode *in;
 	struct hfs_inode snapshot;
 
+	if (st == NULL) {
+		errno = EFAULT;
+		return -1;
+	}
+
 	pthread_rwlock_rdlock(&g_metaLock);
 	if (g_fs == NULL) {
 		pthread_rwlock_unlock(&g_metaLock);
@@ -2005,15 +2316,154 @@ int hfs_lib_stat(const char *path, struct stat *st) {
 
 	memset(st, 0, sizeof(*st));
 	st->st_ino = (ino_t)in->id;
-	st->st_mode = (in->type == HFS_INODE_DIR) ? (S_IFDIR | 0755) : (S_IFREG | 0644);
+	st->st_mode = (in->type == HFS_INODE_DIR ? S_IFDIR : S_IFREG) |
+			     (in->mode & 07777U);
 	st->st_size = (off_t)in->size;
+	st->st_atim.tv_sec = (time_t)(in->atimeNs / 1000000000ULL);
+	st->st_atim.tv_nsec = (long)(in->atimeNs % 1000000000ULL);
 	st->st_mtim.tv_sec = (time_t)(in->mtimeNs / 1000000000ULL);
 	st->st_mtim.tv_nsec = (long)(in->mtimeNs % 1000000000ULL);
 	st->st_ctim.tv_sec = (time_t)(in->ctimeNs / 1000000000ULL);
 	st->st_ctim.tv_nsec = (long)(in->ctimeNs % 1000000000ULL);
-	st->st_uid = getuid();
-	st->st_gid = getgid();
+	st->st_uid = (uid_t)in->uid;
+	st->st_gid = (gid_t)in->gid;
 	st->st_nlink = 1;
-	st->st_blksize = 4096;
+	st->st_blksize = (blksize_t)(g_fs != NULL && g_fs->unitSize != 0 ?
+					g_fs->unitSize : 4096);
+	st->st_blocks = (blkcnt_t)((in->size + 511U) / 512U);
+	return 0;
+}
+
+/* Fill statvfs capacity fields from the mounted blobstore snapshot. */
+static void hfs_fill_statvfs(const Hfs *fs, struct statvfs *st) {
+	uint64_t totalClusters = fs->numCluster + fs->freeClusterCount;
+	uint64_t freeClusters = fs->freeClusterCount;
+	uint64_t blockSize = fs->unitSize != 0 ? fs->unitSize : 4096;
+
+	if (totalClusters == 0) {
+		totalClusters = freeClusters;
+	}
+	memset(st, 0, sizeof(*st));
+	st->f_bsize = blockSize;
+	st->f_frsize = blockSize;
+	st->f_blocks = totalClusters;
+	st->f_bfree = freeClusters;
+	st->f_bavail = freeClusters;
+	st->f_files = HFS_MAX_INODES;
+	st->f_ffree = HFS_MAX_INODES - fs->inodeCount;
+	st->f_favail = st->f_ffree;
+	st->f_fsid = HFS_SUPER_MAGIC;
+	st->f_namemax = FILENAME_LENGTH - 1;
+}
+
+/* Fill Linux statfs capacity fields from the mounted blobstore snapshot. */
+static void hfs_fill_statfs(const Hfs *fs, struct statfs *st) {
+	struct statvfs vfs;
+
+	hfs_fill_statvfs(fs, &vfs);
+	memset(st, 0, sizeof(*st));
+	st->f_type = HFS_SUPER_MAGIC;
+	st->f_bsize = (long)vfs.f_bsize;
+	st->f_blocks = vfs.f_blocks;
+	st->f_bfree = vfs.f_bfree;
+	st->f_bavail = vfs.f_bavail;
+	st->f_files = vfs.f_files;
+	st->f_ffree = vfs.f_ffree;
+	st->f_fsid.__val[0] = (int)HFS_SUPER_MAGIC;
+	st->f_namelen = (long)vfs.f_namemax;
+	st->f_frsize = (long)vfs.f_frsize;
+}
+
+/* Return statvfs information for an existing managed path. */
+int hfs_lib_statvfs(const char *path, struct statvfs *st) {
+	if (st == NULL) {
+		errno = EFAULT;
+		return -1;
+	}
+	pthread_rwlock_rdlock(&g_metaLock);
+	if (g_fs == NULL) {
+		pthread_rwlock_unlock(&g_metaLock);
+		errno = ENODEV;
+		return -1;
+	}
+	if (hfsMetaResolvePath(g_fs, path) == NULL) {
+		pthread_rwlock_unlock(&g_metaLock);
+		return -1;
+	}
+	hfs_fill_statvfs(g_fs, st);
+	pthread_rwlock_unlock(&g_metaLock);
+	return 0;
+}
+
+/* Return statvfs information for an HFS fd. */
+int hfs_lib_fstatvfs(int fd, struct statvfs *st) {
+	HfsOpenFile *openFile;
+
+	if (st == NULL) {
+		errno = EFAULT;
+		return -1;
+	}
+	openFile = hfsFdAcquire(fd);
+	if (openFile == NULL) {
+		errno = EBADF;
+		return -1;
+	}
+	pthread_rwlock_rdlock(&g_metaLock);
+	if (g_fs == NULL) {
+		pthread_rwlock_unlock(&g_metaLock);
+		hfs_release_open_file(openFile);
+		errno = ENODEV;
+		return -1;
+	}
+	hfs_fill_statvfs(g_fs, st);
+	pthread_rwlock_unlock(&g_metaLock);
+	hfs_release_open_file(openFile);
+	return 0;
+}
+
+/* Return Linux statfs information for an existing managed path. */
+int hfs_lib_statfs(const char *path, struct statfs *st) {
+	if (st == NULL) {
+		errno = EFAULT;
+		return -1;
+	}
+	pthread_rwlock_rdlock(&g_metaLock);
+	if (g_fs == NULL) {
+		pthread_rwlock_unlock(&g_metaLock);
+		errno = ENODEV;
+		return -1;
+	}
+	if (hfsMetaResolvePath(g_fs, path) == NULL) {
+		pthread_rwlock_unlock(&g_metaLock);
+		return -1;
+	}
+	hfs_fill_statfs(g_fs, st);
+	pthread_rwlock_unlock(&g_metaLock);
+	return 0;
+}
+
+/* Return Linux statfs information for an HFS fd. */
+int hfs_lib_fstatfs(int fd, struct statfs *st) {
+	HfsOpenFile *openFile;
+
+	if (st == NULL) {
+		errno = EFAULT;
+		return -1;
+	}
+	openFile = hfsFdAcquire(fd);
+	if (openFile == NULL) {
+		errno = EBADF;
+		return -1;
+	}
+	pthread_rwlock_rdlock(&g_metaLock);
+	if (g_fs == NULL) {
+		pthread_rwlock_unlock(&g_metaLock);
+		hfs_release_open_file(openFile);
+		errno = ENODEV;
+		return -1;
+	}
+	hfs_fill_statfs(g_fs, st);
+	pthread_rwlock_unlock(&g_metaLock);
+	hfs_release_open_file(openFile);
 	return 0;
 }

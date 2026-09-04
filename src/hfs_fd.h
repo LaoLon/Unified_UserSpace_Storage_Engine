@@ -23,6 +23,10 @@ struct HfsOpenFile {
 	bool isDirectory;
 	uint64_t offset;
 	_Atomic uint64_t size;
+	uint32_t mode;
+	uint32_t uid;
+	uint32_t gid;
+	uint64_t atimeNs;
 	_Atomic uint64_t mtimeNs;
 	uint64_t ctimeNs;
 	char dirPath[PATH_MAX];

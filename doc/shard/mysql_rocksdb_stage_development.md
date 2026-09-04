@@ -202,7 +202,7 @@ unlink 后旧 fd 读写/fstat、rename 覆盖、同路径 rename 和 8 个并发
 新增 `scripts/db/metadata_path_concurrency_smoke.sh`。VM 上 Make/CMake 双构建、
 元数据路径并发（16 线程 × 40 轮）、fd 生命周期、跨进程持久化，以及 16 线程
 10 秒 owner-thread stress 全部通过。MySQL/RocksDB 真实数据库验收仍保留到
-shard-32～35，当前阶段不宣称已支持。
+shard-33～35，当前阶段不宣称已支持。
 
 ---
 
@@ -281,7 +281,7 @@ KEEP_SIZE、PUNCH 和 8 路 positioned write）、元数据事务恢复、元数
 | seq 128K | 5772.32 | 5750.12 | 756.59 MB/s | 753.68 MB/s | 73216 / 142336 | 73216 / 142336 |
 
 阶段口径仍为：fio 使用单进程 `thread=1`，不宣称通用 fork 后共享 HFS 状态；MySQL/RocksDB
-真实数据库验收仍留在 shard-32～35，当前只能表述为“兼容性开发中”。
+真实数据库验收仍留在 shard-33～35，当前只能表述为“兼容性开发中”。
 
 ---
 
@@ -305,6 +305,24 @@ KEEP_SIZE、PUNCH 和 8 路 positioned write）、元数据事务恢复、元数
 - 对未支持调用给出准确 errno，数据库能明确降级或测试直接失败，禁止静默成功。
 
 提交：`shard-32: database POSIX contract`
+
+实现状态（2026-09-04）：核心 POSIX 契约已完成。元数据升级为 v4，保存 mode/uid/gid、
+atime/mtime/ctime，并兼容 v3、v2 与 legacy 布局；创建 inode 的 mode 已贯通到 `open`/`mkdir`。
+preload 已补齐 HFS 目录 fd 的 `openat`/`fstatat`/`unlinkat`/`renameat`/`mkdirat` 路由，
+`statx`、`statfs`/`statvfs`（含 64 位 glibc ABI）、chmod/chown/utimensat/futimens、
+fadvise 和明确的 `mmap -> ENODEV` 语义；`fcntl` 只在命令确实需要时读取变参。新增
+`scripts/db/posix_contract_test.sh` 覆盖成功路径、错误码、属性、容量、空路径和 mmap 契约。
+
+VM 回归通过：`make -B app lib`、CMake Release、POSIX 契约连续 10 次、preload smoke、
+fd 生命周期、元数据事务、元数据路径并发、持久化 bdev、请求级 I/O、16 线程 10 秒压力和
+fio。最近一次 fio（4K randrw / 128K seq，iodepth=32，10s）分别为 6285/6258 与
+4954/4922 read/write IOPS，p50 为 59136/75264 ns，p99 为 185344/244736 ns。
+
+数据库审计结果：已用 strace 跑过现有 MariaDB 初始化和 RocksDB fill/read smoke；现有脚本
+分别因 MariaDB helper 的跨进程初始化、默认进程私有 `Malloc0`/挂载失败而未完成端到端流程，
+不能据此标记数据库 supported。审计未发现 `/hfs/...` 上真实 `read`/`write`/`pread64`/
+`pwrite64`/`mmap` 内核数据调用，HFS 数据路径没有误落到 `/dev/null`；完整持久化、多进程
+初始化、WAL/事务/恢复验收继续由 shard-33～35 完成。
 
 ---
 

@@ -1,7 +1,9 @@
 #ifndef HFS_META_H
 #define HFS_META_H
 
+#include <stdbool.h>
 #include <stdint.h>
+#include <sys/types.h>
 
 #include "hfs.h"
 
@@ -38,7 +40,11 @@ struct hfs_inode {
 	uint8_t type;		/* HFS_INODE_DIR or HFS_INODE_FILE */
 	uint64_t parentId;	/* inode id of the parent directory */
 	uint64_t blobId;	/* data blob (file) or metadata blob (dir) */
+	uint32_t mode;		/* permission bits without the file type */
+	uint32_t uid;		/* owning user id */
+	uint32_t gid;		/* owning group id */
 	uint64_t size;		/* file size in bytes */
+	uint64_t atimeNs;	/* last access time, ns since epoch */
 	uint64_t mtimeNs;	/* last modification time, ns since epoch */
 	uint64_t ctimeNs;	/* creation time, ns since epoch */
 	char name[FILENAME_LENGTH];	/* name within the parent directory */
@@ -98,7 +104,8 @@ int hfsMetaResolveParent(Hfs *fs, const char *path,
  * Create a new directory inode under 'parent' with the given name.
  * Persists the inode table. Fails with EEXIST if the name is taken.
  */
-int hfsMetaMkdir(Hfs *fs, struct hfs_inode *parent, const char *name);
+int hfsMetaMkdir(Hfs *fs, struct hfs_inode *parent, const char *name,
+			 uint32_t mode);
 
 /*
  * Remove an empty directory resolved from 'path'.
@@ -110,7 +117,8 @@ int hfsMetaRmdir(Hfs *fs, const char *path);
  * Create a new file: allocate a data blob, add a FILE inode under
  * 'parent' and persist the table. Fails with EEXIST if the name is taken.
  */
-int hfsMetaCreateFile(Hfs *fs, struct hfs_inode *parent, const char *name);
+int hfsMetaCreateFile(Hfs *fs, struct hfs_inode *parent, const char *name,
+			      uint32_t mode);
 
 /*
  * Remove a file inode from the table without touching the data blob.
@@ -134,5 +142,14 @@ int hfsMetaSetSize(Hfs *fs, struct hfs_inode *in, uint64_t size);
 
 /* Commit metadata changes for the inode identified by 'inodeId'. */
 int hfsMetaCommitInode(Hfs *fs, uint64_t inodeId);
+
+/* Update the stored permission bits and status-change time. */
+int hfsMetaSetMode(Hfs *fs, struct hfs_inode *in, uint32_t mode);
+/* Update the stored owner ids and status-change time. */
+int hfsMetaSetOwner(Hfs *fs, struct hfs_inode *in, uint32_t uid,
+			    uint32_t gid, bool setUid, bool setGid);
+/* Update selected timestamps and persist the inode. */
+int hfsMetaSetTimes(Hfs *fs, struct hfs_inode *in, uint64_t atimeNs,
+			    uint64_t mtimeNs, bool setAtime, bool setMtime);
 
 #endif /* HFS_META_H */
