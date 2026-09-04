@@ -808,8 +808,9 @@ ssize_t read(int fd, void *buf, size_t count) {
 	return real_read(fd, buf, count);
 }
 
-/* Intercept stdio reads because glibc may issue its internal read syscall. */
-size_t fread(void *ptr, size_t size, size_t nmemb, FILE *stream) {
+/* Read an HFS stdio stream while keeping the public and unlocked paths equal. */
+static size_t hfsReadStream(void *ptr, size_t size, size_t nmemb,
+				    FILE *stream, bool unlocked) {
 	int fd;
 	ssize_t n;
 	size_t total;
@@ -823,7 +824,8 @@ size_t fread(void *ptr, size_t size, size_t nmemb, FILE *stream) {
 	}
 	fd = hfs_real_fileno_call(stream);
 	if (!hfs_is_hfs_fd(fd)) {
-		return hfs_real_fread_call(ptr, size, nmemb, stream);
+		return unlocked ? hfs_real_fread_unlocked_call(ptr, size, nmemb, stream) :
+			hfs_real_fread_call(ptr, size, nmemb, stream);
 	}
 	total = size * nmemb;
 	n = hfs_lib_read(fd, ptr, total);
@@ -837,33 +839,14 @@ size_t fread(void *ptr, size_t size, size_t nmemb, FILE *stream) {
 	return (size_t)n / size;
 }
 
+/* Intercept stdio reads because glibc may issue its internal read syscall. */
+size_t fread(void *ptr, size_t size, size_t nmemb, FILE *stream) {
+	return hfsReadStream(ptr, size, nmemb, stream, false);
+}
+
 /* Intercept RocksDB's unlocked stdio read path for HFS streams. */
 size_t fread_unlocked(void *ptr, size_t size, size_t nmemb, FILE *stream) {
-	int fd;
-	ssize_t n;
-	size_t total;
-
-	if (size == 0 || nmemb == 0) {
-		return 0;
-	}
-	if (nmemb > SIZE_MAX / size) {
-		errno = EOVERFLOW;
-		return 0;
-	}
-	fd = hfs_real_fileno_call(stream);
-	if (!hfs_is_hfs_fd(fd)) {
-		return hfs_real_fread_unlocked_call(ptr, size, nmemb, stream);
-	}
-	total = size * nmemb;
-	n = hfs_lib_read(fd, ptr, total);
-	if (n < 0) {
-		hfs_stdio_mark(stream, HFS_STDIO_ERROR);
-		return 0;
-	}
-	if ((size_t)n < total) {
-		hfs_stdio_mark(stream, HFS_STDIO_EOF);
-	}
-	return (size_t)n / size;
+	return hfsReadStream(ptr, size, nmemb, stream, true);
 }
 
 /* Intercept feof(3) for HFS streams whose reads bypass glibc FILE buffers. */

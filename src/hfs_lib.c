@@ -20,11 +20,24 @@
 #include "hfs_log.h"
 #include "hfs_meta.h"
 #include "hfs_runtime.h"
+#include "hfs_stats.h"
 
 /* Protects the mounted inode table and metadata snapshots. */
 static pthread_rwlock_t g_metaLock = PTHREAD_RWLOCK_INITIALIZER;
 /* Serializes append writes across independent open-file descriptions. */
 static pthread_mutex_t g_appendLock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Count metadata read-lock acquisitions without extending lock ownership. */
+static void hfsMetaReadLock(void) {
+	HFS_STATS_META_READ_LOCK();
+	pthread_rwlock_rdlock(&g_metaLock);
+}
+
+/* Count metadata write-lock acquisitions without extending lock ownership. */
+static void hfsMetaWriteLock(void) {
+	HFS_STATS_META_WRITE_LOCK();
+	pthread_rwlock_wrlock(&g_metaLock);
+}
 
 /* The single mounted filesystem instance (one per process). */
 static Hfs *g_fs;
@@ -258,7 +271,7 @@ static int hfsSnapshotFileSize(HfsOpenFile *openFile, uint64_t *sizeOut) {
 	struct hfs_inode *in;
 	uint64_t size;
 
-	pthread_rwlock_rdlock(&g_metaLock);
+	hfsMetaReadLock();
 	if (g_fs == NULL) {
 		pthread_rwlock_unlock(&g_metaLock);
 		errno = ENODEV;
@@ -340,7 +353,7 @@ static ssize_t hfsWritevAt(HfsOpenFile *openFile, const struct iovec *iov,
 static void hfsPublishWriteEnd(HfsOpenFile *openFile, uint64_t end) {
 	struct hfs_inode *in;
 
-	pthread_rwlock_wrlock(&g_metaLock);
+	hfsMetaWriteLock();
 	in = g_fs == NULL ? NULL : hfsMetaFindById(g_fs, openFile->inodeId);
 	if (in != NULL && end > in->size) {
 		in->size = end;
@@ -374,7 +387,8 @@ int hfs_lib_init(void) {
 		errno = ECHILD;
 		return -1;
 	}
-	pthread_rwlock_wrlock(&g_metaLock);
+	hfsMetaWriteLock();
+	hfsStatsInit();
 	if (g_fs != NULL) {
 		pthread_rwlock_unlock(&g_metaLock);
 		return 0;
@@ -475,7 +489,6 @@ Hfs *hfs_lib_get_fs(void) {
 /* Runs before main(): proves the library was loaded by LD_PRELOAD. */
 __attribute__((constructor))
 static void hfs_preload_ctor(void) {
-	fprintf(stderr, "libhfs loaded\n");
 	HFS_LOG_DEBUG("libhfs loaded");
 }
 
@@ -494,8 +507,9 @@ void hfs_lib_fini(void) {
 	if (hfs_lib_is_fork_child()) {
 		return;
 	}
-	pthread_rwlock_wrlock(&g_metaLock);
+	hfsMetaWriteLock();
 	if (g_fs == NULL) {
+		hfsStatsFini();
 		pthread_rwlock_unlock(&g_metaLock);
 		return;
 	}
@@ -519,6 +533,7 @@ void hfs_lib_fini(void) {
 	hfsRuntimeStop();
 	hfs_release_backend_lock();
 	HFS_LOG_DEBUG("libhfs finalized");
+	hfsStatsFini();
 	hfs_log_fini();
 	pthread_rwlock_unlock(&g_metaLock);
 }
@@ -538,7 +553,7 @@ int hfs_lib_open(const char *path, int flags, mode_t mode) {
 	int rc;
 	bool created = false;
 
-	pthread_rwlock_wrlock(&g_metaLock);
+	hfsMetaWriteLock();
 	if (g_fs == NULL) {
 		pthread_rwlock_unlock(&g_metaLock);
 		errno = ENODEV;
@@ -775,7 +790,7 @@ ssize_t hfs_lib_read(int fd, void *buf, size_t count) {
 		return -1;
 	}
 	pthread_mutex_lock(&openFile->ioLock);
-	pthread_rwlock_rdlock(&g_metaLock);
+	hfsMetaReadLock();
 	in = g_fs == NULL ? NULL : hfsMetaFindById(g_fs, openFile->inodeId);
 	if (g_fs == NULL) {
 		pthread_rwlock_unlock(&g_metaLock);
@@ -848,7 +863,7 @@ ssize_t hfs_lib_write(int fd, const void *buf, size_t count) {
 	if (append) {
 		uint64_t appendSize;
 
-		pthread_rwlock_rdlock(&g_metaLock);
+		hfsMetaReadLock();
 		in = g_fs == NULL ? NULL : hfsMetaFindById(g_fs, openFile->inodeId);
 		if (g_fs == NULL) {
 			pthread_rwlock_unlock(&g_metaLock);
@@ -885,7 +900,7 @@ ssize_t hfs_lib_write(int fd, const void *buf, size_t count) {
 		return -1;
 	}
 	openFile->offset = writeOffset + (uint64_t)n;
-	pthread_rwlock_wrlock(&g_metaLock);
+	hfsMetaWriteLock();
 	in = g_fs == NULL ? NULL : hfsMetaFindById(g_fs, openFile->inodeId);
 	if (in != NULL && openFile->offset > in->size) {
 		/* Update size/mtime in memory; persisted at fsync/close. */
@@ -935,7 +950,7 @@ ssize_t hfs_lib_pread(int fd, void *buf, size_t count, off_t offset) {
 	if (openFile == NULL) {
 		return -1;
 	}
-	pthread_rwlock_rdlock(&g_metaLock);
+	hfsMetaReadLock();
 	in = g_fs == NULL ? NULL : hfsMetaFindById(g_fs, openFile->inodeId);
 	if (g_fs == NULL) {
 		pthread_rwlock_unlock(&g_metaLock);
@@ -1002,7 +1017,7 @@ ssize_t hfs_lib_pwrite(int fd, const void *buf, size_t count, off_t offset) {
 	if (append) {
 		uint64_t appendSize;
 
-		pthread_rwlock_rdlock(&g_metaLock);
+		hfsMetaReadLock();
 		in = g_fs == NULL ? NULL : hfsMetaFindById(g_fs, openFile->inodeId);
 		if (g_fs == NULL) {
 			pthread_rwlock_unlock(&g_metaLock);
@@ -1035,7 +1050,7 @@ ssize_t hfs_lib_pwrite(int fd, const void *buf, size_t count, off_t offset) {
 		errno = n < 0 ? savedErrno : EIO;
 		return -1;
 	}
-	pthread_rwlock_wrlock(&g_metaLock);
+	hfsMetaWriteLock();
 	in = g_fs == NULL ? NULL : hfsMetaFindById(g_fs, openFile->inodeId);
 	if (in != NULL && writeOffset + (uint64_t)n > in->size) {
 		in->size = writeOffset + (uint64_t)n;
@@ -1249,7 +1264,7 @@ off_t hfs_lib_lseek(int fd, off_t offset, int whence) {
 		return -1;
 	}
 	pthread_mutex_lock(&openFile->ioLock);
-	pthread_rwlock_rdlock(&g_metaLock);
+	hfsMetaReadLock();
 	if (g_fs == NULL) {
 		pthread_rwlock_unlock(&g_metaLock);
 		pthread_mutex_unlock(&openFile->ioLock);
@@ -1372,7 +1387,7 @@ int hfs_lib_unlink(const char *path) {
 	HfsOrphan *orphan = NULL;
 	int rc;
 
-	pthread_rwlock_wrlock(&g_metaLock);
+	hfsMetaWriteLock();
 	if (g_fs == NULL) {
 		pthread_rwlock_unlock(&g_metaLock);
 		errno = ENODEV;
@@ -1444,7 +1459,7 @@ int hfs_lib_ftruncate(int fd, off_t length) {
 		return -1;
 	}
 	pthread_mutex_lock(&openFile->ioLock);
-	pthread_rwlock_rdlock(&g_metaLock);
+	hfsMetaReadLock();
 	in = g_fs == NULL ? NULL : hfsMetaFindById(g_fs, openFile->inodeId);
 	if (g_fs == NULL) {
 		pthread_rwlock_unlock(&g_metaLock);
@@ -1476,7 +1491,7 @@ int hfs_lib_ftruncate(int fd, off_t length) {
 	}
 
 	/* Upgrade to a writer only for the stable inode update. */
-	pthread_rwlock_wrlock(&g_metaLock);
+	hfsMetaWriteLock();
 	in = g_fs == NULL ? NULL : hfsMetaFindById(g_fs, openFile->inodeId);
 	if (g_fs == NULL) {
 		pthread_rwlock_unlock(&g_metaLock);
@@ -1531,7 +1546,7 @@ int hfs_lib_fstat(int fd, struct stat *st) {
 		errno = EBADF;
 		return -1;
 	}
-	pthread_rwlock_rdlock(&g_metaLock);
+	hfsMetaReadLock();
 	in = g_fs == NULL ? NULL : hfsMetaFindById(g_fs, openFile->inodeId);
 	if (in == NULL && !hfsFdGetOrphanInfo(openFile, &orphanSize,
 					     &orphanCtimeNs, &orphanMtimeNs)) {
@@ -1585,7 +1600,7 @@ int hfs_lib_fstat(int fd, struct stat *st) {
 int hfs_lib_access(const char *path, int mode) {
 	struct hfs_inode *in;
 
-	pthread_rwlock_rdlock(&g_metaLock);
+	hfsMetaReadLock();
 	if (g_fs == NULL) {
 		pthread_rwlock_unlock(&g_metaLock);
 		errno = ENODEV;
@@ -1654,7 +1669,7 @@ static int hfs_update_path_attribute(const char *path, int attribute,
 	bool setMtime = false;
 	int rc = 0;
 
-	pthread_rwlock_wrlock(&g_metaLock);
+	hfsMetaWriteLock();
 	if (g_fs == NULL) {
 		pthread_rwlock_unlock(&g_metaLock);
 		errno = ENODEV;
@@ -1724,7 +1739,7 @@ int hfs_lib_fchmod(int fd, mode_t mode) {
 		return -1;
 	}
 	pthread_mutex_lock(&openFile->ioLock);
-	pthread_rwlock_wrlock(&g_metaLock);
+	hfsMetaWriteLock();
 	in = g_fs == NULL ? NULL : hfsMetaFindById(g_fs, openFile->inodeId);
 	if (g_fs == NULL) {
 		rc = ENODEV;
@@ -1760,7 +1775,7 @@ int hfs_lib_fchown(int fd, uid_t uid, gid_t gid) {
 		return -1;
 	}
 	pthread_mutex_lock(&openFile->ioLock);
-	pthread_rwlock_wrlock(&g_metaLock);
+	hfsMetaWriteLock();
 	in = g_fs == NULL ? NULL : hfsMetaFindById(g_fs, openFile->inodeId);
 	if (g_fs == NULL) {
 		rc = ENODEV;
@@ -1814,7 +1829,7 @@ int hfs_lib_futimens(int fd, const struct timespec times[2]) {
 		return -1;
 	}
 	pthread_mutex_lock(&openFile->ioLock);
-	pthread_rwlock_wrlock(&g_metaLock);
+	hfsMetaWriteLock();
 	in = g_fs == NULL ? NULL : hfsMetaFindById(g_fs, openFile->inodeId);
 	if (g_fs == NULL) {
 		rc = ENODEV;
@@ -1961,7 +1976,7 @@ int hfs_lib_fsync(int fd) {
 		hfs_release_open_file(openFile);
 		return -1;
 	}
-	pthread_rwlock_wrlock(&g_metaLock);
+	hfsMetaWriteLock();
 	if (g_fs == NULL) {
 		pthread_rwlock_unlock(&g_metaLock);
 		if (ioLocked) {
@@ -2104,7 +2119,7 @@ int hfs_lib_mkdir(const char *path, mode_t mode) {
 	const char *leaf;
 	int rc;
 
-	pthread_rwlock_wrlock(&g_metaLock);
+	hfsMetaWriteLock();
 	if (g_fs == NULL) {
 		pthread_rwlock_unlock(&g_metaLock);
 		errno = ENODEV;
@@ -2132,7 +2147,7 @@ int hfs_lib_mkdir(const char *path, mode_t mode) {
 int hfs_lib_rmdir(const char *path) {
 	int rc;
 
-	pthread_rwlock_wrlock(&g_metaLock);
+	hfsMetaWriteLock();
 	if (g_fs == NULL) {
 		pthread_rwlock_unlock(&g_metaLock);
 		errno = ENODEV;
@@ -2156,7 +2171,7 @@ int hfs_lib_rename(const char *oldPath, const char *newPath) {
 	HfsOrphan *orphan = NULL;
 	int rc;
 
-	pthread_rwlock_wrlock(&g_metaLock);
+	hfsMetaWriteLock();
 	if (g_fs == NULL) {
 		pthread_rwlock_unlock(&g_metaLock);
 		errno = ENODEV;
@@ -2205,7 +2220,7 @@ struct hfs_dir *hfs_lib_opendir(const char *path) {
 	int i;
 	uint64_t n = 0;
 
-	pthread_rwlock_rdlock(&g_metaLock);
+	hfsMetaReadLock();
 	if (g_fs == NULL) {
 		pthread_rwlock_unlock(&g_metaLock);
 		errno = ENODEV;
@@ -2307,7 +2322,7 @@ int hfs_lib_stat(const char *path, struct stat *st) {
 		return -1;
 	}
 
-	pthread_rwlock_rdlock(&g_metaLock);
+	hfsMetaReadLock();
 	if (g_fs == NULL) {
 		pthread_rwlock_unlock(&g_metaLock);
 		errno = ENODEV;
@@ -2389,7 +2404,7 @@ int hfs_lib_statvfs(const char *path, struct statvfs *st) {
 		errno = EFAULT;
 		return -1;
 	}
-	pthread_rwlock_rdlock(&g_metaLock);
+	hfsMetaReadLock();
 	if (g_fs == NULL) {
 		pthread_rwlock_unlock(&g_metaLock);
 		errno = ENODEV;
@@ -2417,7 +2432,7 @@ int hfs_lib_fstatvfs(int fd, struct statvfs *st) {
 		errno = EBADF;
 		return -1;
 	}
-	pthread_rwlock_rdlock(&g_metaLock);
+	hfsMetaReadLock();
 	if (g_fs == NULL) {
 		pthread_rwlock_unlock(&g_metaLock);
 		hfs_release_open_file(openFile);
@@ -2436,7 +2451,7 @@ int hfs_lib_statfs(const char *path, struct statfs *st) {
 		errno = EFAULT;
 		return -1;
 	}
-	pthread_rwlock_rdlock(&g_metaLock);
+	hfsMetaReadLock();
 	if (g_fs == NULL) {
 		pthread_rwlock_unlock(&g_metaLock);
 		errno = ENODEV;
@@ -2464,7 +2479,7 @@ int hfs_lib_fstatfs(int fd, struct statfs *st) {
 		errno = EBADF;
 		return -1;
 	}
-	pthread_rwlock_rdlock(&g_metaLock);
+	hfsMetaReadLock();
 	if (g_fs == NULL) {
 		pthread_rwlock_unlock(&g_metaLock);
 		hfs_release_open_file(openFile);

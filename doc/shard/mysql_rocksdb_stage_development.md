@@ -16,7 +16,10 @@
 6. `fsync`、`fdatasync`、目录 `fsync`、rename、unlink、truncate 的语义满足数据库恢复要求。
 7. 基础 preload/fio 回归全绿；Malloc bdev 的既有单线程性能下降不超过 10%。
 
-## 2. 当前阻塞点
+## 2. 阶段启动时阻塞点
+
+以下问题是 shard-26 开始时的基线，已由本阶段各 shard 逐项关闭；保留它们用于解释设计
+取舍和验收顺序。
 
 ### 2.1 后端不持久
 
@@ -280,8 +283,8 @@ KEEP_SIZE、PUNCH 和 8 路 positioned write）、元数据事务恢复、元数
 | randrw 4K | 6839.52 | 6806.22 | 28.01 MB/s | 27.88 MB/s | 58112 / 120320 | 58112 / 119296 |
 | seq 128K | 5772.32 | 5750.12 | 756.59 MB/s | 753.68 MB/s | 73216 / 142336 | 73216 / 142336 |
 
-阶段口径仍为：fio 使用单进程 `thread=1`，不宣称通用 fork 后共享 HFS 状态；MySQL/RocksDB
-真实数据库验收仍留在 shard-33～35，当前只能表述为“兼容性开发中”。
+阶段口径仍为：fio 使用单进程 `thread=1`，不宣称通用 fork 后共享 HFS 状态；在 shard-31
+完成时真实数据库验收仍留在 shard-33～35，只能表述为“兼容性开发中”。
 
 ---
 
@@ -358,9 +361,9 @@ open、`readlink`、`realpath`、64 位 stat ABI，以及绝对路径和 HFS 目
 VM 验收通过：系统表初始化、数据库/表/索引创建、CRUD、事务提交与回滚、LONGTEXT、
 临时表、正常重启、SIGKILL 后 committed/uncommitted 数据恢复，以及 4/16 并发客户端
 负载。当前 VM 未安装 sysbench，因此并发验收使用 `mysqlslap` 4/16、每档 3 轮；完整
-脚本输出 `MYSQL PERSISTENT RECOVERY OK`。这只完成 MariaDB/MySQL 兼容性验收，RocksDB
-仍待 shard-34，性能汇总和两种数据库连续三轮验收仍待 shard-35，阶段总口径继续保持
-“兼容性开发中”。
+脚本输出 `MYSQL PERSISTENT RECOVERY OK`。这只完成 MariaDB/MySQL 兼容性验收；在 shard-33
+完成时 RocksDB 仍待 shard-34，性能汇总和两种数据库连续三轮验收仍待 shard-35，阶段总口径
+保持“兼容性开发中”。
 
 ---
 
@@ -396,8 +399,8 @@ VM 上 `make -B app lib`、CMake Release 均通过。RocksDB 完整流程连续 
 20,000 条 fillseq、跨进程 readrandom、direct I/O 重开、overwrite、flush/compact、8 线程
 60 秒 readwhilewriting、SIGKILL 后 WAL recovery 以及 `ldb checkconsistency`，每轮输出
 `ROCKSDB PERSISTENT RECOVERY OK`，总验收输出 `SHARD34_ACCEPTANCE_OK`。RocksDB 的阶段验收
-已完成，但性能汇总和两种数据库的最终支持口径仍留给 shard-35；在 shard-35 完成前仍统一
-称为“兼容性开发中”。
+已完成，但性能汇总和两种数据库的最终支持口径仍留给 shard-35；这是 shard-34 完成时的
+阶段状态，现已由本节后续内容收口。
 
 ---
 
@@ -422,6 +425,33 @@ VM 上 `make -B app lib`、CMake Release 均通过。RocksDB 完整流程连续 
 
 提交：`shard-35: database support performance closeout`
 
+实现状态（2026-09-05）：阶段已完成并收口。新增 `scripts/db/database_benchmark.sh`，固定
+记录环境/config、RocksDB 吞吐、写延迟 p50/p99、elapsed/user/sys/CPU/RSS、错误数以及可选
+的 fd/meta lock、DMA pool、SPDK submit/complete/reject 计数。统计默认关闭，仅设置
+`HFS_STATS_PATH` 或 `HFS_STATS=1` 时启用；同时清理 preload 中重复的 stdio wrapper 和构造
+阶段噪声输出。
+
+VM 正式数据库 benchmark 使用持久化 Aio、20,000 条、256-byte value、WAL 开启、mmap 关闭、
+60 秒读写窗口：fillseq 为 2,491 ops/s，readwhilewriting 1 线程为 63,854 ops/s、p50/p99
+为 345/972 µs，4 线程为 235,831 ops/s、p50/p99 为 380/1,165 µs，4 线程约为 1 线程
+3.69 倍；三组 errors=0，SPDK submit/complete 一致，reject=0，4 线程 DMA active peak=4。
+
+Malloc bdev FIO 回归（单线程、O_DIRECT、psync、iodepth=32、10 秒）结果为 randrw 4K
+read/write 6,472/6,436 IOPS、p50/p99 61,184/136,192 ns，seq 128K read/write
+5,676/5,653 IOPS、p50/p99 74,240/146,432 ns；相对 shard-31 已记录同口径结果下降
+1.7%～5.4%，未超过 10% 门槛。稳态对齐 I/O 继续使用固定 DMA pool；全套 preload、fd、元数据、
+快速 I/O、POSIX、runtime 回归，以及最终代码版本下的 MariaDB/RocksDB 持久化 smoke 均通过。
+
+### 数据库支持矩阵
+
+| 后端 | 阶段状态 | 已验证内容 | 边界 |
+|---|---|---|---|
+| MySQL/MariaDB-compatible server | supported | 持久化初始化、SQL CRUD/DDL、事务、正常重启、SIGKILL 恢复、4/16 并发客户端 | 使用单个 HFS 进程挂载后端，客户端经 socket/TCP 访问 |
+| RocksDB | supported | 跨进程重开、普通/direct I/O、fill/read/overwrite、flush/compact、WAL、并发读写、SIGKILL recovery、`ldb checkconsistency` | mmap 返回 ENODEV；native libaio/io_uring 不在支持范围 |
+
+因此，本阶段完成后可以准确表述为：HFS 已支持单数据库进程在持久化 SPDK AIO/NVMe bdev
+上运行 MySQL/MariaDB-compatible server 与 RocksDB；不支持多个 HFS 进程同时共享挂载。
+
 ## 6. 明确不在本阶段实现
 
 - 多个独立进程同时直接挂载并访问同一个 Blobstore。
@@ -438,4 +468,5 @@ VM 上 `make -B app lib`、CMake Release 均通过。RocksDB 完整流程连续 
 
 > HFS 支持单数据库进程在持久化 SPDK AIO/NVMe bdev 上运行 MySQL 和 RocksDB；支持多线程 POSIX 同步 I/O、WAL/事务恢复、正常重启和异常退出恢复。数据库客户端通过 socket/TCP 访问。暂不支持多个 HFS 进程共享挂载、文件 mmap 和 native libaio/io_uring。
 
-在 shard-33、34、35 未全部通过前，统一表述为“兼容性开发中”，不能写“已支持”。
+shard-33、34、35 已全部通过；后续文档应保留上述单进程持久化和未支持能力边界，不能扩大
+为通用 Linux 文件系统或多进程共享挂载承诺。

@@ -7,10 +7,23 @@
 
 #include "hfs_fd.h"
 #include "hfs_lib.h"
+#include "hfs_stats.h"
 
 /* One short critical section protects fd slots and reference transitions. */
 static pthread_rwlock_t g_fdLock = PTHREAD_RWLOCK_INITIALIZER;
 static HfsOpenFile *g_fdSlots[HFS_FD_TABLE_SIZE];
+
+/* Count fd registry lock acquisitions while preserving short lock scopes. */
+static void hfsFdReadLock(void) {
+	HFS_STATS_FD_READ_LOCK();
+	pthread_rwlock_rdlock(&g_fdLock);
+}
+
+/* Count fd registry write lock acquisitions while preserving short lock scopes. */
+static void hfsFdWriteLock(void) {
+	HFS_STATS_FD_WRITE_LOCK();
+	pthread_rwlock_wrlock(&g_fdLock);
+}
 
 /* Allocate a description shared by all duplicate fd slots. */
 int hfsFdCreate(HfsOpenFile **out, HfsFile *file, uint64_t inodeId,
@@ -61,7 +74,7 @@ int hfsFdRegister(int fd, HfsOpenFile *openFile) {
 		errno = EBADF;
 		return -1;
 	}
-	pthread_rwlock_wrlock(&g_fdLock);
+	hfsFdWriteLock();
 	if (g_fdSlots[fd] != NULL) {
 		rc = -1;
 		errno = EBUSY;
@@ -79,7 +92,7 @@ HfsOpenFile *hfsFdAcquire(int fd) {
 	if (fd < 0 || fd >= HFS_FD_TABLE_SIZE) {
 		return NULL;
 	}
-	pthread_rwlock_wrlock(&g_fdLock);
+	hfsFdWriteLock();
 	openFile = g_fdSlots[fd];
 	if (openFile != NULL) {
 		openFile->refs++;
@@ -95,7 +108,7 @@ HfsOpenFile *hfsFdDetach(int fd) {
 	if (fd < 0 || fd >= HFS_FD_TABLE_SIZE) {
 		return NULL;
 	}
-	pthread_rwlock_wrlock(&g_fdLock);
+	hfsFdWriteLock();
 	openFile = g_fdSlots[fd];
 	g_fdSlots[fd] = NULL;
 	pthread_rwlock_unlock(&g_fdLock);
@@ -107,7 +120,7 @@ HfsOpenFile *hfsFdDetachAny(int *fdOut) {
 	HfsOpenFile *openFile = NULL;
 	int i;
 
-	pthread_rwlock_wrlock(&g_fdLock);
+	hfsFdWriteLock();
 	for (i = 0; i < HFS_FD_TABLE_SIZE; i++) {
 		if (g_fdSlots[i] != NULL) {
 			openFile = g_fdSlots[i];
@@ -136,7 +149,7 @@ int hfsFdCopy(int oldfd, int newfd, HfsOpenFile **replacedFile) {
 		errno = EBADF;
 		return -1;
 	}
-	pthread_rwlock_wrlock(&g_fdLock);
+	hfsFdWriteLock();
 	oldFile = g_fdSlots[oldfd];
 	if (oldFile == NULL) {
 		pthread_rwlock_unlock(&g_fdLock);
@@ -171,7 +184,7 @@ bool hfsFdRelease(HfsOpenFile *openFile, HfsOrphan **readyOrphan) {
 	if (openFile == NULL) {
 		return false;
 	}
-	pthread_rwlock_wrlock(&g_fdLock);
+	hfsFdWriteLock();
 	if (openFile->refs > 0) {
 		openFile->refs--;
 	}
@@ -194,7 +207,7 @@ bool hfsFdIsHfs(int fd) {
 	if (fd < 0 || fd >= HFS_FD_TABLE_SIZE) {
 		return false;
 	}
-	pthread_rwlock_rdlock(&g_fdLock);
+	hfsFdReadLock();
 	result = g_fdSlots[fd] != NULL;
 	pthread_rwlock_unlock(&g_fdLock);
 	return result;
@@ -202,7 +215,7 @@ bool hfsFdIsHfs(int fd) {
 
 /* Clear the registry during a fresh library initialization. */
 void hfsFdReset(void) {
-	pthread_rwlock_wrlock(&g_fdLock);
+	hfsFdWriteLock();
 	memset(g_fdSlots, 0, sizeof(g_fdSlots));
 	pthread_rwlock_unlock(&g_fdLock);
 }
@@ -218,7 +231,7 @@ int hfsFdMarkOrphan(uint64_t inodeId, uint64_t blobId,
 	if (orphanOut != NULL) {
 		*orphanOut = NULL;
 	}
-	pthread_rwlock_wrlock(&g_fdLock);
+	hfsFdWriteLock();
 	for (i = 0; i < HFS_FD_TABLE_SIZE; i++) {
 		HfsOpenFile *openFile = g_fdSlots[i];
 		bool seen = false;
@@ -268,7 +281,7 @@ bool hfsFdGetOrphanInfo(HfsOpenFile *openFile, uint64_t *size,
 	if (openFile == NULL) {
 		return false;
 	}
-	pthread_rwlock_rdlock(&g_fdLock);
+	hfsFdReadLock();
 	result = openFile->orphan != NULL;
 	if (result) {
 		if (size != NULL) {
