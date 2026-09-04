@@ -31,6 +31,10 @@ static int (*real_open)(const char *path, int flags, ...);
 static int (*real_open64)(const char *path, int flags, ...);
 static int (*real_openat)(int dirfd, const char *path, int flags, ...);
 static int (*real_openat64)(int dirfd, const char *path, int flags, ...);
+static int (*real___open_2)(const char *path, int flags);
+static int (*real___open64_2)(const char *path, int flags);
+static int (*real___openat_2)(int dirfd, const char *path, int flags);
+static int (*real___openat64_2)(int dirfd, const char *path, int flags);
 static int (*real_close)(int fd);
 static ssize_t (*real_read)(int fd, void *buf, size_t count);
 static ssize_t (*real_write)(int fd, const void *buf, size_t count);
@@ -154,6 +158,11 @@ static pthread_rwlock_t g_hfs_cwd_lock = PTHREAD_RWLOCK_INITIALIZER;
 
 static int (*real_chdir)(const char *path);
 static int (*real_fchdir)(int fd);
+static char *(*real_getcwd)(char *buf, size_t size);
+static char *(*real_get_current_dir_name)(void);
+static char *(*real_realpath)(const char *path, char *resolved);
+static char *(*real___realpath_chk)(const char *path, char *resolved,
+					    size_t resolvedSize);
 
 /*
  * Set when this process inherited an initialized HFS environment from
@@ -297,6 +306,18 @@ static int hfs_view_at_path(int dirfd, const char *path, char *buf,
 		errno = EFAULT;
 		return -1;
 	}
+	if (path[0] == '/') {
+		/* Absolute paths ignore dirfd, even when dirfd is not AT_FDCWD. */
+		vp = hfs_view_path_buf(path, buf, size);
+		if (vp == NULL) {
+			return 0;
+		}
+		if (snprintf(buf, size, "%s", vp) >= (int)size) {
+			errno = ENAMETOOLONG;
+			return -1;
+		}
+		return 1;
+	}
 	if (dirfd == AT_FDCWD) {
 		/* Always materialize the translated path for callers that reuse buf. */
 		vp = hfs_view_path(path);
@@ -311,17 +332,6 @@ static int hfs_view_at_path(int dirfd, const char *path, char *buf,
 	}
 	if (!hfs_is_hfs_fd(dirfd)) {
 		return 0;
-	}
-	if (path[0] == '/') {
-		vp = hfs_view_path_buf(path, buf, size);
-		if (vp == NULL) {
-			return 0; /* Absolute paths ignore dirfd, as required by POSIX. */
-		}
-		if (snprintf(buf, size, "%s", vp) >= (int)size) {
-			errno = ENAMETOOLONG;
-			return -1;
-		}
-		return 1;
 	}
 	if (path[0] == '\0') {
 		buf[0] = '\0';
@@ -344,6 +354,90 @@ static void *hfs_real_sym(const char *name) {
 		fprintf(stderr, "libhfs: dlsym(%s) failed: %s\n", name, dlerror());
 	}
 	return sym;
+}
+
+/* Resolve statfs64 lazily because dependency constructors can call it first. */
+static int hfs_real_statfs64_call(const char *path, struct statfs64 *st) {
+	if (real_statfs64 == NULL) {
+		real_statfs64 = hfs_real_sym("statfs64");
+	}
+	if (real_statfs64 != NULL) {
+		return real_statfs64(path, st);
+	}
+	if (real_statfs == NULL) {
+		real_statfs = hfs_real_sym("statfs");
+	}
+	if (real_statfs == NULL) {
+		errno = ENOSYS;
+		return -1;
+	}
+	return real_statfs(path, (struct statfs *)st);
+}
+
+/* Resolve fstatfs64 lazily and fall back to the native-width ABI. */
+static int hfs_real_fstatfs64_call(int fd, struct statfs64 *st) {
+	if (real_fstatfs64 == NULL) {
+		real_fstatfs64 = hfs_real_sym("fstatfs64");
+	}
+	if (real_fstatfs64 != NULL) {
+		return real_fstatfs64(fd, st);
+	}
+	if (real_fstatfs == NULL) {
+		real_fstatfs = hfs_real_sym("fstatfs");
+	}
+	if (real_fstatfs == NULL) {
+		errno = ENOSYS;
+		return -1;
+	}
+	return real_fstatfs(fd, (struct statfs *)st);
+}
+
+/* Resolve statvfs64 lazily because dependency constructors can call it first. */
+static int hfs_real_statvfs64_call(const char *path, struct statvfs64 *st) {
+	if (real_statvfs64 == NULL) {
+		real_statvfs64 = hfs_real_sym("statvfs64");
+	}
+	if (real_statvfs64 != NULL) {
+		return real_statvfs64(path, st);
+	}
+	if (real_statvfs == NULL) {
+		real_statvfs = hfs_real_sym("statvfs");
+	}
+	if (real_statvfs == NULL) {
+		errno = ENOSYS;
+		return -1;
+	}
+	return real_statvfs(path, (struct statvfs *)st);
+}
+
+/* Resolve fstatvfs64 lazily and fall back to the native-width ABI. */
+static int hfs_real_fstatvfs64_call(int fd, struct statvfs64 *st) {
+	if (real_fstatvfs64 == NULL) {
+		real_fstatvfs64 = hfs_real_sym("fstatvfs64");
+	}
+	if (real_fstatvfs64 != NULL) {
+		return real_fstatvfs64(fd, st);
+	}
+	if (real_fstatvfs == NULL) {
+		real_fstatvfs = hfs_real_sym("fstatvfs");
+	}
+	if (real_fstatvfs == NULL) {
+		errno = ENOSYS;
+		return -1;
+	}
+	return real_fstatvfs(fd, (struct statvfs *)st);
+}
+
+/* Resolve access lazily because dependency constructors can call it first. */
+static int hfs_real_access_call(const char *path, int mode) {
+	if (real_access == NULL) {
+		real_access = hfs_real_sym("access");
+	}
+	if (real_access == NULL) {
+		errno = ENOSYS;
+		return -1;
+	}
+	return real_access(path, mode);
 }
 
 /* Shared body of the open/open64 interception. */
@@ -419,10 +513,79 @@ int open64(const char *path, int flags, ...) {
 						 real_open64(path, flags);
 }
 
+/* Intercept fortified open variants emitted when no mode argument is used. */
+int __open_2(const char *path, int flags) {
+	int rc = hfs_intercept_open(path, flags, 0);
+
+	if (rc != -2) {
+		return rc;
+	}
+	return real___open_2 != NULL ? real___open_2(path, flags) :
+					 real_open(path, flags);
+}
+
+/* Intercept the large-file fortified open variant. */
+int __open64_2(const char *path, int flags) {
+	int rc = hfs_intercept_open(path, flags, 0);
+
+	if (rc != -2) {
+		return rc;
+	}
+	return real___open64_2 != NULL ? real___open64_2(path, flags) :
+					 real_open64(path, flags);
+}
+
+/* Intercept fortified openat for HFS directory-relative paths. */
+int __openat_2(int dirfd, const char *path, int flags) {
+	int rc = -2;
+
+	if (dirfd == AT_FDCWD) {
+		rc = hfs_intercept_open(path, flags, 0);
+	} else if (path != NULL && path[0] == '/' &&
+		   hfs_view_path(path) != NULL) {
+		/* Absolute paths ignore dirfd under openat(2) semantics. */
+		rc = hfs_intercept_open(path, flags, 0);
+	} else if (hfs_is_hfs_fd(dirfd)) {
+		if (hfs_lib_init() != 0) {
+			errno = ENODEV;
+			return -1;
+		}
+		rc = hfs_lib_openat(dirfd, path, flags, 0);
+	}
+	if (rc != -2) {
+		return rc;
+	}
+	return real___openat_2 != NULL ? real___openat_2(dirfd, path, flags) :
+					 real_openat(dirfd, path, flags);
+}
+
+/* Intercept the large-file fortified openat variant. */
+int __openat64_2(int dirfd, const char *path, int flags) {
+	int rc = -2;
+
+	if (dirfd == AT_FDCWD) {
+		rc = hfs_intercept_open(path, flags, 0);
+	} else if (path != NULL && path[0] == '/' &&
+		   hfs_view_path(path) != NULL) {
+		/* Absolute paths ignore dirfd under openat(2) semantics. */
+		rc = hfs_intercept_open(path, flags, 0);
+	} else if (hfs_is_hfs_fd(dirfd)) {
+		if (hfs_lib_init() != 0) {
+			errno = ENODEV;
+			return -1;
+		}
+		rc = hfs_lib_openat(dirfd, path, flags, 0);
+	}
+	if (rc != -2) {
+		return rc;
+	}
+	return real___openat64_2 != NULL ? real___openat64_2(dirfd, path, flags) :
+					 real_openat64(dirfd, path, flags);
+}
+
 /*
- * Intercepted openat(2). Only AT_FDCWD with a managed path is routed
- * to HFS; everything else (including dirfd-relative paths) is passed
- * through to the real libc call.
+ * Intercepted openat(2). Absolute managed paths ignore dirfd; relative
+ * paths are routed only when dirfd identifies an HFS directory.
  */
 int openat(int dirfd, const char *path, int flags, ...) {
 	va_list ap;
@@ -433,8 +596,8 @@ int openat(int dirfd, const char *path, int flags, ...) {
 		mode = va_arg(ap, mode_t);
 		va_end(ap);
 	}
-
-	if (dirfd == AT_FDCWD) {
+	if (dirfd == AT_FDCWD || (path != NULL && path[0] == '/' &&
+				       hfs_view_path(path) != NULL)) {
 		int rc = hfs_intercept_open(path, flags, mode);
 		if (rc != -2) {
 			return rc;
@@ -463,8 +626,8 @@ int openat64(int dirfd, const char *path, int flags, ...) {
 		mode = va_arg(ap, mode_t);
 		va_end(ap);
 	}
-
-	if (dirfd == AT_FDCWD) {
+	if (dirfd == AT_FDCWD || (path != NULL && path[0] == '/' &&
+				       hfs_view_path(path) != NULL)) {
 		int rc = hfs_intercept_open(path, flags, mode);
 		if (rc != -2) {
 			return rc;
@@ -1021,6 +1184,172 @@ int fchdir(int fd) {
 	return real_fchdir(fd);
 }
 
+/* Return the virtual HFS cwd while preserving libc allocation semantics. */
+char *getcwd(char *buf, size_t size) {
+	char cwd[PATH_MAX];
+	size_t length;
+	bool active;
+
+	pthread_rwlock_rdlock(&g_hfs_cwd_lock);
+	active = g_hfs_cwd_active;
+	if (active) {
+		snprintf(cwd, sizeof(cwd), "%s", g_hfs_cwd);
+	}
+	pthread_rwlock_unlock(&g_hfs_cwd_lock);
+	if (!active) {
+		return real_getcwd(buf, size);
+	}
+	length = strlen(cwd);
+	if (buf == NULL) {
+		if (size != 0 && length + 1 > size) {
+			errno = ERANGE;
+			return NULL;
+		}
+		buf = malloc(length + 1);
+		if (buf == NULL) {
+			errno = ENOMEM;
+			return NULL;
+		}
+	} else if (size <= length) {
+		errno = ERANGE;
+		return NULL;
+	}
+	memcpy(buf, cwd, length + 1);
+	return buf;
+}
+
+/* Return an allocated virtual HFS cwd for libc callers without a buffer. */
+char *get_current_dir_name(void) {
+	bool active;
+
+	pthread_rwlock_rdlock(&g_hfs_cwd_lock);
+	active = g_hfs_cwd_active;
+	pthread_rwlock_unlock(&g_hfs_cwd_lock);
+	if (active) {
+		return getcwd(NULL, 0);
+	}
+	if (real_get_current_dir_name != NULL) {
+		return real_get_current_dir_name();
+	}
+	return real_getcwd(NULL, 0);
+}
+
+/* Canonicalize a path lexically; HFS exposes no symbolic links. */
+static bool hfs_normalize_path(const char *path, char *normalized,
+				       size_t size) {
+	char copy[PATH_MAX];
+	char *component;
+	char *saveptr = NULL;
+	size_t length = 1;
+
+	if (path == NULL || normalized == NULL || size < 2 ||
+	    snprintf(copy, sizeof(copy), "%s", path) >= (int)sizeof(copy) ||
+	    copy[0] != '/') {
+		return false;
+	}
+	normalized[0] = '/';
+	normalized[1] = '\0';
+	for (component = strtok_r(copy, "/", &saveptr);
+	     component != NULL;
+	     component = strtok_r(NULL, "/", &saveptr)) {
+		size_t componentLength;
+		if (strcmp(component, ".") == 0 || component[0] == '\0') {
+			continue;
+		}
+		if (strcmp(component, "..") == 0) {
+			if (length > 1) {
+				char *slash = strrchr(normalized, '/');
+				*slash = '\0';
+				length = (size_t)(slash - normalized);
+				if (length == 0) {
+					length = 1;
+					normalized[0] = '/';
+					normalized[1] = '\0';
+				}
+			}
+			continue;
+		}
+		componentLength = strlen(component);
+		if (length > 1 && length + 1 + componentLength + 1 > size) {
+			return false;
+		}
+		if (length > 1) {
+			normalized[length++] = '/';
+		}
+		if (length + componentLength + 1 > size) {
+			return false;
+		}
+		memcpy(normalized + length, component, componentLength + 1);
+		length += componentLength;
+	}
+	return true;
+}
+
+/* Return a canonical path for an existing managed HFS inode. */
+static char *hfs_realpath_managed(const char *path, char *resolved,
+					  size_t resolvedSize) {
+	char fullPath[PATH_MAX];
+	char normalized[PATH_MAX];
+	struct stat st;
+	const char *innerPath;
+	char *result;
+	size_t length;
+
+	if (!hfs_full_path_buf(path, fullPath, sizeof(fullPath)) ||
+	    !hfs_normalize_path(fullPath, normalized, sizeof(normalized))) {
+		errno = ENAMETOOLONG;
+		return NULL;
+	}
+	if (hfs_lib_init() != 0) {
+		errno = ENODEV;
+		return NULL;
+	}
+	innerPath = hfs_inner_path(normalized);
+	if (hfs_lib_stat(innerPath, &st) != 0) {
+		return NULL;
+	}
+	length = strlen(normalized);
+	if (resolved == NULL) {
+		if (resolvedSize != 0 && length + 1 > resolvedSize) {
+			errno = ERANGE;
+			return NULL;
+		}
+		result = malloc(length + 1);
+		if (result == NULL) {
+			errno = ENOMEM;
+			return NULL;
+		}
+	} else {
+		if (resolvedSize <= length) {
+			errno = ERANGE;
+			return NULL;
+		}
+		result = resolved;
+	}
+	memcpy(result, normalized, length + 1);
+	return result;
+}
+
+/* Intercept realpath and its fortified variant for the HFS namespace. */
+char *realpath(const char *path, char *resolved) {
+	char fullPath[PATH_MAX];
+
+	if (hfs_full_path_buf(path, fullPath, sizeof(fullPath))) {
+		return hfs_realpath_managed(path, resolved, resolved != NULL ? PATH_MAX : 0);
+	}
+	return real_realpath(path, resolved);
+}
+
+/* Intercept __realpath_chk while enforcing the caller's destination size. */
+char *__realpath_chk(const char *path, char *resolved, size_t resolvedSize) {
+	char fullPath[PATH_MAX];
+
+	if (hfs_full_path_buf(path, fullPath, sizeof(fullPath))) {
+		return hfs_realpath_managed(path, resolved, resolvedSize);
+	}
+	return real___realpath_chk(path, resolved, resolvedSize);
+}
+
 /* Intercepted stat(2): managed paths stat an HFS inode. */
 int stat(const char *path, struct stat *st) {
 	const char *vp = hfs_view_path(path);
@@ -1412,7 +1741,7 @@ int statfs64(const char *path, struct statfs64 *st) {
 		}
 		return hfs_lib_statfs(vp, (struct statfs *)st);
 	}
-	return real_statfs64(path, st);
+	return hfs_real_statfs64_call(path, st);
 }
 
 /* Intercept the large-file fd statfs ABI used by database runtimes. */
@@ -1420,7 +1749,7 @@ int fstatfs64(int fd, struct statfs64 *st) {
 	if (hfs_is_hfs_fd(fd)) {
 		return hfs_lib_fstatfs(fd, (struct statfs *)st);
 	}
-	return real_fstatfs64(fd, st);
+	return hfs_real_fstatfs64_call(fd, st);
 }
 
 /* Intercept the large-file statvfs ABI used by CPython and database tools. */
@@ -1434,7 +1763,7 @@ int statvfs64(const char *path, struct statvfs64 *st) {
 		}
 		return hfs_lib_statvfs(vp, (struct statvfs *)st);
 	}
-	return real_statvfs64(path, st);
+	return hfs_real_statvfs64_call(path, st);
 }
 
 /* Intercept the large-file fd statvfs ABI used by CPython and database tools. */
@@ -1442,7 +1771,7 @@ int fstatvfs64(int fd, struct statvfs64 *st) {
 	if (hfs_is_hfs_fd(fd)) {
 		return hfs_lib_fstatvfs(fd, (struct statvfs *)st);
 	}
-	return real_fstatvfs64(fd, st);
+	return hfs_real_fstatvfs64_call(fd, st);
 }
 
 /* Intercepted access(2): managed paths have no permission model. */
@@ -1455,7 +1784,7 @@ int access(const char *path, int mode) {
 		}
 		return hfs_lib_access(vp, mode);
 	}
-	return real_access(path, mode);
+	return hfs_real_access_call(path, mode);
 }
 
 /* Intercepted faccessat(2): AT_FDCWD with a managed path. */
@@ -2001,17 +2330,21 @@ ssize_t readlink(const char *path, char *buf, size_t bufsiz) {
 	return hfs_readlink_impl(path, buf, bufsiz, hfs_real_readlink_get());
 }
 
-/* Intercepted readlinkat(2): AT_FDCWD with a managed path. */
+/* Intercept readlinkat(2) for absolute paths and HFS directory fds. */
 ssize_t readlinkat(int dirfd, const char *path, char *buf, size_t bufsiz) {
-	const char *vp = hfs_view_path(path);
+	char pathBuf[PATH_MAX];
 	struct stat st;
+	int managed = hfs_view_at_path(dirfd, path, pathBuf, sizeof(pathBuf));
 
-	if (dirfd == AT_FDCWD && vp != NULL) {
+	if (managed < 0) {
+		return -1;
+	}
+	if (managed > 0) {
 		if (hfs_lib_init() != 0) {
 			errno = ENODEV;
 			return -1;
 		}
-		if (hfs_lib_stat(vp, &st) != 0) {
+		if (hfs_lib_stat(pathBuf, &st) != 0) {
 			errno = ENOENT;
 			return -1;
 		}
@@ -2041,6 +2374,10 @@ static void hfs_preload_ctor(void) {
 	real_open64 = hfs_real_sym("open64");
 	real_openat = hfs_real_sym("openat");
 	real_openat64 = hfs_real_sym("openat64");
+	real___open_2 = hfs_real_sym("__open_2");
+	real___open64_2 = hfs_real_sym("__open64_2");
+	real___openat_2 = hfs_real_sym("__openat_2");
+	real___openat64_2 = hfs_real_sym("__openat64_2");
 	real_close = hfs_real_sym("close");
 	real_read = hfs_real_sym("read");
 	real_write = hfs_real_sym("write");
@@ -2079,6 +2416,10 @@ static void hfs_preload_ctor(void) {
 	real_renameat2 = hfs_real_sym("renameat2");
 	real_chdir = hfs_real_sym("chdir");
 	real_fchdir = hfs_real_sym("fchdir");
+	real_getcwd = hfs_real_sym("getcwd");
+	real_get_current_dir_name = hfs_real_sym("get_current_dir_name");
+	real_realpath = hfs_real_sym("realpath");
+	real___realpath_chk = hfs_real_sym("__realpath_chk");
 	real_stat = hfs_real_sym("stat");
 	real_lstat = hfs_real_sym("lstat");
 	real_fstat = hfs_real_sym("fstat");
@@ -2092,6 +2433,19 @@ static void hfs_preload_ctor(void) {
 	real_fstatvfs = hfs_real_sym("fstatvfs");
 	real_statvfs64 = hfs_real_sym("statvfs64");
 	real_fstatvfs64 = hfs_real_sym("fstatvfs64");
+	/* Some libc builds expose only the non-64 statfs entry points. */
+	if (real_statfs64 == NULL) {
+		real_statfs64 = (int (*)(const char *, struct statfs64 *))real_statfs;
+	}
+	if (real_fstatfs64 == NULL) {
+		real_fstatfs64 = (int (*)(int, struct statfs64 *))real_fstatfs;
+	}
+	if (real_statvfs64 == NULL) {
+		real_statvfs64 = (int (*)(const char *, struct statvfs64 *))real_statvfs;
+	}
+	if (real_fstatvfs64 == NULL) {
+		real_fstatvfs64 = (int (*)(int, struct statvfs64 *))real_fstatvfs;
+	}
 	real_chmod = hfs_real_sym("chmod");
 	real_fchmod = hfs_real_sym("fchmod");
 	real_fchmodat = hfs_real_sym("fchmodat");
