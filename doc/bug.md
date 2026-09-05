@@ -606,9 +606,9 @@ Bug 等级：**致命 > 严重 > 一般**。
 - **后续**：用 syscall 级 trace 对该次 `openat/openat64`、目录 inode 状态和 HFS runtime
   teardown 顺序做最小复现；修复前不将 buffer pool dump 视为 HFS MariaDB 退出阶段完全兼容。
 
-### 45. truncate 缩短后再扩展读回历史数据（待修复，严重级）
+### 45. truncate 缩短后再扩展读回历史数据（shard-36 修复，严重级）
 
-- **状态**：未修复
+- **状态**：已修复
 - **时间**：2026-09-05（架构与性能审查）
 - **等级**：严重（违反 POSIX 零填充语义，可能向调用方暴露已截断的历史内容）
 - **现象**：VM 最小复现先写入 4096 个 `A`，执行 `ftruncate(fd, 0)`，再执行
@@ -619,13 +619,16 @@ Bug 等级：**致命 > 严重 > 一般**。
   `hfsResizeTo`，但 blob 已经拥有足够 cluster，因此直接成功返回，旧 payload 重新进入可读范围。
 - **根因**：inode 逻辑长度和 blob 已分配/有效数据范围没有独立建模；truncate shrink 没有建立
   “截断后区域必须读零”的持久语义。
-- **后续**：缩短时至少清零新 EOF 的非对齐尾部，并对完整 cluster 执行释放/打孔或维护稀疏
-  extent；扩展时对逻辑 EOF 到新 EOF 的范围保证 zero-fill。新增 shrink→grow、O_TRUNC→grow、
-  崩溃重挂载和跨 cluster 回归。
+- **修复**：新增 `hfsIoZeroRange`，shrink 先清零 `[newEOF, oldEOF)`（保留非对齐 unit 前缀），
+  再通过 `hfsResizeExact` 释放完整后继 cluster；grow 在发布新 EOF 前清零
+  `[oldEOF, newEOF)`，即使 blob 已有容量也不会重新暴露旧 payload。`O_TRUNC` 复用相同流程，
+  先完成数据清理再提交 inode size。
+- **验证**：新增 `scripts/db/posix_data_contract_test.sh`，覆盖 shrink→grow、O_TRUNC→grow、
+  非对齐 EOF、跨 1 MiB cluster、首次格式化和第二进程重挂载；VM 上均通过。
 
-### 46. 覆盖写不更新 mtime（待修复，一般级）
+### 46. 覆盖写不更新 mtime（shard-36 修复，一般级）
 
-- **状态**：未修复
+- **状态**：已修复
 - **时间**：2026-09-05（架构与性能审查）
 - **等级**：一般（文件内容已变化但 stat/fstat 时间戳保持旧值）
 - **现象**：VM 探针把文件 mtime 设置为 1 秒，随后在 offset 0 覆盖写 1 字节并 fsync；
@@ -634,13 +637,15 @@ Bug 等级：**致命 > 严重 > 一般**。
   `writeEnd > inode.size` 时更新 size/mtime。对文件现有范围内的覆盖写没有任何 mtime 更新。
 - **根因**：把“更新写入时间”错误绑定到“文件增长”，缺少独立的 content-dirty/mtime-dirty
   状态。
-- **后续**：任意成功写入都更新内存 mtime；size 仅在 write end 超过 EOF 时更新。将 dirty
-  bit 按 inode/字段拆分，fsync/fdatasync 根据语义提交，并增加覆盖写和并发 positioned write
-  时间戳回归。
+- **修复**：统一 write、pwrite、writev 和 pwritev 的成功收尾路径；任意成功内容写均更新
+  inode 与 open-file description 的 mtime/ctime，size 仅在 write end 超过 EOF 时增长，并将
+  metadata 标记为待提交。
+- **验证**：数据契约脚本将 mtime 设为 1 秒后执行同长度 `pwrite` 和 `fsync`，断言
+  `st_mtime_ns` 严格前进；VM 通过。
 
-### 47. statfs/statvfs 容量混用且长期陈旧（待修复，一般级）
+### 47. statfs/statvfs 容量混用且长期陈旧（shard-36 修复，一般级）
 
-- **状态**：未修复
+- **状态**：已修复
 - **时间**：2026-09-05（架构与性能审查）
 - **等级**：一般（容量监控、数据库预分配判断和 ENOSPC 预警不可信）
 - **现象**：默认 1.5GiB Malloc0 配置下，VM 探针在创建一个文件后得到
@@ -651,9 +656,12 @@ Bug 等级：**致命 > 严重 > 一般**。
   同时把 cluster 计数配上 `unitSize`（512B）作为 block size，且 free 值从 mount 后不再刷新。
 - **根因**：同一字段承担“文件已分配 cluster”和“文件系统总 cluster”两个含义；容量单位和
   刷新策略没有统一。
-- **后续**：拆分 `totalDataClusters`、per-blob allocated clusters；statfs 时在 owner thread
-  获取当前 free cluster，或维护可靠的原子增减计数；用 blobstore cluster size 作为容量换算
-  单位，并加入格式化后、扩容后、删除后的精确容量回归。
+- **修复**：删除创建文件时“占满全部 free cluster”的错误预分配；`Hfs` 拆分为固定的
+  `totalDataClusters`、`clusterSize` 与原子 `freeClusterCount`。`statfs/statvfs` 在 SPDK
+  owner thread 刷新空闲 cluster，统一以 blobstore cluster size 填充 `f_bsize/f_frsize`，不再
+  把单个 blob 的分配量当作文件系统容量。
+- **验证**：数据契约脚本断言总容量大于 512 MiB、`f_blocks` 在分配/删除前后不变、写入两个
+  cluster 后 `f_bfree` 下降、unlink 后 `f_bfree` 回升；VM 通过。
 
 ### 48. SPDK 异步操作错误被 waiter 当作成功（待修复，严重级）
 

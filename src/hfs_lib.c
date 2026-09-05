@@ -61,6 +61,52 @@ static uint64_t hfs_now_ns(void) {
 	return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
 
+/* Request state used to sample blobstore capacity on the SPDK owner thread. */
+typedef struct HfsCapacityRequest {
+	Hfs *fs;
+	uint64_t freeClusters;
+	int operationRc;
+	HfsCompletion completion;
+} HfsCapacityRequest;
+
+/* Refresh the free-cluster cache without touching blobstore state from callers. */
+static void hfsDoRefreshCapacity(void *arg) {
+	HfsCapacityRequest *request = arg;
+
+	if (request->fs == NULL || request->fs->blobstore == NULL) {
+		request->operationRc = -ENODEV;
+	} else {
+		request->freeClusters =
+			spdk_bs_free_cluster_count(request->fs->blobstore);
+		atomic_store_explicit(&request->fs->freeClusterCount,
+				      request->freeClusters, memory_order_relaxed);
+		request->operationRc = 0;
+	}
+	hfsRuntimeCompletionComplete(&request->completion);
+}
+
+/* Sample current blobstore capacity before reporting POSIX filesystem stats. */
+static int hfsRefreshCapacity(Hfs *fs) {
+	HfsCapacityRequest request;
+
+	if (fs == NULL || fs->blobstore == NULL) {
+		errno = ENODEV;
+		return -1;
+	}
+	memset(&request, 0, sizeof(request));
+	request.fs = fs;
+	request.operationRc = -EIO;
+	if (!waiter(globalThread, hfsDoRefreshCapacity, &request,
+		    &request.completion)) {
+		return -1;
+	}
+	if (request.operationRc != 0) {
+		errno = request.operationRc < 0 ? -request.operationRc : EIO;
+		return -1;
+	}
+	return 0;
+}
+
 /* Acquire an external lock so two processes cannot mount one backend. */
 static int hfs_acquire_backend_lock(void) {
 	const char *configured = getenv("HFS_LOCK_PATH");
@@ -352,17 +398,23 @@ static ssize_t hfsWritevAt(HfsOpenFile *openFile, const struct iovec *iov,
 /* Publish a successful write end for both linked and unlinked open files. */
 static void hfsPublishWriteEnd(HfsOpenFile *openFile, uint64_t end) {
 	struct hfs_inode *in;
+	uint64_t nowNs = hfs_now_ns();
 
 	hfsMetaWriteLock();
 	in = g_fs == NULL ? NULL : hfsMetaFindById(g_fs, openFile->inodeId);
-	if (in != NULL && end > in->size) {
-		in->size = end;
-		in->mtimeNs = hfs_now_ns();
+	if (in != NULL) {
+		if (end > in->size) {
+			in->size = end;
+		}
+		/* Every successful content write changes mtime and ctime. */
+		in->mtimeNs = nowNs;
+		in->ctimeNs = nowNs;
 		g_fs->metaDirty = true;
 		atomic_store_explicit(&openFile->size, in->size,
 				      memory_order_relaxed);
 		atomic_store_explicit(&openFile->mtimeNs, in->mtimeNs,
 				      memory_order_relaxed);
+		openFile->ctimeNs = nowNs;
 	} else if (in == NULL && hfsFdGetOrphanInfo(openFile, NULL, NULL, NULL)) {
 		uint64_t size = atomic_load_explicit(&openFile->size,
 					     memory_order_relaxed);
@@ -371,10 +423,29 @@ static void hfsPublishWriteEnd(HfsOpenFile *openFile, uint64_t end) {
 			atomic_store_explicit(&openFile->size, end,
 					      memory_order_relaxed);
 		}
-		atomic_store_explicit(&openFile->mtimeNs, hfs_now_ns(),
+		atomic_store_explicit(&openFile->mtimeNs, nowNs,
 				      memory_order_relaxed);
+		openFile->ctimeNs = nowNs;
 	}
 	pthread_rwlock_unlock(&g_metaLock);
+}
+
+/* Prepare a truncate range before publishing its new logical file size. */
+static int hfsPrepareTruncate(HfsFile *file, uint64_t currentSize,
+			       uint64_t targetSize) {
+	if (targetSize > currentSize) {
+		if (hfsResizeTo(file, targetSize) != 0) {
+			return -1;
+		}
+		return hfsIoZeroRange(file, currentSize, targetSize - currentSize);
+	}
+	if (targetSize < currentSize) {
+		if (hfsIoZeroRange(file, targetSize, currentSize - targetSize) != 0) {
+			return -1;
+		}
+		return hfsResizeExact(file, targetSize);
+	}
+	return 0;
 }
 
 /*
@@ -436,9 +507,13 @@ int hfs_lib_init(void) {
 		pthread_rwlock_unlock(&g_metaLock);
 		return -1;
 	}
-	/* Cache blobstore capacity for lock-free statfs/statvfs reporting. */
-	g_fs->numCluster = spdk_bs_total_data_cluster_count(g_fs->blobstore);
-	g_fs->freeClusterCount = spdk_bs_free_cluster_count(g_fs->blobstore);
+	/* Keep filesystem capacity separate from individual data blob allocation. */
+	g_fs->clusterSize = spdk_bs_get_cluster_size(g_fs->blobstore);
+	g_fs->totalDataClusters =
+		spdk_bs_total_data_cluster_count(g_fs->blobstore);
+	atomic_store_explicit(&g_fs->freeClusterCount,
+			      spdk_bs_free_cluster_count(g_fs->blobstore),
+			      memory_order_relaxed);
 
 	if (hfsIoInit(g_fs) != 0) {
 		HFS_LOG_ERROR("hfsIoInit failed");
@@ -552,6 +627,7 @@ int hfs_lib_open(const char *path, int flags, mode_t mode) {
 	int fd;
 	int rc;
 	bool created = false;
+	bool truncateRequested = false;
 
 	hfsMetaWriteLock();
 	if (g_fs == NULL) {
@@ -642,10 +718,7 @@ int hfs_lib_open(const char *path, int flags, mode_t mode) {
 
 	if ((flags & O_TRUNC) != 0 &&
 	    (flags & O_ACCMODE) != O_RDONLY) {
-		if (hfsMetaSetSize(g_fs, in, 0) != 0) {
-			pthread_rwlock_unlock(&g_metaLock);
-			return -1;
-		}
+		truncateRequested = true;
 	}
 
 	/*
@@ -682,6 +755,20 @@ int hfs_lib_open(const char *path, int flags, mode_t mode) {
 		pthread_rwlock_unlock(&g_metaLock);
 		errno = EIO;
 		return -1;
+	}
+	if (truncateRequested && in->size != 0) {
+		int savedErrno;
+
+		if (hfsPrepareTruncate(file, in->size, 0) != 0 ||
+		    hfsMetaSetSize(g_fs, in, 0) != 0) {
+			savedErrno = errno;
+			hfsClose(file);
+			free(file);
+			close(fd);
+			pthread_rwlock_unlock(&g_metaLock);
+			errno = savedErrno;
+			return -1;
+		}
 	}
 	if (hfsFdCreate(&openFile, file, in->id, flags,
 			((flags & O_ACCMODE) != O_RDONLY), false, NULL) != 0 ||
@@ -900,29 +987,7 @@ ssize_t hfs_lib_write(int fd, const void *buf, size_t count) {
 		return -1;
 	}
 	openFile->offset = writeOffset + (uint64_t)n;
-	hfsMetaWriteLock();
-	in = g_fs == NULL ? NULL : hfsMetaFindById(g_fs, openFile->inodeId);
-	if (in != NULL && openFile->offset > in->size) {
-		/* Update size/mtime in memory; persisted at fsync/close. */
-		in->size = openFile->offset;
-		in->mtimeNs = hfs_now_ns();
-		g_fs->metaDirty = true;
-		atomic_store_explicit(&openFile->size, in->size,
-				      memory_order_relaxed);
-		atomic_store_explicit(&openFile->mtimeNs, in->mtimeNs,
-				      memory_order_relaxed);
-	} else if (in == NULL && hfsFdGetOrphanInfo(openFile, NULL, NULL, NULL)) {
-		uint64_t size = atomic_load_explicit(&openFile->size,
-					     memory_order_relaxed);
-
-		if (openFile->offset > size) {
-			atomic_store_explicit(&openFile->size, openFile->offset,
-					      memory_order_relaxed);
-		}
-		atomic_store_explicit(&openFile->mtimeNs, hfs_now_ns(),
-				      memory_order_relaxed);
-	}
-	pthread_rwlock_unlock(&g_metaLock);
+	hfsPublishWriteEnd(openFile, openFile->offset);
 	pthread_mutex_unlock(&openFile->ioLock);
 	if (append) {
 		pthread_mutex_unlock(&g_appendLock);
@@ -1050,29 +1115,7 @@ ssize_t hfs_lib_pwrite(int fd, const void *buf, size_t count, off_t offset) {
 		errno = n < 0 ? savedErrno : EIO;
 		return -1;
 	}
-	hfsMetaWriteLock();
-	in = g_fs == NULL ? NULL : hfsMetaFindById(g_fs, openFile->inodeId);
-	if (in != NULL && writeOffset + (uint64_t)n > in->size) {
-		in->size = writeOffset + (uint64_t)n;
-		in->mtimeNs = hfs_now_ns();
-		g_fs->metaDirty = true;
-		atomic_store_explicit(&openFile->size, in->size,
-				      memory_order_relaxed);
-		atomic_store_explicit(&openFile->mtimeNs, in->mtimeNs,
-				      memory_order_relaxed);
-	} else if (in == NULL && hfsFdGetOrphanInfo(openFile, NULL, NULL, NULL)) {
-		uint64_t size = atomic_load_explicit(&openFile->size,
-					     memory_order_relaxed);
-		uint64_t end = writeOffset + (uint64_t)n;
-
-		if (end > size) {
-			atomic_store_explicit(&openFile->size, end,
-					      memory_order_relaxed);
-		}
-		atomic_store_explicit(&openFile->mtimeNs, hfs_now_ns(),
-				      memory_order_relaxed);
-	}
-	pthread_rwlock_unlock(&g_metaLock);
+	hfsPublishWriteEnd(openFile, writeOffset + (uint64_t)n);
 	if (append) {
 		pthread_mutex_unlock(&g_appendLock);
 	}
@@ -1442,6 +1485,7 @@ int hfs_lib_ftruncate(int fd, off_t length) {
 	HfsOpenFile *openFile;
 	struct hfs_inode *in;
 	uint64_t currentSize;
+	int savedErrno;
 	int rc;
 
 	if (length < 0) {
@@ -1480,14 +1524,14 @@ int hfs_lib_ftruncate(int fd, off_t length) {
 
 	pthread_rwlock_unlock(&g_metaLock);
 
-	/* Grow the blob first so the new size is backed by storage. */
-	if (length > (off_t)currentSize) {
-		if (hfsResizeTo(openFile->file, (uint64_t)length) != 0) {
-			pthread_mutex_unlock(&openFile->ioLock);
-			hfs_release_open_file(openFile);
-			errno = EIO;
-			return -1;
-		}
+	/* Clear both growth and shrink ranges before publishing the new EOF. */
+	if (hfsPrepareTruncate(openFile->file, currentSize,
+			       (uint64_t)length) != 0) {
+		savedErrno = errno;
+		pthread_mutex_unlock(&openFile->ioLock);
+		hfs_release_open_file(openFile);
+		errno = savedErrno;
+		return -1;
 	}
 
 	/* Upgrade to a writer only for the stable inode update. */
@@ -2358,14 +2402,16 @@ int hfs_lib_stat(const char *path, struct stat *st) {
 	return 0;
 }
 
-/* Fill statvfs capacity fields from the mounted blobstore snapshot. */
+/* Fill statvfs capacity fields from the current blobstore capacity snapshot. */
 static void hfs_fill_statvfs(const Hfs *fs, struct statvfs *st) {
-	uint64_t totalClusters = fs->numCluster + fs->freeClusterCount;
-	uint64_t freeClusters = fs->freeClusterCount;
-	uint64_t blockSize = fs->unitSize != 0 ? fs->unitSize : 4096;
+	uint64_t totalClusters = fs->totalDataClusters;
+	uint64_t freeClusters = atomic_load_explicit(&fs->freeClusterCount,
+					       memory_order_relaxed);
+	uint64_t blockSize = fs->clusterSize != 0 ? fs->clusterSize :
+		fs->unitSize != 0 ? fs->unitSize : 4096;
 
-	if (totalClusters == 0) {
-		totalClusters = freeClusters;
+	if (freeClusters > totalClusters) {
+		freeClusters = totalClusters;
 	}
 	memset(st, 0, sizeof(*st));
 	st->f_bsize = blockSize;
@@ -2414,6 +2460,10 @@ int hfs_lib_statvfs(const char *path, struct statvfs *st) {
 		pthread_rwlock_unlock(&g_metaLock);
 		return -1;
 	}
+	if (hfsRefreshCapacity(g_fs) != 0) {
+		pthread_rwlock_unlock(&g_metaLock);
+		return -1;
+	}
 	hfs_fill_statvfs(g_fs, st);
 	pthread_rwlock_unlock(&g_metaLock);
 	return 0;
@@ -2439,6 +2489,11 @@ int hfs_lib_fstatvfs(int fd, struct statvfs *st) {
 		errno = ENODEV;
 		return -1;
 	}
+	if (hfsRefreshCapacity(g_fs) != 0) {
+		pthread_rwlock_unlock(&g_metaLock);
+		hfs_release_open_file(openFile);
+		return -1;
+	}
 	hfs_fill_statvfs(g_fs, st);
 	pthread_rwlock_unlock(&g_metaLock);
 	hfs_release_open_file(openFile);
@@ -2458,6 +2513,10 @@ int hfs_lib_statfs(const char *path, struct statfs *st) {
 		return -1;
 	}
 	if (hfsMetaResolvePath(g_fs, path) == NULL) {
+		pthread_rwlock_unlock(&g_metaLock);
+		return -1;
+	}
+	if (hfsRefreshCapacity(g_fs) != 0) {
 		pthread_rwlock_unlock(&g_metaLock);
 		return -1;
 	}
@@ -2484,6 +2543,11 @@ int hfs_lib_fstatfs(int fd, struct statfs *st) {
 		pthread_rwlock_unlock(&g_metaLock);
 		hfs_release_open_file(openFile);
 		errno = ENODEV;
+		return -1;
+	}
+	if (hfsRefreshCapacity(g_fs) != 0) {
+		pthread_rwlock_unlock(&g_metaLock);
+		hfs_release_open_file(openFile);
 		return -1;
 	}
 	hfs_fill_statfs(g_fs, st);

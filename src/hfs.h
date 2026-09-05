@@ -34,8 +34,9 @@ typedef struct Hfs {
 	struct spdk_bdev_desc *bdevDesc;	/* descriptor used for durable flush */
 	struct spdk_io_channel *bdevChannel;	/* bdev channel used for durable flush */
 	uint64_t unitSize;			/* blobstore io unit size (bytes) */
-	uint64_t freeClusterCount;		/* free clusters at mount time */
-	uint64_t numCluster;			/* cluster count of the data blob */
+	uint64_t clusterSize;			/* blobstore allocation cluster size (bytes) */
+	uint64_t totalDataClusters;		/* immutable data-cluster capacity */
+	_Atomic uint64_t freeClusterCount;	/* refreshed free data-cluster capacity */
 
 	/* Metadata state. */
 	spdk_blob_id metaBlobId;		/* blob id of the metadata blob */
@@ -110,6 +111,8 @@ int hfsOpen(HfsFile *file);
 int hfsOpenById(HfsFile *file);
 /* Resize the blob so it covers at least 'bytes' (grow only). */
 int hfsResizeTo(HfsFile *file, uint64_t bytes);
+/* Resize the blob exactly to cover 'bytes' and release unused clusters. */
+int hfsResizeExact(HfsFile *file, uint64_t bytes);
 /* Sequential read at file->offset; advances the offset. */
 int hfsRead(HfsFile *file, uint8_t *buffer, size_t count);
 /* Sequential write at file->offset; advances the offset. */

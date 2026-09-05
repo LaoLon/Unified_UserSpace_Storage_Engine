@@ -11,6 +11,16 @@
 #include "hfs_io.h"
 #include "hfs_log.h"
 
+/* Refresh the cached free capacity while running on the SPDK owner thread. */
+static void hfsRefreshFreeClusterCount(Hfs *fs) {
+	if (fs == NULL || fs->blobstore == NULL) {
+		return;
+	}
+	atomic_store_explicit(&fs->freeClusterCount,
+			      spdk_bs_free_cluster_count(fs->blobstore),
+			      memory_order_relaxed);
+}
+
 /* Completion callback for spdk_bs_delete_blob. */
 static void hfsSpdkBlobDeleteCb(void *arg, int bserrno) {
 	HfsFile *file = (HfsFile *)arg;
@@ -18,6 +28,8 @@ static void hfsSpdkBlobDeleteCb(void *arg, int bserrno) {
 	if (bserrno != 0) {
 		HFS_LOG_ERROR("delete blob %"PRIu64" failed bserrno=%d",
 			      file->blobId, bserrno);
+	} else {
+		hfsRefreshFreeClusterCount(file->fs);
 	}
 	SPDK_NOTICELOG("blob deleted, id=%"PRIu64"\n", file->blobId);
 	hfsRuntimeCompletionComplete(&file->completion);
@@ -170,24 +182,9 @@ static void hfsSpdkBlobSyncCb(void *arg, int bserrno) {
 	hfsRuntimeCompletionComplete(&file->completion);
 }
 
-/* Completion callback for spdk_blob_resize (open path): sync metadata. */
-static void hfsSpdkBlobResizeCb(void *arg, int bserrno) {
-	HfsFile *file = (HfsFile *)arg;
-
-	if (bserrno != 0) {
-		HFS_LOG_ERROR("blob resize failed bserrno=%d", bserrno);
-	}
-	uint64_t total = spdk_blob_get_num_clusters(file->blob);
-	file->fs->numCluster = total;
-
-	SPDK_NOTICELOG("resize blob :%"PRIu64"\n", total);
-
-	spdk_blob_sync_md(file->blob, hfsSpdkBlobSyncCb, file);
-}
-
 /*
  * Completion callback for spdk_bs_open_blob (open path):
- * grow the blob to all free clusters, then sync metadata.
+ * sync the freshly created empty blob metadata.
  */
 static void hfsSpdkBsOpenBlobCb(void *arg, struct spdk_blob *blb, int bserrno) {
 	HfsFile *file = (HfsFile *)arg;
@@ -198,12 +195,7 @@ static void hfsSpdkBsOpenBlobCb(void *arg, struct spdk_blob *blb, int bserrno) {
 		return;
 	}
 	file->blob = blb;
-
-	uint64_t freeCluster = spdk_bs_free_cluster_count(file->fs->blobstore);
-	SPDK_NOTICELOG("freeCluster : %"PRIu64"\n", freeCluster);
-	file->fs->freeClusterCount = freeCluster;
-
-	spdk_blob_resize(blb, freeCluster, hfsSpdkBlobResizeCb, file);
+	spdk_blob_sync_md(blb, hfsSpdkBlobSyncCb, file);
 }
 
 /* Completion callback for spdk_bs_create_blob (open path). */
@@ -271,8 +263,7 @@ static void hfsSpdkBlobResizeDoneCb(void *arg, int bserrno) {
 
 	request->operationRc = bserrno;
 	if (bserrno == 0) {
-		request->file->fs->numCluster =
-			spdk_blob_get_num_clusters(request->file->blob);
+		hfsRefreshFreeClusterCount(request->file->fs);
 	}
 	hfsRuntimeCompletionComplete(&request->completion);
 }
@@ -291,14 +282,43 @@ static int hfsResizeError(int rc) {
 	return -1;
 }
 
-/* Resize the blob so it covers at least 'bytes' (grow only). */
-int hfsResizeTo(HfsFile *file, uint64_t bytes) {
-	uint64_t clusterSize;
-	uint64_t needClusters;
+/* Resize one blob to a target cluster count, optionally preserving growth-only semantics. */
+static int hfsResizeClusters(HfsFile *file, uint64_t needClusters,
+				  bool growOnly) {
 	HfsResizeRequest request;
+	uint64_t currentClusters;
 	int rc;
 
-	if (file == NULL || file->fs == NULL || file->blob == NULL) {
+	currentClusters = spdk_blob_get_num_clusters(file->blob);
+	if (currentClusters == needClusters ||
+	    (growOnly && currentClusters >= needClusters)) {
+		return 0;
+	}
+
+	memset(&request, 0, sizeof(request));
+	request.file = file;
+	request.clusters = needClusters;
+	request.operationRc = -EIO;
+	if (!waiter(globalThread, hfsDoResize, &request, &request.completion)) {
+		return -1;
+	}
+	rc = request.operationRc;
+	if (rc != 0) {
+		HFS_LOG_ERROR("blob resize failed clusters=%"PRIu64" bserrno=%d",
+			      needClusters, rc);
+		return hfsResizeError(rc);
+	}
+	return 0;
+}
+
+/* Convert a byte length into a blob cluster count. */
+static int hfsBytesToClusters(HfsFile *file, uint64_t bytes,
+			      uint64_t *clustersOut) {
+	uint64_t clusterSize;
+	uint64_t needClusters;
+
+	if (file == NULL || file->fs == NULL || file->blob == NULL ||
+	    clustersOut == NULL) {
 		errno = EINVAL;
 		return -1;
 	}
@@ -308,29 +328,38 @@ int hfsResizeTo(HfsFile *file, uint64_t bytes) {
 		return -1;
 	}
 	needClusters = bytes == 0 ? 0 : (bytes - 1) / clusterSize + 1;
+	*clustersOut = needClusters;
+	return 0;
+}
 
-	pthread_mutex_lock(&file->fs->resizeLock);
-	if (spdk_blob_get_num_clusters(file->blob) >= needClusters) {
-		pthread_mutex_unlock(&file->fs->resizeLock);
-		return 0;
-	}
+/* Resize the blob so it covers at least 'bytes' (grow only). */
+int hfsResizeTo(HfsFile *file, uint64_t bytes) {
+	uint64_t needClusters;
+	int rc;
 
-	memset(&request, 0, sizeof(request));
-	request.file = file;
-	request.clusters = needClusters;
-	request.operationRc = -EIO;
-	if (!waiter(globalThread, hfsDoResize, &request, &request.completion)) {
-		pthread_mutex_unlock(&file->fs->resizeLock);
+	if (hfsBytesToClusters(file, bytes, &needClusters) != 0) {
 		return -1;
 	}
-	rc = request.operationRc;
+
+	pthread_mutex_lock(&file->fs->resizeLock);
+	rc = hfsResizeClusters(file, needClusters, true);
 	pthread_mutex_unlock(&file->fs->resizeLock);
-	if (rc != 0) {
-		HFS_LOG_ERROR("blob resize failed clusters=%"PRIu64" bserrno=%d",
-			      needClusters, rc);
-		return hfsResizeError(rc);
+	return rc;
+}
+
+/* Resize the blob exactly to the clusters required by a logical file size. */
+int hfsResizeExact(HfsFile *file, uint64_t bytes) {
+	uint64_t needClusters;
+	int rc;
+
+	if (hfsBytesToClusters(file, bytes, &needClusters) != 0) {
+		return -1;
 	}
-	return 0;
+
+	pthread_mutex_lock(&file->fs->resizeLock);
+	rc = hfsResizeClusters(file, needClusters, false);
+	pthread_mutex_unlock(&file->fs->resizeLock);
+	return rc;
 }
 
 /* Read a byte range at an explicit offset through the request-local I/O path. */

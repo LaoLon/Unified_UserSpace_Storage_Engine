@@ -1,6 +1,6 @@
 # HFS 可靠性与性能优化阶段计划（shard-36 起）
 
-> 状态：规划中，尚未实施  
+> 状态：执行中；shard-36 已完成，shard-37 尚未开始<br>
 > 制定日期：2026-09-05  
 > 适用基线：`main@431735e`（shard-35 已完成）  
 > 输入文档：`review/hfs_architecture_performance_review_2026-09-05.md`  
@@ -99,6 +99,11 @@ flowchart LR
 性能目标是 go/no-go 判断线，不是通过篡改 workload 获得的发布数字。若正确性回归通过但性能目标未达，必须保存 profile、锁等待和队列深度证据后再决定继续优化或调整目标。
 
 ## 5. shard-36：POSIX 数据与元数据语义收口
+
+> 状态：已完成（2026-09-05）<br>
+> 验收：Make 强制构建、CMake Release、POSIX 数据契约、I/O fast path、fd lifecycle、
+> metadata transaction/path concurrency、persistent、POSIX contract、32 线程 60 秒 runtime、
+> MariaDB/MySQL persistent recovery 与 RocksDB persistent recovery 均通过。
 
 ### 目标
 

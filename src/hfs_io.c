@@ -588,8 +588,8 @@ static int hfsIoUnmapUnits(HfsFile *file, uint64_t offset, uint64_t units) {
 	return hfsIoWriteZeroUnits(file, offset, units);
 }
 
-/* Punch a range with edge-preserving zeroes and aligned unmap operations. */
-int hfsIoPunchHole(HfsFile *file, uint64_t offset, uint64_t length) {
+/* Clear a range with edge-preserving zeroes and aligned unmap operations. */
+int hfsIoZeroRange(HfsFile *file, uint64_t offset, uint64_t length) {
 	uint64_t unitSize;
 	uint64_t end;
 	uint64_t cursor;
@@ -638,4 +638,9 @@ int hfsIoPunchHole(HfsFile *file, uint64_t offset, uint64_t length) {
 	}
 	pthread_rwlock_unlock(&file->fs->ioLock);
 	return 0;
+}
+
+/* Punching a logical hole uses the same zero-read guarantee as truncate. */
+int hfsIoPunchHole(HfsFile *file, uint64_t offset, uint64_t length) {
+	return hfsIoZeroRange(file, offset, length);
 }
