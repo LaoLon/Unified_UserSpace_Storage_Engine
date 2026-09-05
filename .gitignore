@@ -1,6 +1,5 @@
 /build/
 /compile_commands.json
-/doc/
 /spdk/build/
 /spdk/dpdk/build/
 /spdk/dpdk/build-tmp/

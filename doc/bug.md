@@ -1,0 +1,712 @@
+# HFS 项目 Bug 记录
+
+Bug 等级：**致命 > 严重 > 一般**。
+
+每条记录：现象 → 排查过程 → 根因 → 修复。排查过程中的思路和关键证据一并记录，方便复盘。
+
+---
+
+## 状态汇总（截至 2026-09-05）
+
+### 已修复
+
+1–5、8–10、10b、11–43。包括已由后续 shard 修复的历史记录；条目中的原始“遗留”描述保留用于复盘，当前状态以本汇总和条目状态字段为准。
+
+### 未修复
+
+6、7、44–50。
+
+- 6：SPDK io channel 释放的 `wrong_thread` 日志仍存在，当前仅接受该 cosmetic 问题。
+- 7：fork/exec 子进程共享 HFS 运行时仍是架构限制。
+- 44：MariaDB 正常退出时 `ib_buffer_pool.incomplete` 创建失败，待进一步定位路径语义和 teardown 时序。
+- 45：文件缩短后再扩展会读回旧数据，违反 truncate 零填充语义并可能泄露历史内容。
+- 46：覆盖写不推进 mtime，普通写入后的 inode 时间语义不完整。
+- 47：statfs/statvfs 混用文件 cluster 数和文件系统容量，且 free 值不刷新，容量结果错误。
+- 48：多条 SPDK 异步回调只唤醒 waiter、不传播 bserrno，失败可能被报告为成功。
+- 49：元数据事务失败不回滚内存 after-image，创建失败路径还可能遗留孤儿 blob/占位 fd。
+- 50：fsync 在 inode 元数据事务之前执行设备 flush，事务写入后没有持久化屏障，掉电语义不完整。
+
+---
+
+## 致命级
+
+### 1. spdk_env_init 单线程 futex 自锁挂起（init 死锁）
+
+- **状态**：已修复
+- **时间**：2026-09-01（shard-15 验证后，shard-16 开发期间）
+- **等级**：致命
+- **现象**：`spdk-hfs` 主程序与所有 LD_PRELOAD 进程（touch/cat/sh）在 `spdk_env_init` 处挂起。strace 显示单线程 `futex(0x..., FUTEX_WAIT_PRIVATE, 2, NULL)`（锁值 2=被持有，自锁）。重启 VM 无效，`spdk_lspci`（同样 DPDK 库）正常。
+
+#### 排查过程（约 2 小时，多轮排除）
+
+1. **怀疑环境残留**：清理 `/var/tmp/spdk*`、`/run/dpdk`、`/var/run/dpdk`、`/dev/hugepages/*`、残留进程（`pkill -9` tar/log/spdk-hfs）→ 仍挂。
+2. **怀疑 DPDK 共享状态**：`SPDK_FILE_PREFIX=hfs_t1` 绕过损坏的共享配置 → 仍挂。
+3. **怀疑代码回归**：`git stash` 回到已验证的 shard-15 提交 → 仍挂。一度误判为"系统环境问题"。
+4. **用户重启 VM** → 仍挂。**排除环境残留**。
+5. **最小复现**：写 `/tmp/env_test.c`（仅 `spdk_env_opts_init + spdk_env_init + fini`，链接 libspdk_env_dpdk + DPDK 全库）→ **成功（T=0）**！证明 `spdk_env_init` 本身正常，问题在 spdk-hfs 二进制的进程上下文中。
+6. **拦截 pthread_mutex_lock 打栈**（`LD_PRELOAD=/tmp/libml.so`，检测 `*(int*)mutex != 0`）→ 捕获：`close 拦截器 → pthread_mutex_lock`，锁 word=1（同一线程已持有）→ **自锁确认**。
+7. **读代码定位**：`hfs_lib_init`（持 `g_libLock`）→ `hfs_log_init` → `hfsLogTrimTail()` → `close(fd)` → **close 拦截器** → `hfs_is_hfs_fd()` → **再次 lock `g_libLock`** → 单线程自锁。
+
+#### 根因
+
+`hfs_is_hfs_fd` 是 close 拦截器的快速路径，内部却加 `g_libLock`。当 `hfs_lib_init` 已持有该锁、期间任何 close（如 `hfsLogTrimTail` 关闭日志文件）被拦截时，同一线程重复加锁 → futex 自锁。
+
+**为什么 15:01 前不挂**：日志文件 `/var/log/hfs/run/hfs_base_spdk.log` 首次运行前不存在 → `hfsLogTrimTail` 的 `open()` 失败提前返回 → 无 close。文件一旦创建，此后每次运行必挂——**与 VM 重启无关，解释了所有"重启无效"的现象**。
+
+#### 修复
+
+`hfs_is_hfs_fd` 去掉锁（fd 表固定数组、单写者、快速路径），见 `src/hfs_lib.c`。同时补充注释说明原因。
+
+#### 经验
+
+- **拦截器内部的快速路径（is_xxx 检查）绝不能加锁**：它可能在库初始化持锁期间被调用。
+- 排查"挂起"类问题：先做最小复现（剥离业务代码）→ 缩小到进程上下文 → 用 LD_PRELOAD 拦截器打印调用栈（无 gdb 环境）。
+- 状态相关 bug（首次 OK、此后必挂）优先怀疑"文件/资源一旦创建就改变路径"的代码。
+
+---
+
+### 2. 双 umount 崩溃（已卸载 blobstore 再次 unload）
+
+- **状态**：已修复
+- **时间**：2026-09-01（死锁修复后首次完整运行）
+- **等级**：致命
+- **现象**：`spdk-hfs` 主程序 umount 时 `spdk_put_io_channel called from wrong thread` 报错后 segfault（`ip == segfault 地址`，跳转到含 `_HFS_INIT_DONE=1` 字符串的堆区——函数指针损坏）。
+- **根因**：`main` 结尾调 `hfsUmount(fs)`，随后 `hfs_lib_fini()`（dtor 也调用）再调 `hfsUmount(g_fs)`——**同一 fs 双 umount**：第二次对已卸载的 blobstore 再 `spdk_bs_unload` → 内部状态已销毁 → 跳坏指针。偶发（app20=0 因内存未重用幸运通过，app21=139）。
+- **修复**：`hfsSpdkBsUnloadCb` 回调中置 `fs->blobstore = NULL`；`hfsDoUmount` 幂等（blobstore 为空时直接完成）。见 `src/hfs_mount.c`。
+- **经验**：异步资源释放要"回调里置空句柄 + 幂等"，防止重复释放。
+
+---
+
+## 严重级
+
+### 3. hfs fd 与内核真实 fd 编号冲突（数据写丢/读错）
+
+- **状态**：已修复
+- **时间**：2026-09-01（shard-16 验证）
+- **等级**：严重
+- **现象**：python 场景 `os.write(fd, b'hello world')` 返回 11，随后 `os.read(fd, 100)` 返回 `b''`；`os.fstat` 返回 15152（无关数据）。主程序（无并发 fd）却一切正常。
+- **排查**：strace 确认 write/read 都走了拦截（无对应 syscall）；write 的 DBG 显示 `size=11` 正常更新；read 的 DBG 不打印（EOF 分支）。**关键线索**：`SIZE_AFTER_OPEN: 15152`——fstat 透传内核返回了 fd 3 上**别的真实文件**的大小。
+- **根因**：hfs fd 表占用编号 3，但**内核 fd 3 是空闲的**。hfs 打开后，进程内其他 real open（python 内部文件）拿到内核 fd 3 → 与 hfs fd 3 撞号 → 后续 close(3) 被拦截成 hfs close（关错句柄）、read(3) 透传读到别的文件。malloc bdev 项目里主程序 fd 少不冲突，python 等复杂进程必现。
+- **修复**：`hfs_lib_open` 里用 `open("/dev/null", O_RDONLY)` **占坑真实内核 fd**，hfs fd 编号 == 内核占位 fd；`hfs_lib_close` 清表后释放占位。冲突消除（python FD: 3 → 191）。
+- **经验**：LD_PRELOAD 拦截层的"假 fd"必须与内核 fd 一一对应（占坑），否则多 fd 进程必崩。
+
+---
+
+## 一般级
+
+### 4. lseek64/pread64/pwrite64 未拦截（python 等 64 位程序 lseek 失效）
+
+- **状态**：已修复
+- **时间**：2026-09-01
+- **等级**：一般（数据通路断裂但无崩溃）
+- **现象**：python `os.lseek(fd, 6, SEEK_SET)` 后 `os.read` 返回空。strace 显示 `lseek(191, 0, SEEK_SET)` 系统调用（走了 real，落到 /dev/null 占位）。
+- **根因**：64 位构建的程序用 `lseek64` 符号（最终也是 lseek 系统调用），只拦截了 `lseek`。
+- **修复**：补 `lseek64/pread64/pwrite64` 拦截，转发到同一 hfs_lib 函数。同理 open64/openat64（dash/busybox 用）。
+- **经验**：LD_PRELOAD 拦截要同时覆盖 64 位变体（open64/openat64/lseek64/pread64/pwrite64）。
+
+### 5. dup/dup2/dup3 未拦截（sh 重定向数据断裂 + 引用计数缺失） 
+
+
+- **时间**：2026-09-01
+- **等级**：一般（sh 的 `>` 重定向失效；曾升级为严重——dup 复制后 close 旧 fd 释放共享 file，导致已关闭 blob 上写 I/O → abort `spinlock destroyed`）
+- **状态**：已修复
+- **现象**：`sh -c 'echo hello > /hfs/t1'` 报 `I/O error`；或（补 dup 拦截后）`spdk_for_each_channel: could not find io_device` + abort。
+- **根因**：
+  1. dash 重定向用 `dup2(3, 1)`：未拦截时 fd 1 内核侧变成 /dev/null，echo 写进 /dev/null（数据断裂）；write 后 hfs 表里 fd 1 无记录 → 拦截层行为不一致。
+  2. dup 拦截后：fdTable[1] 与 fdTable[3] 共享同一 HfsFile，close(3) 释放 file（blob 已关），fd 1 仍指向 → 写已关闭 blob → SPDK abort。
+- **修复**：拦截 dup/dup2/dup3（`real_dup` 占位内核 + `hfs_lib_fd_copy` 复制表项）；**HfsFile 加 refCount**：open=1、fd_copy++、close--（归零才 hfsClose+free）。见 `src/hfs_lib.c`、`src/hfs_preload.c`。
+- **经验**：任何 fd 复制接口（dup 族）都要同步 hfs 表；共享句柄必须引用计数。
+
+### 6. spdk_bs_free_io_channel wrong_thread 警告（cosmetic）
+
+- **状态**：未修复
+- **时间**：2026-09-01
+- **等级**：一般（Release/NDEBUG 下仅打印 ERRLOG，assert 不生效；功能正常）
+- **现象**：umount 时 `spdk_put_io_channel(ch) called from wrong thread global:1 (should be :...<乱码>)`。
+- **根因**：malloc bdev 的 io channel 归属 SPDK 内部线程（bdev 创建线程），我们在 globalThread 上下文释放；`spdk_bs_free_io_channel` 的线程检查失败（Release 下 assert 被 NDEBUG 禁用，仅日志）。**注意：不能去掉 free**——`spdk_bs_unload` 需要 channel 释放完成，否则 unload 永远等待（见此前"去掉 free 后所有进程 dtor 挂起"的教训）。
+- **处理**：保留 free（功能必须），警告接受为已知问题；channel 释放线程问题留待接入真实 bdev/事件框架时解决。
+
+---
+
+### 7. fork+exec 子进程无法访问 HFS（架构限制，一般级）
+
+- **状态**：未修复
+- **时间**：2026-09-02（shard-17 验收时暴露）
+- **等级**：一般（已知架构限制，非缺陷）
+- **现象**：`LD_PRELOAD=... sh -c 'mkdir -p /hfs/d; dd if=/dev/zero of=/hfs/d/f ...; rm /hfs/d/f; rmdir /hfs/d'` 中 mkdir/dd/rm/rmdir 全部静默失败（exit 0 是 echo 掩盖）。同进程 python 场景（mkdir→open→write→fsync→rename→unlink→rmdir）全链路通过。
+- **根因**：dash 的 mkdir/dd/rm/rmdir 是外部命令 → fork+exec 子进程 → 子进程继承 `_HFS_INIT_DONE` 走 pass-through（透传内核）→ 内核里 /hfs 不存在 → 失败。而 shard-16 的 `echo > /hfs/t1` 成功是因为 echo 是**内建**（sh 主进程执行重定向）。malloc bdev 是进程私有内存，跨进程本就无法共享数据；即使子进程重新 init 也各自独立。
+- **处理**：shard-17 拦截实现正确，验证改用单进程场景；跨进程一致性需换可共享 bdev 或 SPDK primary/secondary 多进程支持（列入后续规划，FIO/数据库冒烟将使用单进程或专用 runner）。
+- **经验**：验收 shell 命令要注意内建 vs 外部命令（fork+exec）；LD_PRELOAD 文件系统在"进程私有存储"架构下天然只对单进程场景可靠。
+
+### 8. fio 相关三个问题（一般级，shard-22 修复）
+
+- **状态**：已修复
+- **时间**：2026-09-02（shard-21/22）
+- **等级**：一般（fio 配置/环境层面）
+- **问题 A：libaio io_submit 对 HFS fd 报 EBADF**
+  - 现象：fio libaio 引擎 `io commit error=Bad file descriptor`。
+  - 根因：io_setup/io_submit 走系统调用，绕过 read/write 拦截；iocb 的 fd 是内核 /dev/null 占位 fd，内核 AIO 不支持 → EBADF。
+  - 处理：fio 改用 psync 引擎（pread/pwrite 走拦截，同步执行）。libaio 的 io_submit 拦截（异步转同步）留作后续增强。
+- **问题 B：malloc bdev 容量不足（ENOSPC）**
+  - 现象：blob resize 报 `Unfreeze failed, rc=-28`（ENOSPC），fio 64MB 文件写不进去。
+  - 根因：config/hfs.json bdev 仅 32768×512=16MB。
+  - 处理：num_blocks 32768 → 524288（256MB）。
+- **问题 C：create_on_open 读空文件报 EIO（full resid）**
+  - 现象：fio randread/randrw 报 `err=5, func=full resid`；单独 write job 正常。
+  - 根因：create_on_open=1 时 fio 不预分配文件，随机读命中未写区域 → hfs pread 返回 0 → fio resid 检查判 EIO。
+  - 处理：去掉 create_on_open（fio setup 阶段 ftruncate 预分配 64MB，hfs_lib_ftruncate 增长 blob）；配置改为混合 rw job（读写同一文件）。
+- **验证**：randrw err=0（read 12.9K/write 12.9K IOPS，各 52.9MB/s）；seq err=0（9.8K IOPS，1.28GB/s）。
+- **经验**：fio 配置项会改变 setup 行为（create_on_open 跳过预分配）；读路径 EIO 优先怀疑"读未写区域返回 0"。
+
+### 9. MariaDB 冒烟暴露的拦截层问题（shard-24 修复，一般级）
+
+- **状态**：已修复
+- **时间**：2026-09-02
+- **等级**：一般（数据库场景暴露的拦截缺口）
+- **问题 A：目录 fd 不支持（O_DIRECTORY 打开报 EISDIR）**
+  - 现象：mariadbd 检查 datadir 时 `File '/hfs/mysql/' not found (Errcode: 21)`。
+  - 根因：hfs_lib_open 对目录 inode 直接报 EISDIR；mariadbd 需要只读打开目录（检查 + fsync）。
+  - 修复：目录只读打开分配目录 fd（file=NULL、inodeId 有效）；hfs_is_hfs_fd 改为按 inodeId 判定；close/fsync/fstat/fcntl 兼容 file=NULL；数据操作（read/write 等）返回 EISDIR。
+- **问题 B：fcntl 文件锁缺失**
+  - 现象：InnoDB `Unable to lock ./ibdata1 error: 22`（EINVAL）。
+  - 根因：F_SETLK/F_SETLKW/F_GETLK 未处理返回 EINVAL。
+  - 修复：F_SETLK/LKW 返回 0（接受锁），F_GETLK 置空 flock。
+- **问题 C：相对路径 + chdir 支持缺失**
+  - 现象：mariadbd chdir(datadir) 后报 `Can't change dir (Errcode: 2/20)`；相对路径文件全部透传内核失败。
+  - 修复：拦截 chdir/fchdir（managed 目录校验 + 记录 cwd）；hfs_view_path 把相对路径按 cwd 拼接再判断前缀；所有 path 型拦截改用 hfs_view_path。
+- **问题 D：hfs_view_path TLS 单 buffer 双路径覆盖**
+  - 现象：python rename 相对路径报 ENOENT（源存在）。
+  - 根因：rename(old,new) 两次调用 hfs_view_path 用同一 TLS buffer，new 覆盖 old。
+  - 修复：新增 hfs_view_path_buf（调用方 buffer），rename/renameat/renameat2 用两个独立 buffer。
+- **问题 E：posix_fallocate / fallocate64 绕过拦截**
+  - 现象：InnoDB `preallocating ./ibdata1 failed error 9`（EBADF）。
+  - 根因：libc posix_fallocate 直接发 fallocate 系统调用；mariadbd 绑定 fallocate64 符号——都绕过 fallocate 拦截，内核 fallocate 对 /dev/null 占位 fd 报 EBADF。
+  - 修复：拦截 posix_fallocate（返回 errno 语义）与 fallocate64。
+- **问题 F：readlink 透传导致 aria 误判**
+  - 现象：Aria 表创建后 `Can't find file global_priv.MAI (errno: 2)`。
+  - 根因：aria 用 readlink 检查控制/表文件，透传内核视角 ENOENT（HFS 文件内核不可见），aria 误判文件缺失。
+  - 修复：拦截 readlink/readlinkat（managed 路径：存在返回 EINVAL，缺失 ENOENT）。
+- **问题 G：新拦截函数 real_ 指针懒 resolve 缺失导致 ctor 前崩溃**
+  - 现象：加 readlink 拦截后 mariadbd/DPDK 启动段错误（连续 3 次），主程序与 python 正常。
+  - 根因：依赖库 ctor（DPDK）在程序 ctor 前调 readlink，real_readlink 未 resolve → NULL 调用。
+  - 修复：readlink/readlinkat 懒 resolve（同 opendir 系列）。
+- **验证**：主程序 APP=0、冒烟 SMOKE=0、fio err=0（randrw 12.6K IOPS / seq 9.4K IOPS）全绿。
+- **遗留**：MariaDB bootstrap 主体成功（InnoDB 完整初始化）但退出阶段多线程卡（信号线程 110 秒）；Aria 表文件 1017 在无 readlink 拦截时复现；bootstrap 卡住需后续多线程/退出路径修复。记录不阻塞 shard-25（RocksDB 单进程为主）。
+
+### 10. RocksDB 冒烟暴露的问题（shard-25，一般级）
+
+- **状态**：已修复
+- **时间**：2026-09-02
+- **等级**：一般
+- **问题 A：sync_file_range 探测触发断言崩溃**
+  - 现象：db_bench 启动断言 `IsSyncFileRangeSupported: Assertion !(ret == -1 && errno != ENOSYS)`。
+  - 根因：RocksDB 用零范围探测 sync_file_range 支持；未拦截，内核对我们 /dev/null 占位 fd 返回 EBADF/EINVAL（非 ENOSYS）触发断言。
+  - 修复：拦截 sync_file_range，HFS fd 返回 ENOSYS（RocksDB 降级 fsync）。
+- **问题 B：readv/writev/preadv2 绕过拦截**
+  - 现象：RocksDB 的 CURRENT 校验失败（"does not end with newline"）——读返回 0。
+  - 根因：RocksDB 部分读路径用 readv/preadv2，未拦截 → 内核 /dev/null 占位 fd 返回 0。
+  - 修复：拦截 readv/writev/preadv/pwritev/preadv2/pwritev2（临时 buffer 聚合/分散），及 glibc 内部 __read/__write（fopen/fread 路径）。
+  - **遗留（补充排查结论）**：gdb/strace/打点三重确认 CURRENT 读完全未经过任何 read 系列符号（read/pread/preadv/preadv2/__read 全无触发），
+    且 open 显示 CURRENT size=16——判断 RocksDB 的 ReadFileToString 走 GetFileSize(fstat)+0 字节读路径（多线程场景下 fd 表项
+    时序/GetFileSize 透传），属于多线程 fd 表状态问题，留待 shard-29（per-file 锁/多线程模型）解决。
+- **验证**：主程序/冒烟/fio 回归全绿（fio randrw 11K IOPS、seq 7.9K IOPS）。
+
+### 10b. MariaDB/RocksDB 修复跟进（一般级）
+
+- **状态**：已修复
+- **时间**：2026-09-02（"先修复"轮）
+- **问题 A：waiter 超时过大导致退出卡 ~110 秒**
+  - 现象：MariaDB bootstrap abort 后关闭卡（"Signal handler thread did not exit in a timely manner"，110 秒后才响应 SIGTERM）。
+  - 根因：WAITER_MAX_TIME=20 亿次 poll 循环（约 110 秒），SPDK 消息丢失/饥饿时超时极慢，进程退出被拖死。
+  - 修复：WAITER_MAX_TIME 20 亿 → 500 万（约 0.5-2 秒快速失败）；实测 Signal handler 提示从大量 → 1 次。
+- **问题 B：openat(dirfd) 目录 fd 支持缺失**
+  - 现象：Aria/InnoDB 用 openat(目录 fd, 相对名) 打开表文件（global_priv.MAI 等），dirfd 非 AT_FDCWD 被透传内核失败（1017）。
+  - 修复：目录 fd 记录 dirPath（hfs_handle 新字段）；openat/openat64 对 hfs 目录 fd 走 hfs_lib_openat（拼接 dirPath 解析）。
+  - 遗留：1017 仍现（Aria 建表后的 GetFileSize/头部读取同样走透传路径，与 RocksDB CURRENT 同根因——多线程 fd 表时序）。
+- **验证**：主程序/冒烟/fio 回归全绿（randrw 12.5K IOPS / seq 9.6K IOPS）。
+
+### 11. 持久化后端阶段暴露的问题（shard-26 修复）
+
+- **时间**：2026-09-03
+- **等级**：严重（后端数据无法跨进程复用，数据库场景不可用）
+- **状态**：已修复
+- **现象**：每个进程都把后端固定为 `Malloc0`，mount 总是调用 `spdk_bs_init`；前一个进程写入的数据无法被后一个进程加载。配置文件读取失败也可能被忽略，继续执行后续 mount。
+- **排查过程**：对 mount、SPDK subsystem 配置加载和 preload 初始化链路逐段检查；将 bdev 改为 AIO 文件后，先执行格式化进程，再执行默认加载进程，确认第二个进程能读到第一进程写入的内容；并启动两个持有者进程验证同一后端的互斥锁。
+- **根因**：bdev 名称硬编码；没有区分“首次格式化”和“已有 blobstore 加载”；`hfsEnvSetup` 只等待 JSON 回调完成，没有检查回调 rc；多个进程没有主机侧 backend ownership 保护。
+- **修复**：增加 `HFS_CONFIG_PATH`、`HFS_BDEV_NAME`、`HFS_FORMAT=1`；默认走 `spdk_bs_load`，显式格式化才走 `spdk_bs_init`；传播 JSON 配置失败；按 backend 创建 `flock` 锁并在 mount 失败/退出时释放。新增 `config/hfs_db_aio.json` 和 `scripts/db/persistent_smoke.sh`。
+- **验证**：VM 上 `make app`、`make lib`、`make run`、CMake Release 构建、preload smoke 和持久化 smoke 全部通过。
+
+### 12. Windows 同步导致 shell 脚本执行权限丢失（shard-26 修复）
+
+- **时间**：2026-09-03
+- **等级**：一般（测试/部署脚本无法直接启动）
+- **状态**：已修复
+- **现象**：持久化 smoke 在 VM 上通过源码同步后执行准备脚本时报 `Permission denied`；tar 从 Windows 工作树传输时没有保留 Unix executable mode。
+- **排查过程**：源码编译和 preload smoke 已通过，失败只发生在 `persistent_smoke.sh` 调用镜像准备脚本的阶段；检查远端脚本 mode 后确认是执行权限，而非路径或依赖问题。
+- **根因**：Windows 工作树不可靠地保存/传递 POSIX 脚本执行位。
+- **修复**：脚本内部改为显式 `bash prepare_hfs_db_bdev.sh` 调用，避免依赖同步后的 mode。
+
+### 13. recreate 镜像未清除旧 blobstore 元数据（shard-26 修复）
+
+- **时间**：2026-09-03
+- **等级**：一般（测试隔离失效，可能掩盖空盘加载保护问题）
+- **状态**：已修复
+- **现象**：持久化 smoke 的“空白 backend 必须拒绝加载”检查意外成功；检查发现测试复用了上一次运行已经格式化的镜像。
+- **排查过程**：确认 `HFS_RECREATE=1` 已传递，继续检查准备脚本；发现脚本只 `truncate` 已存在文件。truncate 不会清除文件前部已有的 SPDK blobstore 元数据。
+- **根因**：把调整文件大小误当成重新创建镜像，导致跨次运行的测试状态泄漏。
+- **修复**：仅在显式 `HFS_RECREATE=1` 时删除已有镜像，再创建新的稀疏文件；默认仍拒绝覆盖已有镜像。
+
+### 14. 空盘保护测试只检查应用退出码导致误判（shard-26 修复）
+
+- **时间**：2026-09-03
+- **等级**：一般（测试无法证明 preload 初始化失败）
+- **状态**：已修复
+- **现象**：空镜像上的 `python3 -c 'pass'` 返回 0，测试误报“未格式化 backend 被加载”。
+- **排查过程**：检查日志确认 HFS 初始化实际失败；进一步发现 preload 初始化失败后会让应用回退到透传，Python 本身没有执行失败，所以退出码不能作为挂载结果。
+- **根因**：测试把应用进程退出状态误当成 HFS 挂载状态，未执行 HFS 路径操作。
+- **修复**：改为空盘上执行 `/hfs/unformatted.txt` 的 `open(O_CREAT)`；若 HFS 未挂载则返回错误，若错误自动挂载则测试会成功并触发失败分支。
+
+### 15. CMake run 目标的嵌套 shell 引号破坏执行（shard-26 修复）
+
+- **时间**：2026-09-03
+- **等级**：一般（CMake 自测目标不可执行）
+- **状态**：已修复
+- **现象**：CMake `run` 目标执行时，`/bin/sh` 将 hugepage 检查中的命令拆开，出现 `cat ... not found`、`syntax error` 和目标失败。
+- **排查过程**：Make 构建和应用自测正常，失败仅在 CMake custom target；对比生成器命令后确认 `bash -c` 与 CMake/Make 的多层参数解析发生冲突。
+- **根因**：把复杂的条件 shell 逻辑嵌入 CMake `COMMAND`，同时经过 CMake、Make 和 `/bin/sh` 三层解析，引用边界不稳定。
+- **修复**：CMake `run` 改用 `${CMAKE_COMMAND} -E env HFS_FORMAT=1 <target>`，只保留目标执行和显式格式化；VM 上 CMake `run` 已通过。
+
+### 16. owner-thread 压测脚本错误判断 fsync 返回值并泄漏 fd（shard-27 修复）
+
+- **时间**：2026-09-03
+- **等级**：一般（测试脚本缺陷；会把有效实现误报失败并拖慢进程退出）
+- **状态**：已修复
+- **现象**：32 线程压力测试初始化阶段在 `assert os.fsync(fd) == 0` 处失败；随后未关闭的 HFS fd 使卸载日志报告 `Blobstore still has open blobs`，外层 `timeout` 等待 75 秒后退出。
+- **排查过程**：根据 Python traceback 定位到压力测试 heredoc 第 17 行；单独运行同样的持久化写入并打印返回值，确认 `os.pwrite` 成功且 Python `os.fsync` 成功时返回 `None`，不是整数 0。进一步检查卸载错误，确认初始化断言异常绕过了 `os.close`。
+- **根因**：把 Python `os.fsync` 的成功语义误写成 C 风格整数断言；测试初始化和循环中的 fd 缺少异常安全的 `finally` 清理。
+- **修复**：改为直接调用 `os.fsync`，并在初始化和 worker 循环中用 `try/finally` 确保 fd 关闭；重新执行压力测试验证卸载不再残留 open blob。
+
+### 17. SPDK env opts_size 未初始化导致启动告警（shard-27 修复）
+
+- **时间**：2026-09-03
+- **等级**：一般（当前 SPDK 会自动回退到最小结构长度，但新增字段可能被忽略）
+- **状态**：已修复
+- **现象**：每次启动都输出 `Invalid opts->opts_size 0 too small, please set opts_size correctly`，但环境仍然能够初始化。
+- **排查过程**：检查 owner thread 的 SPDK 初始化代码和 SPDK `spdk_env_opts_init` 实现，发现该初始化函数会保留调用方传入的 `opts_size`；调用方对零初始化的结构直接调用它，导致大小字段仍为 0。SPDK 随后只在内部按最小兼容长度继续处理。
+- **根因**：未按 SPDK ABI 约定在 `spdk_env_opts_init` 前设置 `opts.opts_size = sizeof(opts)`。
+- **修复**：用带 `.opts_size` 的结构初始化 owner thread 的环境选项，再调用 `spdk_env_opts_init`；重新构建和回归确认启动告警消失。
+
+### 18. 默认 Make 目标未更新共享库导致专项测试误用旧代码（shard-28 修复）
+
+- **时间**：2026-09-03
+- **等级**：一般（验证结果不可信，可能掩盖新实现问题）
+- **状态**：已修复
+- **现象**：fd 生命周期专项测试在首次运行时仍表现为旧的共享偏移行为；检查发现 `build/lib/libhfs.so` 的时间戳早于本轮源码，而默认 `make` 只构建 `app`。
+- **排查过程**：对比 `build/bin/spdk-hfs` 与 `build/lib/libhfs.so` 的构建时间，随后执行 `make -B app lib`；强制重建共享库后，测试路径和新 fd registry 行为一致。
+- **根因**：Makefile 的默认目标没有依赖 `lib`，仅执行 `make` 或 `make app lib` 时可能因时间戳判断跳过共享库链接。
+- **修复**：VM 构建脚本改为 `make -B -j$(nproc) app lib`，每轮专项测试前强制生成 app 和 preload 库。
+
+### 19. 共享库版本脚本覆盖 glibc 符号导致 preload 静默失效（shard-28 修复）
+
+- **时间**：2026-09-03
+- **等级**：严重（HFS 路径可能落到宿主文件系统，数据库数据隔离失效）
+- **状态**：已修复
+- **现象**：为解决 Python 的 `fcntl64@GLIBC_2.28` 解析，初版版本脚本把所有导出符号放入 `HFS_1.0`；Python 的其他版本化 libc 调用未命中 HFS wrapper，`/hfs/fd-lifecycle` 被创建到了宿主文件系统。
+- **排查过程**：检查 `nm -D` 的符号版本并清理宿主测试目录；用 SPDK mount 日志和宿主目录状态交叉确认，问题只在全量版本脚本存在时出现。
+- **根因**：版本脚本改变了未版本化 wrapper 的符号匹配，导致动态链接器优先选择应用所需的其他版本符号。
+- **修复**：版本脚本只为 `fcntl64` 导出 `GLIBC_2.28`，其余 HFS wrapper 保持未版本化；重新构建后，专项脚本只在 HFS 元数据中创建测试路径。
+
+### 20. unlink 后旧 fd 读取 inode 表失败（shard-28 修复）
+
+- **时间**：2026-09-03
+- **等级**：严重（违反 POSIX unlink-open 语义，WAL/临时文件可能读不到已打开数据）
+- **状态**：已修复
+- **现象**：文件写入并 unlink 后，旧 fd 的 `pread` 返回 `ENOENT`，但对应数据 blob 仍然存在。
+- **排查过程**：确认 unlink 已从 inode 表删除目录项；继续检查读路径，发现 read/pread/lseek/fstat 都重新按 inode id 查表，因此无法访问已摘链的 inode。
+- **根因**：打开文件描述只保存 blob handle，没有保存 orphan 文件的大小和时间属性；目录项删除后所有 fd 操作仍依赖可失效的 inode 表项。
+- **修复**：新增 `HfsOpenFile` orphan 状态和引用计数，保存 size/ctime/mtime；旧 fd 的 read/pread/lseek/fstat/ftruncate/write 走 orphan 元数据，最后一个 open-file description 释放后才删除 blob。
+
+### 21. rename 覆盖触发 inode 数组压缩后的悬空指针（shard-28 修复）
+
+- **时间**：2026-09-03
+- **等级**：严重（可能修改错误 inode 或造成 rename 数据损坏）
+- **状态**：已修复
+- **现象**：rename 覆盖目标时，删除目标 inode 会用数组末元素填补空洞；随后继续使用删除前保存的 source/parent 指针，覆盖场景可能更新错误元素。
+- **排查过程**：构造 destination 先创建、source 后创建的顺序，使 source 位于数组末端；审查 `hfsMetaRename` 的 compact 分支，确认删除目标后旧指针不再稳定。
+- **根因**：inode 表使用紧凑数组，删除操作会移动元素；函数跨越删除边界持有元素指针。
+- **修复**：在压缩前保存 source 和 destination parent 的 inode id，压缩后按 id 重新查找，再更新 parent/name；缺失时返回 `EIO`。
+
+### 22. rename 同一路径被误判为覆盖并删除自身 blob（shard-28 修复）
+
+- **时间**：2026-09-03
+- **等级**：严重（幂等 rename 可能导致文件数据不可恢复）
+- **状态**：已修复
+- **现象**：元数据层对 `rename(path, path)` 正确返回 no-op，但外层先把目标当作待替换文件；成功返回后可能标记并删除该文件自己的 blob。
+- **排查过程**：对比 `hfsMetaRename` 的同路径早退与 `hfs_lib_rename` 的覆盖回收逻辑，确认两层判断不一致。
+- **根因**：外层只检查目标是否为普通文件，没有比较 source 和 destination 是否指向同一 inode。
+- **修复**：rename 回收目标前解析 source inode，并仅当 source/destination inode 不同才建立 orphan 回收记录；fd 生命周期专项测试加入同路径 rename 数据保持断言。
+
+### 23. fcntl 无第三参数时拦截器仍读取 va_arg（shard-28 修复）
+
+- **时间**：2026-09-03
+- **等级**：一般（数据库常见 fd 状态探测存在未定义行为，极端情况下可能崩溃）
+- **状态**：已修复
+- **现象**：`fcntl(F_GETFL)` 和 `fcntl(F_GETFD)` 的调用约定不带第三参数，但 preload wrapper 无条件读取可变参数。
+- **排查过程**：对 fd 复制专项测试加入无参 `F_GETFL`，检查 wrapper 的两条 `fcntl`/`fcntl64` 路径，确认状态查询在 C ABI 层读取了不存在的参数。
+- **根因**：把所有 fcntl 命令按“带参数”处理，未按命令区分可选第三参数。
+- **修复**：新增命令判断，仅对需要参数的命令执行 `va_arg`；无参状态查询使用默认值，并验证 HFS fd 的 `F_GETFL` 返回打开 flags。
+
+### 24. O_CREAT|O_EXCL 在本次创建后被重复判定为 EEXIST（shard-29 修复）
+
+- **时间**：2026-09-04
+- **等级**：严重（数据库初始化创建文件会全部失败）
+- **状态**：已修复
+- **现象**：元数据并发 smoke 首次创建 `relative.dat` 时返回 `EEXIST`。
+- **排查过程**：确认镜像为本轮重新格式化，且 inode 在 open 前不存在；逐行检查 `hfs_lib_open` 后发现 `O_EXCL` 判断位于创建分支之后，对新建 inode 和原有 inode 使用了同一条件。
+- **根因**：没有记录 inode 是否由当前 open 调用创建，导致成功创建后再次触发“排他创建遇到已存在文件”的错误路径。
+- **修复**：增加 `created` 状态，仅对 open 开始前已存在的 inode 返回 `EEXIST`；保留创建成功路径的正常返回。
+
+### 25. 紧凑 inode 表按数量分配 ID 导致并发删除后 ID 复用（shard-29 修复）
+
+- **时间**：2026-09-04
+- **等级**：致命（旧 fd 可能解析到新文件，rename/stat 结果错误并破坏数据生命周期）
+- **状态**：已修复
+- **现象**：16 线程创建、rename、stat、删除 smoke 中出现 `ENOENT`、size 断言失败和 SPDK 删除 open snapshot 告警。
+- **排查过程**：确认元数据读写锁已覆盖 resolver 和 mutator；将失败缩小到创建/删除循环后，检查 inode 表的删除压缩逻辑，发现尾部 inode 被前移后，新 inode 仍以 `inodeCount + 1` 取 ID，可能与存活 inode 或旧 open fd 的 inode ID 重合。
+- **根因**：把紧凑数组下标数量误当作全局稳定 inode ID，删除元素后没有单调递增且持久化的 ID 分配器。
+- **修复**：元数据头新增 `nextInodeId`，创建时单调分配并持久化；加载旧版 `[count][inodes]` 布局时按最大现存 ID 初始化，保存时自动升级为新布局。
+
+### 26. fsync 未刷新数据 bdev 导致突退出后读到零（shard-30 修复）
+
+- **时间**：2026-09-04
+- **等级**：严重（数据库已提交数据可能在进程突退出后丢失）
+- **状态**：已修复
+- **现象**：元数据 intent 故障注入测试中，`fsync` 返回成功且 inode size 已恢复为 4，但重挂载后读取文件内容为四个零字节。
+- **排查过程**：逐步确认 create intent 和 size after-image 均能在三个崩溃边界后重放；重挂载时 `fstat` size 正确，只有数据内容错误。检查 `hfs_lib_fsync` 发现其只调用元数据整表保存，没有对数据 blob 执行 `spdk_blob_sync_md`，也没有提交底层 AIO bdev flush。故障进程直接 `_exit` 时，数据仍可能停留在 bdev/page cache。
+- **根因**：把“元数据持久化完成”错误当成“文件数据已持久化”，缺少 POSIX `fsync` 所需的数据同步和设备 flush 顺序。
+- **修复**：新增 `hfsSync`，先同步文件 blob metadata，再通过独立可写 bdev descriptor 的 `spdk_bdev_flush` 刷新底层设备；`hfs_lib_fsync` 在 metadata intent 提交前等待该同步完成。故障注入测试增加数据内容校验，修复后必须同时恢复 size 和 payload。
+
+### 27. rename 覆盖源 inode 位于数组末尾时 intent 下标失效（shard-30 修复）
+
+- **时间**：2026-09-04
+- **等级**：严重（崩溃恢复可能生成错误 inode 表，导致文件丢失或名称错配）
+- **状态**：已修复
+- **现象**：目标文件先创建、源文件后创建时执行覆盖 rename；若在 intent 已落盘、稳定镜像尚未写入时退出，重挂载后的目标项可能为空或仍指向旧 inode。
+- **排查过程**：构造目标 inode 位于较小下标、源 inode 位于数组末尾的场景，审查压缩流程发现删除目标时末尾源 inode 被移动到目标下标；原实现仍把删除前的源下标写入 intent，`hfsMetaBuildIntent` 会忽略已超出新 count 的旧下标，导致 step-1 恢复缺少源 after-image。
+- **根因**：紧凑 inode 数组的下标在删除/压缩后不稳定，rename 在压缩前保存的 source index 被错误地当作事务 after-image 下标。
+- **修复**：rename 压缩并重新按稳定 inode ID 定位后，使用源 inode 和被填充目标槽的最终下标构造 intent；新增 source-last 覆盖 rename 的三个崩溃边界回归。
+
+### 28. 请求级写路径把 resize 成功当成失败（shard-31 修复）
+
+- **时间**：2026-09-04
+- **等级**：严重（所有首次写入均失败，数据库无法初始化数据文件）
+- **状态**：已修复
+- **现象**：shard-31 首次 `pwrite` 返回 `EAGAIN`，请求级 I/O smoke 在创建文件后立即失败。
+- **排查过程**：远端构建成功，但 resize 回调和数据 I/O 回调均没有错误日志；检查写路径发现 `hfsResizeTo` 成功返回 `0` 后被 `if (!hfsResizeTo(...))` 误判为失败，函数直接返回，调用方继承了旧的 `errno=EAGAIN`。
+- **根因**：将“成功返回 0、失败返回 -1”的 C API 误写成了布尔成功判断，导致成功分支提前退出。
+- **修复**：改为显式判断 `hfsResizeTo(...) != 0`，并用请求级 fast I/O smoke 覆盖首次写入、非对齐 RMW、向量 I/O 和并发写入。
+
+### 29. Python 大文件向量入口绕过 preload wrapper（shard-31 修复）
+
+- **时间**：2026-09-04
+- **等级**：严重（Python/RocksDB 的 `pwritev` 可能对占位 fd 直接返回 `EBADF`）
+- **状态**：已修复
+- **现象**：请求级 smoke 的标量 `pwrite` 成功，但 `os.pwritev` 返回 `EBADF`；`strace` 显示调用的是 `pwritev2` 系统调用。
+- **排查过程**：确认 `pwritev2` 的 `GLIBC_2.26` 版本符号已经导出后，继续检查 Python 可执行文件的未定义符号，发现其依赖的是 `pwritev64v2@GLIBC_2.26`，而 preload 库没有提供该 glibc large-file 别名。
+- **根因**：只实现了普通 `pwritev2/preadv2` 名称，没有覆盖 64 位 ABI 别名，Python 直接落回 libc 并对 `/dev/null` 占位 fd 发起系统调用。
+- **修复**：新增并导出 `pwritev64v2/preadv64v2`，统一转入 HFS vector I/O；回归脚本加入 Python `pwritev/preadv` 检查。
+
+### 30. unmap 成功返回但未清零数据（shard-31 修复）
+
+- **时间**：2026-09-04
+- **等级**：严重（`PUNCH_HOLE` 读回旧数据，可能泄露已删除内容并违反 POSIX 语义）
+- **状态**：已修复
+- **现象**：`fallocate(PUNCH_HOLE|KEEP_SIZE)` 返回成功，但读回被 punch 的范围仍为原始数据。
+- **排查过程**：确认边缘范围的读改写路径正常后，检查 SPDK blobstore 的 unmap 实现；发现底层 bdev 不支持 unmap 时 blobstore 会直接返回成功，并且 blobstore 文档明确不依赖 unmap 的清零效果。Aio 测试配置未启用 fallocate，因此该路径实际是成功空操作。
+- **根因**：把 `spdk_blob_io_unmap` 的成功回调错误地当成了“读到零”的保证，忽略了 blobstore/bdev 的 unmap 语义差异。
+- **修复**：对齐范围仍先提交 unmap 以释放底层空间；随后提交 `WRITE_ZEROES`，若后端不支持则使用固定 DMA 池分块写零，保证读语义确定且不引入无限分配。
+
+### 31. fio 创建虚拟挂载点时根路径解析错误（shard-31 修复）
+
+- **状态**：已修复
+- **时间**：2026-09-04
+- **等级**：一般（fio 无法创建 `/hfs` 父目录，性能回归无法执行）
+- **现象**：fio randrw 在准备阶段报告 `failed to create dir (/hfs): Invalid argument`，而 `/hfs/fio/...` 的普通文件 I/O 路径本身尚未执行。
+- **排查过程**：单独运行 fio 并保留 stderr，确认失败发生在 `mkdir("/hfs")`；先修正默认前缀 `/hfs/` 的精确路径转换，使其返回 `/`，随后发现元数据层仍把根目录创建请求返回为 `EINVAL`。
+- **根因**：虚拟挂载前缀带尾部 `/` 时，精确前缀路径和前缀下的根路径没有统一转换为 HFS 根 inode；根 inode 已存在时也没有返回 POSIX 约定的 `EEXIST`。
+- **修复**：`hfs_inner_path` 对精确挂载点及单独尾斜杠路径统一返回 `/`，`hfs_lib_mkdir("/")` 返回 `EEXIST`，fio 的目录准备和后续 I/O 恢复正常。
+
+### 32. fio fork 子进程继承 SPDK 运行时上下文（shard-31 修复）
+
+- **状态**：已修复
+- **时间**：2026-09-04
+- **等级**：严重（子进程可能崩溃或卡死，数据库基准无法稳定运行）
+- **现象**：fio 使用默认 process job 模式时，在创建/打开 HFS 文件期间收到 SIGSEGV；同一配置增加 `thread=1` 后稳定通过。
+- **排查过程**：gdb 显示崩溃位于 `hfsDoOpenById`，父进程 SPDK owner 线程正在消费子进程地址空间中的请求上下文；上下文中的 HFS 对象字段已被无关数据覆盖。对比 fio 的 fork 启动方式和 HFS 的进程内 SPDK message queue 后，确认问题只出现在 fork 后继续复用已初始化运行时的场景。
+- **根因**：fork 只复制用户态地址空间，不复制可继续工作的 SPDK 线程/消息队列状态；子进程提交的栈或堆指针可能被父进程 owner 线程按相同虚拟地址解释，造成跨进程指针访问和锁状态失效。
+- **修复**：运行时记录 owner PID，fork 子进程禁止提交 SPDK 消息、识别继承的 HFS fd 或重新初始化/析构 inherited HFS 状态；路径解析在进入继承锁前直接转为 passthrough。fio 基线显式使用 `thread=1`，避免把不安全的 fork job 模式当成 HFS 并发能力；fork 子进程 smoke 覆盖“不崩溃且不静默创建 HFS 文件”。
+
+### 33. 非对齐 PUNCH 在单 unit 范围内错误清零前缀（shard-31 修复）
+
+- **状态**：已修复
+- **时间**：2026-09-04
+- **等级**：严重（部分数据可能被错误清零，违反 `PUNCH_HOLE` 范围语义）
+- **现象**：打孔范围完全位于一个非对齐 unit 时，请求前的同一 unit 前缀也可能被清零。
+- **排查过程**：补充 offset=17、length=23 的单 unit 打孔用例后，逐步检查首尾边缘处理和对齐中间范围处理，发现首边缘处理完成后 `alignedEnd` 可能小于当前游标。
+- **根因**：无论是否实际执行 aligned unmap，都无条件把游标重置为 `alignedEnd`；当没有中间完整 unit 时，游标从请求结束位置回退到了 unit 起点。
+- **修复**：仅在成功执行 aligned unmap 后更新游标；无中间完整 unit 时保留首边缘后的游标，再处理尾边缘。请求级 smoke 加入单 unit 非对齐 PUNCH 的前后边界校验。
+
+### 34. open 创建 mode 被丢弃导致 stat 权限不符合调用方请求（shard-32 修复）
+
+- **状态**：已修复
+- **时间**：2026-09-04
+- **等级**：严重（数据库创建的数据文件权限不符合 POSIX 契约，可能导致后续访问失败或权限配置失效）
+- **现象**：POSIX 契约测试用 `openat(..., 0640)` 创建文件后，`stat` 返回权限 `0644`。
+- **排查过程**：确认 `hfs_preload.c` 已正确读取 open 的变参后，检查 `hfs_lib_open` 到 `hfsMetaCreateFile` 的调用链，发现 mode 没有继续传入；元数据创建逻辑固定使用默认文件 mode。
+- **根因**：创建接口没有把调用方的 mode 传入 inode，导致 mode 参数在 preload 层之后被静默丢弃。
+- **修复**：扩展 `hfsMetaCreateFile`/`hfsMetaMkdir` 接口，创建 inode 时保存 `mode & 07777`；stat/fstat 统一从 inode 属性返回。契约测试加入自定义文件和目录 mode 校验。
+
+### 35. AT_FDCWD 路径转换成功但未写入目标缓冲（shard-32 修复）
+
+- **状态**：已修复
+- **时间**：2026-09-04
+- **等级**：严重（statx/fstatat 等路径接口对合法 HFS 路径返回 `ENOENT`，数据库能力探测会误判文件系统状态）
+- **现象**：`statx(AT_FDCWD, "/hfs/...", ...)` 路由已进入 HFS，但因后续使用未初始化的 path buffer 返回 `ENOENT`。
+- **排查过程**：契约测试已通过普通 `stat` 和目录 fd 相对 `fstatat`，仅绝对 HFS `statx` 失败；检查 `hfs_view_at_path` 发现 AT_FDCWD 分支调用了返回 inner path 的 helper，却没有把结果复制到调用者 buffer。
+- **根因**：路径判定与路径物化复用了不同的存储语义，返回指针指向 TLS/输入字符串，而调用方统一假设结果在 pathBuf 中。
+- **修复**：AT_FDCWD 分支统一通过 `hfs_view_path` 获取结果并复制到 pathBuf，同时保留长度检查；statx/fstatat 回归覆盖绝对和 fd-relative 两种路径。
+
+### 36. Python statvfs64 符号未被 preload 拦截（shard-32 修复）
+
+- **状态**：已修复
+- **时间**：2026-09-04
+- **等级**：一般（Python/数据库探测 HFS 容量时落入内核路径并得到 `ENOENT`）
+- **现象**：ctypes 直接调用 `statvfs` 成功，但 `os.statvfs("/hfs/...")` 仍访问真实内核路径并返回 `ENOENT`。
+- **排查过程**：对失败进程做 strace，并检查 Python 可执行文件动态符号，确认其依赖 `statvfs64@GLIBC_2.2.5` 与 `fstatvfs64@GLIBC_2.2.5`，而 preload 只提供普通 `statvfs/fstatvfs`。
+- **根因**：只覆盖了源码层面的普通 API 名称，没有覆盖运行时实际绑定的 large-file ABI 及对应 glibc 版本符号。
+- **修复**：加入 statfs64/fstatfs64/statvfs64/fstatvfs64 wrapper，映射到统一 HFS 实现，并在 version script 导出 GLIBC_2.2.5 版本；契约测试加入 Python `os.statvfs` 路径。
+
+### 37. 旧数据库 smoke 使用进程私有 Malloc0，无法作为端到端验收（shard-32 记录）
+
+- **状态**：已修复
+- **时间**：2026-09-04
+- **等级**：严重（若误把旧 smoke 的失败/成功当成数据库支持结论，会掩盖跨进程数据路径缺口）
+- **现象**：strace 审计中，旧 `mysql_smoke.sh` 的 `mariadb-install-db` 无法在 HFS datadir 创建 InnoDB/Aria 文件；旧 `rocksdb_smoke.sh` 的 `db_bench` 返回 `No such device`。两者均未完成数据库端到端流程。
+- **排查过程**：保留完整输出后确认 MariaDB helper 会 exec 新的 `mariadbd` 进程，而脚本只设置默认 `Malloc0` 和 `HFS_AUTO_MKDIRS`；RocksDB 同样使用默认进程私有 `Malloc0`。HFS 日志显示 RocksDB 进程初始化/挂载失败，随后路径 wrapper 按设计返回 `ENODEV`。strace 未发现对 `/hfs/...` 的真实 `read/write/pread64/pwrite64/mmap` 内核数据调用，仅看到参数打印和程序启动参数。
+- **根因**：旧脚本的注释假定“exec 后仍可复用进程内 malloc bdev”，与当前 owner-PID/fork 防护和 SPDK 进程模型不一致；脚本也没有使用 Aio 持久后端及独立运行目录。
+- **修复**：本阶段将其明确标记为非验收脚本，保留审计证据；真实 MySQL 多进程初始化/启动和 RocksDB fill/read 迁移到 shard-33～35，必须使用持久 Aio 后端、正确的进程生命周期和不依赖 `/dev/null` 的数据路径后重新验收。
+
+### 38. 依赖库构造阶段调用 preload wrapper 触发空指针跳转（shard-33 已修复）
+
+- **状态**：已修复
+- **时间**：2026-09-04
+- **等级**：严重（任何链接 libselinux 的辅助程序在 LD_PRELOAD 下都可能在启动阶段崩溃）
+- **现象**：MariaDB 初始化失败；gdb/strace 显示 `/usr/bin/mkdir` 在进入 main 前收到 SIGSEGV。libselinux 构造函数依次调用了 `statfs64` 和 `access`，崩溃地址为 NULL。
+- **排查过程**：直接对 `mkdir --version` 做 gdb 回溯，确认调用栈位于 dynamic loader → libselinux 初始化；反汇编确认 `statfs64@plt` 已绑定到 libhfs wrapper，而 wrapper 的真实函数指针仍为 NULL。修复 `statfs64` 的惰性解析后继续定位，发现 libselinux 随后的 `access@plt` 仍会跳转到未初始化的 `real_access`。
+- **根因**：共享库依赖的构造函数可能早于 libhfs 自身构造函数执行；仅在 `hfs_preload_ctor` 中一次性解析真实 libc 符号，无法覆盖构造阶段提前进入 wrapper 的路径。
+- **修复**：为 `statfs64/fstatfs64/statvfs64/fstatvfs64/access` 增加惰性解析和非 64 位 ABI 回退；所有解析失败路径返回 `ENOSYS`，不再直接调用 NULL。加入无 HFS 路径的外部 helper 启动回归，修复后再继续 MariaDB 验收。
+
+### 39. HFS 后台线程抢收 MariaDB 的进程终止信号（shard-33 修复）
+
+- **状态**：已修复
+- **时间**：2026-09-04
+- **等级**：严重（正常停止和 SIGKILL 恢复可能卡住或留下未清理的数据库进程）
+- **现象**：MariaDB 的信号管理线程没有按预期收到 `SIGTERM`；信号被 HFS SPDK owner/log
+  线程接收，服务停在 `unireg_abort`/`spdk_thread_poll`，smoke 的清理阶段超时。
+- **排查过程**：用 `/proc/<pid>/task/*/status` 检查各线程 signal mask，再用 `strace`
+  追踪进程组信号投递，确认 HFS 新建线程继承了可接收 `SIGHUP/SIGQUIT/SIGALRM/SIGTERM/
+  SIGTSTP` 的 mask；MariaDB 的 `rt_sigtimedwait` 线程因此没有拿到目标信号。
+- **根因**：preload 进程内启动的 SPDK 和日志线程没有遵守宿主程序的信号线程模型。
+- **修复**：runtime owner 在线程入口、log writer 在线程入口屏蔽上述宿主管理信号，并在
+  runtime 初始化失败/退出时恢复原 mask；验证信号由 MariaDB 管理线程接收，完整 smoke
+  的正常停止、重启和异常恢复通过。
+
+### 40. SIGKILL 后 MariaDB 子进程保留 HFS 后端锁（shard-33 修复）
+
+- **状态**：已修复
+- **时间**：2026-09-04
+- **等级**：严重（下一次挂载可能得到 `ENODEV`，恢复验收被残留进程污染）
+- **现象**：只 kill `mariadbd` 的单个 PID 后，bootstrap/helper 或后台子进程仍持有 HFS
+  lock；下一次启动偶发挂载失败，或 smoke 外层清理阶段一直等待。
+- **排查过程**：对比正常重启和 SIGKILL 流程，检查进程树、lock 文件持有者和 HFS owner
+  线程，确认 MariaDB 的进程组中存在未随主 PID 退出的 helper/线程相关进程。
+- **根因**：测试脚本只保存并杀主进程 PID，没有隔离和回收整个数据库进程组。
+- **修复**：bootstrap 和 server 均使用独立 session/process group；失败清理和 SIGKILL
+  恢复使用负 PGID 回收整个进程组，并保留 PID 等待。随后持久化 SIGKILL recovery smoke
+  在同一镜像上稳定通过。
+
+### 41. MariaDB `openat64` 绝对路径被错误按 dirfd 解释（shard-33 修复）
+
+- **状态**：已修复
+- **时间**：2026-09-04
+- **等级**：严重（系统表存在但初始化仍报告文件不存在或无法打开）
+- **现象**：MariaDB 使用 `openat64`/fortify open 访问 `/hfs/mysql/...` 时，传入的 dirfd
+  不是 `AT_FDCWD`；preload 没有按 POSIX 规则忽略 dirfd，导致已存在的 HFS 文件得到
+  `ENOENT`/`ENODEV`。
+- **排查过程**：对 `global_priv.MAI` 的 `lstat64`、`readlink`、`realpath` 和最终 open
+  调用做 native syscall 对照，发现路径为绝对路径且 dirfd 为 -1；HFS stat 成功而
+  `openat64` 没有进入 HFS 路由。
+- **根因**：`hfs_view_at_path` 和 openat wrapper 只把 `AT_FDCWD` 当作绝对路径入口，
+  忽略了 `openat(2)` 对绝对路径“dirfd 无效且必须被忽略”的规定。
+- **修复**：绝对路径优先物化到 HFS 内部路径，再处理 `AT_FDCWD` 和 HFS 目录 fd 相对路径；
+  同步覆盖 `openat/openat64/__openat*_2/readlinkat`。MariaDB 初始化和持久化重启回归通过。
+
+### 42. RocksDB 版本化 stdio ABI 绕过 HFS，以及 `fclose` 残留 fd slot（shard-34 修复）
+
+- **状态**：已修复
+- **时间**：2026-09-05
+- **等级**：严重（数据库元数据读取会误落到占位 fd，或因 fd slot 残留导致后续打开失败）
+- **现象**：RocksDB 在 preload 下读取 `CURRENT` 时报告缺少换行，随后可能出现
+  `No such device`、manifest 打开失败或 `EBUSY`；HFS 介质上的 `CURRENT` 实际内容正确。
+- **排查过程**：先对比 HFS 介质上的文件内容与 RocksDB 进程读取结果，再用 strace 和动态
+  符号绑定检查调用链，确认 `libstdc++` 使用 `read@GLIBC_2.2.5`，RocksDB 使用
+  `fread_unlocked@GLIBC_2.2.5`，它们绕过了原先只有未版本化导出的 wrapper。补齐版本化
+  wrapper 后，RocksDB 已能读取文件，但 libc 内部关闭 stdio 流不经过公开 `close` wrapper，
+  HFS fd slot 仍占用同一个占位 fd，导致后续打开返回 `EBUSY`。
+- **根因**：preload 没有覆盖数据库实际绑定的 glibc 版本化 `read`/stdio ABI；同时把 HFS
+  fd 交给 libc `fclose` 时没有先摘除 HFS fd slot。
+- **修复**：在 version script 中导出 GLIBC_2.2.5 版本的 `read`、`__read`、`fread`、
+  `fread_unlocked`、`feof`、`ferror`、`clearerr` 和 `fclose`；为 HFS stdio 流增加轻量 EOF/
+  error 状态，读路径直接路由 `hfs_lib_read`；新增 `hfs_lib_release_fd`，由 `fclose` 先摘
+  slot 并释放 open-file description，再调用 libc 关闭占位 fd。
+- **验证**：Make/CMake 强制构建通过；RocksDB 20,000 条数据、8 线程 60 秒 WAL 并发、
+  普通/direct I/O、覆盖写、flush/compact、SIGKILL/WAL recovery 和 `ldb checkconsistency`
+  连续 3 轮通过，输出 `SHARD34_ACCEPTANCE_OK`。
+
+### 43. shard-35 临时回归执行器直接执行非可执行脚本（测试工具修复）
+
+- **状态**：已修复
+- **时间**：2026-09-05
+- **等级**：一般（临时回归执行器误报多项项目测试失败）
+- **现象**：回归执行器对权限为 0644 的 shell 脚本直接执行，远端返回 exit code 126，
+  看起来像 preload、持久化和契约测试全部失败。
+- **排查过程**：检查每个失败日志均为 `Permission denied`，而同批次直接通过 `bash`
+  调用的 request-local fast I/O 测试正常；检查脚本权限确认仓库脚本并未标记 executable。
+- **根因**：临时执行器把脚本路径当作可执行文件调用，没有显式交给 bash；这是测试编排
+  错误，不是 HFS 运行时或脚本逻辑错误。
+- **修复**：执行器统一改为 `bash <script> <args>`，随后重新执行完整回归并按各脚本
+  的真实返回码判定结果。
+
+### 44. MariaDB HFS Hook 正常退出时 buffer pool 临时文件创建失败（待修复，一般级）
+
+- **状态**：未修复
+- **时间**：2026-09-05
+- **等级**：一般（不影响本轮 SQL 结果和主数据恢复，但会丢失 InnoDB buffer pool dump，
+  可能影响下一次启动的预热状态）
+- **现象**：原生 ext4 与 HFS Hook 对比压测均完成，HFS 组在正常 shutdown 阶段额外出现
+  `InnoDB: Cannot open '/hfs/mysql/ib_buffer_pool.incomplete' for writing: No such file or directory`；
+  随后仍输出 `Shutdown complete`。原生组没有该错误。
+- **排查过程**：对比两组独立 MariaDB 10.11.14 日志；HFS 组的错误只出现在 InnoDB
+  `Starting shutdown`/`Dumping buffer pool(s)` 之后，前面的 12 个 mysqlslap case 全部返回 0，
+  `benchdb.t` 行数保持 10,000，未发现 I/O error、崩溃或表损坏。错误前可见多次 HFS blob
+  close 完成日志，说明问题位于退出阶段的 HFS 路径/生命周期边界，而非压测 SQL 主路径。
+- **初步根因**：InnoDB 退出线程创建隐藏临时文件 `ib_buffer_pool.incomplete` 时，HFS
+  Hook 的目录视图或 runtime 退出时序未能保持 `/hfs/mysql` 可创建状态；当前证据尚不足以
+  区分 open 路径语义缺口和 runtime teardown 竞态。
+- **后续**：用 syscall 级 trace 对该次 `openat/openat64`、目录 inode 状态和 HFS runtime
+  teardown 顺序做最小复现；修复前不将 buffer pool dump 视为 HFS MariaDB 退出阶段完全兼容。
+
+### 45. truncate 缩短后再扩展读回历史数据（待修复，严重级）
+
+- **状态**：未修复
+- **时间**：2026-09-05（架构与性能审查）
+- **等级**：严重（违反 POSIX 零填充语义，可能向调用方暴露已截断的历史内容）
+- **现象**：VM 最小复现先写入 4096 个 `A`，执行 `ftruncate(fd, 0)`，再执行
+  `ftruncate(fd, 4096)`；随后 `pread` 读回的 4096 字节仍全部为 `A`，而不是零。探针输出
+  `TRUNCATE_REGROW_ZERO=0 old_byte_count=4096`。
+- **排查过程**：检查 `hfs_lib_ftruncate`，缩短路径只调用 `hfsMetaSetSize` 修改 inode size；
+  数据 blob 不缩容、不打孔，也不清理新 EOF 所在 unit 的尾部。再次扩展时调用
+  `hfsResizeTo`，但 blob 已经拥有足够 cluster，因此直接成功返回，旧 payload 重新进入可读范围。
+- **根因**：inode 逻辑长度和 blob 已分配/有效数据范围没有独立建模；truncate shrink 没有建立
+  “截断后区域必须读零”的持久语义。
+- **后续**：缩短时至少清零新 EOF 的非对齐尾部，并对完整 cluster 执行释放/打孔或维护稀疏
+  extent；扩展时对逻辑 EOF 到新 EOF 的范围保证 zero-fill。新增 shrink→grow、O_TRUNC→grow、
+  崩溃重挂载和跨 cluster 回归。
+
+### 46. 覆盖写不更新 mtime（待修复，一般级）
+
+- **状态**：未修复
+- **时间**：2026-09-05（架构与性能审查）
+- **等级**：一般（文件内容已变化但 stat/fstat 时间戳保持旧值）
+- **现象**：VM 探针把文件 mtime 设置为 1 秒，随后在 offset 0 覆盖写 1 字节并 fsync；
+  `fstat` 前后均为 `1000000000ns`，输出 `OVERWRITE_MTIME_ADVANCED=0`。
+- **排查过程**：检查 `hfs_lib_write`、`hfs_lib_pwrite` 和 `hfsPublishWriteEnd`，三处都只在
+  `writeEnd > inode.size` 时更新 size/mtime。对文件现有范围内的覆盖写没有任何 mtime 更新。
+- **根因**：把“更新写入时间”错误绑定到“文件增长”，缺少独立的 content-dirty/mtime-dirty
+  状态。
+- **后续**：任意成功写入都更新内存 mtime；size 仅在 write end 超过 EOF 时更新。将 dirty
+  bit 按 inode/字段拆分，fsync/fdatasync 根据语义提交，并增加覆盖写和并发 positioned write
+  时间戳回归。
+
+### 47. statfs/statvfs 容量混用且长期陈旧（待修复，一般级）
+
+- **状态**：未修复
+- **时间**：2026-09-05（架构与性能审查）
+- **等级**：一般（容量监控、数据库预分配判断和 ENOSPC 预警不可信）
+- **现象**：默认 1.5GiB Malloc0 配置下，VM 探针在创建一个文件后得到
+  `f_frsize=512, f_blocks=1530, f_bfree=1529`，折算总容量仅 783,360 字节。
+- **排查过程**：初始化时 `g_fs->numCluster` 保存 blobstore 总 data cluster 数，
+  `freeClusterCount` 保存当时空闲 cluster；但每次文件 resize 回调又把 `numCluster` 覆盖为
+  当前文件的 cluster 数。`hfs_fill_statvfs` 随后把 `numCluster + freeClusterCount` 当成总块数，
+  同时把 cluster 计数配上 `unitSize`（512B）作为 block size，且 free 值从 mount 后不再刷新。
+- **根因**：同一字段承担“文件已分配 cluster”和“文件系统总 cluster”两个含义；容量单位和
+  刷新策略没有统一。
+- **后续**：拆分 `totalDataClusters`、per-blob allocated clusters；statfs 时在 owner thread
+  获取当前 free cluster，或维护可靠的原子增减计数；用 blobstore cluster size 作为容量换算
+  单位，并加入格式化后、扩容后、删除后的精确容量回归。
+
+### 48. SPDK 异步操作错误被 waiter 当作成功（待修复，严重级）
+
+- **状态**：未修复
+- **时间**：2026-09-05（架构与性能审查）
+- **等级**：严重（底层 I/O/元数据失败可能向数据库返回成功，破坏错误处理与持久化保证）
+- **现象**：静态审查发现 `hfsMetaOpCb` 忽略 `bserrno`，只完成共享 completion；因此
+  `hfsMetaBlobWrite` 的 open/resize/write/sync/close 任一步只要回调到达，函数最终即可返回 0。
+  `hfsSpdkBsOpenByIdCb`、blob close/delete 回调也只记录日志，没有让 `hfsOpenById`、
+  `hfsClose`、`hfsDeleteBlobById` 返回失败。
+- **排查过程**：逐一对照所有 `waiter` 调用、回调参数和 `operationRc` 字段。`hfsIoRequest`、
+  resize 和 fsync 路径已使用 request-local rc；元数据和部分 blob 生命周期路径仍复用
+  `Hfs::completion`/`HfsFile::completion`，但没有一致保存错误码。
+- **根因**：completion 只表达“回调已发生”，没有统一携带操作结果；部分旧 callback 在请求级
+  rc 模型引入后未迁移。
+- **后续**：所有异步操作使用独立 request context，callback 必须先保存 rc 再 complete；
+  public API 统一把 SPDK 负 errno 映射到 errno。用 error bdev/故障注入覆盖 open、resize、
+  data/meta write、sync、close、delete 和 unload。
+
+### 49. 元数据提交失败不回滚内存状态并可能泄露资源（待修复，严重级）
+
+- **状态**：未修复
+- **时间**：2026-09-05（架构与性能审查）
+- **等级**：严重（API 返回失败后，同进程仍可能看见未持久化的新命名空间或错误 size）
+- **现象**：静态审查发现 mkdir/create/remove/rename/set-size 均先原地修改 `fs->inodes` 和
+  `inodeCount`，再调用 `hfsMetaCommit`；commit 失败分支只释放临时 buffer，不恢复旧数组。
+  create-file 在 data blob 创建成功后，若 inode 表已满或 commit 失败，也没有删除新 blob。
+  `hfs_lib_open` 在占用 `/dev/null` placeholder 后若 `HfsFile` 分配失败，同样没有关闭该 fd。
+- **排查过程**：沿每个 metadata mutator 的失败出口检查对象所有权和内存 after-image，确认
+  没有 undo image、staging table 或统一 cleanup 标签；再与 intent record 的磁盘恢复逻辑
+  对照，磁盘事务并不能修复仍在运行进程的内存状态。
+- **根因**：把“先改内存、后持久化”的 happy-path 实现误当成完整短事务，缺少提交前 staging
+  和失败时的资源补偿。
+- **后续**：在私有 transaction/staging 对象中构造 after-image，磁盘提交成功后再 publish；
+  或保留精确 undo image 并在失败时回滚。新建 blob、placeholder fd、open blob handle 均纳入
+  单一所有权状态机，并做每个失败点的 leak/一致性注入测试。
+
+### 50. fsync 的 inode 元数据写入位于最后一次设备 flush 之后（待修复，严重级）
+
+- **状态**：未修复
+- **时间**：2026-09-05（架构与性能审查）
+- **等级**：严重（带易失写缓存的 AIO/NVMe 后端上，fsync 返回后 inode size/mtime 仍可能掉电丢失）
+- **现象**：代码顺序为 `hfsSync(file)` 执行 blob metadata sync 和 bdev flush，随后
+  `hfsMetaCommitInode` 才把 HFS inode intent/stable/clear 三个镜像写入 metadata blob；提交后
+  没有第二次 bdev flush。现有 crash smoke 使用进程 `_exit`/SIGKILL，不能模拟设备缓存掉电。
+- **排查过程**：对照 `hfs_lib_fsync`、`hfsSync`、`hfsMetaCommit` 和本仓库 SPDK bdev API 注释；
+  SPDK 明确说明带 volatile cache 的设备在 flush 完成前不保证持久，而 HFS inode payload 在该
+  flush 完成后才提交。
+- **根因**：当前顺序只保证数据先于 inode 更新提交到队列，没有给 inode 事务阶段建立持久化
+  barrier；intent 的三个阶段也没有用 flush/FUA 隔开，恢复协议只在进程崩溃/page-cache 场景
+  经过验证。
+- **后续**：重新定义 power-fail 模型和 barrier：data/blob mapping 落盘 → flush；intent 落盘
+  → flush；stable image/log commit 落盘 → flush；clear 可延迟批量完成。实现 group commit 减少
+  flush 数，并用 SPDK error bdev、可控 write-cache/掉电模拟验证 fsync/fdatasync/目录 fsync。
+
+## 通用经验总结
