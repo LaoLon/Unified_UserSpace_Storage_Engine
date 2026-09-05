@@ -41,6 +41,7 @@ set(HFS_CORE_SRC
   src/hfs_io.c
   src/hfs_log.c
   src/hfs_stats.c
+  src/hfs_durability.c
   src/hfs_lib.c
   src/hfs_meta.c
   src/hfs_preload.c
@@ -71,7 +72,7 @@ set(ISAL_LIBS
   ${SPDK_ROOT_DIR}/isa-l/.libs/libisal.a
   ${SPDK_ROOT_DIR}/isa-l-crypto/.libs/libisal_crypto.a
 )
-set(HFS_SYS_LIBS numa dl rt uuid ssl crypto m fuse3 keyutils aio)
+set(HFS_SYS_LIBS numa dl rt uuid ssl crypto m lz4 fuse3 keyutils aio)
 
 # 共享链接的公共部分：SPDK(whole-archive) + DPDK(whole-archive) + ISA-L + 系统库
 # 注意：链接选项必须与库在同一 target_link_libraries 调用中，保证顺序

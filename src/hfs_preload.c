@@ -885,15 +885,21 @@ int fclose(FILE *stream) {
 	int fd = hfs_real_fileno_call(stream);
 	bool managed = hfs_is_hfs_fd(fd);
 	int rc;
+	int releaseRc = 0;
+	int savedErrno = 0;
 
 	/* Detach first so libc's internal close cannot leave a stale HFS slot. */
-	if (managed && hfs_lib_release_fd(fd) != 0) {
-		hfs_stdio_forget(stream);
-		return -1;
+	if (managed) {
+		releaseRc = hfs_lib_release_fd(fd);
+		savedErrno = errno;
 	}
 	rc = hfs_real_fclose_call(stream);
 	if (managed) {
 		hfs_stdio_forget(stream);
+	}
+	if (releaseRc != 0) {
+		errno = savedErrno;
+		return -1;
 	}
 	return rc;
 }

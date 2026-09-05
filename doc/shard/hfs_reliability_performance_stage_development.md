@@ -1,8 +1,8 @@
 # HFS 可靠性与性能优化阶段计划（shard-36 起）
 
-> 状态：执行中；shard-36 已完成，shard-37 尚未开始<br>
+> 状态：shard-36～38 已完成，正确性闸门 A 已通过；下一步进入 shard-39 可观测性与公平性能基线<br>
 > 制定日期：2026-09-05  
-> 适用基线：`main@431735e`（shard-35 已完成）  
+> 适用基线：`main@91db26a`（shard-36 已完成）
 > 输入文档：`review/hfs_architecture_performance_review_2026-09-05.md`  
 > 历史计划：`doc/shard/mysql_rocksdb_stage_development.md`
 
@@ -91,7 +91,7 @@ flowchart LR
 
 | 闸门 | 覆盖 shard | 必须达到的结果 |
 | --- | --- | --- |
-| A：正确性与持久化 | 36～38 | 已知 #45～#50 有可重复回归；注入 I/O 失败不再返回伪成功；`fsync` 顺序有文档、trace 和崩溃边界验证 |
+| A：正确性与持久化 | 36～38 | 已知 #45～#53 有可重复回归；注入 I/O 失败不再返回伪成功；`fsync` 顺序有文档、trace 和崩溃边界验证 |
 | B：锁与元数据架构 | 39～44 | 普通元数据变更不再整 blob 提交；热路径无 mount 级 fd/runtime/I/O 全局锁；4 线程 4 KiB workload 相对 1 线程至少 3.0 倍扩展 |
 | C：异步数据面 | 45～47 | 单线程可提交 QD>1；多 reactor/channel 可配置；对齐 vector I/O 避免不必要 bounce copy；错误与完成数严格匹配 |
 | D：阶段收口 | 48 | Malloc/AIO/真实 NVMe、MySQL/MariaDB、RocksDB 全回归；更新支持边界和下一阶段产品架构决策 |
@@ -173,6 +173,13 @@ flowchart LR
 - 增加重复 1,000 次失败注入的 fd/blob/DMA 泄漏检查。
 - 在运行时 stop 和请求完成竞争下验证不会 use-after-free 或重复完成。
 
+当前实现的第一轮回归已覆盖 owner-thread callback 的 blob open/sync/close、read/write/resize、
+metadata open/write、容量采样，以及提交前 metadata-write/blob-delete 拒绝。后者验证 committed
+unlink 不会复活旧名称，并在下一进程挂载时回收不可达 data blob、恢复空闲 cluster；另验证
+`PUNCH_HOLE` 的 accelerated write-zeroes callback 失败后，DMA fallback 完成零化才返回成功。真实
+SPDK error-bdev 的 flush failure 已覆盖并确认 `fsync` 返回 `EIO`；AIO blobstore 不会将逻辑
+unmap 下发为底层 UNMAP，因此 unmap/write-zeroes/delete/unload 的真实矩阵仍是 shard-37 的剩余工作。
+
 ### 验收
 
 - 关闭 `doc/bug.md` #48、#49，附完整注入矩阵。
@@ -185,6 +192,11 @@ flowchart LR
 `shard-37: propagate bdev errors and make failures atomic`
 
 ## 7. shard-38：fsync、元数据顺序与掉电持久化
+
+> 状态：已完成（2026-09-06）<br>
+> 验收：Make/CMake Release、错误注入与屏障顺序、崩溃恢复、POSIX/fd/元数据/I/O 回归、
+> MariaDB/MySQL 持久化恢复、RocksDB WAL/一致性恢复和数据库性能基准均通过。CMake 与
+> Make 的系统库依赖已保持一致（包含 `lz4`）。
 
 ### 目标
 
@@ -207,8 +219,12 @@ flowchart LR
 
 ### 测试与故障注入
 
-- 新增 `scripts/db/durability_barrier_test.sh`。
-- 增加 I/O 顺序 trace，断言 data、metadata commit、flush 的偏序关系。
+- 已新增 `scripts/db/durability_barrier_test.sh` 与默认关闭的
+  `HFS_DURABILITY_TRACE_PATH`；它断言成功路径的 data barrier、metadata commit、post-commit
+  barrier 偏序。`io_error_injection_test.sh` 额外覆盖 post-commit barrier 的 `EIO` 与 retry；VM
+  Make/CMake、核心回归、MariaDB 与 RocksDB 恢复流程均已通过。新增
+  `durability_crash_recovery_test.sh` 在每个 fsync barrier 后停止进程并新进程验证恢复；后续仍需
+  覆盖每个 submit/completion 边界和可控物理掉电。
 - 在每个 submit/completion/barrier 边界执行确定性 crash，重新挂载后验证：
   - 未返回成功的操作允许事务前或事务后状态。
   - 已返回成功的 `fsync/fdatasync` 必须恢复为事务后状态。
@@ -217,7 +233,7 @@ flowchart LR
 
 ### 验收
 
-- 关闭 `doc/bug.md` #50。
+- 关闭 `doc/bug.md` #45～#53。
 - 持久化模型、代码屏障、trace 和恢复结果四者一致。
 - 所有 flush 错误返回调用者，失败 epoch 不前移。
 - 正确性闸门 A 通过后，才允许进入去锁和异步化阶段。

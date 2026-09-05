@@ -11,6 +11,16 @@
 #include "hfs_io.h"
 #include "hfs_log.h"
 
+/* Request state used by blob lifecycle and fsync operation chains. */
+typedef struct HfsFileRequest {
+	HfsFile *file;
+	HfsRequestResult result;
+	struct spdk_bs_dev_cb_args flushArgs;
+	HfsRequestOperation flushOperation;
+	int primaryRc;
+	bool createdBlob;
+} HfsFileRequest;
+
 /* Refresh the cached free capacity while running on the SPDK owner thread. */
 static void hfsRefreshFreeClusterCount(Hfs *fs) {
 	if (fs == NULL || fs->blobstore == NULL) {
@@ -21,9 +31,10 @@ static void hfsRefreshFreeClusterCount(Hfs *fs) {
 			      memory_order_relaxed);
 }
 
-/* Completion callback for spdk_bs_delete_blob. */
+/* Complete a regular data-blob delete request. */
 static void hfsSpdkBlobDeleteCb(void *arg, int bserrno) {
-	HfsFile *file = (HfsFile *)arg;
+	HfsFileRequest *request = arg;
+	HfsFile *file = request->file;
 
 	if (bserrno != 0) {
 		HFS_LOG_ERROR("delete blob %"PRIu64" failed bserrno=%d",
@@ -31,255 +42,358 @@ static void hfsSpdkBlobDeleteCb(void *arg, int bserrno) {
 	} else {
 		hfsRefreshFreeClusterCount(file->fs);
 	}
-	SPDK_NOTICELOG("blob deleted, id=%"PRIu64"\n", file->blobId);
-	hfsRuntimeCompletionComplete(&file->completion);
+	hfsRequestComplete(&request->result, bserrno, 0);
 }
 
-/* Completion callback for spdk_blob_close. */
+/* Complete a close request and retire the local blob handle only on success. */
 static void hfsSpdkBlobCloseCb(void *arg, int bserrno) {
-	HfsFile *file = (HfsFile *)arg;
+	HfsFileRequest *request = arg;
+	HfsFile *file = request->file;
 
 	if (bserrno != 0) {
 		HFS_LOG_ERROR("close blob %"PRIu64" failed bserrno=%d",
 			      file->blobId, bserrno);
+	} else {
+		file->blob = NULL;
 	}
-	SPDK_NOTICELOG("close complete\n");
-	hfsRuntimeCompletionComplete(&file->completion);
+	hfsRequestComplete(&request->result, bserrno, 0);
 }
 
-/* SPDK-thread task: close the data blob (handle only). */
+/* SPDK-thread task: close the data blob handle. */
 static void hfsDoClose(void *arg) {
-	HfsFile *file = (HfsFile *)arg;
+	HfsFileRequest *request = arg;
 
-	spdk_blob_close(file->blob, hfsSpdkBlobCloseCb, file);
+	if (hfsRequestCompletionInjected(request->result.operation)) {
+		hfsSpdkBlobCloseCb(request, -EIO);
+		return;
+	}
+	spdk_blob_close(request->file->blob, hfsSpdkBlobCloseCb, request);
 }
 
-/* Completion callback for spdk_bs_delete_blob (delete path). */
-static void hfsSpdkBsDeleteDoneCb(void *arg, int bserrno) {
-	hfsSpdkBlobDeleteCb(arg, bserrno);
-}
-
-/* SPDK-thread task: delete the data blob by id (unlink path). */
+/* SPDK-thread task: delete a data blob by its stable id. */
 static void hfsDoDeleteBlob(void *arg) {
-	HfsFile *file = (HfsFile *)arg;
+	HfsFileRequest *request = arg;
+	HfsFile *file = request->file;
 
-	spdk_bs_delete_blob(file->fs->blobstore, file->blobId, hfsSpdkBsDeleteDoneCb, file);
+	if (hfsRequestCompletionInjected(request->result.operation)) {
+		hfsSpdkBlobDeleteCb(request, -EIO);
+		return;
+	}
+	spdk_bs_delete_blob(file->fs->blobstore, file->blobId,
+			    hfsSpdkBlobDeleteCb, request);
 }
 
 /* Complete the device flush used by file fsync. */
 static void hfsSpdkFsyncFlushCb(struct spdk_io_channel *channel, void *arg,
-					int bserrno) {
-	HfsFile *file = (HfsFile *)arg;
+				 int bserrno) {
+	HfsFileRequest *request = arg;
 
-	file->operationRc = bserrno;
 	if (bserrno != 0) {
 		HFS_LOG_ERROR("bdev flush failed bserrno=%d", bserrno);
 	}
-	hfsRuntimeCompletionComplete(&file->completion);
+	hfsRequestComplete(&request->result, bserrno, 0);
 }
 
 /* Complete a direct bdev flush and release the SPDK I/O object. */
 static void hfsSpdkBdevFlushCb(struct spdk_bdev_io *bdevIo, bool success, void *arg) {
-	HfsFile *file = (HfsFile *)arg;
+	HfsFileRequest *request = arg;
 
-	file->operationRc = success ? 0 : -EIO;
 	if (!success) {
 		HFS_LOG_ERROR("bdev flush failed");
 	}
 	spdk_bdev_free_io(bdevIo);
-	hfsRuntimeCompletionComplete(&file->completion);
+	hfsRequestComplete(&request->result, success ? 0 : -EIO, 0);
 }
 
 /* Submit a direct bdev flush, with a blobstore-device fallback for custom devices. */
-static void hfsSubmitFsyncFlush(HfsFile *file) {
+static void hfsSubmitFsyncFlush(HfsFileRequest *request) {
+	HfsFile *file = request->file;
 	int rc;
 
+	if (hfsRequestCompletionInjected(request->flushOperation)) {
+		hfsRequestComplete(&request->result, -EIO, 0);
+		return;
+	}
 	if (file->fs->bdevDesc != NULL && file->fs->bdevChannel != NULL) {
 		rc = spdk_bdev_flush(file->fs->bdevDesc, file->fs->bdevChannel, 0, 0,
-				      hfsSpdkBdevFlushCb, file);
+				      hfsSpdkBdevFlushCb, request);
 		if (rc != 0) {
-			file->operationRc = rc;
-			hfsRuntimeCompletionComplete(&file->completion);
+			hfsRequestComplete(&request->result, rc, 0);
 		}
 		return;
 	}
 	if (file->fs->bsDev == NULL || file->fs->bsDev->flush == NULL) {
-		file->operationRc = -EOPNOTSUPP;
-		hfsRuntimeCompletionComplete(&file->completion);
+		hfsRequestComplete(&request->result, -EOPNOTSUPP, 0);
 		return;
 	}
-	memset(&file->flushArgs, 0, sizeof(file->flushArgs));
-	file->flushArgs.cb_fn = hfsSpdkFsyncFlushCb;
-	file->flushArgs.channel = file->fs->channel;
-	file->flushArgs.cb_arg = file;
+	memset(&request->flushArgs, 0, sizeof(request->flushArgs));
+	request->flushArgs.cb_fn = hfsSpdkFsyncFlushCb;
+	request->flushArgs.channel = file->fs->channel;
+	request->flushArgs.cb_arg = request;
 	file->fs->bsDev->flush(file->fs->bsDev, file->fs->channel,
-				      &file->flushArgs);
+				      &request->flushArgs);
 }
 
 /* Flush blob metadata before flushing the backing device. */
 static void hfsSpdkFsyncBlobCb(void *arg, int bserrno) {
-	HfsFile *file = (HfsFile *)arg;
+	HfsFileRequest *request = arg;
 
 	if (bserrno != 0) {
-		file->operationRc = bserrno;
-		hfsRuntimeCompletionComplete(&file->completion);
+		hfsRequestComplete(&request->result, bserrno, 0);
 		return;
 	}
-	hfsSubmitFsyncFlush(file);
+	hfsSubmitFsyncFlush(request);
 }
 
 /* SPDK-thread task: start the file metadata and device flush chain. */
 static void hfsDoSync(void *arg) {
-	HfsFile *file = (HfsFile *)arg;
+	HfsFileRequest *request = arg;
+	HfsFile *file = request->file;
 
-	if (file->blob == NULL) {
-		hfsSubmitFsyncFlush(file);
+	if (hfsRequestCompletionInjected(request->result.operation)) {
+		hfsSpdkFsyncBlobCb(request, -EIO);
 		return;
 	}
-	spdk_blob_sync_md(file->blob, hfsSpdkFsyncBlobCb, file);
-}
-
-/*
- * Close the file handle only; the blob is kept.
- * Blob deletion is the responsibility of unlink (hfsDeleteBlobById).
- */
-int hfsClose(HfsFile *file) {
-	return waiter(globalThread, hfsDoClose, file, &file->completion);
-}
-
-/* Delete the data blob by id (used by unlink). */
-int hfsDeleteBlobById(HfsFile *file) {
-	return waiter(globalThread, hfsDoDeleteBlob, file, &file->completion);
-}
-
-/* Flush one open file and its backing bdev for POSIX fsync semantics. */
-int hfsSync(HfsFile *file) {
-	if (file == NULL || file->fs == NULL) {
-		errno = EINVAL;
-		return -1;
+	if (file->blob == NULL) {
+		hfsSubmitFsyncFlush(request);
+		return;
 	}
-	file->operationRc = 0;
-	if (!waiter(globalThread, hfsDoSync, file, &file->completion)) {
-		errno = ETIMEDOUT;
-		return -1;
-	}
-	if (file->operationRc != 0) {
-		errno = -file->operationRc;
-		return -1;
-	}
-	return 0;
+	spdk_blob_sync_md(file->blob, hfsSpdkFsyncBlobCb, request);
 }
 
-/* Completion callback for spdk_blob_sync_md (open path). */
+/* Preserve the first open failure while the cleanup chain releases its blob. */
+static void hfsOpenCleanupDeleteCb(void *arg, int bserrno) {
+	HfsFileRequest *request = arg;
+
+	if (bserrno != 0) {
+		HFS_LOG_ERROR("open cleanup delete failed blob=%"PRIu64" bserrno=%d",
+			      request->file->blobId, bserrno);
+	} else {
+		hfsRefreshFreeClusterCount(request->file->fs);
+	}
+	request->file->blob = NULL;
+	hfsRequestComplete(&request->result, request->primaryRc, 0);
+}
+
+/* Close a just-opened blob before deleting it after a failed open chain. */
+static void hfsOpenCleanupCloseCb(void *arg, int bserrno) {
+	HfsFileRequest *request = arg;
+
+	if (bserrno != 0) {
+		HFS_LOG_ERROR("open cleanup close failed blob=%"PRIu64" bserrno=%d",
+			      request->file->blobId, bserrno);
+	}
+	request->file->blob = NULL;
+	spdk_bs_delete_blob(request->file->fs->blobstore, request->file->blobId,
+			    hfsOpenCleanupDeleteCb, request);
+}
+
+/* Start cleanup without replacing the operation error observed by the caller. */
+static void hfsOpenFail(HfsFileRequest *request, int bserrno) {
+	request->primaryRc = bserrno != 0 ? bserrno : -EIO;
+	if (request->file->blob != NULL) {
+		spdk_blob_close(request->file->blob, hfsOpenCleanupCloseCb, request);
+		return;
+	}
+	if (request->createdBlob) {
+		spdk_bs_delete_blob(request->file->fs->blobstore,
+				    request->file->blobId, hfsOpenCleanupDeleteCb, request);
+		return;
+	}
+	hfsRequestComplete(&request->result, request->primaryRc, 0);
+}
+
+/* Complete the metadata sync for a newly created file blob. */
 static void hfsSpdkBlobSyncCb(void *arg, int bserrno) {
-	HfsFile *file = (HfsFile *)arg;
+	HfsFileRequest *request = arg;
 
 	if (bserrno != 0) {
 		HFS_LOG_ERROR("blob sync failed bserrno=%d", bserrno);
-	}
-	SPDK_NOTICELOG("open complete\n");
-
-	hfsRuntimeCompletionComplete(&file->completion);
-}
-
-/*
- * Completion callback for spdk_bs_open_blob (open path):
- * sync the freshly created empty blob metadata.
- */
-static void hfsSpdkBsOpenBlobCb(void *arg, struct spdk_blob *blb, int bserrno) {
-	HfsFile *file = (HfsFile *)arg;
-
-	if (bserrno != 0) {
-		HFS_LOG_ERROR("open blob failed bserrno=%d", bserrno);
-		hfsRuntimeCompletionComplete(&file->completion);
+		hfsOpenFail(request, bserrno);
 		return;
 	}
-	file->blob = blb;
-	spdk_blob_sync_md(blb, hfsSpdkBlobSyncCb, file);
+	hfsRequestComplete(&request->result, 0, 0);
 }
 
-/* Completion callback for spdk_bs_create_blob (open path). */
+/* Open a created blob and continue the fresh-blob metadata sync chain. */
+static void hfsSpdkBsOpenBlobCb(void *arg, struct spdk_blob *blob, int bserrno) {
+	HfsFileRequest *request = arg;
+
+	if (bserrno != 0 || blob == NULL) {
+		HFS_LOG_ERROR("open created blob failed bserrno=%d", bserrno);
+		hfsOpenFail(request, bserrno);
+		return;
+	}
+	request->file->blob = blob;
+	spdk_blob_sync_md(blob, hfsSpdkBlobSyncCb, request);
+}
+
+/* Capture a newly allocated blob id before opening it. */
 static void hfsSpdkBsCreateBlobCb(void *arg, spdk_blob_id blobId, int bserrno) {
-	HfsFile *file = (HfsFile *)arg;
+	HfsFileRequest *request = arg;
 
-	if (bserrno != 0) {
+	if (bserrno != 0 || blobId == SPDK_BLOBID_INVALID) {
 		HFS_LOG_ERROR("create blob failed bserrno=%d", bserrno);
-		hfsRuntimeCompletionComplete(&file->completion);
+		hfsRequestComplete(&request->result, bserrno != 0 ? bserrno : -EIO, 0);
 		return;
 	}
-	file->blobId = blobId;
-	SPDK_NOTICELOG("blobId : %"PRIu64"\n", blobId);
-
-	spdk_bs_open_blob(file->fs->blobstore, blobId, hfsSpdkBsOpenBlobCb, file);
+	request->file->blobId = blobId;
+	request->createdBlob = true;
+	spdk_bs_open_blob(request->file->fs->blobstore, blobId,
+			  hfsSpdkBsOpenBlobCb, request);
 }
 
-/* SPDK-thread task: create a new blob (open creates a fresh file). */
+/* SPDK-thread task: create a new blob and begin the fresh-file chain. */
 static void hfsDoOpen(void *arg) {
-	HfsFile *file = (HfsFile *)arg;
+	HfsFileRequest *request = arg;
 
-	spdk_bs_create_blob(file->fs->blobstore, hfsSpdkBsCreateBlobCb, file);
-}
-
-/* Open a fresh file: create blob -> open -> grow -> sync. */
-int hfsOpen(HfsFile *file) {
-	return waiter(globalThread, hfsDoOpen, file, &file->completion);
-}
-
-/* Completion callback for spdk_bs_open_blob (open-by-id path). */
-static void hfsSpdkBsOpenByIdCb(void *arg, struct spdk_blob *blb, int bserrno) {
-	HfsFile *file = (HfsFile *)arg;
-
-	if (bserrno != 0) {
-		HFS_LOG_ERROR("open blob %"PRIu64" failed bserrno=%d",
-			      file->blobId, bserrno);
+	if (hfsRequestCompletionInjected(request->result.operation)) {
+		hfsSpdkBsCreateBlobCb(request, SPDK_BLOBID_INVALID, -EIO);
+		return;
 	}
-	file->blob = blb;
-	hfsRuntimeCompletionComplete(&file->completion);
+	spdk_bs_create_blob(request->file->fs->blobstore, hfsSpdkBsCreateBlobCb,
+			    request);
 }
 
-/* SPDK-thread task: open an existing blob by id (no create). */
-static void hfsDoOpenById(void *arg) {
-	HfsFile *file = (HfsFile *)arg;
+/* Open a fresh file: create blob -> open -> sync, with cleanup on failure. */
+int hfsOpen(HfsFile *file) {
+	HfsFileRequest request;
 
-	spdk_bs_open_blob(file->fs->blobstore, file->blobId, hfsSpdkBsOpenByIdCb, file);
+	if (file == NULL || file->fs == NULL) {
+		errno = EINVAL;
+		return 0;
+	}
+	memset(&request, 0, sizeof(request));
+	request.file = file;
+	hfsRequestInit(&request.result, HFS_REQUEST_BLOB_CREATE);
+	return hfsRequestWait(&request.result, hfsDoOpen, &request) == 0;
+}
+
+/* Complete an open-by-id request without publishing a failed blob handle. */
+static void hfsSpdkBsOpenByIdCb(void *arg, struct spdk_blob *blob, int bserrno) {
+	HfsFileRequest *request = arg;
+
+	if (bserrno != 0 || blob == NULL) {
+		HFS_LOG_ERROR("open blob %"PRIu64" failed bserrno=%d",
+			      request->file->blobId, bserrno);
+		hfsRequestComplete(&request->result, bserrno != 0 ? bserrno : -EIO, 0);
+		return;
+	}
+	request->file->blob = blob;
+	hfsRequestComplete(&request->result, 0, 0);
+}
+
+/* SPDK-thread task: open an existing blob by id. */
+static void hfsDoOpenById(void *arg) {
+	HfsFileRequest *request = arg;
+
+	if (hfsRequestCompletionInjected(request->result.operation)) {
+		hfsSpdkBsOpenByIdCb(request, NULL, -EIO);
+		return;
+	}
+	spdk_bs_open_blob(request->file->fs->blobstore, request->file->blobId,
+			  hfsSpdkBsOpenByIdCb, request);
 }
 
 /* Open an existing blob by id; used by the library open path. */
 int hfsOpenById(HfsFile *file) {
-	return waiter(globalThread, hfsDoOpenById, file, &file->completion);
+	HfsFileRequest request;
+
+	if (file == NULL || file->fs == NULL) {
+		errno = EINVAL;
+		return 0;
+	}
+	memset(&request, 0, sizeof(request));
+	request.file = file;
+	hfsRequestInit(&request.result, HFS_REQUEST_BLOB_OPEN);
+	return hfsRequestWait(&request.result, hfsDoOpenById, &request) == 0;
+}
+
+/* Close the file handle only; the blob is kept for a later unlink. */
+int hfsClose(HfsFile *file) {
+	HfsFileRequest request;
+
+	if (file == NULL || file->fs == NULL) {
+		errno = EINVAL;
+		return 0;
+	}
+	if (file->blob == NULL) {
+		return 1;
+	}
+	memset(&request, 0, sizeof(request));
+	request.file = file;
+	hfsRequestInit(&request.result, HFS_REQUEST_BLOB_CLOSE);
+	return hfsRequestWait(&request.result, hfsDoClose, &request) == 0;
+}
+
+/* Delete the data blob by id after its directory entry has been removed. */
+int hfsDeleteBlobById(HfsFile *file) {
+	HfsFileRequest request;
+
+	if (file == NULL || file->fs == NULL) {
+		errno = EINVAL;
+		return 0;
+	}
+	memset(&request, 0, sizeof(request));
+	request.file = file;
+	hfsRequestInit(&request.result, HFS_REQUEST_BLOB_DELETE);
+	return hfsRequestWait(&request.result, hfsDoDeleteBlob, &request) == 0;
+}
+
+/* Execute a blob sync followed by one named device-flush boundary. */
+static int hfsSyncWithFlushOperation(HfsFile *file,
+				     HfsRequestOperation flushOperation) {
+	HfsFileRequest request;
+
+	if (file == NULL || file->fs == NULL) {
+		errno = EINVAL;
+		return -1;
+	}
+	memset(&request, 0, sizeof(request));
+	request.file = file;
+	request.flushOperation = flushOperation;
+	hfsRequestInit(&request.result, HFS_REQUEST_BLOB_SYNC);
+	return hfsRequestWait(&request.result, hfsDoSync, &request);
+}
+
+/* Flush one open file and its backing bdev for the first fsync barrier. */
+int hfsSync(HfsFile *file) {
+	return hfsSyncWithFlushOperation(file, HFS_REQUEST_BDEV_FLUSH);
+}
+
+/* Flush the device boundary that follows a completed metadata transaction. */
+int hfsSyncPostCommit(HfsFile *file) {
+	return hfsSyncWithFlushOperation(file,
+					HFS_REQUEST_BDEV_FLUSH_POST_COMMIT);
 }
 
 /* Per-request state for a blob resize operation. */
 typedef struct HfsResizeRequest {
 	HfsFile *file;
 	uint64_t clusters;
-	int operationRc;
-	HfsCompletion completion;
+	HfsRequestResult result;
 } HfsResizeRequest;
 
 /* Complete one request-local blob resize. */
 static void hfsSpdkBlobResizeDoneCb(void *arg, int bserrno) {
 	HfsResizeRequest *request = arg;
 
-	request->operationRc = bserrno;
 	if (bserrno == 0) {
 		hfsRefreshFreeClusterCount(request->file->fs);
 	}
-	hfsRuntimeCompletionComplete(&request->completion);
+	hfsRequestComplete(&request->result, bserrno, request->clusters);
 }
 
 /* SPDK-thread task: grow the blob to the request's cluster count. */
 static void hfsDoResize(void *arg) {
 	HfsResizeRequest *request = arg;
 
+	if (hfsRequestCompletionInjected(request->result.operation)) {
+		hfsSpdkBlobResizeDoneCb(request, -EIO);
+		return;
+	}
 	spdk_blob_resize(request->file->blob, request->clusters,
 			 hfsSpdkBlobResizeDoneCb, request);
-}
-
-/* Convert an SPDK result into a public errno and return failure. */
-static int hfsResizeError(int rc) {
-	errno = rc < 0 ? -rc : (rc == 0 ? EIO : rc);
-	return -1;
 }
 
 /* Resize one blob to a target cluster count, optionally preserving growth-only semantics. */
@@ -287,7 +401,6 @@ static int hfsResizeClusters(HfsFile *file, uint64_t needClusters,
 				  bool growOnly) {
 	HfsResizeRequest request;
 	uint64_t currentClusters;
-	int rc;
 
 	currentClusters = spdk_blob_get_num_clusters(file->blob);
 	if (currentClusters == needClusters ||
@@ -298,15 +411,13 @@ static int hfsResizeClusters(HfsFile *file, uint64_t needClusters,
 	memset(&request, 0, sizeof(request));
 	request.file = file;
 	request.clusters = needClusters;
-	request.operationRc = -EIO;
-	if (!waiter(globalThread, hfsDoResize, &request, &request.completion)) {
+	hfsRequestInit(&request.result, HFS_REQUEST_BLOB_RESIZE);
+	if (hfsRequestWait(&request.result, hfsDoResize, &request) != 0) {
+		HFS_LOG_ERROR("blob resize failed clusters=%"PRIu64
+			      " submitRc=%d completionRc=%d bserrno=%d",
+			      needClusters, request.result.submitRc,
+			      request.result.completionRc, request.result.bserrno);
 		return -1;
-	}
-	rc = request.operationRc;
-	if (rc != 0) {
-		HFS_LOG_ERROR("blob resize failed clusters=%"PRIu64" bserrno=%d",
-			      needClusters, rc);
-		return hfsResizeError(rc);
 	}
 	return 0;
 }

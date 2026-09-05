@@ -273,6 +273,25 @@ int hfsFdMarkOrphan(uint64_t inodeId, uint64_t blobId,
 	return 0;
 }
 
+/* Detach a provisional orphan from all descriptions and release its record. */
+void hfsFdClearOrphan(HfsOrphan *orphan) {
+	uint32_t i;
+
+	if (orphan == NULL) {
+		return;
+	}
+	hfsFdWriteLock();
+	for (i = 0; i < HFS_FD_TABLE_SIZE; i++) {
+		HfsOpenFile *openFile = g_fdSlots[i];
+
+		if (openFile != NULL && openFile->orphan == orphan) {
+			openFile->orphan = NULL;
+		}
+	}
+	pthread_rwlock_unlock(&g_fdLock);
+	free(orphan);
+}
+
 /* Read metadata retained by an unlinked open-file description. */
 bool hfsFdGetOrphanInfo(HfsOpenFile *openFile, uint64_t *size,
 			uint64_t *ctimeNs, uint64_t *mtimeNs) {

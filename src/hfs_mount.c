@@ -25,18 +25,24 @@ static bool hfs_format_requested(void) {
 	return format != NULL && strcmp(format, "1") == 0;
 }
 
+/* Request-private mount state retained through the SPDK init/unload callback. */
+typedef struct HfsMountRequest {
+	Hfs *fs;
+	HfsRequestResult result;
+} HfsMountRequest;
+
 /* Completion callback for spdk_bs_unload: clear the blobstore so a
  * second umount (e.g. from hfs_lib_fini) is a no-op. */
 static void hfsSpdkBsUnloadCb(void *arg, int bserrno) {
-	Hfs *fs = (Hfs *)arg;
+	HfsMountRequest *request = arg;
+	Hfs *fs = request->fs;
 
 	if (bserrno != 0) {
 		HFS_LOG_ERROR("blobstore unload failed bserrno=%d", bserrno);
 	}
-	fs->operationRc = bserrno;
 	fs->blobstore = NULL;
 	fs->bsDev = NULL;
-	hfsRuntimeCompletionComplete(&fs->completion);
+	hfsRequestComplete(&request->result, bserrno, 0);
 }
 
 /*
@@ -47,8 +53,13 @@ static void hfsSpdkBsUnloadCb(void *arg, int bserrno) {
  * guarded so a second umount (e.g. from hfs_lib_fini) is a no-op.
  */
 static void hfsDoUmount(void *arg) {
-	Hfs *fs = (Hfs *)arg;
+	HfsMountRequest *request = arg;
+	Hfs *fs = request->fs;
 
+	if (hfsRequestCompletionInjected(request->result.operation)) {
+		hfsRequestComplete(&request->result, -EIO, 0);
+		return;
+	}
 	if (fs->blobstore) {
 		if (fs->channel) {
 			spdk_bs_free_io_channel(fs->channel);
@@ -62,7 +73,7 @@ static void hfsDoUmount(void *arg) {
 			spdk_bdev_close(fs->bdevDesc);
 			fs->bdevDesc = NULL;
 		}
-		spdk_bs_unload(fs->blobstore, hfsSpdkBsUnloadCb, fs);
+		spdk_bs_unload(fs->blobstore, hfsSpdkBsUnloadCb, request);
 	} else {
 		if (fs->bdevChannel) {
 			spdk_put_io_channel(fs->bdevChannel);
@@ -72,7 +83,7 @@ static void hfsDoUmount(void *arg) {
 			spdk_bdev_close(fs->bdevDesc);
 			fs->bdevDesc = NULL;
 		}
-		hfsRuntimeCompletionComplete(&fs->completion);
+		hfsRequestComplete(&request->result, 0, 0);
 	}
 }
 
@@ -81,11 +92,12 @@ static void hfsDoUmount(void *arg) {
  * io unit size and allocate the I/O channel used by all blob operations.
  */
 static void hfsSpdkBsInitCb(void *arg, struct spdk_blob_store *bs, int bserrno) {
-	Hfs *fs = (Hfs *)arg;
+	HfsMountRequest *request = arg;
+	Hfs *fs = request->fs;
+	uint64_t ioUnitSize;
 
 	if (bserrno != 0 || bs == NULL) {
 		HFS_LOG_ERROR("blobstore init failed bserrno=%d", bserrno);
-		fs->operationRc = bserrno != 0 ? bserrno : -EINVAL;
 		if (fs->bdevChannel) {
 			spdk_put_io_channel(fs->bdevChannel);
 			fs->bdevChannel = NULL;
@@ -95,11 +107,12 @@ static void hfsSpdkBsInitCb(void *arg, struct spdk_blob_store *bs, int bserrno) 
 			fs->bdevDesc = NULL;
 		}
 		fs->bsDev = NULL;
-		hfsRuntimeCompletionComplete(&fs->completion);
+		hfsRequestComplete(&request->result,
+				   bserrno != 0 ? bserrno : -EINVAL, 0);
 		return;
 	}
 
-	uint64_t ioUnitSize = spdk_bs_get_io_unit_size(bs);
+	ioUnitSize = spdk_bs_get_io_unit_size(bs);
 	SPDK_NOTICELOG("ioUnitSize : %"PRIu64"\n", ioUnitSize);
 
 	fs->unitSize = ioUnitSize;
@@ -108,7 +121,6 @@ static void hfsSpdkBsInitCb(void *arg, struct spdk_blob_store *bs, int bserrno) 
 	fs->channel = spdk_bs_alloc_io_channel(fs->blobstore);
 	if (fs->channel == NULL) {
 		HFS_LOG_ERROR("blobstore io channel allocation failed");
-		fs->operationRc = -ENOMEM;
 		if (fs->bdevChannel) {
 			spdk_put_io_channel(fs->bdevChannel);
 			fs->bdevChannel = NULL;
@@ -118,12 +130,12 @@ static void hfsSpdkBsInitCb(void *arg, struct spdk_blob_store *bs, int bserrno) 
 			fs->bdevDesc = NULL;
 		}
 		fs->bsDev = NULL;
-		hfsRuntimeCompletionComplete(&fs->completion);
+		hfsRequestComplete(&request->result, -ENOMEM, 0);
 		return;
 	}
 
 	SPDK_NOTICELOG("mount finished\n");
-	hfsRuntimeCompletionComplete(&fs->completion);
+	hfsRequestComplete(&request->result, 0, 0);
 }
 
 /* Bdev event callback (informational, currently unused). */
@@ -169,16 +181,20 @@ static int hfsOpenBdevFlushHandle(Hfs *fs, struct spdk_bs_dev *bsDev) {
  * initialize or load the blobstore according to the explicit format flag.
  */
 static void hfsDoMount(void *arg) {
-	Hfs *fs = (Hfs *)arg;
-
+	HfsMountRequest *request = arg;
+	Hfs *fs = request->fs;
 	struct spdk_bs_dev *bsDev = NULL;
+	int rc;
 
-	int rc = spdk_bdev_create_bs_dev_ext(hfs_bdev_name(), hfsSpdkBdevEventCb,
+	if (hfsRequestCompletionInjected(request->result.operation)) {
+		hfsRequestComplete(&request->result, -EIO, 0);
+		return;
+	}
+	rc = spdk_bdev_create_bs_dev_ext(hfs_bdev_name(), hfsSpdkBdevEventCb,
 					     NULL, &bsDev);
 	if (rc != 0) {
 		HFS_LOG_ERROR("create bs dev failed rc=%d", rc);
-		fs->operationRc = rc;
-		hfsRuntimeCompletionComplete(&fs->completion);
+		hfsRequestComplete(&request->result, rc, 0);
 		return;
 	}
 	fs->bsDev = bsDev;
@@ -187,15 +203,14 @@ static void hfsDoMount(void *arg) {
 		HFS_LOG_ERROR("open bdev flush handle failed rc=%d", rc);
 		bsDev->destroy(bsDev);
 		fs->bsDev = NULL;
-		fs->operationRc = rc;
-		hfsRuntimeCompletionComplete(&fs->completion);
+		hfsRequestComplete(&request->result, rc, 0);
 		return;
 	}
 
 	if (hfs_format_requested()) {
-		spdk_bs_init(bsDev, NULL, hfsSpdkBsInitCb, fs);
+		spdk_bs_init(bsDev, NULL, hfsSpdkBsInitCb, request);
 	} else {
-		spdk_bs_load(bsDev, NULL, hfsSpdkBsInitCb, fs);
+		spdk_bs_load(bsDev, NULL, hfsSpdkBsInitCb, request);
 	}
 
 	SPDK_NOTICELOG("hfs_entry\n");
@@ -203,20 +218,30 @@ static void hfsDoMount(void *arg) {
 
 /* Mount the blobstore synchronously; return false on timeout or SPDK error. */
 int hfsMount(Hfs *fs) {
-	fs->operationRc = 0;
+	HfsMountRequest request;
 
-	if (!waiter(globalThread, hfsDoMount, fs, &fs->completion)) {
+	if (fs == NULL) {
+		errno = EINVAL;
 		return 0;
 	}
-	return fs->operationRc == 0 && fs->blobstore != NULL;
+	memset(&request, 0, sizeof(request));
+	request.fs = fs;
+	hfsRequestInit(&request.result, HFS_REQUEST_MOUNT);
+	return hfsRequestWait(&request.result, hfsDoMount, &request) == 0 &&
+		fs->blobstore != NULL;
 }
 
 /* Unmount the blobstore synchronously; return false on timeout or SPDK error. */
 int hfsUmount(Hfs *fs) {
-	fs->operationRc = 0;
+	HfsMountRequest request;
 
-	if (!waiter(globalThread, hfsDoUmount, fs, &fs->completion)) {
+	if (fs == NULL) {
+		errno = EINVAL;
 		return 0;
 	}
-	return fs->operationRc == 0 && fs->blobstore == NULL;
+	memset(&request, 0, sizeof(request));
+	request.fs = fs;
+	hfsRequestInit(&request.result, HFS_REQUEST_UMOUNT);
+	return hfsRequestWait(&request.result, hfsDoUmount, &request) == 0 &&
+		fs->blobstore == NULL;
 }

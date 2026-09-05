@@ -16,4 +16,11 @@ extern struct spdk_thread *globalThread;
 bool waiter(struct spdk_thread *thread, spdk_msg_fn startFn, void *ctx,
 		HfsCompletion *completion);
 
+/* Initialize, complete, and wait for a request-private SPDK result. */
+void hfsRequestInit(HfsRequestResult *result, HfsRequestOperation operation);
+void hfsRequestComplete(HfsRequestResult *result, int bserrno,
+			uint64_t completedUnits);
+int hfsRequestWait(HfsRequestResult *result, spdk_msg_fn startFn, void *ctx);
+bool hfsRequestCompletionInjected(HfsRequestOperation operation);
+
 #endif /* HFS_INTERNAL_H */

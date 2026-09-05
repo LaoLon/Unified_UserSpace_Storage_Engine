@@ -33,6 +33,7 @@ struct HfsOpenFile {
 	pthread_mutex_t ioLock;
 	uint32_t refs;
 	HfsOrphan *orphan;
+	HfsOpenFile *deferredNext;
 };
 
 struct HfsOrphan {
@@ -66,6 +67,8 @@ void hfsFdReset(void);
 int hfsFdMarkOrphan(uint64_t inodeId, uint64_t blobId,
 		   uint64_t size, uint64_t ctimeNs, uint64_t mtimeNs,
 		   HfsOrphan **orphanOut);
+/* Undo a provisional orphan mark when its metadata transaction did not publish. */
+void hfsFdClearOrphan(HfsOrphan *orphan);
 /* Read orphan metadata while holding the fd registry read lock. */
 bool hfsFdGetOrphanInfo(HfsOpenFile *openFile, uint64_t *size,
 			uint64_t *ctimeNs, uint64_t *mtimeNs);

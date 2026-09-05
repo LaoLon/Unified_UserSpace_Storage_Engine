@@ -53,19 +53,26 @@ typedef struct HfsIoRequest {
 	uint64_t offset;
 	uint64_t units;
 	HfsIoOperation operation;
-	int operationRc;
-	HfsCompletion completion;
+	HfsRequestResult result;
 } HfsIoRequest;
 
 /* Capture an SPDK completion code before waking the synchronous caller. */
 static void hfsIoDone(void *arg, int bserrno);
 
-/* Convert an SPDK error into the errno convention used by the public API. */
-static int hfsIoSetError(int rc) {
-	int error = rc < 0 ? -rc : rc;
-
-	errno = error == 0 ? EIO : error;
-	return -1;
+/* Map a data transfer opcode to the shared request result vocabulary. */
+static HfsRequestOperation hfsIoRequestOperation(HfsIoOperation operation) {
+	switch (operation) {
+	case HFS_IO_READ:
+		return HFS_REQUEST_BLOB_READ;
+	case HFS_IO_WRITE:
+		return HFS_REQUEST_BLOB_WRITE;
+	case HFS_IO_UNMAP:
+		return HFS_REQUEST_BLOB_UNMAP;
+	case HFS_IO_WRITE_ZEROES:
+		return HFS_REQUEST_BLOB_WRITE_ZEROES;
+	default:
+		return HFS_REQUEST_BLOB_READ;
+	}
 }
 
 /* Return the number of complete I/O units one pool buffer can hold. */
@@ -125,6 +132,10 @@ static void hfsIoStart(void *arg) {
 	HfsIoRequest *request = arg;
 	HfsFile *file = request->file;
 
+	if (hfsRequestCompletionInjected(request->result.operation)) {
+		hfsIoDone(request, -EIO);
+		return;
+	}
 	switch (request->operation) {
 	case HFS_IO_READ:
 		spdk_blob_io_read(file->blob, file->fs->channel, request->buffer,
@@ -152,46 +163,29 @@ static void hfsIoStart(void *arg) {
 static void hfsIoDone(void *arg, int bserrno) {
 	HfsIoRequest *request = arg;
 
-	request->operationRc = bserrno;
-	if (bserrno != 0) {
-		HFS_STATS_ERROR();
-		HFS_LOG_ERROR("data I/O failed operation=%d offset=%"PRIu64
-			      " units=%"PRIu64" bserrno=%d",
-			      request->operation, request->offset, request->units,
-			      bserrno);
-	}
-	hfsRuntimeCompletionComplete(&request->completion);
+	hfsRequestComplete(&request->result, bserrno, request->units);
 }
 
 /* Start one request-local transfer and wait for its owner-thread callback. */
 static int hfsIoSubmit(HfsFile *file, void *buffer, uint64_t offset,
 		       uint64_t units, HfsIoOperation operation) {
-	HfsIoRequest request = {
-		.file = file,
-		.buffer = buffer,
-		.offset = offset,
-		.units = units,
-		.operation = operation,
-		.operationRc = -EIO,
-	};
+	HfsIoRequest request;
 
 	/* The callback owns only this request, so the HfsFile has no I/O scratch state. */
-	hfsRuntimeCompletionReset(&request.completion);
-	if (hfsRuntimeSubmit(hfsIoStart, &request) != 0) {
+	memset(&request, 0, sizeof(request));
+	request.file = file;
+	request.buffer = buffer;
+	request.offset = offset;
+	request.units = units;
+	request.operation = operation;
+	hfsRequestInit(&request.result, hfsIoRequestOperation(operation));
+	if (hfsRequestWait(&request.result, hfsIoStart, &request) != 0) {
 		HFS_STATS_ERROR();
-		HFS_LOG_ERROR("data I/O submission rejected operation=%d", operation);
-		errno = ESHUTDOWN;
+		HFS_LOG_ERROR("data I/O failed operation=%d offset=%"PRIu64
+			      " units=%"PRIu64" submitRc=%d completionRc=%d bserrno=%d",
+			      operation, offset, units, request.result.submitRc,
+			      request.result.completionRc, request.result.bserrno);
 		return -1;
-	}
-	if (!hfsRuntimeCompletionWait(&request.completion,
-				      HFS_RUNTIME_TIMEOUT_MS)) {
-		HFS_STATS_ERROR();
-		HFS_LOG_ERROR("data I/O wait failed operation=%d errno=%d",
-			      operation, errno);
-		return -1;
-	}
-	if (request.operationRc != 0) {
-		return hfsIoSetError(request.operationRc);
 	}
 	return 0;
 }
@@ -568,7 +562,7 @@ static int hfsIoZeroPartial(HfsFile *file, uint64_t unitOffset,
 	return rc;
 }
 
-/* Unmap first, then guarantee zero-read semantics with zeroes or pooled writes. */
+/* Unmap first, then commit the logical zero range through a reliable fallback. */
 static int hfsIoUnmapUnits(HfsFile *file, uint64_t offset, uint64_t units) {
 	int savedErrno;
 
@@ -581,10 +575,11 @@ static int hfsIoUnmapUnits(HfsFile *file, uint64_t offset, uint64_t units) {
 	if (hfsIoSubmit(file, NULL, offset, units, HFS_IO_WRITE_ZEROES) == 0) {
 		return 0;
 	}
-	savedErrno = errno;
-	if (savedErrno != EOPNOTSUPP && savedErrno != ENOTSUP) {
-		return -1;
-	}
+	/*
+	 * An unmap completion does not promise reads of zero on every bdev. If the
+	 * accelerated zeroes path fails, retry through the DMA write path and only
+	 * report success after the observable hole contents are actually zero.
+	 */
 	return hfsIoWriteZeroUnits(file, offset, units);
 }
 

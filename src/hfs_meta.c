@@ -10,6 +10,7 @@
 #include <spdk/log.h>
 
 #include "hfs_internal.h"
+#include "hfs_log.h"
 #include "hfs_meta.h"
 
 /* Versioned metadata header used to keep inode IDs stable across compaction. */
@@ -210,63 +211,262 @@ static bool hfs_format_requested(void) {
 	return format != NULL && strcmp(format, "1") == 0;
 }
 
-/* Generic completion callback: marks the waiter as done. */
-static void hfsMetaOpCb(void *arg, int bserrno) {
-	Hfs *fs = (Hfs *)arg;
+/* Per-operation metadata I/O state; never stored in the mounted filesystem. */
+typedef struct HfsMetaIoRequest {
+	Hfs *fs;
+	struct spdk_blob *blob;
+	void *buffer;
+	uint64_t units;
+	uint64_t clusters;
+	HfsRequestResult result;
+} HfsMetaIoRequest;
 
-	hfsRuntimeCompletionComplete(&fs->completion);
+/* Owner-thread state used to reclaim blobs no longer named by metadata. */
+typedef struct HfsMetaReclaimRequest {
+	Hfs *fs;
+	spdk_blob_id *blobIds;
+	uint32_t count;
+	uint32_t capacity;
+	uint32_t deleteIndex;
+	HfsRequestResult result;
+} HfsMetaReclaimRequest;
+
+/* Return whether a blob is still reachable from the committed inode table. */
+static bool hfsMetaBlobReferenced(const Hfs *fs, spdk_blob_id blobId) {
+	uint32_t i;
+
+	if (fs == NULL || blobId == SPDK_BLOBID_INVALID) {
+		return true;
+	}
+	if (blobId == fs->metaBlobId) {
+		return true;
+	}
+	for (i = 0; i < fs->inodeCount; i++) {
+		if (fs->inodes[i].type == HFS_INODE_FILE &&
+		    fs->inodes[i].blobId == blobId) {
+			return true;
+		}
+	}
+	return false;
 }
 
-/* Completion callback for spdk_bs_open_blob: stores the opened blob. */
-static void hfsMetaOpenBlobCb(void *arg, struct spdk_blob *blob, int bserrno) {
-	Hfs *fs = (Hfs *)arg;
+/* Append one unreferenced blob id while iterating on the owner thread. */
+static int hfsMetaRememberUnreachableBlob(HfsMetaReclaimRequest *request,
+					  spdk_blob_id blobId) {
+	spdk_blob_id *ids;
+	uint32_t capacity;
 
-	fs->metaBlob = blob;
-	hfsRuntimeCompletionComplete(&fs->completion);
+	if (request->count == request->capacity) {
+		if (request->capacity > UINT32_MAX / 2U) {
+			errno = ENOMEM;
+			return -1;
+		}
+		capacity = request->capacity == 0 ? 16U : request->capacity * 2U;
+		ids = realloc(request->blobIds, (size_t)capacity * sizeof(*ids));
+		if (ids == NULL) {
+			return -1;
+		}
+		request->blobIds = ids;
+		request->capacity = capacity;
+	}
+	request->blobIds[request->count++] = blobId;
+	return 0;
+}
+
+/* Submit the next unreachable blob deletion after enumeration is complete. */
+static void hfsMetaReclaimDeleteNext(HfsMetaReclaimRequest *request);
+
+/* Complete one unreachable blob deletion or continue the reclaim chain. */
+static void hfsMetaReclaimDeleteCb(void *arg, int bserrno) {
+	HfsMetaReclaimRequest *request = arg;
+
+	if (bserrno != 0) {
+		HFS_LOG_ERROR("mount reclaim delete failed blob=%"PRIu64,
+			      request->blobIds[request->deleteIndex]);
+		hfsRequestComplete(&request->result, bserrno, request->deleteIndex);
+		return;
+	}
+	request->deleteIndex++;
+	hfsMetaReclaimDeleteNext(request);
+}
+
+/* Delete all collected blobs and refresh free capacity only after success. */
+static void hfsMetaReclaimDeleteNext(HfsMetaReclaimRequest *request) {
+	if (request->deleteIndex == request->count) {
+		atomic_store_explicit(&request->fs->freeClusterCount,
+			spdk_bs_free_cluster_count(request->fs->blobstore),
+			memory_order_relaxed);
+		hfsRequestComplete(&request->result, 0, request->count);
+		return;
+	}
+	spdk_bs_delete_blob(request->fs->blobstore,
+			    request->blobIds[request->deleteIndex],
+			    hfsMetaReclaimDeleteCb, request);
+}
+
+/* Collect unreachable blob ids before deleting so the iterator stays valid. */
+static void hfsMetaReclaimIterCb(void *arg, struct spdk_blob *blob,
+				 int bserrno) {
+	HfsMetaReclaimRequest *request = arg;
+	spdk_blob_id blobId;
+
+	if (bserrno == -ENOENT) {
+		hfsMetaReclaimDeleteNext(request);
+		return;
+	}
+	if (bserrno != 0 || blob == NULL) {
+		hfsRequestComplete(&request->result,
+			bserrno != 0 ? bserrno : -EIO, request->count);
+		return;
+	}
+	blobId = spdk_blob_get_id(blob);
+	if (!hfsMetaBlobReferenced(request->fs, blobId) &&
+	    hfsMetaRememberUnreachableBlob(request, blobId) != 0) {
+		hfsRequestComplete(&request->result, -errno, request->count);
+		return;
+	}
+	spdk_bs_iter_next(request->fs->blobstore, blob, hfsMetaReclaimIterCb,
+			 request);
+}
+
+/* Start the blobstore enumeration from the SPDK owner thread. */
+static void hfsMetaDoReclaimUnreachable(void *arg) {
+	HfsMetaReclaimRequest *request = arg;
+
+	if (hfsRequestCompletionInjected(request->result.operation)) {
+		hfsRequestComplete(&request->result, -EIO, 0);
+		return;
+	}
+	spdk_bs_iter_first(request->fs->blobstore, hfsMetaReclaimIterCb, request);
+}
+
+/* Reclaim blobs orphaned by an earlier committed namespace transaction. */
+static int hfsMetaReclaimUnreachable(Hfs *fs) {
+	HfsMetaReclaimRequest request;
+	int rc;
+
+	memset(&request, 0, sizeof(request));
+	request.fs = fs;
+	hfsRequestInit(&request.result, HFS_REQUEST_BLOB_DELETE);
+	rc = hfsRequestWait(&request.result, hfsMetaDoReclaimUnreachable, &request);
+	free(request.blobIds);
+	return rc;
+}
+
+/* Complete one metadata I/O callback using its request-private result. */
+static void hfsMetaOpCb(void *arg, int bserrno) {
+	HfsMetaIoRequest *request = arg;
+
+	hfsRequestComplete(&request->result, bserrno, request->units);
+}
+
+/* Store a successfully opened metadata blob before waking the caller. */
+static void hfsMetaOpenBlobCb(void *arg, struct spdk_blob *blob, int bserrno) {
+	HfsMetaIoRequest *request = arg;
+
+	if (bserrno != 0 || blob == NULL) {
+		hfsRequestComplete(&request->result,
+				   bserrno != 0 ? bserrno : -EIO, 0);
+		return;
+	}
+	request->blob = blob;
+	hfsRequestComplete(&request->result, 0, 0);
 }
 
 /* SPDK-thread task: open the metadata blob. */
 static void hfsMetaDoOpenBlob(void *arg) {
-	Hfs *fs = (Hfs *)arg;
+	HfsMetaIoRequest *request = arg;
 
-	spdk_bs_open_blob(fs->blobstore, fs->metaBlobId, hfsMetaOpenBlobCb, fs);
+	if (hfsRequestCompletionInjected(request->result.operation)) {
+		hfsMetaOpenBlobCb(request, NULL, -EIO);
+		return;
+	}
+	spdk_bs_open_blob(request->fs->blobstore, request->fs->metaBlobId,
+			  hfsMetaOpenBlobCb, request);
 }
 
 /* SPDK-thread task: resize the metadata blob to the needed cluster count. */
 static void hfsMetaDoResize(void *arg) {
-	Hfs *fs = (Hfs *)arg;
+	HfsMetaIoRequest *request = arg;
 
-	spdk_blob_resize(fs->metaBlob, fs->metaClusters, hfsMetaOpCb, fs);
+	if (hfsRequestCompletionInjected(request->result.operation)) {
+		hfsMetaOpCb(request, -EIO);
+		return;
+	}
+	spdk_blob_resize(request->blob, request->clusters, hfsMetaOpCb, request);
 }
 
 /* SPDK-thread task: write the serialized metadata into the blob. */
 static void hfsMetaDoWrite(void *arg) {
-	Hfs *fs = (Hfs *)arg;
+	HfsMetaIoRequest *request = arg;
 
-	spdk_blob_io_write(fs->metaBlob, fs->channel, fs->metaBuf,
-		0, fs->metaUnits, hfsMetaOpCb, fs);
+	if (hfsRequestCompletionInjected(request->result.operation)) {
+		hfsMetaOpCb(request, -EIO);
+		return;
+	}
+	spdk_blob_io_write(request->blob, request->fs->channel, request->buffer,
+		0, request->units, hfsMetaOpCb, request);
 }
 
 /* SPDK-thread task: read the metadata blob into the DMA buffer. */
 static void hfsMetaDoRead(void *arg) {
-	Hfs *fs = (Hfs *)arg;
+	HfsMetaIoRequest *request = arg;
 
-	spdk_blob_io_read(fs->metaBlob, fs->channel, fs->metaBuf,
-		0, fs->metaUnits, hfsMetaOpCb, fs);
+	if (hfsRequestCompletionInjected(request->result.operation)) {
+		hfsMetaOpCb(request, -EIO);
+		return;
+	}
+	spdk_blob_io_read(request->blob, request->fs->channel, request->buffer,
+		0, request->units, hfsMetaOpCb, request);
 }
 
 /* SPDK-thread task: flush blob metadata to the backing device. */
 static void hfsMetaDoSync(void *arg) {
-	Hfs *fs = (Hfs *)arg;
+	HfsMetaIoRequest *request = arg;
 
-	spdk_blob_sync_md(fs->metaBlob, hfsMetaOpCb, fs);
+	if (hfsRequestCompletionInjected(request->result.operation)) {
+		hfsMetaOpCb(request, -EIO);
+		return;
+	}
+	spdk_blob_sync_md(request->blob, hfsMetaOpCb, request);
+}
+
+/* Close one metadata blob and retire its request-local handle on success. */
+static void hfsMetaCloseBlobCb(void *arg, int bserrno) {
+	HfsMetaIoRequest *request = arg;
+
+	if (bserrno == 0) {
+		request->blob = NULL;
+	}
+	hfsRequestComplete(&request->result, bserrno, 0);
 }
 
 /* SPDK-thread task: close the metadata blob. */
 static void hfsMetaDoClose(void *arg) {
-	Hfs *fs = (Hfs *)arg;
+	HfsMetaIoRequest *request = arg;
 
-	spdk_blob_close(fs->metaBlob, hfsMetaOpCb, fs);
+	if (hfsRequestCompletionInjected(request->result.operation)) {
+		hfsMetaCloseBlobCb(request, -EIO);
+		return;
+	}
+	spdk_blob_close(request->blob, hfsMetaCloseBlobCb, request);
+}
+
+/* Run one metadata I/O stage and preserve the exact SPDK completion status. */
+static int hfsMetaWait(HfsMetaIoRequest *request, HfsRequestOperation operation,
+			       spdk_msg_fn startFn) {
+	hfsRequestInit(&request->result, operation);
+	return hfsRequestWait(&request->result, startFn, request);
+}
+
+/* Close a partially completed metadata request without replacing its failure. */
+static void hfsMetaCloseBestEffort(HfsMetaIoRequest *request) {
+	int savedErrno = errno;
+
+	if (request->blob != NULL) {
+		(void)hfsMetaWait(request, HFS_REQUEST_BLOB_CLOSE, hfsMetaDoClose);
+	}
+	errno = savedErrno;
 }
 
 /*
@@ -280,29 +480,41 @@ static int hfsMetaBlobWrite(Hfs *fs, const void *buf, size_t len) {
 	uint64_t ioUnitSize = fs->unitSize;
 	uint64_t needClusters = (len + clusterSize - 1) / clusterSize;
 	uint64_t needUnits = needClusters * clusterSize / ioUnitSize;
+	HfsMetaIoRequest request;
 	void *tmp;
 	int rc = -1;
 
 	tmp = spdk_malloc(needUnits * ioUnitSize, 0x1000, NULL,
 		SPDK_ENV_LCORE_ID_ANY, SPDK_MALLOC_DMA);
 	if (tmp == NULL) {
+		errno = ENOMEM;
 		return -1;
 	}
 	memset(tmp, 0, needUnits * ioUnitSize);
 	memcpy(tmp, buf, len);
 
-	fs->metaBuf = tmp;
-	fs->metaUnits = needUnits;
-	fs->metaClusters = needClusters;
+	memset(&request, 0, sizeof(request));
+	request.fs = fs;
+	request.buffer = tmp;
+	request.units = needUnits;
+	request.clusters = needClusters;
 
-	if (!waiter(globalThread, hfsMetaDoOpenBlob, fs, &fs->completion)) goto out;
-	if (!waiter(globalThread, hfsMetaDoResize, fs, &fs->completion)) goto out;
-	if (!waiter(globalThread, hfsMetaDoWrite, fs, &fs->completion)) goto out;
-	if (!waiter(globalThread, hfsMetaDoSync, fs, &fs->completion)) goto out;
-	if (!waiter(globalThread, hfsMetaDoClose, fs, &fs->completion)) goto out;
+	if (hfsMetaWait(&request, HFS_REQUEST_METADATA_OPEN,
+			hfsMetaDoOpenBlob) != 0) goto out;
+	if (hfsMetaWait(&request, HFS_REQUEST_BLOB_RESIZE,
+			hfsMetaDoResize) != 0) goto out;
+	if (hfsMetaWait(&request, HFS_REQUEST_METADATA_WRITE,
+			hfsMetaDoWrite) != 0) goto out;
+	if (hfsMetaWait(&request, HFS_REQUEST_BLOB_SYNC,
+			hfsMetaDoSync) != 0) goto out;
+	if (hfsMetaWait(&request, HFS_REQUEST_BLOB_CLOSE,
+			hfsMetaDoClose) != 0) goto out;
 
 	rc = 0;
 out:
+	if (rc != 0) {
+		hfsMetaCloseBestEffort(&request);
+	}
 	spdk_free(tmp);
 	return rc;
 }
@@ -317,37 +529,52 @@ static int hfsMetaBlobRead(Hfs *fs, void **outBuf, size_t *outLen) {
 	uint64_t ioUnitSize = fs->unitSize;
 	uint64_t clusters;
 	uint64_t units;
+	HfsMetaIoRequest request;
 	void *tmp;
 	int rc = -1;
 
-	if (!waiter(globalThread, hfsMetaDoOpenBlob, fs, &fs->completion)) {
+	if (outBuf == NULL || outLen == NULL) {
+		errno = EINVAL;
+		return -1;
+	}
+	*outBuf = NULL;
+	*outLen = 0;
+	memset(&request, 0, sizeof(request));
+	request.fs = fs;
+	if (hfsMetaWait(&request, HFS_REQUEST_METADATA_OPEN,
+			hfsMetaDoOpenBlob) != 0) {
 		return -1;
 	}
 
 	/* Derive the read size from the current blob size. */
-	clusters = spdk_blob_get_num_clusters(fs->metaBlob);
+	clusters = spdk_blob_get_num_clusters(request.blob);
 	units = clusters * clusterSize / ioUnitSize;
 	if (units == 0) {
-		waiter(globalThread, hfsMetaDoClose, fs, &fs->completion);
+		errno = EIO;
+		hfsMetaCloseBestEffort(&request);
 		return -1;
 	}
 
 	tmp = spdk_malloc(units * ioUnitSize, 0x1000, NULL,
 		SPDK_ENV_LCORE_ID_ANY, SPDK_MALLOC_DMA);
 	if (tmp == NULL) {
-		waiter(globalThread, hfsMetaDoClose, fs, &fs->completion);
+		errno = ENOMEM;
+		hfsMetaCloseBestEffort(&request);
 		return -1;
 	}
 
-	fs->metaBuf = tmp;
-	fs->metaUnits = units;
-	if (!waiter(globalThread, hfsMetaDoRead, fs, &fs->completion)) goto out;
-	if (!waiter(globalThread, hfsMetaDoClose, fs, &fs->completion)) goto out;
+	request.buffer = tmp;
+	request.units = units;
+	if (hfsMetaWait(&request, HFS_REQUEST_METADATA_READ,
+			hfsMetaDoRead) != 0) goto out;
+	if (hfsMetaWait(&request, HFS_REQUEST_BLOB_CLOSE,
+			hfsMetaDoClose) != 0) goto out;
 
 	*outBuf = tmp;
 	*outLen = units * ioUnitSize;
 	return 0;
 out:
+	hfsMetaCloseBestEffort(&request);
 	spdk_free(tmp);
 	return rc;
 }
@@ -390,6 +617,53 @@ static int hfsMetaBuildStableImage(Hfs *fs, uint64_t generation,
 	return 0;
 }
 
+/* Restore a validated v4 stable image after a failed in-memory mutation. */
+static int hfsMetaRestoreStableImage(Hfs *fs, const uint8_t *buf, size_t len) {
+	HfsMetaHeaderDisk header;
+	size_t inodeBytes;
+
+	if (buf == NULL || len < HFS_META_INODE_OFFSET) {
+		errno = EIO;
+		return -1;
+	}
+	memcpy(&header, buf, sizeof(header));
+	if (header.magic != HFS_META_MAGIC ||
+	    header.version != HFS_META_VERSION ||
+	    header.generation == 0 || header.count > HFS_MAX_INODES ||
+	    header.nextInodeId == 0) {
+		errno = EIO;
+		return -1;
+	}
+	inodeBytes = (size_t)header.count * sizeof(struct hfs_inode);
+	if (inodeBytes > len - HFS_META_INODE_OFFSET ||
+	    header.checksum != hfsMetaImageChecksum(
+		    &header, (const struct hfs_inode *)(buf + HFS_META_INODE_OFFSET),
+		    header.count)) {
+		errno = EIO;
+		return -1;
+	}
+	memcpy(fs->inodes, buf + HFS_META_INODE_OFFSET, inodeBytes);
+	fs->inodeCount = header.count;
+	fs->nextInodeId = header.nextInodeId;
+	fs->metaGeneration = header.generation;
+	fs->metaNeedsMigration = false;
+	fs->metaDirty = false;
+	return 0;
+}
+
+/* Reject another mutation once a failed transaction must be recovered by remount. */
+static int hfsMetaEnsureWritable(const Hfs *fs) {
+	if (fs == NULL) {
+		errno = EINVAL;
+		return -1;
+	}
+	if (fs->metaRecoveryRequired) {
+		errno = EIO;
+		return -1;
+	}
+	return 0;
+}
+
 /* Build the fixed-size intent after-image for a metadata transaction. */
 static void hfsMetaBuildIntent(Hfs *fs, uint64_t baseGeneration,
 				       uint64_t generation, uint32_t baseCount,
@@ -420,9 +694,15 @@ static void hfsMetaBuildIntent(Hfs *fs, uint64_t baseGeneration,
 	intent->checksum = hfsMetaIntentChecksum(intent);
 }
 
-/* Commit a metadata image with intent-before-data ordering. */
+/*
+ * Commit a metadata image with intent-before-data ordering.
+ *
+ * A data-write checkpoint is different from a namespace mutation: the write
+ * already returned success, so a failure before the intent becomes durable
+ * must retain its dirty in-memory inode for a later fsync retry.
+ */
 static int hfsMetaCommit(Hfs *fs, const uint32_t *indices,
-				 uint32_t indexCount) {
+				 uint32_t indexCount, bool retainRuntimeMutation) {
 	HfsMetaHeaderDisk oldHeader;
 	HfsMetaIntentDisk intent;
 	uint8_t *oldBuf = NULL;
@@ -434,12 +714,18 @@ static int hfsMetaCommit(Hfs *fs, const uint32_t *indices,
 	size_t pendingLen;
 	uint64_t generation;
 	int rc = -1;
+	int savedErrno;
+	bool intentPublished = false;
 
+	if (hfsMetaEnsureWritable(fs) != 0) {
+		return -1;
+	}
 	if (indexCount > HFS_META_INTENT_MAX_SLOTS) {
 		errno = E2BIG;
 		return -1;
 	}
 	if (fs->metaNeedsMigration && hfsMetaSaveAll(fs) != 0) {
+		fs->metaRecoveryRequired = true;
 		return -1;
 	}
 	if (fs->metaGeneration == UINT64_MAX) {
@@ -448,8 +734,11 @@ static int hfsMetaCommit(Hfs *fs, const uint32_t *indices,
 	}
 	generation = fs->metaGeneration == 0 ? 1 : fs->metaGeneration + 1;
 
-	if (hfsMetaBlobRead(fs, (void **)&oldBuf, &oldLen) != 0 ||
-	    oldLen < HFS_META_INODE_OFFSET) {
+	if (hfsMetaBlobRead(fs, (void **)&oldBuf, &oldLen) != 0) {
+		fs->metaRecoveryRequired = true;
+		goto out;
+	}
+	if (oldLen < HFS_META_INODE_OFFSET) {
 		errno = EIO;
 		goto out;
 	}
@@ -474,6 +763,7 @@ static int hfsMetaCommit(Hfs *fs, const uint32_t *indices,
 	if (hfsMetaBlobWrite(fs, pendingBuf, pendingLen) != 0) {
 		goto out;
 	}
+	intentPublished = true;
 	hfsMetaCrashPoint(1);
 
 	memcpy(stableBuf + HFS_META_HEADER_SIZE, &intent, sizeof(intent));
@@ -493,6 +783,22 @@ static int hfsMetaCommit(Hfs *fs, const uint32_t *indices,
 	fs->metaDirty = false;
 	rc = 0;
 out:
+	savedErrno = errno;
+	if (rc != 0) {
+		/*
+		 * A published intent can replay after a restart, so it must fail
+		 * closed. Before publication, namespace mutations roll memory back;
+		 * a dirty data checkpoint instead remains visible and retryable.
+		 */
+		if (retainRuntimeMutation && oldBuf != NULL && !intentPublished) {
+			fs->metaDirty = true;
+		} else if (oldBuf == NULL ||
+			   hfsMetaRestoreStableImage(fs, oldBuf, oldLen) != 0 ||
+			   intentPublished) {
+			fs->metaRecoveryRequired = true;
+		}
+		errno = savedErrno;
+	}
 	if (oldBuf != NULL) {
 		spdk_free(oldBuf);
 	}
@@ -508,6 +814,9 @@ int hfsMetaSaveAll(Hfs *fs) {
 	uint64_t generation = fs->metaGeneration == 0 ? 1 : fs->metaGeneration;
 	int rc;
 
+	if (hfsMetaEnsureWritable(fs) != 0) {
+		return -1;
+	}
 	if (hfsMetaBuildStableImage(fs, generation, &buf, &len) != 0) {
 		return -1;
 	}
@@ -931,6 +1240,9 @@ int hfsMetaMkdir(Hfs *fs, struct hfs_inode *parent, const char *name,
 	struct timespec ts;
 	uint32_t index;
 
+	if (hfsMetaEnsureWritable(fs) != 0) {
+		return -1;
+	}
 	if (parent->type != HFS_INODE_DIR) {
 		errno = ENOTDIR;
 		return -1;
@@ -961,7 +1273,7 @@ int hfsMetaMkdir(Hfs *fs, struct hfs_inode *parent, const char *name,
 	snprintf(dir->name, sizeof(dir->name), "%s", name);
 	index = fs->inodeCount - 1;
 
-	return hfsMetaCommit(fs, &index, 1);
+	return hfsMetaCommit(fs, &index, 1, false);
 }
 
 /*
@@ -973,6 +1285,9 @@ int hfsMetaRmdir(Hfs *fs, const char *path) {
 	uint32_t removedIndex = 0;
 	uint32_t i;
 
+	if (hfsMetaEnsureWritable(fs) != 0) {
+		return -1;
+	}
 	dir = hfsMetaResolvePath(fs, path);
 	if (dir == NULL) {
 		return -1;
@@ -1001,15 +1316,14 @@ int hfsMetaRmdir(Hfs *fs, const char *path) {
 	}
 
 	return removedIndex < fs->inodeCount
-		? hfsMetaCommit(fs, &removedIndex, 1)
-		: hfsMetaCommit(fs, NULL, 0);
+		? hfsMetaCommit(fs, &removedIndex, 1, false)
+		: hfsMetaCommit(fs, NULL, 0, false);
 }
 
 /* Async context for hfsMetaCreateFile (blob creation waiter). */
 struct hfs_meta_create_ctx {
 	Hfs *fs;
-	HfsCompletion completion;
-	int rc;
+	HfsRequestResult result;
 	spdk_blob_id blobId;
 };
 
@@ -1017,15 +1331,22 @@ struct hfs_meta_create_ctx {
 static void hfsMetaCreateFileCb(void *arg, spdk_blob_id blobId, int bserrno) {
 	struct hfs_meta_create_ctx *ctx = (struct hfs_meta_create_ctx *)arg;
 
+	if (bserrno != 0 || blobId == SPDK_BLOBID_INVALID) {
+		hfsRequestComplete(&ctx->result, bserrno != 0 ? bserrno : -EIO, 0);
+		return;
+	}
 	ctx->blobId = blobId;
-	ctx->rc = bserrno;
-	hfsRuntimeCompletionComplete(&ctx->completion);
+	hfsRequestComplete(&ctx->result, 0, 0);
 }
 
 /* SPDK-thread task: allocate a new data blob for a file. */
 static void hfsMetaDoCreateFileBlob(void *arg) {
 	struct hfs_meta_create_ctx *ctx = (struct hfs_meta_create_ctx *)arg;
 
+	if (hfsRequestCompletionInjected(ctx->result.operation)) {
+		hfsMetaCreateFileCb(ctx, SPDK_BLOBID_INVALID, -EIO);
+		return;
+	}
 	spdk_bs_create_blob(ctx->fs->blobstore, hfsMetaCreateFileCb, ctx);
 }
 
@@ -1039,7 +1360,12 @@ int hfsMetaCreateFile(Hfs *fs, struct hfs_inode *parent, const char *name,
 	struct hfs_inode *in;
 	struct timespec ts;
 	uint32_t index;
+	int savedErrno;
+	int rc;
 
+	if (hfsMetaEnsureWritable(fs) != 0) {
+		return -1;
+	}
 	if (parent->type != HFS_INODE_DIR) {
 		errno = ENOTDIR;
 		return -1;
@@ -1053,21 +1379,23 @@ int hfsMetaCreateFile(Hfs *fs, struct hfs_inode *parent, const char *name,
 		return -1;
 	}
 
-	ctx.rc = 0;
 	ctx.blobId = SPDK_BLOBID_INVALID;
 	ctx.fs = fs;
+	hfsRequestInit(&ctx.result, HFS_REQUEST_BLOB_CREATE);
 
-	if (!waiter(globalThread, hfsMetaDoCreateFileBlob, &ctx, &ctx.completion)) {
-		errno = ETIMEDOUT;
-		return -1;
-	}
-	if (ctx.rc != 0) {
-		errno = -ctx.rc;
+	if (hfsRequestWait(&ctx.result, hfsMetaDoCreateFileBlob, &ctx) != 0) {
 		return -1;
 	}
 
 	in = hfsMetaAddInode(fs);
 	if (in == NULL) {
+		HfsFile file = {
+			.fs = fs,
+			.blobId = ctx.blobId,
+		};
+
+		errno = ENOSPC;
+		(void)hfsDeleteBlobById(&file);
 		errno = ENOSPC;
 		return -1;
 	}
@@ -1084,7 +1412,21 @@ int hfsMetaCreateFile(Hfs *fs, struct hfs_inode *parent, const char *name,
 	snprintf(in->name, sizeof(in->name), "%s", name);
 	index = fs->inodeCount - 1;
 
-	return hfsMetaCommit(fs, &index, 1);
+	rc = hfsMetaCommit(fs, &index, 1, false);
+	if (rc == 0 || fs->metaRecoveryRequired) {
+		return rc;
+	}
+	/* The failed transaction was never published, so release its new blob. */
+	savedErrno = errno;
+	{
+		HfsFile file = {
+			.fs = fs,
+			.blobId = ctx.blobId,
+		};
+		(void)hfsDeleteBlobById(&file);
+	}
+	errno = savedErrno;
+	return -1;
 }
 
 /*
@@ -1097,6 +1439,9 @@ int hfsMetaRemoveFile(Hfs *fs, struct hfs_inode *parent, const char *name,
 	uint32_t removedIndex = 0;
 	uint32_t i;
 
+	if (hfsMetaEnsureWritable(fs) != 0) {
+		return -1;
+	}
 	in = hfsMetaFindByName(fs, parent->id, name);
 	if (in == NULL) {
 		errno = ENOENT;
@@ -1120,8 +1465,8 @@ int hfsMetaRemoveFile(Hfs *fs, struct hfs_inode *parent, const char *name,
 	}
 
 	return removedIndex < fs->inodeCount
-		? hfsMetaCommit(fs, &removedIndex, 1)
-		: hfsMetaCommit(fs, NULL, 0);
+		? hfsMetaCommit(fs, &removedIndex, 1, false)
+		: hfsMetaCommit(fs, NULL, 0, false);
 }
 
 /*
@@ -1141,6 +1486,9 @@ int hfsMetaRename(Hfs *fs, const char *oldPath, const char *newPath) {
 	const char *newLeaf;
 	uint32_t i;
 
+	if (hfsMetaEnsureWritable(fs) != 0) {
+		return -1;
+	}
 	src = hfsMetaResolvePath(fs, oldPath);
 	if (src == NULL) {
 		return -1;
@@ -1213,7 +1561,7 @@ int hfsMetaRename(Hfs *fs, const char *oldPath, const char *newPath) {
 		changedIndices[changedCount++] = dstIndex;
 	}
 
-	return hfsMetaCommit(fs, changedIndices, changedCount);
+	return hfsMetaCommit(fs, changedIndices, changedCount, false);
 }
 
 /* Update an inode's size and mtime, then persist the table. */
@@ -1221,21 +1569,27 @@ int hfsMetaSetSize(Hfs *fs, struct hfs_inode *in, uint64_t size) {
 	struct timespec ts;
 	uint32_t index = (uint32_t)(in - fs->inodes);
 
+	if (hfsMetaEnsureWritable(fs) != 0) {
+		return -1;
+	}
 	clock_gettime(CLOCK_REALTIME, &ts);
 	in->size = size;
 	in->mtimeNs = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 	in->ctimeNs = in->mtimeNs;
 
-	return hfsMetaCommit(fs, &index, 1);
+	return hfsMetaCommit(fs, &index, 1, false);
 }
 
 /* Persist a permission-bit change and refresh ctime. */
 int hfsMetaSetMode(Hfs *fs, struct hfs_inode *in, uint32_t mode) {
 	uint32_t index = (uint32_t)(in - fs->inodes);
 
+	if (hfsMetaEnsureWritable(fs) != 0) {
+		return -1;
+	}
 	in->mode = mode & 07777U;
 	in->ctimeNs = hfsMetaNowNs();
-	return hfsMetaCommit(fs, &index, 1);
+	return hfsMetaCommit(fs, &index, 1, false);
 }
 
 /* Persist one or both owner-id changes and refresh ctime. */
@@ -1243,6 +1597,9 @@ int hfsMetaSetOwner(Hfs *fs, struct hfs_inode *in, uint32_t uid,
 			    uint32_t gid, bool setUid, bool setGid) {
 	uint32_t index = (uint32_t)(in - fs->inodes);
 
+	if (hfsMetaEnsureWritable(fs) != 0) {
+		return -1;
+	}
 	if (!setUid && !setGid) {
 		return 0;
 	}
@@ -1253,7 +1610,7 @@ int hfsMetaSetOwner(Hfs *fs, struct hfs_inode *in, uint32_t uid,
 		in->gid = gid;
 	}
 	in->ctimeNs = hfsMetaNowNs();
-	return hfsMetaCommit(fs, &index, 1);
+	return hfsMetaCommit(fs, &index, 1, false);
 }
 
 /* Persist selected timestamps and refresh ctime for a metadata change. */
@@ -1261,6 +1618,9 @@ int hfsMetaSetTimes(Hfs *fs, struct hfs_inode *in, uint64_t atimeNs,
 			    uint64_t mtimeNs, bool setAtime, bool setMtime) {
 	uint32_t index = (uint32_t)(in - fs->inodes);
 
+	if (hfsMetaEnsureWritable(fs) != 0) {
+		return -1;
+	}
 	if (!setAtime && !setMtime) {
 		return 0;
 	}
@@ -1271,69 +1631,105 @@ int hfsMetaSetTimes(Hfs *fs, struct hfs_inode *in, uint64_t atimeNs,
 		in->mtimeNs = mtimeNs;
 	}
 	in->ctimeNs = hfsMetaNowNs();
-	return hfsMetaCommit(fs, &index, 1);
+	return hfsMetaCommit(fs, &index, 1, false);
 }
 
-/* Commit metadata changes for an inode selected by its stable id. */
+/* Commit a successful data-write checkpoint for an inode selected by id. */
 int hfsMetaCommitInode(Hfs *fs, uint64_t inodeId) {
 	struct hfs_inode *in = hfsMetaFindById(fs, inodeId);
 	uint32_t index;
 
+	if (hfsMetaEnsureWritable(fs) != 0) {
+		return -1;
+	}
 	if (in == NULL) {
 		errno = ENOENT;
 		return -1;
 	}
 	index = (uint32_t)(in - fs->inodes);
-	return hfsMetaCommit(fs, &index, 1);
+	return hfsMetaCommit(fs, &index, 1, true);
 }
 
-/* Completion callback for spdk_bs_get_super: records the super blob id. */
+/* Request state used while loading or creating the blobstore super blob. */
+typedef struct HfsMetaSuperRequest {
+	Hfs *fs;
+	spdk_blob_id blobId;
+	HfsRequestResult result;
+	int primaryRc;
+} HfsMetaSuperRequest;
+
+/* Complete one super-blob lookup and publish only a successful id. */
 static void hfsMetaGetSuperCb(void *arg, spdk_blob_id blobId, int bserrno) {
-	Hfs *fs = (Hfs *)arg;
+	HfsMetaSuperRequest *request = arg;
 
 	if (bserrno != 0) {
-		fs->metaBlobId = SPDK_BLOBID_INVALID;
-		hfsRuntimeCompletionComplete(&fs->completion);
+		request->fs->metaBlobId = SPDK_BLOBID_INVALID;
+		hfsRequestComplete(&request->result, bserrno, 0);
 		return;
 	}
-
-	fs->metaBlobId = blobId;
-	hfsRuntimeCompletionComplete(&fs->completion);
+	request->fs->metaBlobId = blobId;
+	hfsRequestComplete(&request->result, 0, 0);
 }
 
-/* Completion callback for spdk_bs_set_super. */
+/* Finish failed format cleanup without masking the original set-super error. */
+static void hfsMetaFormatDeleteCb(void *arg, int bserrno) {
+	HfsMetaSuperRequest *request = arg;
+
+	if (bserrno != 0) {
+		HFS_LOG_ERROR("metadata format cleanup failed blob=%"PRIu64" bserrno=%d",
+			      request->blobId, bserrno);
+	}
+	hfsRequestComplete(&request->result, request->primaryRc, 0);
+}
+
+/* Publish the metadata blob id only after it becomes the blobstore super blob. */
 static void hfsMetaSetSuperCb(void *arg, int bserrno) {
-	Hfs *fs = (Hfs *)arg;
+	HfsMetaSuperRequest *request = arg;
 
-	hfsRuntimeCompletionComplete(&fs->completion);
-}
-
-/* Completion callback for spdk_bs_create_blob: registers the new blob
- * as the blobstore super blob. */
-static void hfsMetaCreateBlobCb(void *arg, spdk_blob_id blobId, int bserrno) {
-	Hfs *fs = (Hfs *)arg;
-
-	if (bserrno != 0) {
-		hfsRuntimeCompletionComplete(&fs->completion);
+	if (bserrno == 0) {
+		request->fs->metaBlobId = request->blobId;
+		hfsRequestComplete(&request->result, 0, 0);
 		return;
 	}
+	request->primaryRc = bserrno;
+	spdk_bs_delete_blob(request->fs->blobstore, request->blobId,
+			    hfsMetaFormatDeleteCb, request);
+}
 
-	fs->metaBlobId = blobId;
-	spdk_bs_set_super(fs->blobstore, blobId, hfsMetaSetSuperCb, fs);
+/* Create one metadata blob and register it as the blobstore super blob. */
+static void hfsMetaCreateBlobCb(void *arg, spdk_blob_id blobId, int bserrno) {
+	HfsMetaSuperRequest *request = arg;
+
+	if (bserrno != 0 || blobId == SPDK_BLOBID_INVALID) {
+		hfsRequestComplete(&request->result,
+				   bserrno != 0 ? bserrno : -EIO, 0);
+		return;
+	}
+	request->blobId = blobId;
+	spdk_bs_set_super(request->fs->blobstore, blobId, hfsMetaSetSuperCb,
+			  request);
 }
 
 /* SPDK-thread task: create the metadata blob (first-time format). */
 static void hfsMetaDoFormat(void *arg) {
-	Hfs *fs = (Hfs *)arg;
+	HfsMetaSuperRequest *request = arg;
 
-	spdk_bs_create_blob(fs->blobstore, hfsMetaCreateBlobCb, fs);
+	if (hfsRequestCompletionInjected(request->result.operation)) {
+		hfsMetaCreateBlobCb(request, SPDK_BLOBID_INVALID, -EIO);
+		return;
+	}
+	spdk_bs_create_blob(request->fs->blobstore, hfsMetaCreateBlobCb, request);
 }
 
 /* SPDK-thread task: fetch the blobstore super blob id. */
 static void hfsMetaDoGetSuper(void *arg) {
-	Hfs *fs = (Hfs *)arg;
+	HfsMetaSuperRequest *request = arg;
 
-	spdk_bs_get_super(fs->blobstore, hfsMetaGetSuperCb, fs);
+	if (hfsRequestCompletionInjected(request->result.operation)) {
+		hfsMetaGetSuperCb(request, SPDK_BLOBID_INVALID, -EIO);
+		return;
+	}
+	spdk_bs_get_super(request->fs->blobstore, hfsMetaGetSuperCb, request);
 }
 
 /*
@@ -1341,7 +1737,17 @@ static void hfsMetaDoGetSuper(void *arg) {
  * Returns -1 with errno=ENOENT if the storage has never been formatted.
  */
 int hfsMetaLoad(Hfs *fs) {
-	if (!waiter(globalThread, hfsMetaDoGetSuper, fs, &fs->completion)) {
+	HfsMetaSuperRequest request;
+
+	if (fs == NULL) {
+		errno = EINVAL;
+		return -1;
+	}
+	memset(&request, 0, sizeof(request));
+	request.fs = fs;
+	fs->metaBlobId = SPDK_BLOBID_INVALID;
+	hfsRequestInit(&request.result, HFS_REQUEST_METADATA_GET_SUPER);
+	if (hfsRequestWait(&request.result, hfsMetaDoGetSuper, &request) != 0) {
 		return -1;
 	}
 
@@ -1359,7 +1765,18 @@ int hfsMetaLoad(Hfs *fs) {
  * blobstore super blob so it can be found on the next mount.
  */
 int hfsMetaFormat(Hfs *fs) {
-	if (!waiter(globalThread, hfsMetaDoFormat, fs, &fs->completion)) {
+	HfsMetaSuperRequest request;
+
+	if (fs == NULL) {
+		errno = EINVAL;
+		return -1;
+	}
+	memset(&request, 0, sizeof(request));
+	request.fs = fs;
+	request.blobId = SPDK_BLOBID_INVALID;
+	fs->metaBlobId = SPDK_BLOBID_INVALID;
+	hfsRequestInit(&request.result, HFS_REQUEST_METADATA_FORMAT);
+	if (hfsRequestWait(&request.result, hfsMetaDoFormat, &request) != 0) {
 		return -1;
 	}
 
@@ -1385,7 +1802,14 @@ int hfsMetaInit(Hfs *fs) {
 	}
 
 	if (hfsMetaLoad(fs) == 0) {
-		return hfsMetaLoadAll(fs);
+		if (hfsMetaLoadAll(fs) != 0) {
+			return -1;
+		}
+		/* A prior committed unlink/rename may have left a retryable blob. */
+		if (hfsMetaReclaimUnreachable(fs) != 0) {
+			HFS_LOG_ERROR("mount reclaim deferred: %s", strerror(errno));
+		}
+		return 0;
 	}
 	if (errno != ENOENT) {
 		free(fs->inodes);

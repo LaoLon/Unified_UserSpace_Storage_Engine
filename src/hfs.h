@@ -18,6 +18,41 @@ typedef struct HfsCompletion {
 	atomic_int state;
 } HfsCompletion;
 
+/* Operations recorded by one request-private SPDK result object. */
+typedef enum HfsRequestOperation {
+	HFS_REQUEST_BLOB_CREATE,
+	HFS_REQUEST_BLOB_OPEN,
+	HFS_REQUEST_BLOB_CLOSE,
+	HFS_REQUEST_BLOB_DELETE,
+	HFS_REQUEST_BLOB_RESIZE,
+	HFS_REQUEST_BLOB_READ,
+	HFS_REQUEST_BLOB_WRITE,
+	HFS_REQUEST_BLOB_UNMAP,
+	HFS_REQUEST_BLOB_WRITE_ZEROES,
+	HFS_REQUEST_BLOB_SYNC,
+	HFS_REQUEST_BDEV_FLUSH,
+	HFS_REQUEST_BDEV_FLUSH_POST_COMMIT,
+	HFS_REQUEST_METADATA_OPEN,
+	HFS_REQUEST_METADATA_READ,
+	HFS_REQUEST_METADATA_WRITE,
+	HFS_REQUEST_METADATA_FORMAT,
+	HFS_REQUEST_METADATA_GET_SUPER,
+	HFS_REQUEST_MOUNT,
+	HFS_REQUEST_UMOUNT,
+	HFS_REQUEST_CAPACITY,
+} HfsRequestOperation;
+
+/* Completion result owned by exactly one synchronous SPDK request. */
+typedef struct HfsRequestResult {
+	HfsCompletion completion;
+	HfsRequestOperation operation;
+	uint64_t requestId;
+	uint64_t completedUnits;
+	int submitRc;
+	int completionRc;
+	int bserrno;
+} HfsRequestResult;
+
 /* Maximum size of a single I/O buffer (bytes). */
 #define BUFFER_SIZE		512
 /* Maximum length of a file name including the trailing NUL. */
@@ -47,21 +82,15 @@ typedef struct Hfs {
 	uint64_t metaGeneration;			/* committed metadata generation */
 	bool metaNeedsMigration;			/* old metadata layout needs upgrade */
 	bool metaDirty;			/* in-memory inode fields need commit */
+	bool metaRecoveryRequired;		/* uncertain transaction requires remount */
 
 	/* Request-local data I/O synchronization and DMA buffer pool. */
 	pthread_rwlock_t ioLock;		/* shared aligned I/O/RMW lock */
 	pthread_mutex_t resizeLock;		/* serializes blob growth decisions */
 	struct hfs_io_pool *ioPool;		/* bounded DMA buffer pool */
 
-	/* Scratch state for metadata blob I/O (waiter chain). */
-	struct spdk_blob *metaBlob;		/* opened metadata blob */
-	void *metaBuf;				/* DMA buffer for read/write */
-	uint64_t metaUnits;			/* io units to transfer */
-	uint64_t metaClusters;			/* target cluster count */
 
 	struct spdk_io_channel *channel;	/* blobstore I/O channel */
-	HfsCompletion completion;			/* mount/metadata request completion */
-	int operationRc;			/* result of the current mount operation */
 } Hfs;
 
 /* Operation table for mount/umount (reserved for future use). */
@@ -84,9 +113,6 @@ typedef struct HfsFile {
 
 	uint64_t offset;			/* sequential I/O position */
 
-	HfsCompletion completion;			/* open/close/flush request completion */
-	struct spdk_bs_dev_cb_args flushArgs;	/* fallback blobstore flush arguments */
-	int operationRc;			/* result of the current file operation */
 } HfsFile;
 
 /* Operation table for file ops (reserved for future use). */
@@ -127,5 +153,7 @@ int hfsClose(HfsFile *file);
 int hfsDeleteBlobById(HfsFile *file);
 /* Flush file metadata and the backing bdev for fsync semantics. */
 int hfsSync(HfsFile *file);
+/* Flush the final fsync barrier after an inode metadata transaction. */
+int hfsSyncPostCommit(HfsFile *file);
 
 #endif /* HFS_H */

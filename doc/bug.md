@@ -6,22 +6,19 @@ Bug 等级：**致命 > 严重 > 一般**。
 
 ---
 
-## 状态汇总（截至 2026-09-05）
+## 状态汇总（截至 2026-09-06）
 
 ### 已修复
 
-1–5、8–10、10b、11–43。包括已由后续 shard 修复的历史记录；条目中的原始“遗留”描述保留用于复盘，当前状态以本汇总和条目状态字段为准。
+1–5、8–10、10b、11–43、45–47、51、52。包括已由后续 shard 修复的历史记录；条目中的原始“遗留”描述保留用于复盘，当前状态以本汇总和条目状态字段为准。
 
 ### 未修复
 
-6、7、44–50。
+6、7、44、48–50。
 
 - 6：SPDK io channel 释放的 `wrong_thread` 日志仍存在，当前仅接受该 cosmetic 问题。
 - 7：fork/exec 子进程共享 HFS 运行时仍是架构限制。
 - 44：MariaDB 正常退出时 `ib_buffer_pool.incomplete` 创建失败，待进一步定位路径语义和 teardown 时序。
-- 45：文件缩短后再扩展会读回旧数据，违反 truncate 零填充语义并可能泄露历史内容。
-- 46：覆盖写不推进 mtime，普通写入后的 inode 时间语义不完整。
-- 47：statfs/statvfs 混用文件 cluster 数和文件系统容量，且 free 值不刷新，容量结果错误。
 - 48：多条 SPDK 异步回调只唤醒 waiter、不传播 bserrno，失败可能被报告为成功。
 - 49：元数据事务失败不回滚内存 after-image，创建失败路径还可能遗留孤儿 blob/占位 fd。
 - 50：fsync 在 inode 元数据事务之前执行设备 flush，事务写入后没有持久化屏障，掉电语义不完整。
@@ -663,9 +660,9 @@ Bug 等级：**致命 > 严重 > 一般**。
 - **验证**：数据契约脚本断言总容量大于 512 MiB、`f_blocks` 在分配/删除前后不变、写入两个
   cluster 后 `f_bfree` 下降、unlink 后 `f_bfree` 回升；VM 通过。
 
-### 48. SPDK 异步操作错误被 waiter 当作成功（待修复，严重级）
+### 48. SPDK 异步操作错误被 waiter 当作成功（执行中，严重级）
 
-- **状态**：未修复
+- **状态**：执行中；请求私有错误传播已完成，真实 error-bdev 完整矩阵待补
 - **时间**：2026-09-05（架构与性能审查）
 - **等级**：严重（底层 I/O/元数据失败可能向数据库返回成功，破坏错误处理与持久化保证）
 - **现象**：静态审查发现 `hfsMetaOpCb` 忽略 `bserrno`，只完成共享 completion；因此
@@ -677,13 +674,20 @@ Bug 等级：**致命 > 严重 > 一般**。
   `Hfs::completion`/`HfsFile::completion`，但没有一致保存错误码。
 - **根因**：completion 只表达“回调已发生”，没有统一携带操作结果；部分旧 callback 在请求级
   rc 模型引入后未迁移。
-- **后续**：所有异步操作使用独立 request context，callback 必须先保存 rc 再 complete；
-  public API 统一把 SPDK 负 errno 映射到 errno。用 error bdev/故障注入覆盖 open、resize、
-  data/meta write、sync、close、delete 和 unload。
+- **当前进展**：shard-37 增加 `HfsRequestResult`（operation、request id、submit rc、
+  completion rc、`bserrno`、完成 unit 数），并迁移 blob 生命周期、data I/O、resize、metadata
+  I/O、mount/unmount 和容量采样。callback 在唤醒 waiter 前写入该对象；POSIX 层统一将 SPDK rc
+  映射为 errno。`HFS_TEST_FAIL_SUBMIT` 覆盖提交拒绝，`HFS_TEST_FAIL_COMPLETE` 在 owner thread
+  调用对应 callback 的 EIO 分支，覆盖 blob open/sync/close、read/write/resize、metadata
+  open/write 和 statvfs 容量采样；VM 回归通过。新增 `error_bdev_injection_test.sh` 以 AIO 上的
+  `EE_Aio0` error vbdev 注入一次真实 bdev flush failure，验证 `fsync` 返回 `EIO`，而已写数据仍可读。
+- **剩余工作**：AIO blobstore 的 `spdk_blob_io_unmap` 不会下发底层 bdev UNMAP，故 error vbdev 无法
+  观察该逻辑操作；需在支持 unmap 的后端或专用 SPDK 测试环境完成 unmap/write-zeroes、blob delete 和
+  unload 的真实 completion 矩阵，并核对 request 统计闭合。
 
-### 49. 元数据提交失败不回滚内存状态并可能泄露资源（待修复，严重级）
+### 49. 元数据提交失败不回滚内存状态并可能泄露资源（执行中，严重级）
 
-- **状态**：未修复
+- **状态**：执行中；metadata undo、已提交删除的重挂载回收与 close 延迟回收已完成
 - **时间**：2026-09-05（架构与性能审查）
 - **等级**：严重（API 返回失败后，同进程仍可能看见未持久化的新命名空间或错误 size）
 - **现象**：静态审查发现 mkdir/create/remove/rename/set-size 均先原地修改 `fs->inodes` 和
@@ -695,13 +699,22 @@ Bug 等级：**致命 > 严重 > 一般**。
   对照，磁盘事务并不能修复仍在运行进程的内存状态。
 - **根因**：把“先改内存、后持久化”的 happy-path 实现误当成完整短事务，缺少提交前 staging
   和失败时的资源补偿。
-- **后续**：在私有 transaction/staging 对象中构造 after-image，磁盘提交成功后再 publish；
-  或保留精确 undo image 并在失败时回滚。新建 blob、placeholder fd、open blob handle 均纳入
-  单一所有权状态机，并做每个失败点的 leak/一致性注入测试。
+- **当前进展**：metadata commit 保留稳定镜像，失败时恢复运行中 inode 表；若 intent 已发布或
+  无法恢复，则置 `metaRecoveryRequired` 并拒绝后续可写操作，强制重新挂载恢复。create 的 data
+  blob 与 format 的 super-blob 都有失败 cleanup；final close 失败会返回原始 errno、关闭内核
+  placeholder，并保留 open description/orphan 在 teardown 前重试。挂载在加载并重放元数据后于 SPDK
+  owner thread 遍历 blobstore，收集除 metadata blob 和所有现存 FILE inode blob 以外的 blob，再逐个
+  删除并刷新空闲 cluster；这样已提交 unlink/rename 的后续 delete 失败会在下一次挂载可重复回收，删除
+  再失败只记录并留待下次挂载重试。注入脚本连续 1,000 次 metadata-write 失败后验证目录项、空闲
+  cluster 和重挂载状态均回到基线，并新增已提交 unlink 的 blob-delete 失败、跨进程重挂载后容量恢复断言。
+  对 `PUNCH_HOLE`，若 accelerated `WRITE_ZEROES` callback 失败，会改走 DMA 分块写零；只有可观察的
+  hole 内容最终为零才返回成功，专项注入已验证该 fallback。
+- **剩余工作**：用真实 error-bdev 验证 unmap 后 DMA fallback 也失败时的 PUNCH_HOLE 行为，并覆盖
+  intent/stable/clear 的真实设备 completion 错误。
 
-### 50. fsync 的 inode 元数据写入位于最后一次设备 flush 之后（待修复，严重级）
+### 50. fsync 的 inode 元数据写入位于最后一次设备 flush 之后（执行中，严重级）
 
-- **状态**：未修复
+- **状态**：执行中；双 barrier 顺序已实现，掉电模型与 group commit 待完成
 - **时间**：2026-09-05（架构与性能审查）
 - **等级**：严重（带易失写缓存的 AIO/NVMe 后端上，fsync 返回后 inode size/mtime 仍可能掉电丢失）
 - **现象**：代码顺序为 `hfsSync(file)` 执行 blob metadata sync 和 bdev flush，随后
@@ -713,8 +726,75 @@ Bug 等级：**致命 > 严重 > 一般**。
 - **根因**：当前顺序只保证数据先于 inode 更新提交到队列，没有给 inode 事务阶段建立持久化
   barrier；intent 的三个阶段也没有用 flush/FUA 隔开，恢复协议只在进程崩溃/page-cache 场景
   经过验证。
-- **后续**：重新定义 power-fail 模型和 barrier：data/blob mapping 落盘 → flush；intent 落盘
+- **当前进展**：`hfs_lib_fsync` 现在固定执行 data blob sync + 首次 bdev flush →
+  `hfsMetaCommitInode` → data blob sync + 第二次 bdev flush。第二个 flush 覆盖刚提交的 metadata
+  blob intent/stable/clear 写入；任何阶段失败都向 `fsync` 返回错误。注入回归新增 metadata-write
+  失败断言：数据仍可读、首次 `fsync` 返回 `EIO`，清除故障后的下一次 `fsync` 完成 metadata 提交与
+  post-commit barrier。`HFS_DURABILITY_TRACE_PATH` 默认关闭；启用时记录 data barrier、metadata
+  commit 和 post-commit barrier 的序号、inode 与结果。`durability_barrier_test.sh` 已在 VM 断言
+  `fsync` 和 `fdatasync` 的成功路径偏序；`io_error_injection_test.sh` 额外注入 post-commit
+  bdev flush failure，断言 `fsync` 返回 `EIO`、数据仍可见且后续 barrier retry 可成功。
+  `durability_crash_recovery_test.sh` 用测试专用 hook 在首个 barrier、metadata transaction、最终
+  barrier 后分别终止进程；新进程确认前两个未应答操作只恢复为完整旧镜像或完整新镜像，且最终
+  barrier 后的 inode size 与 payload 一同可恢复。该测试仅验证进程崩溃协议，未将 VM/AIO 文件缓存
+  误称为物理掉电模拟。
+  2026-09-06 VM 上强制 Make/CMake、核心注入回归、MariaDB 完整恢复流程与 RocksDB 跨进程/WAL/
+  一致性检查均通过。
+- **剩余工作**：重新定义 power-fail 模型和 barrier：data/blob mapping 落盘 → flush；intent 落盘
   → flush；stable image/log commit 落盘 → flush；clear 可延迟批量完成。实现 group commit 减少
   flush 数，并用 SPDK error bdev、可控 write-cache/掉电模拟验证 fsync/fdatasync/目录 fsync。
+
+### 51. shard-37 metadata 格式化清理回调缺少日志头（已修复，一般级）
+
+- **状态**：已修复
+- **时间**：2026-09-05（shard-37 开发）
+- **等级**：一般（新增错误路径无法链接，阻塞共享库与测试二进制构建）
+- **现象**：首次 VM 强制执行 `make -B app lib` 时，链接器报告
+  `undefined reference to HFS_LOG_ERROR`，定位到 metadata super-blob format 失败后的 cleanup callback。
+- **排查过程**：编译阶段没有报语法错误，但 `hfs_meta.c` 对日志宏的调用被编译器警告为隐式
+  声明；链接阶段将其视为外部函数引用。对比同文件的 include 列表确认缺少 `hfs_log.h`。
+- **根因**：新增故障清理回调复用了项目日志宏，却没有同步引入宏定义所在的头文件。
+- **修复**：在 `src/hfs_meta.c` 显式包含 `hfs_log.h`；重新执行 VM 强制 Make/CMake 构建与回归。
+
+### 52. fsync 的 metadata 失败回滚了已成功 pwrite 的运行时 inode（已修复，严重级）
+
+- **状态**：已修复；VM 定向与全量回归均通过
+- **时间**：2026-09-06（shard-37/38 衔接开发）
+- **等级**：严重（用户写入已返回成功，却会在同一进程被逻辑 EOF 隐藏）
+- **现象**：先使一个文件的 `fsync` 在 blob sync 阶段失败，再成功 `pwrite(fd, "meta", 4, 0)`；注入
+  `metadata-write` completion failure 后 `fsync` 正确返回 `EIO`，但紧随其后的 `pread(fd, 4, 0)` 返回
+  空串而非 `meta`。data blob 中的内容仍存在，却因 inode size 被回滚为 0 而不可见。
+- **排查过程**：`pwrite` 已将运行时 inode size 置为 4 并标记 `metaDirty`，首次 data sync 成功；故障发生在
+  `hfsMetaCommit` 写入 pending intent 之前。随后该函数的通用失败处理无条件通过 stable image 恢复整个
+  inode 表，把刚刚成功写入但尚未持久化的 size 覆盖成旧的 0。`io_error_injection_test.sh` 的 metadata
+  failure 回归稳定复现该行为。
+- **根因**：通用 metadata transaction rollback 没有区分“调用尚未成功的 namespace mutation”和“已向用户
+  报告成功、仅由 fsync checkpoint 持久化的 data mutation”；两者错误地共享内存回滚策略。
+- **修复**：为 `hfsMetaCommit` 增加运行时 mutation 保留标志。仅 `hfsMetaCommitInode` 在 intent 尚未发布时
+  保留 dirty inode 和 `metaDirty`，使数据继续对当前进程可见并允许后续 `fsync` 重试；mkdir/create/unlink/
+  rename/setattr 等未成功对外提交的 namespace mutation 仍恢复 stable image。若 intent 已发布，仍设置
+  `metaRecoveryRequired` 并拒绝继续写入，以恢复协议为准。
+- **验证**：`scripts/db/io_error_injection_test.sh` 覆盖 metadata-write 注入后的可见性与故障清除后的
+  `fsync` 重试；2026-09-06 VM 强制 Make/CMake Release、POSIX 数据契约、metadata transaction、fd
+  lifecycle、fast I/O、错误注入和真实 error-bdev flush 回归全部通过。
+
+### 53. CMake 链接遗漏 lz4 系统库（已修复，一般级）
+
+- **状态**：已修复
+- **时间**：2026-09-06（shard-37/38 VM 验证）
+- **等级**：一般（不影响 Makefile 构建，但 CMake Release 目标无法链接）
+- **现象**：VM 上 `make -B app lib` 成功，而 `cmake --build build/cmake-release --parallel 4`
+  在链接 `spdk-hfs` 时报告 `libspdk_accel.a(accel_sw.o)` 对
+  `LZ4_createStream`、`LZ4_compress_fast_continue` 等符号的 `undefined reference`。
+- **排查过程**：对比 Makefile 与 CMake 的最终链接命令。Makefile 命令包含 `-llz4`，CMake 的
+  `HFS_SYS_LIBS` 只列出 `numa/dl/rt/uuid/ssl/crypto/m` 及 FUSE/AIO 库，没有 lz4；SPDK
+  `accel_sw` 静态库因此无法解析 LZ4 符号。
+- **根因**：两套构建系统的系统库清单没有保持一致，新增/启用 SPDK software accel 后 CMake
+  路径漏同步 lz4 依赖。
+- **修复**：将 `lz4` 加入 `CMakeLists.txt` 的 `HFS_SYS_LIBS`，保持其位于 SPDK/DPDK 静态库
+  之后，供链接器解析静态库依赖。
+- **验证**：2026-09-06 在 VM 上重新执行 `make -B app lib`、CMake Release、核心可靠性回归、
+  MariaDB/MySQL 持久化恢复、RocksDB WAL/一致性恢复和数据库性能基准，全部通过；CMake
+  Release 最终链接命令已包含 `-llz4`。
 
 ## 通用经验总结

@@ -13,6 +13,7 @@
 #include <unistd.h>
 
 #include "hfs.h"
+#include "hfs_durability.h"
 #include "hfs_fd.h"
 #include "hfs_internal.h"
 #include "hfs_io.h"
@@ -26,6 +27,8 @@
 static pthread_rwlock_t g_metaLock = PTHREAD_RWLOCK_INITIALIZER;
 /* Serializes append writes across independent open-file descriptions. */
 static pthread_mutex_t g_appendLock = PTHREAD_MUTEX_INITIALIZER;
+/* Protects final descriptions whose SPDK close or orphan delete must retry. */
+static pthread_mutex_t g_deferredCloseLock = PTHREAD_MUTEX_INITIALIZER;
 
 /* Count metadata read-lock acquisitions without extending lock ownership. */
 static void hfsMetaReadLock(void) {
@@ -43,6 +46,8 @@ static void hfsMetaWriteLock(void) {
 static Hfs *g_fs;
 /* Exclusive host-side lock for the configured blobstore backend. */
 static int g_backendLockFd = -1;
+/* Last-reference descriptions retained until close and orphan deletion succeed. */
+static HfsOpenFile *g_deferredCloseFiles;
 
 /* Return the configured backend name for lock naming and diagnostics. */
 static const char *hfs_backend_name(void) {
@@ -61,28 +66,39 @@ static uint64_t hfs_now_ns(void) {
 	return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
 
+/* Stop at a requested fsync boundary to test recovery without library teardown. */
+static void hfsFsyncCrashPoint(int point) {
+	const char *step = getenv("HFS_FSYNC_CRASH_STEP");
+
+	if (step != NULL && atoi(step) == point) {
+		_exit(210 + point);
+	}
+}
+
 /* Request state used to sample blobstore capacity on the SPDK owner thread. */
 typedef struct HfsCapacityRequest {
 	Hfs *fs;
 	uint64_t freeClusters;
-	int operationRc;
-	HfsCompletion completion;
+	HfsRequestResult result;
 } HfsCapacityRequest;
 
 /* Refresh the free-cluster cache without touching blobstore state from callers. */
 static void hfsDoRefreshCapacity(void *arg) {
 	HfsCapacityRequest *request = arg;
 
+	if (hfsRequestCompletionInjected(request->result.operation)) {
+		hfsRequestComplete(&request->result, -EIO, 0);
+		return;
+	}
 	if (request->fs == NULL || request->fs->blobstore == NULL) {
-		request->operationRc = -ENODEV;
+		hfsRequestComplete(&request->result, -ENODEV, 0);
 	} else {
 		request->freeClusters =
 			spdk_bs_free_cluster_count(request->fs->blobstore);
 		atomic_store_explicit(&request->fs->freeClusterCount,
 				      request->freeClusters, memory_order_relaxed);
-		request->operationRc = 0;
+		hfsRequestComplete(&request->result, 0, 0);
 	}
-	hfsRuntimeCompletionComplete(&request->completion);
 }
 
 /* Sample current blobstore capacity before reporting POSIX filesystem stats. */
@@ -95,13 +111,8 @@ static int hfsRefreshCapacity(Hfs *fs) {
 	}
 	memset(&request, 0, sizeof(request));
 	request.fs = fs;
-	request.operationRc = -EIO;
-	if (!waiter(globalThread, hfsDoRefreshCapacity, &request,
-		    &request.completion)) {
-		return -1;
-	}
-	if (request.operationRc != 0) {
-		errno = request.operationRc < 0 ? -request.operationRc : EIO;
+	hfsRequestInit(&request.result, HFS_REQUEST_CAPACITY);
+	if (hfsRequestWait(&request.result, hfsDoRefreshCapacity, &request) != 0) {
 		return -1;
 	}
 	return 0;
@@ -231,35 +242,101 @@ struct hfs_dir {
 };
 
 /* Delete a deferred blob after every open description for its inode is gone. */
-static void hfs_delete_orphan(HfsOrphan *orphan) {
+static int hfs_delete_orphan(HfsOrphan *orphan) {
 	HfsFile file;
 
 	if (orphan == NULL) {
-		return;
+		return 0;
+	}
+	if (g_fs == NULL) {
+		errno = ENODEV;
+		return -1;
 	}
 	memset(&file, 0, sizeof(file));
 	file.fs = g_fs;
 	file.blobId = orphan->blobId;
-	if (g_fs != NULL && !hfsDeleteBlobById(&file)) {
+	if (!hfsDeleteBlobById(&file)) {
 		HFS_LOG_ERROR("deferred blob delete failed inode=%"PRIu64,
 			      orphan->inodeId);
+		return -1;
 	}
 	hfsFdOrphanDestroy(orphan);
+	return 0;
 }
 
-/* Release an acquired description and close its blob at the final reference. */
-static void hfs_release_open_file(HfsOpenFile *openFile) {
-	HfsOrphan *readyOrphan = NULL;
-
-	if (openFile == NULL || !hfsFdRelease(openFile, &readyOrphan)) {
+/* Queue a last-reference description until its SPDK resources can be retried. */
+static void hfs_defer_open_file(HfsOpenFile *openFile, HfsOrphan *orphan) {
+	if (openFile == NULL) {
 		return;
 	}
-	if (openFile->file != NULL) {
-		(void)hfsClose(openFile->file);
+	openFile->orphan = orphan;
+	pthread_mutex_lock(&g_deferredCloseLock);
+	openFile->deferredNext = g_deferredCloseFiles;
+	g_deferredCloseFiles = openFile;
+	pthread_mutex_unlock(&g_deferredCloseLock);
+}
+
+/* Retry retained final descriptions before the blobstore unmounts. */
+static void hfs_retry_deferred_closes(void) {
+	HfsOpenFile *openFile;
+	HfsOrphan *orphan;
+
+	for (;;) {
+		pthread_mutex_lock(&g_deferredCloseLock);
+		openFile = g_deferredCloseFiles;
+		if (openFile != NULL) {
+			g_deferredCloseFiles = openFile->deferredNext;
+			openFile->deferredNext = NULL;
+		}
+		pthread_mutex_unlock(&g_deferredCloseLock);
+		if (openFile == NULL) {
+			return;
+		}
+		if (openFile->file != NULL && !hfsClose(openFile->file)) {
+			HFS_LOG_ERROR("deferred blob close failed inode=%"PRIu64,
+				      openFile->inodeId);
+			hfs_defer_open_file(openFile, openFile->orphan);
+			return;
+		}
 		free(openFile->file);
+		openFile->file = NULL;
+		orphan = openFile->orphan;
+		if (hfs_delete_orphan(orphan) != 0) {
+			HFS_LOG_ERROR("deferred orphan retry failed inode=%"PRIu64,
+				      openFile->inodeId);
+			hfs_defer_open_file(openFile, orphan);
+			return;
+		}
+		openFile->orphan = NULL;
+		hfsFdDestroy(openFile);
 	}
+}
+
+/* Release an acquired description and retain failed final cleanup for retry. */
+static int hfs_release_open_file(HfsOpenFile *openFile) {
+	HfsOrphan *readyOrphan = NULL;
+	int savedErrno;
+
+	if (openFile == NULL || !hfsFdRelease(openFile, &readyOrphan)) {
+		return 0;
+	}
+	if (openFile->file != NULL && !hfsClose(openFile->file)) {
+		savedErrno = errno;
+		hfs_defer_open_file(openFile, readyOrphan);
+		errno = savedErrno;
+		return -1;
+	}
+	free(openFile->file);
+	openFile->file = NULL;
+	if (hfs_delete_orphan(readyOrphan) != 0) {
+		savedErrno = errno;
+		hfs_defer_open_file(openFile, readyOrphan);
+		errno = savedErrno;
+		return -1;
+	}
+	openFile->orphan = NULL;
 	hfsFdDestroy(openFile);
-	hfs_delete_orphan(readyOrphan);
+	return 0;
 }
 
 /* Acquire an HFS description and enforce file-vs-directory operation rules. */
@@ -460,6 +537,7 @@ int hfs_lib_init(void) {
 	}
 	hfsMetaWriteLock();
 	hfsStatsInit();
+	hfsDurabilityTraceInit();
 	if (g_fs != NULL) {
 		pthread_rwlock_unlock(&g_metaLock);
 		return 0;
@@ -584,6 +662,7 @@ void hfs_lib_fini(void) {
 	}
 	hfsMetaWriteLock();
 	if (g_fs == NULL) {
+		hfsDurabilityTraceFini();
 		hfsStatsFini();
 		pthread_rwlock_unlock(&g_metaLock);
 		return;
@@ -594,10 +673,12 @@ void hfs_lib_fini(void) {
 	}
 	/* Close every placeholder before unmounting the blobstore. */
 	while ((openFile = hfsFdDetachAny(&fd)) != NULL) {
-		hfs_release_open_file(openFile);
+		(void)hfs_release_open_file(openFile);
 		(void)close(fd);
 	}
 	hfsFdReset();
+	/* Retry final-close failures while SPDK and the blobstore are still live. */
+	hfs_retry_deferred_closes();
 
 	hfsIoFini(g_fs);
 	if (!hfsUmount(g_fs)) {
@@ -608,6 +689,7 @@ void hfs_lib_fini(void) {
 	hfsRuntimeStop();
 	hfs_release_backend_lock();
 	HFS_LOG_DEBUG("libhfs finalized");
+	hfsDurabilityTraceFini();
 	hfsStatsFini();
 	hfs_log_fini();
 	pthread_rwlock_unlock(&g_metaLock);
@@ -753,7 +835,6 @@ int hfs_lib_open(const char *path, int flags, mode_t mode) {
 		close(fd);
 		free(file);
 		pthread_rwlock_unlock(&g_metaLock);
-		errno = EIO;
 		return -1;
 	}
 	if (truncateRequested && in->size != 0) {
@@ -1399,19 +1480,22 @@ int hfs_lib_release_fd(int fd) {
 		errno = EBADF;
 		return -1;
 	}
-	hfs_release_open_file(openFile);
-	return 0;
+	return hfs_release_open_file(openFile);
 }
 
 /* Close an HFS fd and then release its kernel placeholder. */
 int hfs_lib_close(int fd) {
-	if (hfs_lib_release_fd(fd) != 0) {
+	int releaseRc;
+	int savedErrno;
+
+	releaseRc = hfs_lib_release_fd(fd);
+	savedErrno = errno;
+	/* The HFS slot is detached even when its final SPDK close failed. */
+	if (close(fd) != 0 && releaseRc == 0) {
 		return -1;
 	}
-
-	/* Release the kernel placeholder fd. The table slot is already
-	 * cleared, so the close interceptor passes this through. */
-	if (close(fd) != 0) {
+	if (releaseRc != 0) {
+		errno = savedErrno;
 		return -1;
 	}
 	return 0;
@@ -1457,6 +1541,9 @@ int hfs_lib_unlink(const char *path) {
 
 	rc = hfsMetaRemoveFile(g_fs, parent, leaf, &blobId);
 	if (rc != 0) {
+		if (!g_fs->metaRecoveryRequired) {
+			hfsFdClearOrphan(orphan);
+		}
 		pthread_rwlock_unlock(&g_metaLock);
 		return -1;
 	}
@@ -1468,7 +1555,6 @@ int hfs_lib_unlink(const char *path) {
 		file.blobId = blobId;
 		if (!hfsDeleteBlobById(&file)) {
 			pthread_rwlock_unlock(&g_metaLock);
-			errno = EIO;
 			return -1;
 		}
 	}
@@ -1996,12 +2082,14 @@ int hfs_lib_fcntl(int fd, int cmd, long arg) {
 }
 
 /*
- * Flush an HFS fd: persist written data and the dirty inode size/mtime
- * so both survive an abrupt process exit.
+ * Flush an HFS fd with ordered data and metadata durability barriers.
+ * The second sync flushes the metadata transaction committed after data.
  */
 int hfs_lib_fsync(int fd) {
 	HfsOpenFile *openFile = hfsFdAcquire(fd);
+	struct hfs_inode *inode;
 	bool ioLocked = false;
+	int savedErrno;
 
 	if (openFile == NULL) {
 		errno = EBADF;
@@ -2013,13 +2101,21 @@ int hfs_lib_fsync(int fd) {
 		ioLocked = true;
 	}
 	if (openFile->file != NULL && hfsSync(openFile->file) != 0) {
+		savedErrno = errno;
+		hfsDurabilityTraceRecord(openFile->inodeId, "data-barrier",
+					savedErrno != 0 ? -savedErrno : -EIO);
 		if (ioLocked) {
 			pthread_rwlock_unlock(&openFile->file->fs->ioLock);
 		}
 		pthread_mutex_unlock(&openFile->ioLock);
 		hfs_release_open_file(openFile);
+		errno = savedErrno;
 		return -1;
 	}
+	if (openFile->file != NULL) {
+		hfsDurabilityTraceRecord(openFile->inodeId, "data-barrier", 0);
+	}
+	hfsFsyncCrashPoint(1);
 	hfsMetaWriteLock();
 	if (g_fs == NULL) {
 		pthread_rwlock_unlock(&g_metaLock);
@@ -2032,6 +2128,7 @@ int hfs_lib_fsync(int fd) {
 		return -1;
 	}
 	if (!g_fs->metaDirty) {
+		hfsDurabilityTraceRecord(openFile->inodeId, "metadata-skip", 0);
 		pthread_rwlock_unlock(&g_metaLock);
 		if (ioLocked) {
 			pthread_rwlock_unlock(&openFile->file->fs->ioLock);
@@ -2040,18 +2137,44 @@ int hfs_lib_fsync(int fd) {
 		hfs_release_open_file(openFile);
 		return 0;
 	}
-	if (hfsMetaFindById(g_fs, openFile->inodeId) != NULL &&
-	    hfsMetaCommitInode(g_fs, openFile->inodeId) != 0) {
+	inode = hfsMetaFindById(g_fs, openFile->inodeId);
+	if (inode != NULL && hfsMetaCommitInode(g_fs, openFile->inodeId) != 0) {
+		savedErrno = errno;
+		hfsDurabilityTraceRecord(openFile->inodeId, "metadata-commit",
+					savedErrno != 0 ? -savedErrno : -EIO);
 		pthread_rwlock_unlock(&g_metaLock);
 		if (ioLocked) {
 			pthread_rwlock_unlock(&openFile->file->fs->ioLock);
 		}
 		pthread_mutex_unlock(&openFile->ioLock);
 		hfs_release_open_file(openFile);
-		errno = EIO;
+		errno = savedErrno;
 		return -1;
 	}
+	if (inode != NULL) {
+		hfsDurabilityTraceRecord(openFile->inodeId, "metadata-commit", 0);
+	} else {
+		hfsDurabilityTraceRecord(openFile->inodeId, "metadata-skip", 0);
+	}
 	pthread_rwlock_unlock(&g_metaLock);
+	hfsFsyncCrashPoint(2);
+	/* Commit is complete in blob metadata; persist it behind a second bdev flush. */
+	if (openFile->file != NULL && hfsSyncPostCommit(openFile->file) != 0) {
+		savedErrno = errno;
+		hfsDurabilityTraceRecord(openFile->inodeId, "post-metadata-barrier",
+					savedErrno != 0 ? -savedErrno : -EIO);
+		if (ioLocked) {
+			pthread_rwlock_unlock(&openFile->file->fs->ioLock);
+		}
+		pthread_mutex_unlock(&openFile->ioLock);
+		hfs_release_open_file(openFile);
+		errno = savedErrno;
+		return -1;
+	}
+	if (openFile->file != NULL) {
+		hfsDurabilityTraceRecord(openFile->inodeId, "post-metadata-barrier", 0);
+	}
+	hfsFsyncCrashPoint(3);
 	if (ioLocked) {
 		pthread_rwlock_unlock(&openFile->file->fs->ioLock);
 	}
@@ -2233,20 +2356,29 @@ int hfs_lib_rename(const char *oldPath, const char *newPath) {
 		replacedCtimeNs = dst->ctimeNs;
 		replacedMtimeNs = dst->mtimeNs;
 	}
+	if (replacedId != 0 &&
+	    hfsFdMarkOrphan(replacedId, replacedBlobId, replacedSize,
+			    replacedCtimeNs, replacedMtimeNs, &orphan) != 0) {
+		pthread_rwlock_unlock(&g_metaLock);
+		return -1;
+	}
 	rc = hfsMetaRename(g_fs, oldPath, newPath);
-	if (rc == 0 && replacedId != 0) {
-		if (hfsFdMarkOrphan(replacedId, replacedBlobId, replacedSize,
-				    replacedCtimeNs, replacedMtimeNs,
-				    &orphan) == 0 && orphan == NULL) {
-			HfsFile file;
+	if (rc != 0) {
+		if (!g_fs->metaRecoveryRequired) {
+			hfsFdClearOrphan(orphan);
+		}
+		pthread_rwlock_unlock(&g_metaLock);
+		return -1;
+	}
+	if (replacedId != 0 && orphan == NULL) {
+		HfsFile file;
 
-			memset(&file, 0, sizeof(file));
-			file.fs = g_fs;
-			file.blobId = replacedBlobId;
-			if (!hfsDeleteBlobById(&file)) {
-				HFS_LOG_ERROR("rename target blob delete failed inode=%"PRIu64,
-					      replacedId);
-			}
+		memset(&file, 0, sizeof(file));
+		file.fs = g_fs;
+		file.blobId = replacedBlobId;
+		if (!hfsDeleteBlobById(&file)) {
+			HFS_LOG_ERROR("rename target blob delete failed inode=%"PRIu64,
+				      replacedId);
 		}
 	}
 	pthread_rwlock_unlock(&g_metaLock);
