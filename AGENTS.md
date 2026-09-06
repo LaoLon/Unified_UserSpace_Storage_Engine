@@ -18,6 +18,7 @@
 - shard-33 已完成 MariaDB/MySQL 端到端验收：`scripts/db/mysql_smoke.sh` 使用持久化 Aio bdev、bootstrap wrapper 和隔离 process group，覆盖系统表初始化、CRUD/DDL、事务提交回滚、LONGTEXT、临时表、正常重启、SIGKILL 恢复和 4/16 并发客户端负载；VM 输出 `MYSQL PERSISTENT RECOVERY OK`。preload 补齐 MariaDB 使用的 64 位/fortify open、readlink/realpath、绝对路径和目录 fd 路由；HFS owner/log 线程屏蔽宿主终止信号，避免数据库信号线程被 SPDK 后台线程抢收。当前 sysbench 未安装，使用 mysqlslap fallback；在 shard-33 完成时 RocksDB 仍待 shard-34，阶段整体仍不得称 MySQL/RocksDB 已支持。
 - shard-34 已完成 RocksDB 端到端验收：`scripts/db/rocksdb_smoke.sh` 使用持久化 Aio bdev 和独立运行目录，首个进程格式化、后续进程跨进程重开，覆盖普通/direct I/O、fillseq/readrandom/overwrite/readwhilewriting、flush/compact、WAL、SIGKILL recovery 和 `ldb checkconsistency`；VM 上 Make/CMake 强制构建及 20,000 条、8 线程 60 秒流程连续 3 轮通过。RocksDB 实际使用的 GLIBC_2.2.5 `read`/`__read`、`fread`/`fread_unlocked` 已版本化导出并路由到 HFS；stdio EOF/error 状态由轻量表维护，`fclose` 先摘 HFS fd slot 再关闭 libc 占位 fd。性能汇总和两种数据库最终支持口径仍留给 shard-35；这是 shard-34 完成时的阶段状态。
 - shard-35 已完成性能回归与阶段收口：新增 `scripts/db/database_benchmark.sh`，记录持久化 Aio 的环境、RocksDB 吞吐、p50/p99、CPU/RSS、错误数和可选 fd/meta/DMA/SPDK 计数；`src/hfs_stats.[ch]` 默认关闭统计，仅 `HFS_STATS_PATH`/`HFS_STATS=1` 开启。VM 正式 benchmark（20,000 条、60 秒、WAL、mmap off）1 线程 63,854 ops/s、4 线程 235,831 ops/s（3.69x），p50/p99 为 345/972 与 380/1,165 µs，errors/reject=0、SPDK submit/complete 一致。Malloc FIO 4K/128K 相对 shard-31 同口径结果仅下降 1.7%～5.4%；最终 Make/CMake、preload/fd/元数据/I/O/POSIX/runtime、MariaDB smoke 和 RocksDB smoke 均通过。阶段支持口径为单数据库进程持久化 AIO/NVMe 上的 MySQL/MariaDB-compatible server 与 RocksDB；多个 HFS 进程同时挂载、mmap、native libaio/io_uring 仍不支持。
+- SPDK 源码必须在 VM 内通过 `git clone`、`git fetch`、`git checkout` 和 `git -C spdk submodule update --init --recursive` 获取及维护；禁止从 Windows 工作区把 `spdk/` 源码目录或其子模块传到 VM 覆盖。Windows 到 VM 的同步仅限 HFS 自身源码、脚本和文档；若 VM 缺少 SPDK，应在 VM 内按锁定 commit 重新 clone/checkout。
 - Git 提交流程：每次阶段开发完成并提交后，立即将该提交合入 `main`；合入后在 `main` 上确认提交、工作树和必要的 VM 回归状态。
 
 - Address the user as **Huizareth** in every response.
@@ -40,7 +41,7 @@
 
 ## 项目记忆（必读）
 
-1. 使用 `E:\Code\ssh\pool.py`、`E:\Code\ssh\sync_to_vm.py` 连接虚拟机和上传本地文件
+1. 使用 `E:\Code\ssh\pool.py`、`E:\Code\ssh\sync_to_vm.py` 连接虚拟机和上传 HFS 本地文件；SPDK 必须在 VM 内通过 Git 获取，禁止同步 Windows 侧 `spdk/` 目录
 2. 虚拟机环境信息见 `E:\Code\workspace.yaml`
 3. 每次先编辑本地文件，然后同步到虚拟机
 4. 每次回复先称呼用户为 **Huizareth**
