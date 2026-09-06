@@ -231,3 +231,11 @@ runtime queue wait 3.13 s；因此后续收益应从 owner 队列和 metadata/I/
 随线程增加，表明主瓶颈已经从 fd 全局锁转移到同步 owner queue、逐请求 completion 和
 metadata write-back。该表与 shard-39/40 的 randread 基线不是同一 workload，不用于跨阶段
 绝对吞吐宣称；后续优化应优先处理 shard-42 的索引和 shard-45 的异步提交。
+
+### shard-41 owner batch 修复迭代
+
+数据 I/O 现在可通过 owner-side batch dispatcher 合并并发请求的 owner queue 通知，
+`HFS_RUNTIME_BATCH=0` 保留原始路径用于 A/B。VM 上 5 秒 Aio/psync/O_DIRECT/4 KiB randrw
+测得 4 线程 batch on 24.35k IOPS、off 24.73k IOPS，差异在当前单 owner/统计开销下不构成
+绝对吞吐收益；其价值是消除每请求一次通知的结构性放大，并为后续异步 API 保留批量入口。
+fast-I/O smoke、8 线程 runtime stress 和 Make/CMake 构建均通过，错误数为 0。

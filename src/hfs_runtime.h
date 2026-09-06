@@ -15,6 +15,15 @@
 int hfsRuntimeStart(void);
 /* Submit one message to the dedicated SPDK owner thread. */
 int hfsRuntimeSubmit(spdk_msg_fn fn, void *ctx);
+/* One request queued into the owner-side batch dispatcher. */
+typedef struct HfsRuntimeBatchItem {
+	spdk_msg_fn fn;
+	void *ctx;
+	uint64_t enqueueNs;
+	struct HfsRuntimeBatchItem *next;
+} HfsRuntimeBatchItem;
+/* Queue one request and coalesce concurrent submissions into one owner message. */
+int hfsRuntimeSubmitBatch(HfsRuntimeBatchItem *item, spdk_msg_fn fn, void *ctx);
 /* Stop accepting work, drain SPDK state, and join the owner pthread. */
 int hfsRuntimeStop(void);
 /* Mark subsystem configuration complete so runtime teardown can finalize it. */

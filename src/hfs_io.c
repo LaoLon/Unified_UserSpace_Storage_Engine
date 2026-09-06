@@ -54,6 +54,7 @@ typedef struct HfsIoRequest {
 	uint64_t offset;
 	uint64_t units;
 	HfsIoOperation operation;
+	HfsRuntimeBatchItem batchItem;
 	HfsRequestResult result;
 } HfsIoRequest;
 
@@ -277,7 +278,8 @@ static int hfsIoSubmit(HfsFile *file, void *buffer, uint64_t offset,
 	request.units = units;
 	request.operation = operation;
 	hfsRequestInit(&request.result, hfsIoRequestOperation(operation));
-	if (hfsRequestWait(&request.result, hfsIoStart, &request) != 0) {
+	if (hfsRequestWaitBatch(&request.result, hfsIoStart, &request,
+				&request.batchItem) != 0) {
 		HFS_STATS_ERROR();
 		HFS_LOG_ERROR("data I/O failed operation=%d offset=%"PRIu64
 			      " units=%"PRIu64" submitRc=%d completionRc=%d bserrno=%d",

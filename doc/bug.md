@@ -10,7 +10,7 @@ Bug 等级：**致命 > 严重 > 一般**。
 
 ### 已修复
 
-1–5、8–10、10b、11–43、45–47、51、52。包括已由后续 shard 修复的历史记录；条目中的原始“遗留”描述保留用于复盘，当前状态以本汇总和条目状态字段为准。
+1–5、8–10、10b、11–43、45–47、51–52、57。包括已由后续 shard 修复的历史记录；条目中的原始“遗留”描述保留用于复盘，当前状态以本汇总和条目状态字段为准。
 
 ### 未修复
 
@@ -849,5 +849,28 @@ Bug 等级：**致命 > 严重 > 一般**。
   不超过 7 字节且全部为零；checksum 仍覆盖物理 payload（含 padding），从而同时保证对齐和完整性。
 - **验证**：VM 上 v5 格式测试覆盖 committed WAL、缺 commit WAL、页 checksum 损坏和 superblock
   A 回退；随后强制 Make、CMake Release 均通过。
+
+### 57. shard-41 数据 I/O 每请求单独通知 owner queue（已修复，一般级）
+
+- **状态**：已修复；同步语义保持不变，单 owner 的并行上限仍列为后续架构工作
+- **时间**：2026-09-06（shard-41 性能修复迭代）
+- **等级**：一般（吞吐扩展受限，不改变数据正确性）
+- **现象**：4 KiB randrw、psync、iodepth=1 的 1/2/4/8/16 线程矩阵中，所有数据 I/O
+  都通过一次独立的 `spdk_thread_send_msg` 和一次同步 completion；queue peak 随线程数升高，
+  4 线程只有约 1.9 倍单线程吞吐。
+- **排查过程**：shard-40 已移除 fd/runtime 全局热锁；shard-41 的统计显示 IO/metadata
+  contention 上升但 owner queue、逐请求 completion 仍是固定串行点。对照 `HfsRuntimeSubmit`
+  和 `hfsIoSubmit` 确认，数据面没有复用 metadata 的异步提交机制，无法把同一 burst 的请求
+  合并到一次 owner 通知中。
+- **根因**：同步 POSIX API 需要等待每个 SPDK completion，但提交通知粒度仍是每请求一次；
+  在高并发下重复进入 SPDK message queue，放大 owner 线程的通知/唤醒开销。
+- **修复**：新增 `HfsRuntimeBatchItem` 和 owner-side batch dispatcher；`hfsIoSubmit` 通过
+  `hfsRequestWaitBatch` 链接调用者栈上的 request，多个并发请求共用一次 owner 通知后逐项提交
+  SPDK I/O。batch dispatcher 只在显式 timing 模式记录每项 queue/owner 时间；`HFS_RUNTIME_BATCH=0`
+  可回退到原始路径用于 A/B。请求仍在 completion 返回前保持栈生命周期，不改变 channel 归属。
+- **验证**：VM 上 `make -B app lib`、CMake Release、`io_fast_path_smoke.sh`、8 线程 5 秒
+  `runtime_stress.sh` 全部通过，错误数为 0；5 秒 A/B 在 4 线程为 24.35k（batch on）对
+  24.73k（batch off），收益未宣称为绝对吞吐提升。单 owner 队列的结构性上限仍需 shard-45
+  异步 API 和 shard-46 多 reactor/channel 解决。
 
 ## 通用经验总结

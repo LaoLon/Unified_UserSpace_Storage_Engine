@@ -5,6 +5,7 @@
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <sched.h>
+#include <string.h>
 #include <sys/syscall.h>
 #include <linux/futex.h>
 #include <time.h>
@@ -28,10 +29,15 @@
 struct hfs_runtime_state {
 	pthread_mutex_t lock;
 	pthread_cond_t stateChanged;
+	pthread_mutex_t batchLock;
+	HfsRuntimeBatchItem *batchHead;
+	HfsRuntimeBatchItem *batchTail;
+	bool batchScheduled;
 	pthread_t owner;
 	_Atomic(struct spdk_thread *) spdkThread;
 	bool threadCreated;
 	bool ready;
+	bool batchEnabled;
 	_Atomic bool accepting;
 	bool stopSubmitted;
 	_Atomic bool subsystemsReady;
@@ -45,6 +51,7 @@ struct hfs_runtime_state {
 static struct hfs_runtime_state g_runtime = {
 	.lock = PTHREAD_MUTEX_INITIALIZER,
 	.stateChanged = PTHREAD_COND_INITIALIZER,
+	.batchLock = PTHREAD_MUTEX_INITIALIZER,
 };
 static _Atomic bool g_ownerViolationLogged;
 
@@ -154,6 +161,47 @@ static void hfsRuntimeDispatchMessage(void *arg) {
 		memory_order_relaxed);
 	hfsStatsRecordRuntimeDispatchFast(queueWaitNs, ownerNs, depth);
 	free(message);
+}
+
+/* Drain all requests currently waiting behind one owner-thread notification. */
+static void hfsRuntimeDispatchBatch(void *arg) {
+	HfsRuntimeBatchItem *item;
+	HfsRuntimeBatchItem *next;
+	uint64_t queueWaitNs;
+	uint64_t ownerStartNs;
+	uint64_t ownerNs;
+	uint64_t depth;
+	bool timing;
+
+	(void)arg;
+	timing = hfsStatsTimingFastEnabled();
+	pthread_mutex_lock(&g_runtime.batchLock);
+	item = g_runtime.batchHead;
+	g_runtime.batchHead = NULL;
+	g_runtime.batchTail = NULL;
+	/* Clear the gate before running callbacks so a concurrent submit schedules the next batch. */
+	g_runtime.batchScheduled = false;
+	pthread_mutex_unlock(&g_runtime.batchLock);
+
+	while (item != NULL) {
+		next = item->next;
+		if (timing) {
+			depth = atomic_fetch_sub_explicit(&g_runtime.queued, 1,
+				memory_order_relaxed) - 1U;
+			atomic_fetch_add_explicit(&g_runtime.inflight, 1,
+				memory_order_relaxed);
+			queueWaitNs = hfsStatsNowNs() - item->enqueueNs;
+			ownerStartNs = hfsStatsNowNs();
+			item->fn(item->ctx);
+			ownerNs = hfsStatsNowNs() - ownerStartNs;
+			depth = atomic_fetch_sub_explicit(&g_runtime.inflight, 1,
+				memory_order_relaxed);
+			hfsStatsRecordRuntimeDispatchFast(queueWaitNs, ownerNs, depth);
+		} else {
+			item->fn(item->ctx);
+		}
+		item = next;
+	}
 }
 
 /* Publish owner initialization state to hfsRuntimeStart. */
@@ -266,6 +314,7 @@ static void *hfsRuntimeOwnerMain(void *arg) {
 
 /* Start the owner pthread once and wait for SPDK initialization. */
 int hfsRuntimeStart(void) {
+	const char *batchEnv;
 	int rc;
 
 	HFS_RUNTIME_STATE_LOCK(&g_runtime.lock);
@@ -278,6 +327,8 @@ int hfsRuntimeStart(void) {
 		HFS_RUNTIME_STATE_UNLOCK(&g_runtime.lock);
 		return -ESHUTDOWN;
 	}
+	batchEnv = getenv("HFS_RUNTIME_BATCH");
+	g_runtime.batchEnabled = batchEnv == NULL || strcmp(batchEnv, "0") != 0;
 
 	rc = pthread_create(&g_runtime.owner, NULL, hfsRuntimeOwnerMain, NULL);
 	if (rc != 0) {
@@ -355,6 +406,84 @@ submit_done:
 		HFS_STATS_SPDK_REJECT();
 	}
 	free(message);
+	atomic_fetch_sub_explicit(&g_runtime.submitters, 1,
+		memory_order_release);
+	return rc;
+}
+
+/* Queue one request and send only one SPDK message for a concurrent burst. */
+int hfsRuntimeSubmitBatch(HfsRuntimeBatchItem *item, spdk_msg_fn fn, void *ctx) {
+	struct spdk_thread *thread;
+	uint64_t queueDepth;
+	bool notify = false;
+	bool timing;
+	int rc = 0;
+
+	if (item == NULL || fn == NULL) {
+		HFS_STATS_SPDK_REJECT();
+		return -EINVAL;
+	}
+	/* Keep an explicit escape hatch for A/B tests and emergency rollback. */
+	if (!g_runtime.batchEnabled) {
+		return hfsRuntimeSubmit(fn, ctx);
+	}
+	/* A fork child must never enqueue a pointer into the parent's SPDK queue. */
+	if (hfsRuntimeIsForkChild()) {
+		HFS_STATS_SPDK_REJECT();
+		return -ECHILD;
+	}
+	atomic_fetch_add_explicit(&g_runtime.submitters, 1,
+		memory_order_acquire);
+	if (!atomic_load_explicit(&g_runtime.accepting, memory_order_acquire)) {
+		rc = -ESHUTDOWN;
+		goto submit_done;
+	}
+	thread = atomic_load_explicit(&g_runtime.spdkThread, memory_order_acquire);
+	if (thread == NULL) {
+		rc = -ESHUTDOWN;
+		goto submit_done;
+	}
+	/* Recheck admission immediately before linking the caller-owned item. */
+	if (hfsRuntimeIsForkChild()) {
+		rc = -ECHILD;
+		goto submit_done;
+	}
+	if (!atomic_load_explicit(&g_runtime.accepting, memory_order_acquire)) {
+		rc = -ESHUTDOWN;
+		goto submit_done;
+	}
+	timing = hfsStatsTimingFastEnabled();
+	item->fn = fn;
+	item->ctx = ctx;
+	item->enqueueNs = timing ? hfsStatsNowNs() : 0;
+	item->next = NULL;
+	/* Account before linking so the owner cannot retire an uncounted item. */
+	if (timing) {
+		queueDepth = atomic_fetch_add_explicit(&g_runtime.queued, 1,
+			memory_order_relaxed) + 1U;
+		hfsStatsRecordRuntimeSubmitFast(queueDepth);
+	}
+	pthread_mutex_lock(&g_runtime.batchLock);
+	if (g_runtime.batchTail != NULL) {
+		g_runtime.batchTail->next = item;
+	} else {
+		g_runtime.batchHead = item;
+	}
+	g_runtime.batchTail = item;
+	if (!g_runtime.batchScheduled) {
+		g_runtime.batchScheduled = true;
+		notify = true;
+	}
+	pthread_mutex_unlock(&g_runtime.batchLock);
+	HFS_STATS_SPDK_SUBMIT();
+	if (notify) {
+		spdk_thread_send_msg(thread, hfsRuntimeDispatchBatch, NULL);
+	}
+
+submit_done:
+	if (rc != 0) {
+		HFS_STATS_SPDK_REJECT();
+	}
 	atomic_fetch_sub_explicit(&g_runtime.submitters, 1,
 		memory_order_release);
 	return rc;

@@ -413,6 +413,19 @@ Aio bdev、4 KiB randrw、iodepth=1、runtime=1 s 的短矩阵如下；统计显
 和既有 I/O/fd/POSIX/runtime 回归均通过。SPDK 仍使用 VM 内仓库，commit 为
 `f0b63ed866f0e4d3c56e73bd4a98d0042956147a`。
 
+### shard-41 性能修复迭代（2026-09-06）
+
+在不改变同步 POSIX 语义和 SPDK channel 线程归属的前提下，数据面新增 owner-side batch
+dispatcher：`hfsIoSubmit` 的 request 通过 `HfsRuntimeBatchItem` 链接到一个批次，多个并发
+调用共享一次 owner queue 通知，再由 owner 逐项提交 SPDK I/O。计时统计按 item 保留 queue
+wait/owner time；设置 `HFS_RUNTIME_BATCH=0` 可回退到原始逐消息路径，便于基准 A/B。
+
+VM 上 5 秒持久化 Aio bdev A/B（统计开启、4 KiB randrw、iodepth=1）结果：4 线程 batch
+开启 24.35k IOPS、关闭 24.73k IOPS；在当前单 owner 架构下未把微小差异宣称为绝对吞吐收益，
+但 fast-I/O 和 runtime stress 均保持通过。该修复消除了数据面“每请求一次 owner 通知”的
+额外放大项；4 线程 3 倍目标仍由 owner 串行化和 metadata write-back 限制，后续进入
+shard-45 异步 API、shard-46 多 reactor/channel。
+
 ### 验收
 
 - 数据热路径不再持有 mount 级 I/O/append/resize 全局锁。

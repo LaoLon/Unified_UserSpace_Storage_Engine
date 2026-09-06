@@ -21,6 +21,8 @@ void hfsRequestInit(HfsRequestResult *result, HfsRequestOperation operation);
 void hfsRequestComplete(HfsRequestResult *result, int bserrno,
 			uint64_t completedUnits);
 int hfsRequestWait(HfsRequestResult *result, spdk_msg_fn startFn, void *ctx);
+int hfsRequestWaitBatch(HfsRequestResult *result, spdk_msg_fn startFn, void *ctx,
+			HfsRuntimeBatchItem *batchItem);
 bool hfsRequestCompletionInjected(HfsRequestOperation operation);
 
 #endif /* HFS_INTERNAL_H */

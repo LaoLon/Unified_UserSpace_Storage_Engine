@@ -134,6 +134,31 @@ int hfsRequestWait(HfsRequestResult *result, spdk_msg_fn startFn, void *ctx) {
 	return 0;
 }
 
+/* Submit a data-path request through the owner-side batch dispatcher. */
+int hfsRequestWaitBatch(HfsRequestResult *result, spdk_msg_fn startFn, void *ctx,
+			HfsRuntimeBatchItem *batchItem) {
+	int rc;
+
+	hfsRuntimeCompletionReset(&result->completion);
+	if (hfsRequestSubmitInjected(result->operation)) {
+		result->submitRc = -EIO;
+		return hfsRequestSetError(result->submitRc);
+	}
+	rc = hfsRuntimeSubmitBatch(batchItem, startFn, ctx);
+	result->submitRc = rc;
+	if (rc != 0) {
+		return hfsRequestSetError(rc);
+	}
+	if (!hfsRuntimeCompletionWait(&result->completion,
+				      HFS_RUNTIME_TIMEOUT_MS)) {
+		return -1;
+	}
+	if (result->completionRc != 0) {
+		return hfsRequestSetError(result->completionRc);
+	}
+	return 0;
+}
+
 /*
  * Turn an async SPDK operation into a synchronous call.
  * Posts startFn to the dedicated owner thread, then waits on the request
