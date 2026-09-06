@@ -813,4 +813,23 @@ Bug 等级：**致命 > 严重 > 一般**。
 - **验证**：脚本 `bash -n`、VM Make/CMake Release 和 fd/I/O/POSIX/runtime 回归均通过；
   stats-off/on 配对仍可输出可复现的独立样本。
 
+### 55. metadata scaling 初版把数据容量耗尽误报为元数据失败（已修复，一般级）
+
+- **状态**：已修复；基准脚本已改为元数据目录对象，并使用可配置的大容量稀疏镜像
+- **时间**：2026-09-06（shard-42 元数据索引开发）
+- **等级**：一般（污染扩展性结论，不改变 HFS 数据一致性）
+- **现象**：初版 `metadata_scaling_benchmark.sh` 在 1 GiB 镜像中创建普通文件；每个文件仍会
+  分配一个 data blob。约 1,022 个对象后 `open(O_CREAT)` 返回 `ENOMEM`，后续 open/stat/rename/
+  unlink 被连锁计入 errors，导致 10K 样本被误判为元数据索引失败。
+- **排查过程**：将失败位置缩小到第 1,022 个 create，检查 HFS bdev cluster 使用后确认是每个
+  文件的 data blob 耗尽 1 GiB 后端容量，而不是 inode/dentry 索引冲突；改用目录对象后同一
+  workload 在 10K inode 下 errors=0，SPDK submit/complete 仍闭合。
+- **根因**：基准意图测量 namespace metadata，却同时把固定 1 GiB 的 data-cluster 容量纳入
+  工作集；脚本没有把对象类型和镜像容量作为参数。
+- **修复**：脚本默认创建目录并用 `O_DIRECTORY`/`rmdir` 覆盖 open/unlink 语义，保留
+  `HFS_METADATA_OBJECT_TYPE=file` 作为显式选项；镜像大小通过 `HFS_METADATA_IMAGE_SIZE` 配置，
+  默认 128 GiB sparse image。报告中明确记录对象类型和容量口径。
+- **验证**：VM 上 1K/10K 目录样本均 errors=0；1K/10K 的 open/stat p99 保持在约 7/8 微秒，
+  create/readdir/rename/unlink 的放大仍被单独记录为 v4 整镜像提交问题，不再与后端 ENOSPC 混淆。
+
 ## 通用经验总结

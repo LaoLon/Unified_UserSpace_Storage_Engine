@@ -1,6 +1,6 @@
 # HFS 可靠性与性能优化阶段计划（shard-36 起）
 
-> 状态：shard-36～41 核心实现已完成，正确性闸门 A 已通过；shard-41 的 per-inode/区间锁已落地，4 线程扩展仍受单 owner 队列限制，下一步进入 shard-42 内存元数据索引<br>
+> 状态：shard-36～42 核心实现已完成，正确性闸门 A 已通过；shard-42 已落地内存元数据索引与常驻 metadata handle，但 10K/1K 的 create/readdir/rename/unlink p99 仍受 v4 整镜像提交放大限制，60K 闸门留给 shard-43 的页式/WAL 元数据实现<br>
 > 制定日期：2026-09-05  
 > 适用基线：`main@91db26a`（shard-36 已完成）
 > 输入文档：`review/hfs_architecture_performance_review_2026-09-05.md`  
@@ -442,17 +442,40 @@ Aio bdev、4 KiB randrw、iodepth=1、runtime=1 s 的短矩阵如下；统计显
 - metadata blob descriptor/handle 在 mount 生命周期内常驻，由 shard-37 的错误与资源模型管理。
 - 保持 v4 on-disk layout 不变，先隔离“内存查找收益”和“磁盘格式迁移风险”。
 
+### 实现状态（2026-09-06）
+
+- `src/hfs_meta_index.[ch]` 已加入 Make/CMake：id open-addressing table、`(parent,name)`
+  dentry hash 和按名称排序的 directory child vector 均由 mount/reopen 重建；结构性 mutation
+  会标记索引 dirty，数据型 inode commit 不再无条件重建整张索引。
+- `hfsMetaFindByName`、`hfsMetaFindById`、`readdir` 已走索引并保留 dirty/failure 时的线性回退；
+  create/unlink/rename 的索引失效窗口会在成功提交后重建，失败仍交给现有 v4 undo/recovery 路径。
+- metadata blob 在 mount 生命周期内保持 resident handle，关闭顺序在 `hfsMetaFini` 中统一处理；
+  当前 v4 镜像布局未改变，旧 v4 镜像仍按原路径加载并重建索引。
+
 ### 测试
 
 - 新增 `scripts/db/metadata_scaling_benchmark.sh`。
-- 在 1K/10K/60K inode 下测量 create/open/stat/readdir/rename/unlink 的吞吐和 p99。
+- 基准默认使用目录对象（`HFS_METADATA_OBJECT_TYPE=dir`）和 128 GiB sparse image，避免把每个
+  普通文件的 data blob 容量消耗混入 namespace 测量；可显式切换到 `file`。
+- VM 上 1K/10K 目录样本 errors=0，SPDK submit/complete 均闭合；代表性 p99（微秒）如下：
+
+  | inode | create | open | stat | readdir | rename | unlink |
+  |---:|---:|---:|---:|---:|---:|---:|
+  | 1K | 1548.06 | 7.03 | 3.55 | 195.37 | 1741.72 | 1651.82 |
+  | 10K | 8128.73 | 7.91 | 3.49 | 1930.04 | 8976.14 | 8780.27 |
+
+- open/stat p99 已基本脱离 inode 数量；create/readdir/rename/unlink 分别约为 5.3x/9.8x/5.2x/
+  5.3x，证实主耗时来自 v4 每次 mutation 的 pending/stable/clear 整镜像写入，而不是查找。
+- 60K 完整矩阵暂不宣称通过：在 v4 整镜像提交和单 owner metadata 队列下，继续扩大只会放大
+  已观测的写放大；该闸门转由 shard-43 页式布局/WAL 解决后重新测量。
 - fuzz rename/unlink/create 顺序，每轮对比 inode table、id index、dentry index 和目录 index 的一致性。
 - crash/reopen 后重新构建索引并与磁盘 inode table 校验。
 
 ### 验收
 
 - path lookup、inode id lookup 和单目录 readdir 不再依赖全 inode 数量的线性扫描。
-- 60K inode 时单文件 open/stat p99 不超过 1K inode 时的 2 倍。
+- 1K/10K 样本的 open/stat p99 分别为 7.03/7.91 和 3.55/3.49 微秒，满足当前可观测的
+  “查找不随 inode 数线性增长”目标；60K 仍待 shard-43 完成后复验。
 - metadata blob 不再为每个普通元数据操作重复 open/close。
 - 所有旧 v4 镜像可直接挂载并通过现有 recovery 测试。
 

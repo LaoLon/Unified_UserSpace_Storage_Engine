@@ -12,6 +12,7 @@
 struct hfs_inode;
 struct hfs_io_pool;
 struct hfs_inode_runtime;
+struct hfs_meta_index;
 struct spdk_bdev_desc;
 
 /* Number of hashed range-lock buckets shared by all mounted inodes. */
@@ -83,12 +84,14 @@ typedef struct Hfs {
 	spdk_blob_id metaBlobId;		/* blob id of the metadata blob */
 	uint64_t rootInodeId;			/* inode id of the root directory */
 	struct hfs_inode *inodes;		/* in-memory inode table */
+	struct hfs_meta_index *metaIndex;		/* indexed path and directory state */
 	uint32_t inodeCount;			/* number of used inodes */
 	uint64_t nextInodeId;			/* next persistent inode id */
 	uint64_t metaGeneration;			/* committed metadata generation */
 	bool metaNeedsMigration;			/* old metadata layout needs upgrade */
 	bool metaDirty;			/* in-memory inode fields need commit */
 	bool metaRecoveryRequired;		/* uncertain transaction requires remount */
+	struct spdk_blob *metaBlob;		/* resident metadata blob handle */
 
 	/* Request-local range synchronization and DMA buffer pool. */
 	pthread_rwlock_t rangeLocks[HFS_RANGE_LOCK_COUNT];

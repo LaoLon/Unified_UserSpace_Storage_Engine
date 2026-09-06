@@ -57,6 +57,9 @@ struct hfs_inode {
  */
 int hfsMetaInit(Hfs *fs);
 
+/* Close the resident metadata handle and release in-memory metadata state. */
+void hfsMetaFini(Hfs *fs);
+
 /* Read the super blob id from the blobstore. */
 int hfsMetaLoad(Hfs *fs);
 
@@ -80,6 +83,12 @@ struct hfs_inode *hfsMetaFindByName(Hfs *fs, uint64_t parentId, const char *name
 
 /* Look up an inode by its id, or NULL if not found. */
 struct hfs_inode *hfsMetaFindById(Hfs *fs, uint64_t id);
+
+/* Return one child in indexed name order, with linear fallback when needed. */
+struct hfs_inode *hfsMetaChildAt(Hfs *fs, uint64_t parentId,
+				 uint32_t ordinal);
+/* Return the number of children in a directory. */
+uint32_t hfsMetaChildCount(Hfs *fs, uint64_t parentId);
 
 /* Root directory inode id (created at format time). */
 #define HFS_ROOT_INODE_ID	1

@@ -750,6 +750,7 @@ void hfs_lib_fini(void) {
 	hfs_retry_deferred_closes();
 
 	hfsIoFini(g_fs);
+	hfsMetaFini(g_fs);
 	if (!hfsUmount(g_fs)) {
 		HFS_LOG_ERROR("hfsUmount failed");
 	}
@@ -2520,7 +2521,7 @@ int hfs_lib_rename(const char *oldPath, const char *newPath) {
 struct hfs_dir *hfs_lib_opendir(const char *path) {
 	struct hfs_inode *in;
 	struct hfs_dir *dir;
-	int i;
+	uint32_t i;
 	uint64_t n = 0;
 
 	hfsMetaReadLock();
@@ -2555,11 +2556,7 @@ struct hfs_dir *hfs_lib_opendir(const char *path) {
 	}
 	dir->inodeId = in->id;
 
-	for (i = 0; i < g_fs->inodeCount; i++) {
-		if (g_fs->inodes[i].parentId == in->id) {
-			n++;
-		}
-	}
+	n = hfsMetaChildCount(g_fs, in->id);
 	dir->entries = calloc(n > 0 ? n : 1, sizeof(struct hfs_dirent));
 	if (dir->entries == NULL) {
 		pthread_mutex_destroy(&dir->lock);
@@ -2569,17 +2566,19 @@ struct hfs_dir *hfs_lib_opendir(const char *path) {
 		return NULL;
 	}
 
-	for (i = 0; i < g_fs->inodeCount; i++) {
-		if (g_fs->inodes[i].parentId == in->id) {
-			struct hfs_dirent *e = &dir->entries[dir->count];
-			strncpy(e->name, g_fs->inodes[i].name,
-				sizeof(e->name) - 1);
-			e->name[sizeof(e->name) - 1] = '\0';
-			e->inodeId = g_fs->inodes[i].id;
-			e->d_type = (g_fs->inodes[i].type == HFS_INODE_DIR)
-				     ? DT_DIR : DT_REG;
-			dir->count++;
+	for (i = 0; i < (uint32_t)n; i++) {
+		struct hfs_inode *child = hfsMetaChildAt(g_fs, in->id, i);
+		struct hfs_dirent *e;
+
+		if (child == NULL) {
+			continue;
 		}
+		e = &dir->entries[dir->count];
+		strncpy(e->name, child->name, sizeof(e->name) - 1);
+		e->name[sizeof(e->name) - 1] = '\0';
+		e->inodeId = child->id;
+		e->d_type = child->type == HFS_INODE_DIR ? DT_DIR : DT_REG;
+		dir->count++;
 	}
 	pthread_rwlock_unlock(&g_metaLock);
 	return dir;
