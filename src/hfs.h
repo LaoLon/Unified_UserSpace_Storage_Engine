@@ -106,6 +106,8 @@ typedef struct Hfs {
 
 
 	struct spdk_io_channel *channel;	/* blobstore I/O channel */
+	struct spdk_io_channel **dataChannels;	/* per-reactor data channels */
+	uint32_t dataReactorCount;		/* configured data reactor count */
 } Hfs;
 
 /* Operation table for mount/umount (reserved for future use). */

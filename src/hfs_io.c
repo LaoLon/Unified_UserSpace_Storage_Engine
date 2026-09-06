@@ -57,6 +57,9 @@ typedef struct HfsIoRequest {
 	uint64_t offset;
 	uint64_t units;
 	HfsIoOperation operation;
+	struct spdk_io_channel *channel;
+	uint32_t dataReactor;
+	bool dataPath;
 	HfsRuntimeBatchItem batchItem;
 	HfsRequestResult result;
 	/* Distinguish worker-free child requests from synchronous stack requests. */
@@ -71,7 +74,11 @@ typedef struct HfsIoRangeGuard {
 	uint16_t buckets[HFS_RANGE_LOCK_COUNT];
 	uint16_t count;
 	bool write;
+	HfsInodeRuntime *runtime;
 } HfsIoRangeGuard;
+
+/* Use a per-inode gate when a range would otherwise lock most global buckets. */
+#define HFS_IO_RANGE_GATE_THRESHOLD (HFS_RANGE_LOCK_COUNT / 4U)
 
 /* Parent state for one worker-free aligned request and its bounded child batches. */
 typedef struct HfsIoAsyncParent {
@@ -92,6 +99,8 @@ typedef struct HfsIoAsyncParent {
 	HfsIoAsyncCallback callback;
 	void *context;
 	HfsInodeRuntime *runtime;
+	struct spdk_io_channel *channel;
+	uint32_t dataReactor;
 	HfsIoRangeGuard guard;
 	HfsIoRequest requests[HFS_IO_MAX_PIPELINE];
 	HfsIoLease leases[HFS_IO_MAX_PIPELINE];
@@ -117,6 +126,7 @@ static int hfsIoRangeLock(HfsFile *file, uint64_t offset, uint64_t length,
 	uint64_t seen[HFS_RANGE_LOCK_COUNT / 64U] = {0};
 	uint32_t bucket;
 	uint32_t seenCount = 0;
+	HfsInodeRuntime *runtime;
 
 	if (file == NULL || file->fs == NULL || file->fs->unitSize == 0 ||
 	    guard == NULL || length == 0 || offset > UINT64_MAX - (length - 1)) {
@@ -124,6 +134,11 @@ static int hfsIoRangeLock(HfsFile *file, uint64_t offset, uint64_t length,
 		return -1;
 	}
 	guard->count = 0;
+	runtime = hfsInodeRuntimeForFile(file);
+	if (runtime == NULL) {
+		return -1;
+	}
+	guard->runtime = runtime;
 	firstUnit = offset / file->fs->unitSize;
 	lastUnit = (offset + length - 1) / file->fs->unitSize;
 	for (unit = firstUnit; unit <= lastUnit; unit++) {
@@ -137,6 +152,12 @@ static int hfsIoRangeLock(HfsFile *file, uint64_t offset, uint64_t length,
 		}
 	}
 	guard->write = write;
+	if (seenCount >= HFS_IO_RANGE_GATE_THRESHOLD) {
+		/* A large range is exclusive per inode, but does not block other files. */
+		pthread_rwlock_wrlock(&runtime->rangeGate);
+		return 0;
+	}
+	pthread_rwlock_rdlock(&runtime->rangeGate);
 	for (bucket = 0; bucket < HFS_RANGE_LOCK_COUNT; bucket++) {
 		if ((seen[bucket / 64U] & (UINT64_C(1) << (bucket % 64U))) == 0) {
 			continue;
@@ -166,6 +187,7 @@ static int hfsIoRangeTryLock(HfsFile *file, uint64_t offset, uint64_t length,
 	uint32_t bucket;
 	uint32_t seenCount = 0;
 	int rc;
+	HfsInodeRuntime *runtime;
 
 	if (file == NULL || file->fs == NULL || file->fs->unitSize == 0 ||
 	    guard == NULL || length == 0 || offset > UINT64_MAX - (length - 1)) {
@@ -173,6 +195,11 @@ static int hfsIoRangeTryLock(HfsFile *file, uint64_t offset, uint64_t length,
 		return -1;
 	}
 	guard->count = 0;
+	runtime = hfsInodeRuntimeForFile(file);
+	if (runtime == NULL) {
+		return -1;
+	}
+	guard->runtime = runtime;
 	firstUnit = offset / file->fs->unitSize;
 	lastUnit = (offset + length - 1) / file->fs->unitSize;
 	for (unit = firstUnit; unit <= lastUnit; unit++) {
@@ -186,6 +213,19 @@ static int hfsIoRangeTryLock(HfsFile *file, uint64_t offset, uint64_t length,
 		}
 	}
 	guard->write = write;
+	if (seenCount >= HFS_IO_RANGE_GATE_THRESHOLD) {
+		rc = pthread_rwlock_trywrlock(&runtime->rangeGate);
+		if (rc != 0) {
+			errno = EAGAIN;
+			return -1;
+		}
+		return 0;
+	}
+	rc = pthread_rwlock_tryrdlock(&runtime->rangeGate);
+	if (rc != 0) {
+		errno = EAGAIN;
+		return -1;
+	}
 	for (bucket = 0; bucket < HFS_RANGE_LOCK_COUNT; bucket++) {
 		if ((seen[bucket / 64U] & (UINT64_C(1) << (bucket % 64U))) == 0) {
 			continue;
@@ -215,7 +255,11 @@ static void hfsIoRangeUnlock(HfsFile *file, HfsIoRangeGuard *guard) {
 		hfsStatsLockReleaseFast(HFS_STATS_LOCK_IO);
 		pthread_rwlock_unlock(&file->fs->rangeLocks[guard->buckets[i - 1]]);
 	}
+	if (guard->runtime != NULL) {
+		pthread_rwlock_unlock(&guard->runtime->rangeGate);
+	}
 	guard->count = 0;
+	guard->runtime = NULL;
 }
 
 /* Enter the per-inode read side so fsync/truncate can take an exclusive barrier. */
@@ -383,6 +427,8 @@ static void hfsIoRelease(HfsIoLease *lease) {
 static void hfsIoStart(void *arg) {
 	HfsIoRequest *request = arg;
 	HfsFile *file = request->file;
+	struct spdk_io_channel *channel = request->channel != NULL
+		? request->channel : file->fs->channel;
 
 	if (hfsRequestCompletionInjected(request->result.operation)) {
 		hfsIoDone(request, -EIO);
@@ -390,21 +436,21 @@ static void hfsIoStart(void *arg) {
 	}
 	switch (request->operation) {
 	case HFS_IO_READ:
-		spdk_blob_io_read(file->blob, file->fs->channel, request->buffer,
+		spdk_blob_io_read(file->blob, channel, request->buffer,
 				  request->offset, request->units,
 				  hfsIoDone, request);
 		break;
 	case HFS_IO_WRITE:
-		spdk_blob_io_write(file->blob, file->fs->channel, request->buffer,
+		spdk_blob_io_write(file->blob, channel, request->buffer,
 				   request->offset, request->units,
 				   hfsIoDone, request);
 		break;
 	case HFS_IO_UNMAP:
-		spdk_blob_io_unmap(file->blob, file->fs->channel, request->offset,
+		spdk_blob_io_unmap(file->blob, channel, request->offset,
 				   request->units, hfsIoDone, request);
 		break;
 	case HFS_IO_WRITE_ZEROES:
-		spdk_blob_io_write_zeroes(file->blob, file->fs->channel,
+		spdk_blob_io_write_zeroes(file->blob, channel,
 					 request->offset, request->units,
 					 hfsIoDone, request);
 		break;
@@ -416,6 +462,9 @@ static void hfsIoDone(void *arg, int bserrno) {
 	HfsIoRequest *request = arg;
 
 	hfsRequestComplete(&request->result, bserrno, request->units);
+	if (request->dataPath) {
+		hfsStatsRecordDataReactorCompleteFast(request->dataReactor);
+	}
 	if (request->asyncMagic == HFS_IO_ASYNC_MAGIC && request->asyncDone != NULL) {
 		request->asyncDone(request);
 	}
@@ -423,9 +472,20 @@ static void hfsIoDone(void *arg, int bserrno) {
 
 /* Submit one child request without waiting for its owner-thread completion. */
 static int hfsIoStartRequest(HfsIoRequest *request) {
+	int rc;
+
 	hfsRequestInit(&request->result, hfsIoRequestOperation(request->operation));
-	return hfsRequestSubmitBatch(&request->result, hfsIoStart, request,
-				     &request->batchItem);
+	if (request->dataPath && request->dataReactor != 0) {
+		rc = hfsRequestSubmitData(&request->result, hfsIoStart, request,
+					   request->dataReactor);
+	} else {
+		rc = hfsRequestSubmitBatch(&request->result, hfsIoStart, request,
+					     &request->batchItem);
+	}
+	if (rc == 0 && request->dataPath) {
+		hfsStatsRecordDataReactorSubmitFast(request->dataReactor);
+	}
+	return rc;
 }
 
 /* Wait for one child request and retain the existing error logging contract. */
@@ -631,6 +691,9 @@ static int hfsIoAsyncStartBatch(HfsIoAsyncParent *parent) {
 			parent->file->fs->unitSize + relativeUnit;
 		parent->requests[i].units = units;
 		parent->requests[i].operation = parent->write ? HFS_IO_WRITE : HFS_IO_READ;
+		parent->requests[i].channel = parent->channel;
+		parent->requests[i].dataReactor = parent->dataReactor;
+		parent->requests[i].dataPath = true;
 		parent->requests[i].asyncMagic = HFS_IO_ASYNC_MAGIC;
 		parent->requests[i].asyncDone = hfsIoAsyncChildDone;
 		parent->requests[i].asyncContext = parent;
@@ -715,6 +778,13 @@ int hfsIoReadAtAsync(HfsFile *file, uint8_t *buffer, size_t count,
 		return -1;
 	}
 	parent->file = file;
+	parent->dataReactor = hfsRuntimeDataReactorFor(file->fs, file->blobId);
+	parent->channel = hfsRuntimeDataChannel(file->fs, parent->dataReactor);
+	if (parent->channel == NULL) {
+		free(parent);
+		errno = EAGAIN;
+		return -1;
+	}
 	parent->readBuffer = buffer;
 	parent->count = count;
 	parent->offset = offset;
@@ -789,6 +859,13 @@ int hfsIoWriteAtAsync(HfsFile *file, const uint8_t *buffer, size_t count,
 		return -1;
 	}
 	parent->file = file;
+	parent->dataReactor = hfsRuntimeDataReactorFor(file->fs, file->blobId);
+	parent->channel = hfsRuntimeDataChannel(file->fs, parent->dataReactor);
+	if (parent->channel == NULL) {
+		free(parent);
+		errno = EAGAIN;
+		return -1;
+	}
 	parent->writeBuffer = buffer;
 	parent->count = count;
 	parent->offset = offset;

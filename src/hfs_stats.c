@@ -19,6 +19,7 @@
 #define HFS_STATS_HIST_BUCKETS 16U
 #define HFS_STATS_IO_SIZE_BUCKETS 16U
 #define HFS_STATS_DMA_SIZE_CLASSES 8U
+#define HFS_STATS_MAX_DATA_REACTORS 8U
 #define HFS_STATS_MAX_LOCK_DEPTH 8U
 #define HFS_STATS_SNAPSHOT_BYTES (128U * 1024U)
 
@@ -61,6 +62,8 @@ typedef struct HfsStatsShard {
 	uint64_t asyncCancel;
 	uint64_t asyncQueueDepthPeak;
 	uint64_t ioPipelinePeak;
+	uint64_t dataReactorSubmit[HFS_STATS_MAX_DATA_REACTORS];
+	uint64_t dataReactorComplete[HFS_STATS_MAX_DATA_REACTORS];
 	uint64_t ioReadOps;
 	uint64_t ioWriteOps;
 	uint64_t ioReadBytes;
@@ -374,6 +377,32 @@ void hfsStatsRecordAsyncCancel(void) {
 	}
 }
 
+/* Record one direct child submission on a bounded data reactor. */
+void hfsStatsRecordDataReactorSubmit(uint32_t reactorId) {
+	HfsStatsShard *shard;
+
+	if (reactorId >= HFS_STATS_MAX_DATA_REACTORS) {
+		return;
+	}
+	shard = hfsStatsShardGet();
+	if (shard != NULL) {
+		shard->dataReactorSubmit[reactorId]++;
+	}
+}
+
+/* Record one direct child completion on a bounded data reactor. */
+void hfsStatsRecordDataReactorComplete(uint32_t reactorId) {
+	HfsStatsShard *shard;
+
+	if (reactorId >= HFS_STATS_MAX_DATA_REACTORS) {
+		return;
+	}
+	shard = hfsStatsShardGet();
+	if (shard != NULL) {
+		shard->dataReactorComplete[reactorId]++;
+	}
+}
+
 /* Record the child fan-out observed by one aligned parent request. */
 void hfsStatsRecordIoPipeline(uint64_t depth) {
 	HfsStatsShard *shard = hfsStatsShardGet();
@@ -483,6 +512,10 @@ static void hfsStatsAggregateShard(HfsStatsShard *total,
 	}
 	if (shard->ioPipelinePeak > total->ioPipelinePeak) {
 		total->ioPipelinePeak = shard->ioPipelinePeak;
+	}
+	for (i = 0; i < HFS_STATS_MAX_DATA_REACTORS; i++) {
+		total->dataReactorSubmit[i] += shard->dataReactorSubmit[i];
+		total->dataReactorComplete[i] += shard->dataReactorComplete[i];
 	}
 	total->ioReadOps += shard->ioReadOps;
 	total->ioWriteOps += shard->ioWriteOps;
@@ -616,6 +649,12 @@ static void hfsStatsWriteSnapshot(void) {
 		total.asyncQueueDepthPeak);
 	HFS_STATS_APPEND("io_pipeline_peak=%"PRIu64"\n",
 		total.ioPipelinePeak);
+	for (i = 0; i < HFS_STATS_MAX_DATA_REACTORS; i++) {
+		HFS_STATS_APPEND("data_reactor_%u_submit=%"PRIu64"\n", i,
+			total.dataReactorSubmit[i]);
+		HFS_STATS_APPEND("data_reactor_%u_complete=%"PRIu64"\n", i,
+			total.dataReactorComplete[i]);
+	}
 	HFS_STATS_APPEND("io_read_ops=%"PRIu64"\n", total.ioReadOps);
 	HFS_STATS_APPEND("io_write_ops=%"PRIu64"\n", total.ioWriteOps);
 	HFS_STATS_APPEND("io_read_bytes=%"PRIu64"\n", total.ioReadBytes);

@@ -10,7 +10,7 @@ Bug 等级：**致命 > 严重 > 一般**。
 
 ### 已修复
 
-1–5、8–10、10b、11–43、45–47、51–52、57、60。包括已由后续 shard 修复的历史记录；条目中的原始“遗留”描述保留用于复盘，当前状态以本汇总和条目状态字段为准。
+1–5、8–10、10b、11–43、45–47、51–52、57、60–62。包括已由后续 shard 修复的历史记录；条目中的原始“遗留”描述保留用于复盘，当前状态以本汇总和条目状态字段为准。
 
 ### 未修复
 
@@ -936,5 +936,27 @@ Bug 等级：**致命 > 严重 > 一般**。
   8 线程 runtime stress、async pipeline、persistent smoke 和 RocksDB WAL/recovery 均返回 0，
   async `spdk_submit=81` 与 `spdk_complete=81` 闭合，`async_submit=20` 与
   `async_complete=20` 闭合，`io_pipeline_peak=4`。
+
+### 61. 多 reactor direct write 完成与 metadata 操作发生锁反转（已修复，严重级）
+
+- **状态**：已修复；direct write 的 metadata 发布改为 owner poller 非阻塞重试，并回原 data reactor 完成
+- **时间**：2026-09-07（shard-46 多 reactor 专项）
+- **等级**：严重（并发 open/create 与 direct write 会稳定超时，旧路径可能进一步 SIGSEGV）
+- **现象**：设置 `HFS_DATA_REACTORS=2` 后，首个 4 MiB aligned direct write 可以完成，但并发创建下一个文件时 `open()` 超时；早期实现还出现 segfault。gdb 显示 SPDK owner 线程停在 `hfs_lib_async_direct_done -> hfsPublishWriteEnd -> pthread_rwlock_wrlock(g_metaLock)`，调用线程持有 `g_metaLock` 并在 `hfsMetaCreateFile -> hfsRequestWait` 等待 owner completion。
+- **排查过程**：先确认数据 reactor completion 已到达，再检查 owner、async worker 和 Python 主线程栈；发现 direct completion 在 owner 回调中同步获取全局 metadata 写锁，而前台 open/create 持有同一锁等待异步 metadata I/O，形成“owner 等锁、调用者等 owner”的闭环。解除 `hfs_lib_open` 在 `hfsOpenById` 周围的锁只是降低一条路径的风险，不能覆盖 create/metadata commit，因此继续用 owner poller 复现并验证完整闭环。
+- **根因**：跨 reactor completion 直接执行阻塞式 metadata 发布，且 metadata API 在持锁期间等待 SPDK completion；SPDK owner 被锁等待阻塞后无法处理释放该锁所需的 completion。
+- **修复**：新增 `hfsTryPublishWriteEnd` 和 `hfs_direct_publish` owner poller；锁忙时只注册 1 ms 周期重试，不在 owner 线程睡眠或阻塞。发布成功后再向原 data reactor 投递 public request completion，保持回调线程归属和 open-file 引用生命周期。
+- **验证**：reactor=2/4 多文件 direct aligned write、open/create 并发、async pipeline、metadata transaction/path、durability、error injection、fast path、runtime stress、MariaDB persistent 和 RocksDB WAL/recovery 全部通过。
+
+### 62. 大范围 range lock 把不同文件错误串行化（已修复，严重级）
+
+- **状态**：已修复；大范围操作使用 per-inode `rangeGate`，小范围操作继续使用有序全局 hash bucket
+- **时间**：2026-09-07（shard-46 多 reactor 专项）
+- **等级**：严重（4 MiB truncate/write 会覆盖全部 256 个 bucket，导致不同 inode 的 I/O 长时间互相阻塞）
+- **现象**：多文件测试在文件 0 完成 direct write 后，主线程对文件 1/2 执行 `ftruncate(4 MiB)` 时卡住；gdb 显示主线程与 async worker 都在 `hfsIoRangeLock` 的同一全局 `rangeLocks[]` 上等待，尽管 blob/inode 不同。
+- **排查过程**：审查 range bucket 计算发现 4 MiB / 4 KiB = 1024 个 unit，遍历过程会收集全部 256 个哈希 bucket；因此一次大范围操作等价于 mount 级排他锁。确认 data reactor/channel 分配不是阻塞根因后，将大范围路径与 per-inode runtime 对照测试。
+- **根因**：固定数量的全局哈希锁只适合小范围区间；当请求覆盖的 unit 足够多时，哈希集合饱和为全表，跨 inode 产生不必要的锁冲突，并与同步 truncate 等待形成队头阻塞。
+- **修复**：为 `HfsInodeRuntime` 增加 `rangeGate`。当请求覆盖至少四分之一 bucket 时仅获取该 inode 的 gate 写锁，不再抓取全局 bucket；小范围请求先获取 gate 读锁，再按 bucket 编号升序加锁，释放时反序释放，保留交叉区间的死锁顺序保证。
+- **验证**：reactor=2（16 文件，64/64 submit-complete）与 reactor=4（32 文件，128/128，3 个 data reactor 均有计数）通过，既有 fast path、crash、stress 和数据库回归无回退。
 
 ## 通用经验总结

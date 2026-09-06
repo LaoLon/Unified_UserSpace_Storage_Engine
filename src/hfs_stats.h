@@ -94,6 +94,9 @@ void hfsStatsRecordAsyncComplete(void);
 void hfsStatsRecordAsyncCancel(void);
 /* Record the number of SPDK child requests held by one aligned parent. */
 void hfsStatsRecordIoPipeline(uint64_t depth);
+/* Record one direct child submit/completion on a selected data reactor. */
+void hfsStatsRecordDataReactorSubmit(uint32_t reactorId);
+void hfsStatsRecordDataReactorComplete(uint32_t reactorId);
 
 /* Record metadata image/page/log writes and transaction batch size. */
 void hfsStatsRecordMetadataWrite(uint64_t bytes, uint64_t imageBytes,
@@ -152,6 +155,16 @@ static inline void hfsStatsRecordAsyncCancelFast(void) {
 static inline void hfsStatsRecordIoPipelineFast(uint64_t depth) {
 	if (hfsStatsEnabledFast()) {
 		hfsStatsRecordIoPipeline(depth);
+	}
+}
+static inline void hfsStatsRecordDataReactorSubmitFast(uint32_t reactorId) {
+	if (hfsStatsEnabledFast()) {
+		hfsStatsRecordDataReactorSubmit(reactorId);
+	}
+}
+static inline void hfsStatsRecordDataReactorCompleteFast(uint32_t reactorId) {
+	if (hfsStatsEnabledFast()) {
+		hfsStatsRecordDataReactorComplete(reactorId);
 	}
 }
 static inline void hfsStatsRecordMetadataWriteFast(uint64_t bytes,

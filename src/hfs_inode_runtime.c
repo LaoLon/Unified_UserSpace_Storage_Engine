@@ -48,6 +48,7 @@ void hfsInodeRuntimeFini(Hfs *fs) {
 		while (runtime != NULL) {
 			HfsInodeRuntime *next = runtime->next;
 
+			pthread_rwlock_destroy(&runtime->rangeGate);
 			pthread_rwlock_destroy(&runtime->syncLock);
 			pthread_mutex_destroy(&runtime->appendLock);
 			pthread_mutex_destroy(&runtime->resizeLock);
@@ -104,6 +105,16 @@ HfsInodeRuntime *hfsInodeRuntimeGet(Hfs *fs, uint64_t inodeId) {
 	}
 	rc = pthread_rwlock_init(&runtime->syncLock, NULL);
 	if (rc != 0) {
+		pthread_mutex_destroy(&runtime->appendLock);
+		pthread_mutex_destroy(&runtime->resizeLock);
+		free(runtime);
+		pthread_mutex_unlock(&fs->inodeRuntimeLock);
+		errno = rc;
+		return NULL;
+	}
+	rc = pthread_rwlock_init(&runtime->rangeGate, NULL);
+	if (rc != 0) {
+		pthread_rwlock_destroy(&runtime->syncLock);
 		pthread_mutex_destroy(&runtime->appendLock);
 		pthread_mutex_destroy(&runtime->resizeLock);
 		free(runtime);

@@ -12,6 +12,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <spdk/thread.h>
+
 #include "hfs.h"
 #include "hfs_durability.h"
 #include "hfs_fd.h"
@@ -530,12 +532,11 @@ static ssize_t hfsWritevAt(HfsOpenFile *openFile, const struct iovec *iov,
 	return (ssize_t)done;
 }
 
-/* Publish a successful write end for both linked and unlinked open files. */
-static void hfsPublishWriteEnd(HfsOpenFile *openFile, uint64_t end) {
+/* Update the in-memory inode while the metadata write lock is held. */
+static void hfsPublishWriteEndLocked(HfsOpenFile *openFile, uint64_t end) {
 	struct hfs_inode *in;
 	uint64_t nowNs = hfs_now_ns();
 
-	hfsMetaWriteLock();
 	in = g_fs == NULL ? NULL : hfsMetaFindById(g_fs, openFile->inodeId);
 	if (in != NULL) {
 		if (end > in->size) {
@@ -562,7 +563,23 @@ static void hfsPublishWriteEnd(HfsOpenFile *openFile, uint64_t end) {
 				      memory_order_relaxed);
 		atomic_store_explicit(&openFile->ctimeNs, nowNs, memory_order_relaxed);
 	}
+}
+
+/* Publish a successful write end for both linked and unlinked open files. */
+static void hfsPublishWriteEnd(HfsOpenFile *openFile, uint64_t end) {
+	hfsMetaWriteLock();
+	hfsPublishWriteEndLocked(openFile, end);
 	pthread_rwlock_unlock(&g_metaLock);
+}
+
+/* Try to publish a write without blocking the SPDK owner thread. */
+static bool hfsTryPublishWriteEnd(HfsOpenFile *openFile, uint64_t end) {
+	if (pthread_rwlock_trywrlock(&g_metaLock) != 0) {
+		return false;
+	}
+	hfsPublishWriteEndLocked(openFile, end);
+	pthread_rwlock_unlock(&g_metaLock);
+	return true;
 }
 
 /* Prepare a truncate range before publishing its new logical file size. */
@@ -789,17 +806,97 @@ typedef struct HfsLibAsyncDirectContext {
 	bool write;
 } HfsLibAsyncDirectContext;
 
-/* Complete a direct data request and release its stable open-file reference. */
-static void hfs_lib_async_direct_done(void *context, ssize_t result, int error) {
-	HfsLibAsyncDirectContext *direct = context;
+/* Carry a multi-reactor write completion through metadata ordering. */
+typedef struct HfsLibAsyncDirectCommit {
+	HfsLibAsyncDirectContext *direct;
+	ssize_t result;
+	int error;
+	uint32_t dataReactor;
+	struct spdk_poller *poller;
+} HfsLibAsyncDirectCommit;
 
-	if (direct->write && error == 0 && result > 0) {
-		hfsPublishWriteEnd(direct->openFile,
-			direct->writeOffset + (uint64_t)result);
-	}
-	hfsAsyncCompleteDirect(direct->request, result, error);
+/* Finish a direct request on its data reactor after metadata publication. */
+static void hfs_lib_async_direct_finish(void *arg) {
+	HfsLibAsyncDirectCommit *commit = arg;
+	HfsLibAsyncDirectContext *direct = commit->direct;
+
+	hfsAsyncCompleteDirect(direct->request, commit->result, commit->error);
 	(void)hfs_release_open_file(direct->openFile);
 	free(direct);
+	free(commit);
+}
+
+/* Retry metadata publication from the owner poller without blocking it. */
+static int hfs_lib_async_direct_publish_poller(void *arg);
+
+/* Publish a direct write's inode size on the metadata reactor. */
+static void hfs_lib_async_direct_publish(void *arg) {
+	HfsLibAsyncDirectCommit *commit = arg;
+	HfsLibAsyncDirectContext *direct = commit->direct;
+
+	if (direct->write && commit->error == 0 && commit->result > 0) {
+		if (!hfsTryPublishWriteEnd(direct->openFile,
+				direct->writeOffset + (uint64_t)commit->result)) {
+			if (commit->poller == NULL) {
+				commit->poller = spdk_poller_register_named(
+					hfs_lib_async_direct_publish_poller, commit, 1000,
+					"hfs_direct_publish");
+			}
+			if (commit->poller != NULL) {
+				return;
+			}
+			commit->error = EIO;
+		}
+	}
+	if (commit->poller != NULL) {
+		spdk_poller_unregister(&commit->poller);
+	}
+	if (hfsRuntimeSubmitData(commit->dataReactor,
+			 hfs_lib_async_direct_finish, commit) != 0) {
+		commit->error = EIO;
+		hfs_lib_async_direct_finish(commit);
+	}
+}
+
+/* Run one deferred metadata publication attempt on the owner reactor. */
+static int hfs_lib_async_direct_publish_poller(void *arg) {
+	hfs_lib_async_direct_publish(arg);
+	return SPDK_POLLER_BUSY;
+}
+
+/* Complete a direct data request without taking metadata locks on a data reactor. */
+static void hfs_lib_async_direct_done(void *context, ssize_t result, int error) {
+	HfsLibAsyncDirectContext *direct = context;
+	uint32_t dataReactor;
+	HfsLibAsyncDirectCommit *commit;
+
+	dataReactor = hfsRuntimeDataReactorFor(direct->openFile->file->fs,
+					      direct->openFile->file->blobId);
+	if (!direct->write || dataReactor == 0) {
+		if (direct->write && error == 0 && result > 0) {
+			hfsPublishWriteEnd(direct->openFile,
+				direct->writeOffset + (uint64_t)result);
+		}
+		hfsAsyncCompleteDirect(direct->request, result, error);
+		(void)hfs_release_open_file(direct->openFile);
+		free(direct);
+		return;
+	}
+	commit = calloc(1, sizeof(*commit));
+	if (commit == NULL) {
+		hfsAsyncCompleteDirect(direct->request, -1, ENOMEM);
+		(void)hfs_release_open_file(direct->openFile);
+		free(direct);
+		return;
+	}
+	commit->direct = direct;
+	commit->result = result;
+	commit->error = error;
+	commit->dataReactor = dataReactor;
+	if (hfsRuntimeSubmit(hfs_lib_async_direct_publish, commit) != 0) {
+		commit->error = EIO;
+		hfs_lib_async_direct_finish(commit);
+	}
 }
 
 /* Return true when a request is large and aligned enough for direct child fan-out. */
@@ -1001,6 +1098,14 @@ int hfs_lib_open(const char *path, int flags, mode_t mode) {
 	const char *leaf;
 	HfsFile *file;
 	HfsOpenFile *openFile = NULL;
+	uint64_t inodeSize;
+	uint64_t inodeCtimeNs;
+	uint64_t inodeMtimeNs;
+	uint64_t inodeAtimeNs;
+	uint32_t inodeMode;
+	uint32_t inodeUid;
+	uint32_t inodeGid;
+	struct hfs_inode *current;
 	int fd;
 	int rc;
 	bool created = false;
@@ -1134,21 +1239,31 @@ int hfs_lib_open(const char *path, int flags, mode_t mode) {
 		pthread_rwlock_unlock(&g_metaLock);
 		return -1;
 	}
+	inodeSize = in->size;
+	inodeCtimeNs = in->ctimeNs;
+	inodeMtimeNs = in->mtimeNs;
+	inodeAtimeNs = in->atimeNs;
+	inodeMode = in->mode;
+	inodeUid = in->uid;
+	inodeGid = in->gid;
 
+	/* Do not hold the process metadata lock while waiting for SPDK metadata I/O. */
+	pthread_rwlock_unlock(&g_metaLock);
 	if (!hfsOpenById(file)) {
 		close(fd);
 		free(file);
-		pthread_rwlock_unlock(&g_metaLock);
 		return -1;
 	}
+	hfsMetaWriteLock();
+	current = g_fs == NULL ? NULL : hfsMetaFindById(g_fs, file->inodeId);
 	atomic_store_explicit(&file->runtime->allocatedClusters,
 			      spdk_blob_get_num_clusters(file->blob),
 			      memory_order_release);
-	if (truncateRequested && in->size != 0) {
+	if (truncateRequested && inodeSize != 0) {
 		int savedErrno;
 
-		if (hfsPrepareTruncate(file, in->size, 0) != 0 ||
-		    hfsMetaSetSize(g_fs, in, 0) != 0) {
+		if (hfsPrepareTruncate(file, inodeSize, 0) != 0 ||
+		    (current != NULL && hfsMetaSetSize(g_fs, current, 0) != 0)) {
 			savedErrno = errno;
 			hfsClose(file);
 			free(file);
@@ -1158,7 +1273,7 @@ int hfs_lib_open(const char *path, int flags, mode_t mode) {
 			return -1;
 		}
 	}
-	if (hfsFdCreate(&openFile, file, in->id, flags,
+	if (hfsFdCreate(&openFile, file, file->inodeId, flags,
 			((flags & O_ACCMODE) != O_RDONLY), false, NULL) != 0 ||
 	    hfsFdRegister(fd, openFile) != 0) {
 		if (openFile != NULL) {
@@ -1170,17 +1285,19 @@ int hfs_lib_open(const char *path, int flags, mode_t mode) {
 		pthread_rwlock_unlock(&g_metaLock);
 		return -1;
 	}
-	atomic_store_explicit(&openFile->size, in->size, memory_order_relaxed);
-	if ((flags & O_APPEND) != 0) {
-		openFile->offset = in->size;
-	}
-	atomic_store_explicit(&openFile->ctimeNs, in->ctimeNs,
+	atomic_store_explicit(&openFile->size,
+			      current != NULL ? current->size : inodeSize,
 			      memory_order_relaxed);
-	openFile->mode = in->mode;
-	openFile->uid = in->uid;
-	openFile->gid = in->gid;
-	openFile->atimeNs = in->atimeNs;
-	atomic_store_explicit(&openFile->mtimeNs, in->mtimeNs,
+	if ((flags & O_APPEND) != 0) {
+		openFile->offset = current != NULL ? current->size : inodeSize;
+	}
+	atomic_store_explicit(&openFile->ctimeNs, inodeCtimeNs,
+			      memory_order_relaxed);
+	openFile->mode = inodeMode;
+	openFile->uid = inodeUid;
+	openFile->gid = inodeGid;
+	openFile->atimeNs = inodeAtimeNs;
+	atomic_store_explicit(&openFile->mtimeNs, inodeMtimeNs,
 			      memory_order_relaxed);
 
 	pthread_rwlock_unlock(&g_metaLock);

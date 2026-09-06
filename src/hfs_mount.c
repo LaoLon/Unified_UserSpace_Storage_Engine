@@ -219,6 +219,7 @@ static void hfsDoMount(void *arg) {
 /* Mount the blobstore synchronously; return false on timeout or SPDK error. */
 int hfsMount(Hfs *fs) {
 	HfsMountRequest request;
+	int rc;
 
 	if (fs == NULL) {
 		errno = EINVAL;
@@ -227,8 +228,18 @@ int hfsMount(Hfs *fs) {
 	memset(&request, 0, sizeof(request));
 	request.fs = fs;
 	hfsRequestInit(&request.result, HFS_REQUEST_MOUNT);
-	return hfsRequestWait(&request.result, hfsDoMount, &request) == 0 &&
-		fs->blobstore != NULL;
+	rc = hfsRequestWait(&request.result, hfsDoMount, &request);
+	if (rc != 0 || fs->blobstore == NULL) {
+		return 0;
+	}
+	if (hfsRuntimeDataInit(fs) != 0) {
+		int savedErrno = errno != 0 ? errno : EIO;
+
+		(void)hfsUmount(fs);
+		errno = savedErrno;
+		return 0;
+	}
+	return 1;
 }
 
 /* Unmount the blobstore synchronously; return false on timeout or SPDK error. */
@@ -237,6 +248,10 @@ int hfsUmount(Hfs *fs) {
 
 	if (fs == NULL) {
 		errno = EINVAL;
+		return 0;
+	}
+	if (hfsRuntimeDataFini(fs) != 0) {
+		errno = EIO;
 		return 0;
 	}
 	memset(&request, 0, sizeof(request));

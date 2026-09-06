@@ -1,6 +1,6 @@
 # HFS asynchronous request model
 
-> Status: shard-45 public direct path (2026-09-06). Large, full-unit aligned positioned I/O
+> Status: shard-46 public direct path with optional data reactors (2026-09-07). Large, full-unit aligned positioned I/O
 > binds a public request directly to a bounded SPDK child parent; unsupported shapes retain the
 > bounded executor fallback.
 
@@ -36,6 +36,15 @@ there is no use-after-free of the fd table entry.
 `hfsAsyncWait` may return before a concurrently scheduled callback has finished executing; users
 that need callback-side state must synchronize that state independently. `hfsAsyncResult` is valid
 after wait completion and is independent of callback timing.
+
+When `HFS_DATA_REACTORS` is greater than one, reactor 0 remains the metadata/compatibility owner and
+the direct data path selects one extra reactor from a stable blob-id hash. Each selected reactor has
+its own SPDK channel and submit/complete counters (`data_reactor_N_submit` and
+`data_reactor_N_complete`). A successful direct write publishes inode size on the metadata owner;
+if the owner is waiting in another metadata transaction, a low-rate owner poller retries the publish
+instead of blocking the owner thread. The public completion is then sent back to the originating data
+reactor. Unsupported shapes, resize/RMW, vector, fsync, small, and resource-contended requests keep
+using the bounded executor fallback.
 
 ## Cancellation and shutdown
 

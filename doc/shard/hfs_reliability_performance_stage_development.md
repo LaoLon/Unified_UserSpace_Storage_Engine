@@ -1,6 +1,6 @@
 # HFS 可靠性与性能优化阶段计划（shard-36 起）
 
-> 状态：shard-36～42 核心实现已完成，正确性闸门 A 已通过；shard-43 已先落地可移植 v5 页/WAL 格式基础和离线恢复校验，shard-44 已加入 v4 脏范围 checkpoint 与受限 group commit 基础，shard-45 已完成 async libhfs executor 及公开 aligned positioned direct child path；运行时仍使用 v4，v5 迁移、设备 WAL 提交、多 reactor/channel 和 SPDK 原生 libaio/io_uring ABI 仍待后续阶段<br>
+> 状态：shard-36～42 核心实现已完成，正确性闸门 A 已通过；shard-43 已先落地可移植 v5 页/WAL 格式基础和离线恢复校验，shard-44 已加入 v4 脏范围 checkpoint 与受限 group commit 基础，shard-45 已完成 async libhfs executor 及公开 aligned positioned direct child path，shard-46 已完成可选多 data reactor/channel 基础与跨 reactor 完成顺序修复；运行时仍使用 v4，v5 迁移、设备 WAL 提交和 SPDK 原生 libaio/io_uring ABI 仍待后续阶段<br>
 > 制定日期：2026-09-05  
 > 适用基线：`main@91db26a`（shard-36 已完成）
 > 输入文档：`review/hfs_architecture_performance_review_2026-09-05.md`  
@@ -675,32 +675,36 @@ mount 上的其他 dirty inode 合并为一个受 v4 intent 四槽位约束的 d
 
 ## 15. shard-46：多 reactor、per-reactor channel 与亲和配置
 
+> 状态：基础实现与专项回归已完成（2026-09-07）。`HFS_DATA_REACTORS=1..8` 现可选启用；reactor 0 保留为 metadata/兼容 owner，额外 reactor 只承载大块、全 unit 对齐的 async direct data path。该 shard 不宣称 metadata/WAL 已多 reactor 化，也不改变多进程、mmap、native libaio/io_uring 的支持边界。
+
 ### 目标
 
 消除单 SPDK owner 线程瓶颈，使数据 I/O 可在多个固定 reactor/channel 上并行，同时保留 metadata 顺序和跨 inode 操作的正确性。
 
 ### 主要改动
 
-- 按配置创建 N 个数据 reactor，每个 reactor 固定 CPU、独立 SPDK I/O channel、请求队列、DMA cache 和统计 shard。
-- I/O 以 inode/blob hash 固定到 reactor，保证同一 inode 的顺序易于推理并减少跨核迁移。
-- metadata/WAL 使用专用 reactor 或协调队列；跨目录 rename 由 transaction coordinator 统一排序。
-- fsync 收集目标 inode 已分发请求的 epoch，只等待相关 reactor，不做无条件全局 drain。
-- owner PID/fork child 防护扩展到 reactor 集合；shutdown 先阻止新请求，再逐 reactor drain 和释放 channel。
-- 增加 CPU affinity、reactor 数、NUMA node 和 queue depth 配置，并在启动日志中输出无敏感信息的实际绑定。
+- 按 `HFS_DATA_REACTORS` 创建 1～8 个运行时 reactor；reactor 0 复用现有 owner/channel，额外 reactor 拥有独立 SPDK I/O channel、提交队列和统计 shard。
+- 数据 I/O 以 blob id 的稳定混合 hash 选择额外 reactor，避免 SPDK blob id 固定低位步长造成分布偏斜；同一 blob 始终落到同一 data reactor。
+- `HFS_DATA_REACTOR_CPUS` 可提供额外 reactor 的 CPU 列表；未配置时保持 SPDK 默认调度，不伪造 NUMA 绑定。
+- direct write 完成先回 metadata owner 更新 inode；metadata owner 忙于同步元数据 I/O 时使用 owner poller 重试，随后把 public request 完成消息送回原 data reactor，避免跨线程直接持有全局 metadata 锁。
+- 大范围 RMW/zero/unmap 不再因哈希到全部全局 range bucket 而阻塞其他文件；每个 inode 的 `rangeGate` 在覆盖大多数 bucket 时提供局部排他保护。
+- owner PID/fork child 防护扩展到 reactor 集合；shutdown 先停止新提交，逐 reactor drain，再释放 channel。
+- 每个 data reactor 导出 `data_reactor_N_submit/complete` 计数，便于确认 channel 闭合和分布。
 
 ### 测试
 
-- 新增 `scripts/db/multireactor_scaling_test.sh`。
-- reactor=1/2/4/8，线程=1/2/4/8/16，QD=1/4/16/32 的矩阵。
-- 同 inode 顺序、不同 inode 并行、跨目录 rename+I/O、fsync+多 reactor、shutdown/fork 压力。
-- 在单 NUMA 和跨 NUMA 配置下记录 remote memory、CPU migration 和 p99.9。
+- 新增 `scripts/db/multireactor_scaling_test.sh`，覆盖 reactor=2/4 的多文件 direct aligned write、open/create 并发、完成等待和 per-reactor submit/complete 计数。
+- VM 上 reactor=2（16 文件）与 reactor=4（32 文件）均通过；reactor=2 的 64/64 请求落在额外 reactor，reactor=4 的 128/128 请求分布到 3 个额外 reactor。
+- 与 async pipeline、metadata transaction/path、I/O error、durability crash、fast path、runtime stress、persistent smoke 和 RocksDB WAL/recovery 回归一起验证；Make/CMake Release 均通过。
+- CPU affinity、跨 NUMA、跨目录 rename+I/O 和 fsync epoch 仍留给后续真实硬件矩阵，不在本 shard 宣称完成。
 
 ### 验收
 
-- 普通数据 I/O 不再全部通过单一 pthread/channel。
-- reactor 数增加时，submit/complete 能分布到相应 channel，且各 channel 计数闭合。
-- 多核测试吞吐随 reactor 增长，直到 bdev 或 CPU 饱和；无错误线程访问、channel 误用和 shutdown 卡死。
-- 单 reactor 模式保持兼容，并作为回退配置。
+- 单 reactor 模式保持兼容并作为回退配置；额外 reactor 的 direct data I/O 不再全部通过单一 SPDK channel。
+- reactor 数增加时，submit/complete 能分布到相应 data channel，且每个 channel 计数闭合。
+- metadata owner 与 data reactor 的完成顺序无全局锁死锁；大范围 range 操作不再锁住其他 inode 的全部哈希 bucket。
+- 多 reactor shutdown、fork child rejection、错误传播和既有数据库回归无回退。
+- 吞吐随 reactor 增长的正式目标、NUMA/CPU 亲和收益和真实 NVMe 证据留给 shard-48，避免把 Malloc smoke 误报为设备扩展性结论。
 
 ### 提交建议
 

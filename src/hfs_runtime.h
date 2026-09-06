@@ -15,6 +15,8 @@
 int hfsRuntimeStart(void);
 /* Submit one message to the dedicated SPDK owner thread. */
 int hfsRuntimeSubmit(spdk_msg_fn fn, void *ctx);
+/* Submit a data-path message to a selected per-reactor SPDK thread. */
+int hfsRuntimeSubmitData(uint32_t reactorId, spdk_msg_fn fn, void *ctx);
 /* One request queued into the owner-side batch dispatcher. */
 typedef struct HfsRuntimeBatchItem {
 	spdk_msg_fn fn;
@@ -24,6 +26,13 @@ typedef struct HfsRuntimeBatchItem {
 } HfsRuntimeBatchItem;
 /* Queue one request and coalesce concurrent submissions into one owner message. */
 int hfsRuntimeSubmitBatch(HfsRuntimeBatchItem *item, spdk_msg_fn fn, void *ctx);
+/* Allocate and release per-reactor blobstore channels after mount. */
+int hfsRuntimeDataInit(Hfs *fs);
+int hfsRuntimeDataFini(Hfs *fs);
+/* Select the stable reactor/channel for one blob. */
+uint32_t hfsRuntimeDataReactorFor(const Hfs *fs, uint64_t blobId);
+struct spdk_io_channel *hfsRuntimeDataChannel(const Hfs *fs,
+						 uint32_t reactorId);
 /* Stop accepting work, drain SPDK state, and join the owner pthread. */
 int hfsRuntimeStop(void);
 /* Mark subsystem configuration complete so runtime teardown can finalize it. */

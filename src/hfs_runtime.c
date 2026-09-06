@@ -5,6 +5,7 @@
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <sched.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/syscall.h>
 #include <linux/futex.h>
@@ -24,6 +25,20 @@
 #define HFS_COMPLETION_PENDING 0
 #define HFS_COMPLETION_DONE 1
 #define HFS_COMPLETION_TIMED_OUT 2
+#define HFS_RUNTIME_MAX_DATA_REACTORS 8U
+
+/* One optional SPDK data reactor; reactor zero remains the metadata owner. */
+typedef struct HfsRuntimeDataReactor {
+	pthread_t owner;
+	_Atomic(struct spdk_thread *) spdkThread;
+	pthread_mutex_t lock;
+	pthread_cond_t stateChanged;
+	unsigned int index;
+	int cpu;
+	bool threadCreated;
+	bool ready;
+	int initRc;
+} HfsRuntimeDataReactor;
 
 /* Runtime state owned by the process-wide HFS library instance. */
 struct hfs_runtime_state {
@@ -46,6 +61,8 @@ struct hfs_runtime_state {
 	_Atomic uint64_t queued;
 	_Atomic uint64_t inflight;
 	_Atomic uint32_t submitters;
+	HfsRuntimeDataReactor *dataReactors;
+	uint32_t dataReactorCount;
 };
 
 static struct hfs_runtime_state g_runtime = {
@@ -57,6 +74,7 @@ static _Atomic bool g_ownerViolationLogged;
 
 /* Owner identity is immutable for a runtime generation and needs no mutex lookup. */
 static _Thread_local bool g_hfsRuntimeOwnerThread;
+static _Thread_local bool g_hfsRuntimeDataThread;
 
 /* Instrument the runtime state mutex while keeping the fast path lock-free in stats-off mode. */
 static int hfsRuntimeMutexLock(pthread_mutex_t *lock) {
@@ -312,6 +330,235 @@ static void *hfsRuntimeOwnerMain(void *arg) {
 	return NULL;
 }
 
+/* Parse a bounded reactor count while retaining a single-reactor default. */
+static uint32_t hfsRuntimeDataReactorCountEnv(void) {
+	const char *value = getenv("HFS_DATA_REACTORS");
+	char *end = NULL;
+	unsigned long parsed;
+
+	if (value == NULL || value[0] == '\0') {
+		return 1;
+	}
+	parsed = strtoul(value, &end, 10);
+	if (end == value || *end != '\0' || parsed == 0 ||
+	    parsed > HFS_RUNTIME_MAX_DATA_REACTORS) {
+		return 1;
+	}
+	return (uint32_t)parsed;
+}
+
+/* Return the optional CPU affinity entry for one data reactor. */
+static int hfsRuntimeDataCpuEnv(unsigned int index) {
+	const char *value = getenv("HFS_DATA_REACTOR_CPUS");
+	const char *cursor;
+	char *end = NULL;
+	unsigned int current = 0;
+	unsigned long parsed;
+
+	if (value == NULL || value[0] == '\0') {
+		return -1;
+	}
+	cursor = value;
+	while (*cursor != '\0') {
+		while (*cursor == ' ' || *cursor == '\t' || *cursor == ',') {
+			cursor++;
+		}
+		if (*cursor == '\0') {
+			break;
+		}
+		parsed = strtoul(cursor, &end, 10);
+		if (end == cursor) {
+			return -1;
+		}
+		if (current == index && parsed <= INT_MAX) {
+			return (int)parsed;
+		}
+		current++;
+		cursor = end;
+		while (*cursor == ' ' || *cursor == '\t') {
+			cursor++;
+		}
+		if (*cursor != ',' && *cursor != '\0') {
+			return -1;
+		}
+	}
+	return -1;
+}
+
+/* Publish one data reactor's SPDK thread and initialization result. */
+static void hfsRuntimeDataPublishReady(HfsRuntimeDataReactor *reactor,
+					       int rc) {
+	pthread_mutex_lock(&reactor->lock);
+	reactor->initRc = rc;
+	reactor->ready = true;
+	pthread_cond_broadcast(&reactor->stateChanged);
+	pthread_mutex_unlock(&reactor->lock);
+}
+
+/* Poll one independently owned SPDK data reactor until shutdown. */
+static void *hfsRuntimeDataMain(void *arg) {
+	HfsRuntimeDataReactor *reactor = arg;
+	struct spdk_thread *thread;
+	char name[32];
+	sigset_t previousSignalMask;
+	bool signalMaskSaved = false;
+	int rc;
+
+	rc = hfsRuntimeBlockManagedSignals(&previousSignalMask);
+	if (rc != 0) {
+		hfsRuntimeDataPublishReady(reactor, -rc);
+		return NULL;
+	}
+	signalMaskSaved = true;
+	if (reactor->cpu >= 0) {
+		cpu_set_t cpuSet;
+
+		CPU_ZERO(&cpuSet);
+		CPU_SET((unsigned int)reactor->cpu, &cpuSet);
+		(void)pthread_setaffinity_np(pthread_self(), sizeof(cpuSet), &cpuSet);
+	}
+	snprintf(name, sizeof(name), "hfs-data-%u", reactor->index);
+	thread = spdk_thread_create(name, NULL);
+	if (thread == NULL) {
+		if (signalMaskSaved) {
+			pthread_sigmask(SIG_SETMASK, &previousSignalMask, NULL);
+		}
+		hfsRuntimeDataPublishReady(reactor, -ENOMEM);
+		return NULL;
+	}
+	atomic_store_explicit(&reactor->spdkThread, thread, memory_order_release);
+	pthread_mutex_lock(&reactor->lock);
+	reactor->threadCreated = true;
+	pthread_mutex_unlock(&reactor->lock);
+	hfsRuntimeDataPublishReady(reactor, 0);
+	spdk_set_thread(thread);
+	g_hfsRuntimeDataThread = true;
+	while (!spdk_thread_is_exited(thread)) {
+		spdk_thread_poll(thread, 0, 0);
+	}
+	g_hfsRuntimeDataThread = false;
+	spdk_set_thread(NULL);
+	spdk_thread_destroy(thread);
+	atomic_store_explicit(&reactor->spdkThread, NULL, memory_order_release);
+	if (signalMaskSaved) {
+		pthread_sigmask(SIG_SETMASK, &previousSignalMask, NULL);
+	}
+	return NULL;
+}
+
+/* Request one data reactor to exit after its queued messages drain. */
+static void hfsRuntimeDataStopMessage(void *arg) {
+	HfsRuntimeDataReactor *reactor = arg;
+	struct spdk_thread *thread =
+		atomic_load_explicit(&reactor->spdkThread, memory_order_acquire);
+
+	if (thread != NULL) {
+		spdk_thread_exit(thread);
+	}
+}
+
+/* Start optional data reactors after the global SPDK thread library is ready. */
+static int hfsRuntimeStartDataReactors(void) {
+	uint32_t count = hfsRuntimeDataReactorCountEnv();
+	uint32_t i;
+	uint32_t initialized = 0;
+	uint32_t created = 0;
+	int rc;
+
+	g_runtime.dataReactorCount = count;
+	if (count <= 1) {
+		return 0;
+	}
+	g_runtime.dataReactors = calloc(count - 1U,
+				       sizeof(*g_runtime.dataReactors));
+	if (g_runtime.dataReactors == NULL) {
+		g_runtime.dataReactorCount = 0;
+		return -ENOMEM;
+	}
+	for (i = 1; i < count; i++) {
+		HfsRuntimeDataReactor *reactor = &g_runtime.dataReactors[i - 1U];
+
+		reactor->index = i;
+		reactor->cpu = hfsRuntimeDataCpuEnv(i - 1U);
+		pthread_mutex_init(&reactor->lock, NULL);
+		pthread_cond_init(&reactor->stateChanged, NULL);
+		initialized = i;
+		rc = pthread_create(&reactor->owner, NULL, hfsRuntimeDataMain,
+				    reactor);
+		if (rc != 0) {
+			break;
+		}
+		created = i;
+		pthread_mutex_lock(&reactor->lock);
+		while (!reactor->ready) {
+			pthread_cond_wait(&reactor->stateChanged, &reactor->lock);
+		}
+		rc = reactor->initRc;
+		pthread_mutex_unlock(&reactor->lock);
+		if (rc != 0) {
+			break;
+		}
+	}
+	if (i != count || rc != 0) {
+		for (uint32_t j = 1; j <= created; j++) {
+			HfsRuntimeDataReactor *reactor =
+				&g_runtime.dataReactors[j - 1U];
+			struct spdk_thread *thread = atomic_load_explicit(
+				&reactor->spdkThread, memory_order_acquire);
+
+			if (thread != NULL) {
+				spdk_thread_send_msg(thread, hfsRuntimeDataStopMessage,
+						    reactor);
+			}
+		}
+		for (uint32_t j = 1; j <= created; j++) {
+			HfsRuntimeDataReactor *reactor =
+				&g_runtime.dataReactors[j - 1U];
+			pthread_join(reactor->owner, NULL);
+		}
+		for (uint32_t j = 1; j <= initialized; j++) {
+			HfsRuntimeDataReactor *reactor =
+				&g_runtime.dataReactors[j - 1U];
+			pthread_cond_destroy(&reactor->stateChanged);
+			pthread_mutex_destroy(&reactor->lock);
+		}
+		free(g_runtime.dataReactors);
+		g_runtime.dataReactors = NULL;
+		g_runtime.dataReactorCount = 0;
+		return rc != 0 ? rc : -EIO;
+	}
+	return 0;
+}
+
+/* Stop and join all optional data reactors before the global SPDK thread. */
+static void hfsRuntimeStopDataReactors(void) {
+	uint32_t i;
+
+	if (g_runtime.dataReactors == NULL) {
+		g_runtime.dataReactorCount = 0;
+		return;
+	}
+	for (i = 1; i < g_runtime.dataReactorCount; i++) {
+		HfsRuntimeDataReactor *reactor = &g_runtime.dataReactors[i - 1U];
+		struct spdk_thread *thread = atomic_load_explicit(
+			&reactor->spdkThread, memory_order_acquire);
+
+		if (thread != NULL) {
+			spdk_thread_send_msg(thread, hfsRuntimeDataStopMessage, reactor);
+		}
+	}
+	for (i = 1; i < g_runtime.dataReactorCount; i++) {
+		HfsRuntimeDataReactor *reactor = &g_runtime.dataReactors[i - 1U];
+
+		pthread_join(reactor->owner, NULL);
+		pthread_cond_destroy(&reactor->stateChanged);
+		pthread_mutex_destroy(&reactor->lock);
+	}
+	free(g_runtime.dataReactors);
+	g_runtime.dataReactors = NULL;
+	g_runtime.dataReactorCount = 0;
+}
+
 /* Start the owner pthread once and wait for SPDK initialization. */
 int hfsRuntimeStart(void) {
 	const char *batchEnv;
@@ -343,6 +590,11 @@ int hfsRuntimeStart(void) {
 
 	if (rc != 0) {
 		pthread_join(g_runtime.owner, NULL);
+		return rc;
+	}
+	rc = hfsRuntimeStartDataReactors();
+	if (rc != 0) {
+		(void)hfsRuntimeStop();
 	}
 	return rc;
 }
@@ -408,6 +660,78 @@ submit_done:
 	free(message);
 	atomic_fetch_sub_explicit(&g_runtime.submitters, 1,
 		memory_order_release);
+	return rc;
+}
+
+/* Submit one message to a non-global data reactor. */
+int hfsRuntimeSubmitData(uint32_t reactorId, spdk_msg_fn fn, void *ctx) {
+	HfsRuntimeMessage *message = NULL;
+	HfsRuntimeDataReactor *reactor;
+	struct spdk_thread *thread;
+	uint64_t queueDepth;
+	int rc = 0;
+
+	if (fn == NULL) {
+		return -EINVAL;
+	}
+	if (reactorId == 0) {
+		return hfsRuntimeSubmit(fn, ctx);
+	}
+	if (hfsRuntimeIsForkChild()) {
+		HFS_STATS_SPDK_REJECT();
+		return -ECHILD;
+	}
+	if (g_runtime.dataReactors == NULL ||
+	    reactorId >= g_runtime.dataReactorCount) {
+		HFS_STATS_SPDK_REJECT();
+		return -ESHUTDOWN;
+	}
+	reactor = &g_runtime.dataReactors[reactorId - 1U];
+	atomic_fetch_add_explicit(&g_runtime.submitters, 1,
+					memory_order_acquire);
+	if (!atomic_load_explicit(&g_runtime.accepting, memory_order_acquire)) {
+		rc = -ESHUTDOWN;
+		goto data_submit_done;
+	}
+	thread = atomic_load_explicit(&reactor->spdkThread, memory_order_acquire);
+	if (thread == NULL) {
+		rc = -ESHUTDOWN;
+		goto data_submit_done;
+	}
+	if (hfsStatsTimingFastEnabled()) {
+		message = calloc(1, sizeof(*message));
+		if (message == NULL) {
+			HFS_STATS_ERROR();
+			rc = -ENOMEM;
+			goto data_submit_done;
+		}
+		message->fn = fn;
+		message->ctx = ctx;
+		message->enqueueNs = hfsStatsNowNs();
+	}
+	if (hfsRuntimeIsForkChild() ||
+	    !atomic_load_explicit(&g_runtime.accepting, memory_order_acquire)) {
+		rc = hfsRuntimeIsForkChild() ? -ECHILD : -ESHUTDOWN;
+		goto data_submit_done;
+	}
+	HFS_STATS_SPDK_SUBMIT();
+	if (message != NULL) {
+		queueDepth = atomic_fetch_add_explicit(&g_runtime.queued, 1,
+						memory_order_relaxed) + 1U;
+		hfsStatsRecordRuntimeSubmitFast(queueDepth);
+		spdk_thread_send_msg(thread, hfsRuntimeDispatchMessage, message);
+		message = NULL;
+	} else {
+		spdk_thread_send_msg(thread, fn, ctx);
+	}
+
+data_submit_done:
+	if (rc != 0) {
+		HFS_STATS_SPDK_REJECT();
+	}
+	free(message);
+	atomic_fetch_sub_explicit(&g_runtime.submitters, 1,
+					memory_order_release);
 	return rc;
 }
 
@@ -489,6 +813,136 @@ submit_done:
 	return rc;
 }
 
+/* Request context for allocating or releasing one reactor-local channel. */
+typedef struct HfsRuntimeChannelOp {
+	Hfs *fs;
+	struct spdk_io_channel **slot;
+	bool release;
+	HfsCompletion completion;
+	int rc;
+} HfsRuntimeChannelOp;
+
+/* Allocate or release a blobstore channel on its owning reactor thread. */
+static void hfsRuntimeChannelOp(void *arg) {
+	HfsRuntimeChannelOp *operation = arg;
+
+	if (operation->release) {
+		if (operation->slot != NULL && *operation->slot != NULL) {
+			spdk_bs_free_io_channel(*operation->slot);
+			*operation->slot = NULL;
+		}
+		operation->rc = 0;
+	} else {
+		*operation->slot = spdk_bs_alloc_io_channel(operation->fs->blobstore);
+		operation->rc = *operation->slot == NULL ? -ENOMEM : 0;
+	}
+	hfsRuntimeCompletionComplete(&operation->completion);
+}
+
+/* Allocate per-reactor channels after the blobstore has been mounted. */
+int hfsRuntimeDataInit(Hfs *fs) {
+	uint32_t count;
+	uint32_t i;
+
+	if (fs == NULL || fs->blobstore == NULL || fs->channel == NULL) {
+		return -EINVAL;
+	}
+	if (fs->dataChannels != NULL) {
+		return 0;
+	}
+	count = g_runtime.dataReactorCount == 0 ? 1 : g_runtime.dataReactorCount;
+	fs->dataChannels = calloc(count, sizeof(*fs->dataChannels));
+	if (fs->dataChannels == NULL) {
+		return -ENOMEM;
+	}
+	fs->dataReactorCount = count;
+	fs->dataChannels[0] = fs->channel;
+	for (i = 1; i < count; i++) {
+		HfsRuntimeChannelOp operation;
+
+		memset(&operation, 0, sizeof(operation));
+		operation.fs = fs;
+		operation.slot = &fs->dataChannels[i];
+		hfsRuntimeCompletionReset(&operation.completion);
+		if (hfsRuntimeSubmitData(i, hfsRuntimeChannelOp, &operation) != 0 ||
+		    !hfsRuntimeCompletionWait(&operation.completion,
+					       HFS_RUNTIME_TIMEOUT_MS) ||
+		    operation.rc != 0) {
+			hfsRuntimeDataFini(fs);
+			return operation.rc != 0 ? operation.rc : -EIO;
+		}
+	}
+	return 0;
+}
+
+/* Release per-reactor channels before the blobstore itself is unloaded. */
+int hfsRuntimeDataFini(Hfs *fs) {
+	uint32_t i;
+	int firstError = 0;
+
+	if (fs == NULL || fs->dataChannels == NULL) {
+		return 0;
+	}
+	for (i = 1; i < fs->dataReactorCount; i++) {
+		HfsRuntimeChannelOp operation;
+
+		if (fs->dataChannels[i] == NULL) {
+			continue;
+		}
+		memset(&operation, 0, sizeof(operation));
+		operation.fs = fs;
+		operation.slot = &fs->dataChannels[i];
+		operation.release = true;
+		hfsRuntimeCompletionReset(&operation.completion);
+		if (hfsRuntimeSubmitData(i, hfsRuntimeChannelOp, &operation) != 0 ||
+		    !hfsRuntimeCompletionWait(&operation.completion,
+					       HFS_RUNTIME_TIMEOUT_MS) ||
+		    operation.rc != 0) {
+			if (firstError == 0) {
+				firstError = operation.rc != 0 ? operation.rc : -EIO;
+			}
+		}
+	}
+	if (firstError != 0) {
+		return firstError;
+	}
+	free(fs->dataChannels);
+	fs->dataChannels = NULL;
+	fs->dataReactorCount = 0;
+	return 0;
+}
+
+/* Select a stable reactor by blob id while keeping reactor zero as fallback. */
+uint32_t hfsRuntimeDataReactorFor(const Hfs *fs, uint64_t blobId) {
+	uint64_t hash;
+
+	if (fs == NULL || fs->dataReactorCount == 0) {
+		return 0;
+	}
+	/* Mix blob ids because SPDK may allocate ids with a fixed low-bit stride. */
+	hash = blobId;
+	hash ^= hash >> 30;
+	hash *= UINT64_C(0xbf58476d1ce4e5b9);
+	hash ^= hash >> 27;
+	hash *= UINT64_C(0x94d049bb133111eb);
+	hash ^= hash >> 31;
+	/* Reactor zero remains the metadata/compatibility owner. */
+	if (fs->dataReactorCount <= 1) {
+		return 0;
+	}
+	return 1U + (uint32_t)(hash % (fs->dataReactorCount - 1U));
+}
+
+/* Return the channel owned by one selected data reactor. */
+struct spdk_io_channel *hfsRuntimeDataChannel(const Hfs *fs,
+						 uint32_t reactorId) {
+	if (fs == NULL || fs->dataChannels == NULL ||
+	    reactorId >= fs->dataReactorCount) {
+		return NULL;
+	}
+	return fs->dataChannels[reactorId];
+}
+
 /* Mark subsystem setup complete so shutdown can run the matching finalizer. */
 void hfsRuntimeMarkSubsystemReady(void) {
 	atomic_store_explicit(&g_runtime.subsystemsReady, true,
@@ -500,7 +954,7 @@ bool hfsRuntimeIsOwnerThread(void) {
 	if (hfsRuntimeIsForkChild()) {
 		return false;
 	}
-	return g_hfsRuntimeOwnerThread;
+	return g_hfsRuntimeOwnerThread || g_hfsRuntimeDataThread;
 }
 
 /* Return true when this process inherited the runtime from a different PID. */
@@ -548,6 +1002,8 @@ int hfsRuntimeStop(void) {
 				memory_order_acquire) != 0) {
 			sched_yield();
 		}
+		/* Stop data reactors before the global SPDK environment is finalized. */
+		hfsRuntimeStopDataReactors();
 		/* Detailed timing mode also waits for wrapped callbacks to retire. */
 		do {
 			queued = atomic_load_explicit(&g_runtime.queued,

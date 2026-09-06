@@ -24,6 +24,9 @@ int hfsRequestWait(HfsRequestResult *result, spdk_msg_fn startFn, void *ctx);
 /* Submit a request without waiting so a parent can keep child I/O in flight. */
 int hfsRequestSubmitBatch(HfsRequestResult *result, spdk_msg_fn startFn,
 			 void *ctx, HfsRuntimeBatchItem *batchItem);
+/* Submit a data child to a selected reactor without waiting. */
+int hfsRequestSubmitData(HfsRequestResult *result, spdk_msg_fn startFn,
+			 void *ctx, uint32_t reactorId);
 /* Wait for a previously submitted request and translate its completion error. */
 int hfsRequestWaitResult(HfsRequestResult *result);
 int hfsRequestWaitBatch(HfsRequestResult *result, spdk_msg_fn startFn, void *ctx,
