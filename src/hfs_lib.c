@@ -781,10 +781,180 @@ void hfs_lib_fini(void) {
 	pthread_rwlock_unlock(&g_metaLock);
 }
 
+/* Context retained by a worker-free positioned data request. */
+typedef struct HfsLibAsyncDirectContext {
+	HfsAsyncRequest *request;
+	HfsOpenFile *openFile;
+	uint64_t writeOffset;
+	bool write;
+} HfsLibAsyncDirectContext;
+
+/* Complete a direct data request and release its stable open-file reference. */
+static void hfs_lib_async_direct_done(void *context, ssize_t result, int error) {
+	HfsLibAsyncDirectContext *direct = context;
+
+	if (direct->write && error == 0 && result > 0) {
+		hfsPublishWriteEnd(direct->openFile,
+			direct->writeOffset + (uint64_t)result);
+	}
+	hfsAsyncCompleteDirect(direct->request, result, error);
+	(void)hfs_release_open_file(direct->openFile);
+	free(direct);
+}
+
+/* Return true when a request is large and aligned enough for direct child fan-out. */
+static bool hfs_lib_async_direct_shape(HfsOpenFile *openFile, size_t count,
+				       uint64_t offset) {
+	uint64_t unitSize;
+
+	if (openFile == NULL || openFile->file == NULL || openFile->file->fs == NULL) {
+		return false;
+	}
+	unitSize = openFile->file->fs->unitSize;
+	return unitSize != 0 && count / (size_t)unitSize >= 2U &&
+		count % (size_t)unitSize == 0 && offset % unitSize == 0;
+}
+
+/* Try the worker-free positioned read path and report whether fallback is needed. */
+static int hfs_lib_async_try_pread(int fd, void *buffer, size_t count,
+				   off_t offset, HfsAsyncCallback callback,
+				   void *context, HfsAsyncRequest **requestOut) {
+	HfsOpenFile *openFile;
+	HfsLibAsyncDirectContext *direct;
+	struct hfs_inode *in;
+	uint64_t fileSize;
+	uint64_t effectiveCount;
+	int savedErrno;
+	int rc;
+
+	if (offset < 0 || count == 0 || !hfsFdIsHfs(fd)) {
+		return 0;
+	}
+	openFile = hfs_acquire_file(fd, true);
+	if (openFile == NULL || !hfs_lib_async_direct_shape(openFile, count,
+							       (uint64_t)offset)) {
+		if (openFile != NULL) {
+			hfs_release_open_file(openFile);
+		}
+		return 0;
+	}
+	hfsMetaReadLock();
+	in = g_fs == NULL ? NULL : hfsMetaFindById(g_fs, openFile->inodeId);
+	if (g_fs == NULL) {
+		pthread_rwlock_unlock(&g_metaLock);
+		hfs_release_open_file(openFile);
+		return 0;
+	}
+	if (in != NULL) {
+		fileSize = in->size;
+	} else if (!hfsFdGetOrphanInfo(openFile, &fileSize, NULL, NULL)) {
+		pthread_rwlock_unlock(&g_metaLock);
+		hfs_release_open_file(openFile);
+		return 0;
+	}
+	if ((uint64_t)offset >= fileSize) {
+		pthread_rwlock_unlock(&g_metaLock);
+		hfs_release_open_file(openFile);
+		return 0;
+	}
+	effectiveCount = count;
+	if ((uint64_t)offset + effectiveCount > fileSize) {
+		effectiveCount = fileSize - (uint64_t)offset;
+	}
+	pthread_rwlock_unlock(&g_metaLock);
+	if (effectiveCount == 0 || effectiveCount % openFile->file->fs->unitSize != 0 ||
+	    effectiveCount > SIZE_MAX) {
+		hfs_release_open_file(openFile);
+		return 0;
+	}
+	direct = calloc(1, sizeof(*direct));
+	if (direct == NULL) {
+		hfs_release_open_file(openFile);
+		errno = ENOMEM;
+		return -1;
+	}
+	direct->openFile = openFile;
+	if (hfsAsyncCreateDirect(callback, context, &direct->request) != 0) {
+		hfs_release_open_file(openFile);
+		free(direct);
+		return -1;
+	}
+	*requestOut = direct->request;
+	rc = hfsIoReadAtAsync(openFile->file, buffer, (size_t)effectiveCount,
+				      (uint64_t)offset, hfs_lib_async_direct_done, direct);
+	if (rc == 0) {
+		hfsAsyncRecordDirectSubmit(direct->request);
+		return 1;
+	}
+	*requestOut = NULL;
+	savedErrno = errno;
+	hfsAsyncDiscardDirect(direct->request);
+	hfs_release_open_file(openFile);
+	free(direct);
+	errno = savedErrno;
+	return savedErrno == EAGAIN ? 0 : -1;
+}
+
+/* Try the worker-free positioned write path and report whether fallback is needed. */
+static int hfs_lib_async_try_pwrite(int fd, const void *buffer, size_t count,
+				    off_t offset, HfsAsyncCallback callback,
+				    void *context, HfsAsyncRequest **requestOut) {
+	HfsOpenFile *openFile;
+	HfsLibAsyncDirectContext *direct;
+	int savedErrno;
+	int rc;
+
+	if (offset < 0 || count == 0 || !hfsFdIsHfs(fd)) {
+		return 0;
+	}
+	openFile = hfs_acquire_file(fd, true);
+	if (openFile == NULL || !openFile->writable ||
+	    (openFile->flags & O_APPEND) != 0 ||
+	    !hfs_lib_async_direct_shape(openFile, count, (uint64_t)offset)) {
+		if (openFile != NULL) {
+			hfs_release_open_file(openFile);
+		}
+		return 0;
+	}
+	direct = calloc(1, sizeof(*direct));
+	if (direct == NULL) {
+		hfs_release_open_file(openFile);
+		errno = ENOMEM;
+		return -1;
+	}
+	direct->openFile = openFile;
+	direct->write = true;
+	direct->writeOffset = (uint64_t)offset;
+	if (hfsAsyncCreateDirect(callback, context, &direct->request) != 0) {
+		hfs_release_open_file(openFile);
+		free(direct);
+		return -1;
+	}
+	*requestOut = direct->request;
+	rc = hfsIoWriteAtAsync(openFile->file, buffer, count, (uint64_t)offset,
+				       hfs_lib_async_direct_done, direct);
+	if (rc == 0) {
+		hfsAsyncRecordDirectSubmit(direct->request);
+		return 1;
+	}
+	*requestOut = NULL;
+	savedErrno = errno;
+	hfsAsyncDiscardDirect(direct->request);
+	hfs_release_open_file(openFile);
+	free(direct);
+	errno = savedErrno;
+	return savedErrno == EAGAIN ? 0 : -1;
+}
+
 /* Submit a positioned read through the async core. */
 int hfs_lib_async_pread(int fd, void *buf, size_t count, off_t offset,
 			HfsAsyncCallback callback, void *context,
 			HfsAsyncRequest **requestOut) {
+	int direct = hfs_lib_async_try_pread(fd, buf, count, offset, callback,
+						 context, requestOut);
+	if (direct != 0) {
+		return direct > 0 ? 0 : -1;
+	}
 	return hfsAsyncPread(fd, buf, count, offset, callback, context, requestOut);
 }
 
@@ -792,6 +962,11 @@ int hfs_lib_async_pread(int fd, void *buf, size_t count, off_t offset,
 int hfs_lib_async_pwrite(int fd, const void *buf, size_t count, off_t offset,
 			 HfsAsyncCallback callback, void *context,
 			 HfsAsyncRequest **requestOut) {
+	int direct = hfs_lib_async_try_pwrite(fd, buf, count, offset, callback,
+						  context, requestOut);
+	if (direct != 0) {
+		return direct > 0 ? 0 : -1;
+	}
 	return hfsAsyncPwrite(fd, buf, count, offset, callback, context, requestOut);
 }
 

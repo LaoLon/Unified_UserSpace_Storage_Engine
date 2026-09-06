@@ -44,4 +44,15 @@ int hfsAsyncResult(HfsAsyncRequest *request, ssize_t *resultOut,
 /* Release the caller-owned request reference. */
 void hfsAsyncRelease(HfsAsyncRequest *request);
 
+/* Create a worker-free request object for the checked libhfs direct path. */
+int hfsAsyncCreateDirect(HfsAsyncCallback callback, void *context,
+			 HfsAsyncRequest **requestOut);
+/* Account a direct request only after its low-level parent was accepted. */
+void hfsAsyncRecordDirectSubmit(HfsAsyncRequest *request);
+/* Complete a worker-free request from an SPDK child-parent callback. */
+void hfsAsyncCompleteDirect(HfsAsyncRequest *request, ssize_t result,
+			    int error);
+/* Discard a direct request when the low-level path elects executor fallback. */
+void hfsAsyncDiscardDirect(HfsAsyncRequest *request);
+
 #endif /* HFS_ASYNC_H */

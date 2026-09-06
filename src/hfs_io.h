@@ -5,6 +5,9 @@
 
 #include "hfs.h"
 
+/* Completion callback for a non-blocking positioned data operation. */
+typedef void (*HfsIoAsyncCallback)(void *context, ssize_t result, int error);
+
 /* Initialize the bounded DMA buffer pool and data synchronization state. */
 int hfsIoInit(Hfs *fs);
 /* Stop new pool waiters and release all DMA buffers after I/O has drained. */
@@ -16,6 +19,12 @@ ssize_t hfsIoReadAt(HfsFile *file, uint8_t *buffer, size_t count,
 /* Write a byte range with aligned direct writes and edge read-modify-write. */
 ssize_t hfsIoWriteAt(HfsFile *file, const uint8_t *buffer, size_t count,
 		     uint64_t offset);
+/* Submit an aligned positioned read without occupying an executor worker. */
+int hfsIoReadAtAsync(HfsFile *file, uint8_t *buffer, size_t count,
+		     uint64_t offset, HfsIoAsyncCallback callback, void *context);
+/* Submit an aligned positioned write without occupying an executor worker. */
+int hfsIoWriteAtAsync(HfsFile *file, const uint8_t *buffer, size_t count,
+		      uint64_t offset, HfsIoAsyncCallback callback, void *context);
 /* Punch a byte range, using unmap for aligned units and zeroing edge units. */
 int hfsIoPunchHole(HfsFile *file, uint64_t offset, uint64_t length);
 /* Punch/zero a range while the caller already holds the inode sync write lock. */

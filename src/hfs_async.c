@@ -41,6 +41,7 @@ struct HfsAsyncRequest {
 	struct HfsAsyncRequest *next;
 	bool cancelRequested;
 	bool completed;
+	bool direct;
 	ssize_t result;
 	int error;
 };
@@ -55,6 +56,7 @@ typedef struct HfsAsyncRuntime {
 	size_t queueDepth;
 	size_t queueLimit;
 	unsigned int workerCount;
+	size_t directInFlight;
 	bool initialized;
 	bool stopping;
 } HfsAsyncRuntime;
@@ -110,6 +112,14 @@ static void hfsAsyncComplete(HfsAsyncRequest *request, ssize_t result,
 	pthread_mutex_unlock(&request->lock);
 	if (deliver) {
 		callback(request, result, error, context);
+	}
+	if (request->direct) {
+		pthread_mutex_lock(&g_async.lock);
+		if (g_async.directInFlight > 0) {
+			g_async.directInFlight--;
+		}
+		pthread_cond_broadcast(&g_async.available);
+		pthread_mutex_unlock(&g_async.lock);
 	}
 	hfsStatsRecordAsyncCompleteFast();
 	hfsAsyncRequestReleaseInternal(request);
@@ -245,11 +255,15 @@ void hfsAsyncFini(void) {
 	}
 	free(g_async.workers);
 	pthread_mutex_lock(&g_async.lock);
+	while (g_async.directInFlight != 0) {
+		pthread_cond_wait(&g_async.available, &g_async.lock);
+	}
 	request = g_async.head;
 	g_async.head = NULL;
 	g_async.tail = NULL;
 	g_async.queueDepth = 0;
 	g_async.workerCount = 0;
+	g_async.directInFlight = 0;
 	g_async.workers = NULL;
 	g_async.initialized = false;
 	g_async.stopping = false;
@@ -459,4 +473,81 @@ void hfsAsyncRelease(HfsAsyncRequest *request) {
 	if (request != NULL) {
 		hfsAsyncRequestReleaseInternal(request);
 	}
+}
+
+/* Allocate a request that is completed by the low-level SPDK parent state. */
+int hfsAsyncCreateDirect(HfsAsyncCallback callback, void *context,
+			 HfsAsyncRequest **requestOut) {
+	HfsAsyncRequest *request;
+
+	if (requestOut == NULL) {
+		errno = EINVAL;
+		return -1;
+	}
+	*requestOut = NULL;
+	request = calloc(1, sizeof(*request));
+	if (request == NULL) {
+		errno = ENOMEM;
+		return -1;
+	}
+	if (pthread_mutex_init(&request->lock, NULL) != 0) {
+		free(request);
+		errno = ENOMEM;
+		return -1;
+	}
+	if (pthread_cond_init(&request->done, NULL) != 0) {
+		pthread_mutex_destroy(&request->lock);
+		free(request);
+		errno = ENOMEM;
+		return -1;
+	}
+	atomic_init(&request->refs, 2U);
+	request->callback = callback;
+	request->callbackContext = context;
+	request->direct = true;
+	pthread_mutex_lock(&g_async.lock);
+	if (!g_async.initialized || g_async.stopping) {
+		pthread_mutex_unlock(&g_async.lock);
+		hfsAsyncRequestReleaseInternal(request);
+		hfsAsyncRequestReleaseInternal(request);
+		errno = ENODEV;
+		return -1;
+	}
+	g_async.directInFlight++;
+	*requestOut = request;
+	pthread_mutex_unlock(&g_async.lock);
+	return 0;
+}
+
+/* Record a direct request after its SPDK parent accepted the first batch. */
+void hfsAsyncRecordDirectSubmit(HfsAsyncRequest *request) {
+	if (request != NULL && request->direct) {
+		hfsStatsRecordAsyncSubmitFast(0);
+	}
+}
+
+/* Publish direct completion and retire the low-level operation reference. */
+void hfsAsyncCompleteDirect(HfsAsyncRequest *request, ssize_t result,
+			    int error) {
+	if (request == NULL) {
+		return;
+	}
+	hfsAsyncComplete(request, result, error);
+}
+
+/* Drop both references when a direct submit falls back before any child starts. */
+void hfsAsyncDiscardDirect(HfsAsyncRequest *request) {
+	if (request == NULL) {
+		return;
+	}
+	if (request->direct) {
+		pthread_mutex_lock(&g_async.lock);
+		if (g_async.directInFlight > 0) {
+			g_async.directInFlight--;
+		}
+		pthread_cond_broadcast(&g_async.available);
+		pthread_mutex_unlock(&g_async.lock);
+	}
+	hfsAsyncRequestReleaseInternal(request);
+	hfsAsyncRequestReleaseInternal(request);
 }

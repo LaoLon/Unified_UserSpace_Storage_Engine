@@ -1,8 +1,8 @@
 # HFS asynchronous request model
 
-> Status: shard-45 bounded child-pipeline foundation (2026-09-06). The public executor still
-> wraps the checked libhfs entry points; the aligned data path now submits multiple SPDK child
-> requests under one parent operation.
+> Status: shard-45 public direct path (2026-09-06). Large, full-unit aligned positioned I/O
+> binds a public request directly to a bounded SPDK child parent; unsupported shapes retain the
+> bounded executor fallback.
 
 ## Scope
 
@@ -20,12 +20,16 @@ there is no use-after-free of the fd table entry.
 1. Submit allocates one request with a caller reference and a worker reference.
 2. A bounded executor queues the request. `HFS_ASYNC_WORKERS` selects 1–32 workers and
    `HFS_ASYNC_QUEUE_DEPTH` selects a 1–4096 queue limit.
-3. A worker invokes the existing checked libhfs operation. Aligned full-unit ranges are split into
-   a bounded parent batch controlled by `HFS_IO_PIPELINE_DEPTH` (default 4, maximum 16); each child
-   owns a fixed DMA lease and completes on the SPDK owner thread. Edge units still use the existing
-   synchronous RMW path, preserving range-lock, metadata and fsync contracts.
-4. Completion stores result and positive errno, wakes `hfsAsyncWait`, and optionally invokes the
-   callback on the worker thread.
+3. A positioned request with at least two full, unit-aligned units first tries the direct path.
+   It allocates the public request, retains the open-file description, and binds it to a bounded
+   parent batch controlled by `HFS_IO_PIPELINE_DEPTH` (default 4, maximum 16). Each child owns a
+   fixed DMA lease and completes on the SPDK owner thread, so no executor worker waits for data
+   I/O. Reads are trimmed to the snapshotted file size; writes use direct mode only when the
+   existing blob capacity already covers the range. Resize, edge-unit RMW, vector, fsync, small,
+   unaligned, and resource-contended requests use the bounded executor fallback.
+4. The parent completion stores result and positive errno, wakes `hfsAsyncWait`, optionally invokes
+   the callback on the SPDK owner thread for direct requests (or the worker thread for fallback),
+   then releases the retained open-file description and operation reference.
 5. The caller reads the result and releases its reference. The worker reference is released after
    callback delivery.
 
@@ -46,8 +50,10 @@ When `HFS_STATS_PATH` is enabled, the snapshot includes `async_submit`, `async_c
 `async_cancel`, and `async_queue_depth_peak`. These counters describe the executor queue and must
 not be confused with SPDK `spdk_submit`/`spdk_complete` or device queue depth.
 
-The current child batch is the low-level completion-aggregation foundation: the parent waits for
-all children, propagates the first observed error, and releases DMA leases only after callbacks.
-The next step is to connect this parent state directly to `HfsAsyncRequest`, so a public async
-request can complete without occupying an executor worker. `io_pipeline_peak` reports the largest
-aligned child fan-out and must be evaluated separately from executor queue depth.
+The child batch is now connected to `HfsAsyncRequest` for the direct shape described above. The
+parent waits for all children, propagates the first observed error, and releases DMA leases only
+after callbacks. `io_pipeline_peak` reports the largest aligned child fan-out and must be evaluated
+separately from executor queue depth; `async_submit`/`async_complete` include both direct and
+fallback public requests. Direct mode deliberately returns `EAGAIN` to the wrapper when it would
+need resize or cannot reserve its bounded resources, allowing the compatibility fallback to retain
+the existing metadata and RMW semantics.

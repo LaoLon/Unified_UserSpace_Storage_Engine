@@ -10,7 +10,7 @@ Bug 等级：**致命 > 严重 > 一般**。
 
 ### 已修复
 
-1–5、8–10、10b、11–43、45–47、51–52、57。包括已由后续 shard 修复的历史记录；条目中的原始“遗留”描述保留用于复盘，当前状态以本汇总和条目状态字段为准。
+1–5、8–10、10b、11–43、45–47、51–52、57、60。包括已由后续 shard 修复的历史记录；条目中的原始“遗留”描述保留用于复盘，当前状态以本汇总和条目状态字段为准。
 
 ### 未修复
 
@@ -910,5 +910,31 @@ Bug 等级：**致命 > 严重 > 一般**。
   同时新增 `metadata_sync_count` 统计，区分 metadata blob sync 与设备 flush。
 - **验证**：新增跨文件 fsync/reopen smoke，要求只 fsync A 后 B 仍可恢复；并复跑 metadata
   checkpoint、事务、路径并发、错误注入、崩溃恢复、fast I/O 与 runtime stress。
+
+### 60. 同步 SPDK 请求误调用异步回调导致并发段错误（已修复，严重级）
+
+- **状态**：已修复；VM 元数据并发、崩溃恢复、错误注入、快速 I/O、runtime stress、async、
+  MariaDB/RocksDB 持久化回归均通过
+- **时间**：2026-09-06（shard-45 public direct path）
+- **等级**：严重（并发 preload/恢复 workload 可能在 SPDK owner thread 跳转到非法地址）
+- **现象**：16 线程 metadata/path smoke 和 durability recovery 偶发或稳定以 SIGSEGV 结束；
+  gdb 显示崩溃位于 SPDK completion 的 callback dispatch，回调参数指向栈上的同步
+  `HfsIoRequest`，而 `hfsIoDone` 从该对象读取了一个非空、位于 worker stack 的伪函数指针。
+- **排查过程**：单线程路径通过，16 线程路径复现；回溯确认崩溃发生在 `bs_request_set_complete`
+  调用 `hfsIoDone` 后，非法跳转紧跟在 `request->asyncDone` 检查处。新增 public direct child
+  path 后，`HfsIoRequest` 扩展了异步 completion 字段，但同步栈请求只有“字段应为 NULL”的
+  隐含约定，缺少可验证的请求类型判别。对同步 I/O、async child 和 SPDK owner completion
+  逐项比对后确定这是 callback metadata 误解释，而不是 blob 数据或 metadata checksum 错误。
+- **根因**：同步与异步 child 共用 `HfsIoRequest` 和 `hfsIoDone`，completion 端只判断函数指针
+  是否非 NULL；同步请求没有显式异步标识，栈对象在并发/复用场景下出现非零扩展字段时会把
+  任意值当作 callback 调用，导致 owner thread 跳坏地址。
+- **修复**：增加 `HFS_IO_ASYNC_MAGIC` 请求标识。只有 async child 在提交前写入 magic 且
+  `asyncDone` 非 NULL 时，`hfsIoDone` 才交付父状态回调；所有同步 request 保持 callback
+  字段不可达。该保护不改变同步等待、DMA lease 或 direct public request 生命周期。
+- **验证**：VM 强制 Make/CMake Release；`metadata_transaction_smoke`、16 线程
+  `metadata_path_concurrency_smoke`、error injection、durability crash recovery、fast I/O、
+  8 线程 runtime stress、async pipeline、persistent smoke 和 RocksDB WAL/recovery 均返回 0，
+  async `spdk_submit=81` 与 `spdk_complete=81` 闭合，`async_submit=20` 与
+  `async_complete=20` 闭合，`io_pipeline_peak=4`。
 
 ## 通用经验总结

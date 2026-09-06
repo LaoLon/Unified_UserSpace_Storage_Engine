@@ -21,6 +21,7 @@
 #define HFS_IO_BUFFER_BYTES	(1U << 20)
 #define HFS_IO_MAX_PIPELINE	16U
 #define HFS_IO_DEFAULT_PIPELINE	4U
+#define HFS_IO_ASYNC_MAGIC	UINT64_C(0x4846534153594e43)
 
 /* One fixed-size DMA buffer leased by one request at a time. */
 typedef struct HfsIoLease {
@@ -58,6 +59,11 @@ typedef struct HfsIoRequest {
 	HfsIoOperation operation;
 	HfsRuntimeBatchItem batchItem;
 	HfsRequestResult result;
+	/* Distinguish worker-free child requests from synchronous stack requests. */
+	uint64_t asyncMagic;
+	void (*asyncDone)(struct HfsIoRequest *request);
+	void *asyncContext;
+	uint32_t asyncIndex;
 } HfsIoRequest;
 
 /* Set of hashed range buckets held by one request in ascending order. */
@@ -66,6 +72,31 @@ typedef struct HfsIoRangeGuard {
 	uint16_t count;
 	bool write;
 } HfsIoRangeGuard;
+
+/* Parent state for one worker-free aligned request and its bounded child batches. */
+typedef struct HfsIoAsyncParent {
+	HfsFile *file;
+	uint8_t *readBuffer;
+	const uint8_t *writeBuffer;
+	size_t count;
+	uint64_t offset;
+	uint64_t totalUnits;
+	uint64_t nextUnit;
+	uint32_t pending;
+	uint32_t launched;
+	uint32_t depth;
+	bool write;
+	bool launching;
+	bool finished;
+	int firstError;
+	HfsIoAsyncCallback callback;
+	void *context;
+	HfsInodeRuntime *runtime;
+	HfsIoRangeGuard guard;
+	HfsIoRequest requests[HFS_IO_MAX_PIPELINE];
+	HfsIoLease leases[HFS_IO_MAX_PIPELINE];
+	pthread_mutex_t lock;
+} HfsIoAsyncParent;
 
 /* Hash a blob/unit pair so unrelated files normally use independent locks. */
 static uint32_t hfsIoRangeBucket(const HfsFile *file, uint64_t unitIndex) {
@@ -122,6 +153,57 @@ static int hfsIoRangeLock(HfsFile *file, uint64_t offset, uint64_t length,
 	return 0;
 }
 
+/* Forward declaration used by the non-blocking range-lock rollback path. */
+static void hfsIoRangeUnlock(HfsFile *file, HfsIoRangeGuard *guard);
+
+/* Acquire range buckets without sleeping for a worker-free async submit. */
+static int hfsIoRangeTryLock(HfsFile *file, uint64_t offset, uint64_t length,
+			      bool write, HfsIoRangeGuard *guard) {
+	uint64_t firstUnit;
+	uint64_t lastUnit;
+	uint64_t unit;
+	uint64_t seen[HFS_RANGE_LOCK_COUNT / 64U] = {0};
+	uint32_t bucket;
+	uint32_t seenCount = 0;
+	int rc;
+
+	if (file == NULL || file->fs == NULL || file->fs->unitSize == 0 ||
+	    guard == NULL || length == 0 || offset > UINT64_MAX - (length - 1)) {
+		errno = EINVAL;
+		return -1;
+	}
+	guard->count = 0;
+	firstUnit = offset / file->fs->unitSize;
+	lastUnit = (offset + length - 1) / file->fs->unitSize;
+	for (unit = firstUnit; unit <= lastUnit; unit++) {
+		bucket = hfsIoRangeBucket(file, unit);
+		if ((seen[bucket / 64U] & (UINT64_C(1) << (bucket % 64U))) == 0) {
+			seen[bucket / 64U] |= UINT64_C(1) << (bucket % 64U);
+			seenCount++;
+		}
+		if (unit == UINT64_MAX || seenCount == HFS_RANGE_LOCK_COUNT) {
+			break;
+		}
+	}
+	guard->write = write;
+	for (bucket = 0; bucket < HFS_RANGE_LOCK_COUNT; bucket++) {
+		if ((seen[bucket / 64U] & (UINT64_C(1) << (bucket % 64U))) == 0) {
+			continue;
+		}
+		hfsStatsLockBeforeFast(HFS_STATS_LOCK_IO);
+		rc = write ? pthread_rwlock_trywrlock(&file->fs->rangeLocks[bucket])
+			    : pthread_rwlock_tryrdlock(&file->fs->rangeLocks[bucket]);
+		if (rc != 0) {
+			hfsIoRangeUnlock(file, guard);
+			errno = EAGAIN;
+			return -1;
+		}
+		hfsStatsLockAfterFast(HFS_STATS_LOCK_IO);
+		guard->buckets[guard->count++] = (uint16_t)bucket;
+	}
+	return 0;
+}
+
 /* Release all buckets acquired by one request. */
 static void hfsIoRangeUnlock(HfsFile *file, HfsIoRangeGuard *guard) {
 	uint16_t i;
@@ -144,6 +226,20 @@ static HfsInodeRuntime *hfsIoSyncReadLock(HfsFile *file) {
 		return NULL;
 	}
 	pthread_rwlock_rdlock(&runtime->syncLock);
+	return runtime;
+}
+
+/* Enter the inode read side without waiting for an async submit. */
+static HfsInodeRuntime *hfsIoSyncReadTryLock(HfsFile *file) {
+	HfsInodeRuntime *runtime = hfsInodeRuntimeForFile(file);
+
+	if (runtime == NULL) {
+		return NULL;
+	}
+	if (pthread_rwlock_tryrdlock(&runtime->syncLock) != 0) {
+		errno = EAGAIN;
+		return NULL;
+	}
 	return runtime;
 }
 
@@ -236,6 +332,34 @@ static int hfsIoAcquire(Hfs *fs, HfsIoLease *lease) {
 	return 0;
 }
 
+/* Acquire one DMA buffer without waiting so an async submit can fall back cleanly. */
+static int hfsIoTryAcquire(Hfs *fs, HfsIoLease *lease) {
+	struct hfs_io_pool *pool = fs->ioPool;
+	int rc;
+
+	HFS_STATS_DMA_ACQUIRE();
+	memset(lease, 0, sizeof(*lease));
+	rc = pthread_mutex_trylock(&pool->lock);
+	if (rc != 0) {
+		errno = EAGAIN;
+		return -1;
+	}
+	if (pool->freeTop == 0 || pool->closing) {
+		pthread_mutex_unlock(&pool->lock);
+		errno = pool->closing ? ESHUTDOWN : EAGAIN;
+		return -1;
+	}
+	lease->pool = pool;
+	lease->slot = pool->freeSlots[--pool->freeTop];
+	lease->buffer = pool->storage +
+		(size_t)lease->slot * pool->bufferBytes;
+	pool->active++;
+	HFS_STATS_DMA_ACTIVE(pool->active);
+	hfsStatsRecordDmaFast(pool->bufferBytes, false, pool->active);
+	pthread_mutex_unlock(&pool->lock);
+	return 0;
+}
+
 /* Return one DMA buffer to the pool and wake the next waiting request. */
 static void hfsIoRelease(HfsIoLease *lease) {
 	struct hfs_io_pool *pool;
@@ -292,6 +416,9 @@ static void hfsIoDone(void *arg, int bserrno) {
 	HfsIoRequest *request = arg;
 
 	hfsRequestComplete(&request->result, bserrno, request->units);
+	if (request->asyncMagic == HFS_IO_ASYNC_MAGIC && request->asyncDone != NULL) {
+		request->asyncDone(request);
+	}
 }
 
 /* Submit one child request without waiting for its owner-thread completion. */
@@ -361,6 +488,339 @@ static int hfsIoSubmit(HfsFile *file, void *buffer, uint64_t offset,
 		return -1;
 	}
 	if (hfsIoWaitRequest(&request) != 0) {
+		return -1;
+	}
+	return 0;
+}
+
+static void hfsIoAsyncChildDone(HfsIoRequest *request);
+static int hfsIoAsyncStartBatch(HfsIoAsyncParent *parent);
+
+/* Finish a worker-free parent after every child and synchronization guard retire. */
+static void hfsIoAsyncFinish(HfsIoAsyncParent *parent) {
+	ssize_t result;
+	int error;
+
+	pthread_mutex_lock(&parent->lock);
+	if (parent->finished) {
+		pthread_mutex_unlock(&parent->lock);
+		return;
+	}
+	parent->finished = true;
+	result = parent->firstError == 0 ? (ssize_t)parent->count : -1;
+	error = parent->firstError;
+	pthread_mutex_unlock(&parent->lock);
+	hfsIoRangeUnlock(parent->file, &parent->guard);
+	hfsIoSyncReadUnlock(parent->runtime);
+	parent->callback(parent->context, result, error);
+	pthread_mutex_destroy(&parent->lock);
+	free(parent);
+}
+
+/* Decide whether a completed batch should launch another batch or finish. */
+static void hfsIoAsyncAfterBatch(HfsIoAsyncParent *parent) {
+	bool advance = false;
+	bool finish = false;
+
+	pthread_mutex_lock(&parent->lock);
+	if (!parent->launching && parent->pending == 0 && !parent->finished) {
+		if (parent->firstError != 0 || parent->nextUnit >= parent->totalUnits) {
+			finish = true;
+		} else {
+			advance = true;
+		}
+	}
+	pthread_mutex_unlock(&parent->lock);
+	if (advance) {
+		if (hfsIoAsyncStartBatch(parent) != 0) {
+			pthread_mutex_lock(&parent->lock);
+			if (parent->firstError == 0) {
+				parent->firstError = errno != 0 ? errno : EIO;
+			}
+			pthread_mutex_unlock(&parent->lock);
+			hfsIoAsyncFinish(parent);
+		}
+	} else if (finish) {
+		hfsIoAsyncFinish(parent);
+	}
+}
+
+/* Submit one bounded child batch while keeping parent storage owner-stable. */
+static int hfsIoAsyncStartBatch(HfsIoAsyncParent *parent) {
+	uint64_t batchStart;
+	uint64_t batchUnits = 0;
+	uint64_t remaining;
+	uint64_t maxUnits = hfsIoMaxUnits(parent->file->fs);
+	uint32_t count;
+	uint32_t i;
+	int savedErrno = 0;
+	bool finish = false;
+
+	if (maxUnits == 0) {
+		errno = EINVAL;
+		return -1;
+	}
+	pthread_mutex_lock(&parent->lock);
+	if (parent->finished || parent->launching || parent->pending != 0) {
+		pthread_mutex_unlock(&parent->lock);
+		return 0;
+	}
+	remaining = parent->totalUnits - parent->nextUnit;
+	if (remaining == 0) {
+		pthread_mutex_unlock(&parent->lock);
+		return 0;
+	}
+	count = (uint32_t)((remaining + maxUnits - 1U) / maxUnits);
+	if (count > parent->depth) {
+		count = parent->depth;
+	}
+	if ((uint64_t)count > HFS_IO_MAX_PIPELINE) {
+		count = HFS_IO_MAX_PIPELINE;
+	}
+	batchStart = parent->nextUnit;
+	for (i = 0; i < count; i++) {
+		uint64_t units = remaining - batchUnits;
+
+		if (units > maxUnits) {
+			units = maxUnits;
+		}
+		batchUnits += units;
+	}
+	parent->nextUnit += batchUnits;
+	parent->launching = true;
+	parent->launched = count;
+	pthread_mutex_unlock(&parent->lock);
+
+	/* Reserve the complete batch before submitting the first child. */
+	for (i = 0; i < count; i++) {
+		if (hfsIoTryAcquire(parent->file->fs, &parent->leases[i]) != 0) {
+			savedErrno = errno != 0 ? errno : EAGAIN;
+			hfsIoReleasePipeline(parent->leases, i);
+			pthread_mutex_lock(&parent->lock);
+			parent->nextUnit = batchStart;
+			parent->launching = false;
+			pthread_mutex_unlock(&parent->lock);
+			errno = savedErrno;
+			return -1;
+		}
+	}
+
+	for (i = 0; i < count; i++) {
+		uint64_t relativeUnit = batchStart;
+		uint64_t prior = 0;
+		uint64_t units;
+		size_t bytes;
+
+		while (prior < i) {
+			units = parent->totalUnits - (batchStart + prior);
+			if (units > maxUnits) {
+				units = maxUnits;
+			}
+			relativeUnit += units;
+			prior++;
+		}
+		units = parent->totalUnits - relativeUnit;
+		if (units > maxUnits) {
+			units = maxUnits;
+		}
+		bytes = (size_t)(units * parent->file->fs->unitSize);
+		memset(&parent->requests[i], 0, sizeof(parent->requests[i]));
+		parent->requests[i].file = parent->file;
+		parent->requests[i].buffer = parent->leases[i].buffer;
+		parent->requests[i].offset = parent->offset /
+			parent->file->fs->unitSize + relativeUnit;
+		parent->requests[i].units = units;
+		parent->requests[i].operation = parent->write ? HFS_IO_WRITE : HFS_IO_READ;
+		parent->requests[i].asyncMagic = HFS_IO_ASYNC_MAGIC;
+		parent->requests[i].asyncDone = hfsIoAsyncChildDone;
+		parent->requests[i].asyncContext = parent;
+		parent->requests[i].asyncIndex = i;
+		if (parent->write) {
+			memcpy(parent->leases[i].buffer,
+			       parent->writeBuffer + (size_t)(relativeUnit *
+					parent->file->fs->unitSize), bytes);
+			hfsStatsRecordCopyFast(bytes);
+		}
+		pthread_mutex_lock(&parent->lock);
+		parent->pending++;
+		pthread_mutex_unlock(&parent->lock);
+		if (hfsIoStartRequest(&parent->requests[i]) != 0) {
+			savedErrno = errno != 0 ? errno : EIO;
+			hfsIoRelease(&parent->leases[i]);
+			pthread_mutex_lock(&parent->lock);
+			parent->pending--;
+			if (parent->firstError == 0) {
+				parent->firstError = savedErrno;
+			}
+			pthread_mutex_unlock(&parent->lock);
+		}
+	}
+	hfsStatsRecordIoPipelineFast(count);
+	pthread_mutex_lock(&parent->lock);
+	parent->launching = false;
+	finish = parent->pending == 0;
+	pthread_mutex_unlock(&parent->lock);
+	if (finish) {
+		hfsIoAsyncAfterBatch(parent);
+	}
+	return 0;
+}
+
+/* Complete one child, copy read data, and advance the parent state machine. */
+static void hfsIoAsyncChildDone(HfsIoRequest *request) {
+	HfsIoAsyncParent *parent = request->asyncContext;
+	uint64_t relativeUnit;
+	ssize_t bytes;
+	int error = request->result.completionRc;
+
+	if (error != 0) {
+		error = error < 0 ? -error : error;
+	} else if (!parent->write) {
+		relativeUnit = request->offset - parent->offset /
+			parent->file->fs->unitSize;
+		bytes = (ssize_t)(request->units * parent->file->fs->unitSize);
+		memcpy(parent->readBuffer + (size_t)(relativeUnit *
+			parent->file->fs->unitSize), request->buffer, (size_t)bytes);
+		hfsStatsRecordCopyFast((size_t)bytes);
+	}
+	hfsIoRelease(&parent->leases[request->asyncIndex]);
+	pthread_mutex_lock(&parent->lock);
+	if (error != 0 && parent->firstError == 0) {
+		parent->firstError = error;
+	}
+	if (parent->pending > 0) {
+		parent->pending--;
+	}
+	pthread_mutex_unlock(&parent->lock);
+	hfsIoAsyncAfterBatch(parent);
+}
+
+/* Submit one aligned read while retaining synchronization until completion. */
+int hfsIoReadAtAsync(HfsFile *file, uint8_t *buffer, size_t count,
+		     uint64_t offset, HfsIoAsyncCallback callback, void *context) {
+	HfsIoAsyncParent *parent;
+
+	if (callback == NULL || file == NULL || file->fs == NULL ||
+	    file->blob == NULL || file->fs->ioPool == NULL ||
+	    file->fs->unitSize == 0 || buffer == NULL || count == 0 ||
+	    count > (size_t)SSIZE_MAX || offset > UINT64_MAX - count ||
+	    offset % file->fs->unitSize != 0 ||
+	    count % (size_t)file->fs->unitSize != 0) {
+		errno = EINVAL;
+		return -1;
+	}
+	parent = calloc(1, sizeof(*parent));
+	if (parent == NULL) {
+		errno = ENOMEM;
+		return -1;
+	}
+	parent->file = file;
+	parent->readBuffer = buffer;
+	parent->count = count;
+	parent->offset = offset;
+	parent->totalUnits = count / file->fs->unitSize;
+	parent->depth = hfsIoPipelineDepth();
+	parent->callback = callback;
+	parent->context = context;
+	parent->runtime = hfsIoSyncReadTryLock(file);
+	if (parent->runtime == NULL ||
+	    hfsIoRangeTryLock(file, offset, count, false, &parent->guard) != 0) {
+		if (parent->runtime != NULL) {
+			hfsIoSyncReadUnlock(parent->runtime);
+		}
+		free(parent);
+		if (errno != EAGAIN) {
+			errno = EAGAIN;
+		}
+		return -1;
+	}
+	if (pthread_mutex_init(&parent->lock, NULL) != 0) {
+		hfsIoRangeUnlock(file, &parent->guard);
+		hfsIoSyncReadUnlock(parent->runtime);
+		free(parent);
+		errno = ENOMEM;
+		return -1;
+	}
+	if (hfsIoAsyncStartBatch(parent) != 0) {
+		hfsIoRangeUnlock(file, &parent->guard);
+		hfsIoSyncReadUnlock(parent->runtime);
+		pthread_mutex_destroy(&parent->lock);
+		free(parent);
+		return -1;
+	}
+	return 0;
+}
+
+/* Submit one aligned write without resizing, retaining synchronization to completion. */
+int hfsIoWriteAtAsync(HfsFile *file, const uint8_t *buffer, size_t count,
+		      uint64_t offset, HfsIoAsyncCallback callback, void *context) {
+	HfsIoAsyncParent *parent;
+	uint64_t end;
+	uint64_t clusters;
+	uint64_t capacity;
+
+	if (callback == NULL || file == NULL || file->fs == NULL ||
+	    file->blob == NULL || file->fs->ioPool == NULL ||
+	    file->fs->unitSize == 0 || buffer == NULL || count == 0 ||
+	    count > (size_t)SSIZE_MAX || offset > UINT64_MAX - count ||
+	    offset % file->fs->unitSize != 0 ||
+	    count % (size_t)file->fs->unitSize != 0) {
+		errno = EINVAL;
+		return -1;
+	}
+	if (file->fs->clusterSize == 0) {
+		errno = EAGAIN;
+		return -1;
+	}
+	clusters = spdk_blob_get_num_clusters(file->blob);
+	if (clusters > UINT64_MAX / file->fs->clusterSize) {
+		errno = EOVERFLOW;
+		return -1;
+	}
+	capacity = clusters * file->fs->clusterSize;
+	end = offset + count;
+	if (end > capacity) {
+		errno = EAGAIN;
+		return -1;
+	}
+	parent = calloc(1, sizeof(*parent));
+	if (parent == NULL) {
+		errno = ENOMEM;
+		return -1;
+	}
+	parent->file = file;
+	parent->writeBuffer = buffer;
+	parent->count = count;
+	parent->offset = offset;
+	parent->totalUnits = count / file->fs->unitSize;
+	parent->depth = hfsIoPipelineDepth();
+	parent->write = true;
+	parent->callback = callback;
+	parent->context = context;
+	parent->runtime = hfsIoSyncReadTryLock(file);
+	if (parent->runtime == NULL ||
+	    hfsIoRangeTryLock(file, offset, count, true, &parent->guard) != 0) {
+		if (parent->runtime != NULL) {
+			hfsIoSyncReadUnlock(parent->runtime);
+		}
+		free(parent);
+		if (errno != EAGAIN) {
+			errno = EAGAIN;
+		}
+		return -1;
+	}
+	if (pthread_mutex_init(&parent->lock, NULL) != 0) {
+		hfsIoRangeUnlock(file, &parent->guard);
+		hfsIoSyncReadUnlock(parent->runtime);
+		free(parent);
+		errno = ENOMEM;
+		return -1;
+	}
+	if (hfsIoAsyncStartBatch(parent) != 0) {
+		hfsIoRangeUnlock(file, &parent->guard);
+		hfsIoSyncReadUnlock(parent->runtime);
+		pthread_mutex_destroy(&parent->lock);
+		free(parent);
 		return -1;
 	}
 	return 0;

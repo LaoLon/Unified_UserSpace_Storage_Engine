@@ -1,6 +1,6 @@
 # HFS 可靠性与性能优化阶段计划（shard-36 起）
 
-> 状态：shard-36～42 核心实现已完成，正确性闸门 A 已通过；shard-43 已先落地可移植 v5 页/WAL 格式基础和离线恢复校验，shard-44 已加入 v4 脏范围 checkpoint 与受限 group commit 基础，shard-45 已加入第一阶段异步 libhfs 请求执行器；运行时仍使用 v4，v5 迁移、设备 WAL 提交和 SPDK 原生异步子请求路径待继续完成<br>
+> 状态：shard-36～42 核心实现已完成，正确性闸门 A 已通过；shard-43 已先落地可移植 v5 页/WAL 格式基础和离线恢复校验，shard-44 已加入 v4 脏范围 checkpoint 与受限 group commit 基础，shard-45 已完成 async libhfs executor 及公开 aligned positioned direct child path；运行时仍使用 v4，v5 迁移、设备 WAL 提交、多 reactor/channel 和 SPDK 原生 libaio/io_uring ABI 仍待后续阶段<br>
 > 制定日期：2026-09-05  
 > 适用基线：`main@91db26a`（shard-36 已完成）
 > 输入文档：`review/hfs_architecture_performance_review_2026-09-05.md`  
@@ -613,11 +613,12 @@ mount 上的其他 dirty inode 合并为一个受 v4 intent 四槽位约束的 d
 
 ## 14. shard-45：异步 libhfs 核心 API
 
-> 状态：第二阶段基础已完成（2026-09-06）<br>
+> 状态：公开 direct path 已完成（2026-09-06）<br>
 > 已提供有界 worker executor、request-private context、callback/wait/result/cancel ABI，以及
-> positioned read/write、readv/writev 和 fsync；同步 preload 入口保持不变。对齐的大块数据 I/O
-> 已在一个父请求下提交有界 SPDK child batch，非对齐首尾仍走既有 RMW。当前公开 async API
-> 仍会占用 executor worker 等待父请求，尚未宣称完整的端到端无 worker 阻塞异步化。
+> positioned read/write、readv/writev 和 fsync；同步 preload 入口保持不变。至少两个完整
+> unit 且首尾对齐的 positioned read/write 现在直接绑定一个 public request 和有界 SPDK child
+> parent，不再占用 executor worker 等待数据 I/O；非对齐首尾、需要 resize、vector、fsync、
+> 小请求和资源不足场景继续使用有界 executor fallback。
 
 ### 目标
 
@@ -637,16 +638,21 @@ mount 上的其他 dirty inode 合并为一个受 v4 intent 四槽位约束的 d
 - 增加 `HFS_IO_PIPELINE_DEPTH`（默认 4，最大 16），对齐完整 unit 的大块读写在 owner 线程
   上拆成多个 child request；固定 DMA lease 在所有 child completion 后才归还，并记录
   `io_pipeline_peak` 以区分 SPDK 子请求并发和 executor queue depth。
+- 公开 async positioned read/write 先尝试 direct path：请求生命周期、open-file 引用、range
+  guard 和 DMA lease 均由父状态持有，SPDK owner-thread completion 直接完成 public request；
+  direct path 无法安全覆盖的形状返回 `EAGAIN` 并回退到原 executor，保留 resize/RMW/元数据
+ 语义。
 - 提供最小稳定 C ABI 和示例，preload 继续使用同步 wrapper。
-- 父请求已能聚合对齐数据 child completion；deadline/cancellation state、公开 async 请求直接
-  绑定父请求，以及同步入口改为等待 future，保留为下一阶段。当前 worker 并发不能替代
-  `io_pipeline_peak` 对 SPDK 子请求并发的观测。
+- 父请求聚合对齐数据 child completion；direct callback 在 SPDK owner thread 交付，fallback
+  callback 仍在 executor worker 交付。deadline/cancellation state 和同步入口改为等待 future
+  仍保留为后续工作；当前不扩展 native libaio/io_uring ABI。
 
 ### 测试与基准
 
 - 新增 `scripts/db/async_io_test.sh`，覆盖 16 路 positioned write、vector write、callback、
   wait/result、取消和 fsync；额外覆盖 4 MiB 对齐写，验证 async 统计 submit=complete、
-  executor queue peak>1 且 `io_pipeline_peak>1`。
+  executor queue peak>1 且 `io_pipeline_peak>1`；direct 4 MiB 请求验证 public request 不进入
+  executor 且 direct submit/complete 闭合。
 - 后续 microbenchmark 必须把“executor QD”和“SPDK owner/channel QD”分开报告；本阶段专项只验证
   API/lifecycle，不把 worker 并发误报成设备层异步收益。
 - 单线程 QD=1/4/16/32，覆盖 aligned/unaligned、read/write/vector、错误注入和取消竞争。
@@ -656,10 +662,9 @@ mount 上的其他 dirty inode 合并为一个受 v4 intent 四槽位约束的 d
 
 - 第一阶段：单线程 async libhfs 能维持 executor QD>1，request callback/result 生命周期和
   submit/complete 计数闭合。
-- 第二阶段基础：单个大块对齐请求能维持有界 SPDK child QD>1，`io_pipeline_peak` 与配置相符；
-  该项不等同于公开 async request 已脱离 worker。
-- 完整阶段：公开 async request 直接绑定父/子状态，worker 不再被 I/O 等待占用，并完成
-  deadline/cancel/error 聚合验收。
+- 第二阶段基础：单个大块对齐请求能维持有界 SPDK child QD>1，`io_pipeline_peak` 与配置相符。
+- 完整阶段：公开 async aligned positioned request 直接绑定父/子状态，worker 不再被数据 I/O
+  等待占用；需要 resize、RMW、vector/fsync 或资源不足时允许 fallback，并完成 error 聚合验收。
 - QD=1 不回退超过 5%；QD=16 吞吐明显高于同步 QD≈1，除非设备已在 QD=1 饱和。
 - submit、子请求完成、父请求完成和 callback 各执行一次，错误不丢失。
 - 本 shard 只宣称 async libhfs API；不得宣称 native libaio/io_uring 已支持。
