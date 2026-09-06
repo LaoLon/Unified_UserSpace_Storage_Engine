@@ -60,6 +60,7 @@ typedef struct HfsStatsShard {
 	uint64_t asyncComplete;
 	uint64_t asyncCancel;
 	uint64_t asyncQueueDepthPeak;
+	uint64_t ioPipelinePeak;
 	uint64_t ioReadOps;
 	uint64_t ioWriteOps;
 	uint64_t ioReadBytes;
@@ -373,6 +374,15 @@ void hfsStatsRecordAsyncCancel(void) {
 	}
 }
 
+/* Record the child fan-out observed by one aligned parent request. */
+void hfsStatsRecordIoPipeline(uint64_t depth) {
+	HfsStatsShard *shard = hfsStatsShardGet();
+
+	if (shard != NULL && depth > shard->ioPipelinePeak) {
+		shard->ioPipelinePeak = depth;
+	}
+}
+
 /* Record serialized metadata bytes and the image/page split. */
 void hfsStatsRecordMetadataWrite(uint64_t bytes, uint64_t imageBytes,
 					 uint64_t pageBytes) {
@@ -470,6 +480,9 @@ static void hfsStatsAggregateShard(HfsStatsShard *total,
 	total->asyncCancel += shard->asyncCancel;
 	if (shard->asyncQueueDepthPeak > total->asyncQueueDepthPeak) {
 		total->asyncQueueDepthPeak = shard->asyncQueueDepthPeak;
+	}
+	if (shard->ioPipelinePeak > total->ioPipelinePeak) {
+		total->ioPipelinePeak = shard->ioPipelinePeak;
 	}
 	total->ioReadOps += shard->ioReadOps;
 	total->ioWriteOps += shard->ioWriteOps;
@@ -601,6 +614,8 @@ static void hfsStatsWriteSnapshot(void) {
 	HFS_STATS_APPEND("async_cancel=%"PRIu64"\n", total.asyncCancel);
 	HFS_STATS_APPEND("async_queue_depth_peak=%"PRIu64"\n",
 		total.asyncQueueDepthPeak);
+	HFS_STATS_APPEND("io_pipeline_peak=%"PRIu64"\n",
+		total.ioPipelinePeak);
 	HFS_STATS_APPEND("io_read_ops=%"PRIu64"\n", total.ioReadOps);
 	HFS_STATS_APPEND("io_write_ops=%"PRIu64"\n", total.ioWriteOps);
 	HFS_STATS_APPEND("io_read_bytes=%"PRIu64"\n", total.ioReadBytes);

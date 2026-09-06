@@ -134,9 +134,9 @@ int hfsRequestWait(HfsRequestResult *result, spdk_msg_fn startFn, void *ctx) {
 	return 0;
 }
 
-/* Submit a data-path request through the owner-side batch dispatcher. */
-int hfsRequestWaitBatch(HfsRequestResult *result, spdk_msg_fn startFn, void *ctx,
-			HfsRuntimeBatchItem *batchItem) {
+/* Submit a request through the owner-side batch dispatcher without waiting. */
+int hfsRequestSubmitBatch(HfsRequestResult *result, spdk_msg_fn startFn,
+			 void *ctx, HfsRuntimeBatchItem *batchItem) {
 	int rc;
 
 	hfsRuntimeCompletionReset(&result->completion);
@@ -149,6 +149,11 @@ int hfsRequestWaitBatch(HfsRequestResult *result, spdk_msg_fn startFn, void *ctx
 	if (rc != 0) {
 		return hfsRequestSetError(rc);
 	}
+	return 0;
+}
+
+/* Wait for a submitted request and translate timeout or SPDK errors. */
+int hfsRequestWaitResult(HfsRequestResult *result) {
 	if (!hfsRuntimeCompletionWait(&result->completion,
 				      HFS_RUNTIME_TIMEOUT_MS)) {
 		return -1;
@@ -157,6 +162,17 @@ int hfsRequestWaitBatch(HfsRequestResult *result, spdk_msg_fn startFn, void *ctx
 		return hfsRequestSetError(result->completionRc);
 	}
 	return 0;
+}
+
+/* Submit a data-path request through the owner-side batch dispatcher. */
+int hfsRequestWaitBatch(HfsRequestResult *result, spdk_msg_fn startFn, void *ctx,
+			HfsRuntimeBatchItem *batchItem) {
+	int rc = hfsRequestSubmitBatch(result, startFn, ctx, batchItem);
+
+	if (rc != 0) {
+		return rc;
+	}
+	return hfsRequestWaitResult(result);
 }
 
 /*

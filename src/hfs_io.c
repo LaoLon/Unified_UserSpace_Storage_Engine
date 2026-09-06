@@ -19,6 +19,8 @@
 /* Keep the hot path bounded while covering the largest common database I/O. */
 #define HFS_IO_POOL_COUNT	16U
 #define HFS_IO_BUFFER_BYTES	(1U << 20)
+#define HFS_IO_MAX_PIPELINE	16U
+#define HFS_IO_DEFAULT_PIPELINE	4U
 
 /* One fixed-size DMA buffer leased by one request at a time. */
 typedef struct HfsIoLease {
@@ -176,6 +178,33 @@ static uint64_t hfsIoMaxUnits(const Hfs *fs) {
 	return (uint64_t)(fs->ioPool->bufferBytes / (size_t)fs->unitSize);
 }
 
+static pthread_once_t g_hfsIoPipelineOnce = PTHREAD_ONCE_INIT;
+static uint32_t g_hfsIoPipelineConfigured;
+
+/* Parse the bounded aligned-I/O child depth once per process. */
+static void hfsIoPipelineInit(void) {
+	const char *value = getenv("HFS_IO_PIPELINE_DEPTH");
+	char *end = NULL;
+	unsigned long parsed;
+
+	g_hfsIoPipelineConfigured = HFS_IO_DEFAULT_PIPELINE;
+	if (value == NULL || value[0] == '\0') {
+		return;
+	}
+	errno = 0;
+	parsed = strtoul(value, &end, 10);
+	if (errno == 0 && end != value && *end == '\0' &&
+	    parsed >= 1U && parsed <= HFS_IO_MAX_PIPELINE) {
+		g_hfsIoPipelineConfigured = (uint32_t)parsed;
+	}
+}
+
+/* Return the maximum number of aligned child requests in one parent batch. */
+static uint32_t hfsIoPipelineDepth(void) {
+	(void)pthread_once(&g_hfsIoPipelineOnce, hfsIoPipelineInit);
+	return g_hfsIoPipelineConfigured;
+}
+
 /* Acquire one bounded DMA buffer, waiting until a request returns one. */
 static int hfsIoAcquire(Hfs *fs, HfsIoLease *lease) {
 	struct hfs_io_pool *pool = fs->ioPool;
@@ -265,6 +294,56 @@ static void hfsIoDone(void *arg, int bserrno) {
 	hfsRequestComplete(&request->result, bserrno, request->units);
 }
 
+/* Submit one child request without waiting for its owner-thread completion. */
+static int hfsIoStartRequest(HfsIoRequest *request) {
+	hfsRequestInit(&request->result, hfsIoRequestOperation(request->operation));
+	return hfsRequestSubmitBatch(&request->result, hfsIoStart, request,
+				     &request->batchItem);
+}
+
+/* Wait for one child request and retain the existing error logging contract. */
+static int hfsIoWaitRequest(HfsIoRequest *request) {
+	if (hfsRequestWaitResult(&request->result) != 0) {
+		HFS_STATS_ERROR();
+		HFS_LOG_ERROR("data I/O failed operation=%d offset=%"PRIu64
+			      " units=%"PRIu64" submitRc=%d completionRc=%d bserrno=%d",
+			      request->operation, request->offset, request->units,
+			      request->result.submitRc, request->result.completionRc,
+			      request->result.bserrno);
+		return -1;
+	}
+	return 0;
+}
+
+/* Wait for every submitted child before parent storage is allowed to unwind. */
+static int hfsIoWaitPipeline(HfsIoRequest *requests, uint32_t count) {
+	int rc = 0;
+	int firstErrno = 0;
+	uint32_t i;
+
+	for (i = 0; i < count; i++) {
+		if (hfsIoWaitRequest(&requests[i]) != 0) {
+			if (firstErrno == 0) {
+				firstErrno = errno;
+			}
+			rc = -1;
+		}
+	}
+	if (firstErrno != 0) {
+		errno = firstErrno;
+	}
+	return rc;
+}
+
+/* Release all DMA leases owned by one completed or failed parent batch. */
+static void hfsIoReleasePipeline(HfsIoLease *leases, uint32_t count) {
+	uint32_t i;
+
+	for (i = 0; i < count; i++) {
+		hfsIoRelease(&leases[i]);
+	}
+}
+
 /* Start one request-local transfer and wait for its owner-thread callback. */
 static int hfsIoSubmit(HfsFile *file, void *buffer, uint64_t offset,
 		       uint64_t units, HfsIoOperation operation) {
@@ -277,14 +356,11 @@ static int hfsIoSubmit(HfsFile *file, void *buffer, uint64_t offset,
 	request.offset = offset;
 	request.units = units;
 	request.operation = operation;
-	hfsRequestInit(&request.result, hfsIoRequestOperation(operation));
-	if (hfsRequestWaitBatch(&request.result, hfsIoStart, &request,
-				&request.batchItem) != 0) {
+	if (hfsIoStartRequest(&request) != 0) {
 		HFS_STATS_ERROR();
-		HFS_LOG_ERROR("data I/O failed operation=%d offset=%"PRIu64
-			      " units=%"PRIu64" submitRc=%d completionRc=%d bserrno=%d",
-			      operation, offset, units, request.result.submitRc,
-			      request.result.completionRc, request.result.bserrno);
+		return -1;
+	}
+	if (hfsIoWaitRequest(&request) != 0) {
 		return -1;
 	}
 	return 0;
@@ -495,28 +571,55 @@ static ssize_t hfsIoReadAtLocked(HfsFile *file, uint8_t *buffer,
 
 	while (remaining >= (size_t)unitSize) {
 		uint64_t fullUnits = remaining / (size_t)unitSize;
-		uint64_t chunkUnits = fullUnits;
-		HfsIoLease lease;
+		uint64_t maxUnits = hfsIoMaxUnits(file->fs);
+		uint64_t pendingUnits = 0;
+		uint32_t pipelineDepth = hfsIoPipelineDepth();
+		uint32_t requestCount = 0;
+		HfsIoRequest requests[HFS_IO_MAX_PIPELINE] = {0};
+		HfsIoLease leases[HFS_IO_MAX_PIPELINE] = {0};
+		uint32_t i;
 
-		if (chunkUnits > hfsIoMaxUnits(file->fs)) {
-			chunkUnits = hfsIoMaxUnits(file->fs);
+		while (requestCount < pipelineDepth && pendingUnits < fullUnits) {
+			uint64_t chunkUnits = fullUnits - pendingUnits;
+
+			if (chunkUnits > maxUnits) {
+				chunkUnits = maxUnits;
+			}
+			if (hfsIoAcquire(file->fs, &leases[requestCount]) != 0) {
+				hfsIoWaitPipeline(requests, requestCount);
+				hfsIoReleasePipeline(leases, requestCount);
+				return -1;
+			}
+			requests[requestCount].file = file;
+			requests[requestCount].buffer = leases[requestCount].buffer;
+			requests[requestCount].offset = cursor / unitSize + pendingUnits;
+			requests[requestCount].units = chunkUnits;
+			requests[requestCount].operation = HFS_IO_READ;
+			if (hfsIoStartRequest(&requests[requestCount]) != 0) {
+				hfsIoRelease(&leases[requestCount]);
+				hfsIoWaitPipeline(requests, requestCount);
+				hfsIoReleasePipeline(leases, requestCount);
+				return -1;
+			}
+			requestCount++;
+			pendingUnits += chunkUnits;
 		}
-		if (hfsIoAcquire(file->fs, &lease) != 0) {
+		hfsStatsRecordIoPipelineFast(requestCount);
+		if (hfsIoWaitPipeline(requests, requestCount) != 0) {
+			hfsIoReleasePipeline(leases, requestCount);
 			return -1;
 		}
-		if (hfsIoSubmit(file, lease.buffer, cursor / unitSize, chunkUnits,
-				HFS_IO_READ) != 0) {
-			hfsIoRelease(&lease);
-			return -1;
+		for (i = 0; i < requestCount; i++) {
+			size_t bytes = (size_t)(requests[i].units * unitSize);
+
+			memcpy(buffer, leases[i].buffer, bytes);
+			hfsStatsRecordCopyFast(bytes);
+			buffer += bytes;
 		}
-		memcpy(buffer, lease.buffer,
-		       (size_t)(chunkUnits * unitSize));
-		hfsStatsRecordCopyFast(chunkUnits * unitSize);
-		hfsIoRelease(&lease);
-		cursor += chunkUnits * unitSize;
-		buffer += (size_t)(chunkUnits * unitSize);
-		remaining -= (size_t)(chunkUnits * unitSize);
-		done += (size_t)(chunkUnits * unitSize);
+		hfsIoReleasePipeline(leases, requestCount);
+		cursor += pendingUnits * unitSize;
+		remaining -= (size_t)(pendingUnits * unitSize);
+		done += (size_t)(pendingUnits * unitSize);
 	}
 
 	if (remaining != 0) {
@@ -564,27 +667,53 @@ static ssize_t hfsIoWriteAtLocked(HfsFile *file, const uint8_t *buffer,
 
 	while (remaining >= (size_t)unitSize) {
 		uint64_t fullUnits = remaining / (size_t)unitSize;
-		uint64_t chunkUnits = fullUnits;
-		HfsIoLease lease;
+		uint64_t maxUnits = hfsIoMaxUnits(file->fs);
+		uint64_t pendingUnits = 0;
+		uint32_t pipelineDepth = hfsIoPipelineDepth();
+		uint32_t requestCount = 0;
+		HfsIoRequest requests[HFS_IO_MAX_PIPELINE] = {0};
+		HfsIoLease leases[HFS_IO_MAX_PIPELINE] = {0};
 
-		if (chunkUnits > hfsIoMaxUnits(file->fs)) {
-			chunkUnits = hfsIoMaxUnits(file->fs);
+		while (requestCount < pipelineDepth && pendingUnits < fullUnits) {
+			uint64_t chunkUnits = fullUnits - pendingUnits;
+			size_t bytes;
+
+			if (chunkUnits > maxUnits) {
+				chunkUnits = maxUnits;
+			}
+			if (hfsIoAcquire(file->fs, &leases[requestCount]) != 0) {
+				hfsIoWaitPipeline(requests, requestCount);
+				hfsIoReleasePipeline(leases, requestCount);
+				return -1;
+			}
+			bytes = (size_t)(chunkUnits * unitSize);
+			memcpy(leases[requestCount].buffer,
+			       buffer + (size_t)(pendingUnits * unitSize), bytes);
+			hfsStatsRecordCopyFast(bytes);
+			requests[requestCount].file = file;
+			requests[requestCount].buffer = leases[requestCount].buffer;
+			requests[requestCount].offset = cursor / unitSize + pendingUnits;
+			requests[requestCount].units = chunkUnits;
+			requests[requestCount].operation = HFS_IO_WRITE;
+			if (hfsIoStartRequest(&requests[requestCount]) != 0) {
+				hfsIoRelease(&leases[requestCount]);
+				hfsIoWaitPipeline(requests, requestCount);
+				hfsIoReleasePipeline(leases, requestCount);
+				return -1;
+			}
+			requestCount++;
+			pendingUnits += chunkUnits;
 		}
-		if (hfsIoAcquire(file->fs, &lease) != 0) {
+		hfsStatsRecordIoPipelineFast(requestCount);
+		if (hfsIoWaitPipeline(requests, requestCount) != 0) {
+			hfsIoReleasePipeline(leases, requestCount);
 			return -1;
 		}
-		memcpy(lease.buffer, buffer, (size_t)(chunkUnits * unitSize));
-		hfsStatsRecordCopyFast(chunkUnits * unitSize);
-		if (hfsIoSubmit(file, lease.buffer, cursor / unitSize, chunkUnits,
-				HFS_IO_WRITE) != 0) {
-			hfsIoRelease(&lease);
-			return -1;
-		}
-		hfsIoRelease(&lease);
-		cursor += chunkUnits * unitSize;
-		buffer += (size_t)(chunkUnits * unitSize);
-		remaining -= (size_t)(chunkUnits * unitSize);
-		done += (size_t)(chunkUnits * unitSize);
+		hfsIoReleasePipeline(leases, requestCount);
+		cursor += pendingUnits * unitSize;
+		buffer += (size_t)(pendingUnits * unitSize);
+		remaining -= (size_t)(pendingUnits * unitSize);
+		done += (size_t)(pendingUnits * unitSize);
 	}
 
 	if (remaining != 0 &&

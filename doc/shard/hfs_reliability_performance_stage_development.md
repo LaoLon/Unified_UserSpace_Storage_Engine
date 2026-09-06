@@ -613,11 +613,11 @@ mount 上的其他 dirty inode 合并为一个受 v4 intent 四槽位约束的 d
 
 ## 14. shard-45：异步 libhfs 核心 API
 
-> 状态：第一阶段基础已完成（2026-09-06）<br>
+> 状态：第二阶段基础已完成（2026-09-06）<br>
 > 已提供有界 worker executor、request-private context、callback/wait/result/cancel ABI，以及
-> positioned read/write、readv/writev 和 fsync；同步 preload 入口保持不变。当前 worker 仍调用
-> 已验证的同步 libhfs 路径，因此能让调用方并发排队，但还不能宣称 SPDK 子请求已完全异步化或
-> 已达到 C 闸门的 QD/吞吐目标。
+> positioned read/write、readv/writev 和 fsync；同步 preload 入口保持不变。对齐的大块数据 I/O
+> 已在一个父请求下提交有界 SPDK child batch，非对齐首尾仍走既有 RMW。当前公开 async API
+> 仍会占用 executor worker 等待父请求，尚未宣称完整的端到端无 worker 阻塞异步化。
 
 ### 目标
 
@@ -634,14 +634,19 @@ mount 上的其他 dirty inode 合并为一个受 v4 intent 四槽位约束的 d
   交付，已开始的 I/O 不提前释放 buffer、iovec 或 fd 相关资源。
 - 增加 `async_submit/complete/cancel/queue_depth_peak` 统计，专项脚本验证 submit/complete
   闭合、vector I/O、回调、取消和 fsync。
+- 增加 `HFS_IO_PIPELINE_DEPTH`（默认 4，最大 16），对齐完整 unit 的大块读写在 owner 线程
+  上拆成多个 child request；固定 DMA lease 在所有 child completion 后才归还，并记录
+  `io_pipeline_peak` 以区分 SPDK 子请求并发和 executor queue depth。
 - 提供最小稳定 C ABI 和示例，preload 继续使用同步 wrapper。
-- 父/子 SPDK 请求聚合、deadline/cancellation state 和同步入口改为等待 future，保留为下一阶段；
-  当前 worker 只复用已验证的同步调用，不把 executor 并发当作 SPDK 子请求并发。
+- 父请求已能聚合对齐数据 child completion；deadline/cancellation state、公开 async 请求直接
+  绑定父请求，以及同步入口改为等待 future，保留为下一阶段。当前 worker 并发不能替代
+  `io_pipeline_peak` 对 SPDK 子请求并发的观测。
 
 ### 测试与基准
 
 - 新增 `scripts/db/async_io_test.sh`，覆盖 16 路 positioned write、vector write、callback、
-  wait/result、取消和 fsync；验证 async 统计 submit=complete 且 queue peak>1。
+  wait/result、取消和 fsync；额外覆盖 4 MiB 对齐写，验证 async 统计 submit=complete、
+  executor queue peak>1 且 `io_pipeline_peak>1`。
 - 后续 microbenchmark 必须把“executor QD”和“SPDK owner/channel QD”分开报告；本阶段专项只验证
   API/lifecycle，不把 worker 并发误报成设备层异步收益。
 - 单线程 QD=1/4/16/32，覆盖 aligned/unaligned、read/write/vector、错误注入和取消竞争。
@@ -651,8 +656,10 @@ mount 上的其他 dirty inode 合并为一个受 v4 intent 四槽位约束的 d
 
 - 第一阶段：单线程 async libhfs 能维持 executor QD>1，request callback/result 生命周期和
   submit/complete 计数闭合。
-- 完整阶段：单线程 async libhfs 能维持 SPDK 子请求 QD>1，观测到的 SPDK inflight 与配置相符；
-  该项留给后续把 `hfsIoRequest` 拆成父/子请求后验收。
+- 第二阶段基础：单个大块对齐请求能维持有界 SPDK child QD>1，`io_pipeline_peak` 与配置相符；
+  该项不等同于公开 async request 已脱离 worker。
+- 完整阶段：公开 async request 直接绑定父/子状态，worker 不再被 I/O 等待占用，并完成
+  deadline/cancel/error 聚合验收。
 - QD=1 不回退超过 5%；QD=16 吞吐明显高于同步 QD≈1，除非设备已在 QD=1 饱和。
 - submit、子请求完成、父请求完成和 callback 各执行一次，错误不丢失。
 - 本 shard 只宣称 async libhfs API；不得宣称 native libaio/io_uring 已支持。

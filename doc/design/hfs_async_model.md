@@ -1,7 +1,8 @@
 # HFS asynchronous request model
 
-> Status: shard-45 first-stage executor foundation (2026-09-06). The executor is not yet the
-> final SPDK child-request implementation.
+> Status: shard-45 bounded child-pipeline foundation (2026-09-06). The public executor still
+> wraps the checked libhfs entry points; the aligned data path now submits multiple SPDK child
+> requests under one parent operation.
 
 ## Scope
 
@@ -19,8 +20,10 @@ there is no use-after-free of the fd table entry.
 1. Submit allocates one request with a caller reference and a worker reference.
 2. A bounded executor queues the request. `HFS_ASYNC_WORKERS` selects 1–32 workers and
    `HFS_ASYNC_QUEUE_DEPTH` selects a 1–4096 queue limit.
-3. A worker invokes the existing checked synchronous libhfs operation. This preserves the current
-   SPDK owner-thread, range-lock, RMW, metadata and fsync contracts while exposing caller-level QD.
+3. A worker invokes the existing checked libhfs operation. Aligned full-unit ranges are split into
+   a bounded parent batch controlled by `HFS_IO_PIPELINE_DEPTH` (default 4, maximum 16); each child
+   owns a fixed DMA lease and completes on the SPDK owner thread. Edge units still use the existing
+   synchronous RMW path, preserving range-lock, metadata and fsync contracts.
 4. Completion stores result and positive errno, wakes `hfsAsyncWait`, and optionally invokes the
    callback on the worker thread.
 5. The caller reads the result and releases its reference. The worker reference is released after
@@ -43,6 +46,8 @@ When `HFS_STATS_PATH` is enabled, the snapshot includes `async_submit`, `async_c
 `async_cancel`, and `async_queue_depth_peak`. These counters describe the executor queue and must
 not be confused with SPDK `spdk_submit`/`spdk_complete` or device queue depth.
 
-The next implementation step is to move the data path from worker-blocking wrappers to a parent
-request with SPDK child requests and a completion aggregator. That step must preserve this public
-lifecycle, propagate the first error, and only then claim SPDK-level QD>1.
+The current child batch is the low-level completion-aggregation foundation: the parent waits for
+all children, propagates the first observed error, and releases DMA leases only after callbacks.
+The next step is to connect this parent state directly to `HfsAsyncRequest`, so a public async
+request can complete without occupying an executor worker. `io_pipeline_peak` reports the largest
+aligned child fan-out and must be evaluated separately from executor queue depth.

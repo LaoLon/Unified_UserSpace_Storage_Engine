@@ -21,6 +21,11 @@ void hfsRequestInit(HfsRequestResult *result, HfsRequestOperation operation);
 void hfsRequestComplete(HfsRequestResult *result, int bserrno,
 			uint64_t completedUnits);
 int hfsRequestWait(HfsRequestResult *result, spdk_msg_fn startFn, void *ctx);
+/* Submit a request without waiting so a parent can keep child I/O in flight. */
+int hfsRequestSubmitBatch(HfsRequestResult *result, spdk_msg_fn startFn,
+			 void *ctx, HfsRuntimeBatchItem *batchItem);
+/* Wait for a previously submitted request and translate its completion error. */
+int hfsRequestWaitResult(HfsRequestResult *result);
 int hfsRequestWaitBatch(HfsRequestResult *result, spdk_msg_fn startFn, void *ctx,
 			HfsRuntimeBatchItem *batchItem);
 bool hfsRequestCompletionInjected(HfsRequestOperation operation);

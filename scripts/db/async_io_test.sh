@@ -24,7 +24,8 @@ STATS_PATH="$RUN_DIR/async.stats"
 env LD_PRELOAD="$LIB" HFS_LIBHFS_PATH="$LIB" HFS_STATS_PATH="$STATS_PATH" \
 	HFS_CONFIG_PATH="$EFFECTIVE_CONFIG" \
 	HFS_BDEV_NAME=Aio0 HFS_LOCK_PATH="$LOCK_PATH" HFS_FORMAT=1 \
-	HFS_ASYNC_WORKERS=4 HFS_ASYNC_QUEUE_DEPTH=64 python3 - <<'PYEOF'
+	HFS_ASYNC_WORKERS=4 HFS_ASYNC_QUEUE_DEPTH=64 HFS_IO_PIPELINE_DEPTH=4 \
+	python3 - <<'PYEOF'
 import ctypes
 import errno
 import os
@@ -98,6 +99,22 @@ assert len(data) == unit * 16
 for index in range(16):
     assert data[index * unit:(index + 1) * unit] == bytes([65 + index]) * unit
 
+# A multi-megabyte aligned request must fan out into several SPDK child I/Os.
+pipeline_units = 1024
+pipeline_payload = ctypes.create_string_buffer(bytes([90]) * (unit * pipeline_units))
+pipeline_request = Request()
+assert lib.hfs_lib_async_pwrite(fd, pipeline_payload, len(pipeline_payload.value),
+                                unit * 64, callback, None,
+                                ctypes.byref(pipeline_request)) == 0
+assert lib.hfsAsyncWait(pipeline_request, 10000) == 0
+result = ctypes.c_ssize_t()
+error = ctypes.c_int()
+assert lib.hfsAsyncResult(pipeline_request, ctypes.byref(result),
+                          ctypes.byref(error)) == 0
+assert result.value == unit * pipeline_units and error.value == 0
+assert os.pread(fd, unit * 2, unit * 64) == bytes([90]) * (unit * 2)
+lib.hfsAsyncRelease(pipeline_request)
+
 # Exercise vector submission while retaining caller-owned iovec storage.
 left = ctypes.create_string_buffer(b"vector-left")
 right = ctypes.create_string_buffer(b"vector-right")
@@ -141,8 +158,11 @@ PYEOF
 async_submit="$(awk -F= '$1 == "async_submit" {print $2}' "$STATS_PATH")"
 async_complete="$(awk -F= '$1 == "async_complete" {print $2}' "$STATS_PATH")"
 async_peak="$(awk -F= '$1 == "async_queue_depth_peak" {print $2}' "$STATS_PATH")"
-if [[ -z "$async_submit" || "$async_submit" != "$async_complete" || "${async_peak:-0}" -lt 2 ]]; then
+io_pipeline_peak="$(awk -F= '$1 == "io_pipeline_peak" {print $2}' "$STATS_PATH")"
+if [[ -z "$async_submit" || "$async_submit" != "$async_complete" ||
+      "${async_peak:-0}" -lt 2 || "${io_pipeline_peak:-0}" -lt 2 ]]; then
 	echo "async executor accounting failed: submit=$async_submit complete=$async_complete peak=$async_peak" >&2
+	echo "aligned child pipeline failed: peak=$io_pipeline_peak" >&2
 	exit 1
 fi
 
