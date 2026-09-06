@@ -46,6 +46,7 @@ set(HFS_CORE_SRC
   src/hfs_durability.c
   src/hfs_lib.c
   src/hfs_meta.c
+  src/hfs_meta_v5.c
   src/hfs_preload.c
   src/hfs_runtime.c
   src/hfs_fd.c

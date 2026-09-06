@@ -832,4 +832,22 @@ Bug 等级：**致命 > 严重 > 一般**。
 - **验证**：VM 上 1K/10K 目录样本均 errors=0；1K/10K 的 open/stat p99 保持在约 7/8 微秒，
   create/readdir/rename/unlink 的放大仍被单独记录为 v4 整镜像提交问题，不再与后端 ENOSPC 混淆。
 
+### 56. v5 WAL 对齐 padding 被误当作逻辑 payload（已修复，严重级）
+
+- **状态**：已修复；离线格式、WAL recovery、Make/CMake 构建均通过
+- **时间**：2026-09-06（shard-43 v5 格式基础）
+- **等级**：严重（所有非 4 字节对齐的 inode WAL 记录无法恢复，可能阻断提交事务重放）
+- **现象**：v5 `SET_INODE` 记录的逻辑 payload 为 212 字节，WAL 记录头要求 8 字节对齐，编码后
+  实际记录长度为 256 字节。恢复解析器直接将 216 字节（包含 4 字节零 padding）传给 inode
+  应用函数，因长度必须等于 212 而拒绝整个事务；提交 marker 也存在同样的 4 字节对齐问题。
+- **排查过程**：`scripts/db/metadata_v5_format_test.sh` 的 checkpoint round-trip 通过，但加入
+  一条 SET_INODE + COMMIT 后 replay 失败并返回 `EIO`。对比 `v5EncodeRecord` 的对齐逻辑和
+  `v5WalRecord` 的 `length - header` 语义，定位到解析层没有区分物理记录长度与逻辑 payload 长度。
+- **根因**：格式设计只保存物理 record length，未额外保存逻辑 payload length；实现却按未对齐
+  payload 长度做严格相等校验。
+- **修复**：恢复端按记录类型声明逻辑长度（SET_INODE=4+208、COMMIT=4），要求尾部 padding
+  不超过 7 字节且全部为零；checksum 仍覆盖物理 payload（含 padding），从而同时保证对齐和完整性。
+- **验证**：VM 上 v5 格式测试覆盖 committed WAL、缺 commit WAL、页 checksum 损坏和 superblock
+  A 回退；随后强制 Make、CMake Release 均通过。
+
 ## 通用经验总结

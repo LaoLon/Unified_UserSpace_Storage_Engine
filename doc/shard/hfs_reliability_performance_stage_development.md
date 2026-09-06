@@ -1,6 +1,6 @@
 # HFS 可靠性与性能优化阶段计划（shard-36 起）
 
-> 状态：shard-36～42 核心实现已完成，正确性闸门 A 已通过；shard-42 已落地内存元数据索引与常驻 metadata handle，但 10K/1K 的 create/readdir/rename/unlink p99 仍受 v4 整镜像提交放大限制，60K 闸门留给 shard-43 的页式/WAL 元数据实现<br>
+> 状态：shard-36～42 核心实现已完成，正确性闸门 A 已通过；shard-43 已先落地可移植 v5 页/WAL 格式基础和离线恢复校验，但运行时仍使用 v4，迁移与设备提交路径待继续完成<br>
 > 制定日期：2026-09-05  
 > 适用基线：`main@91db26a`（shard-36 已完成）
 > 输入文档：`review/hfs_architecture_performance_review_2026-09-05.md`  
@@ -497,6 +497,19 @@ Aio bdev、4 KiB randrw、iodepth=1、runtime=1 s 的短矩阵如下；统计显
 - WAL record：length、type、transaction id、LSN、payload checksum、commit marker。
 - WAL 操作至少覆盖 create、unlink、rename、setattr、size/allocation 更新和 orphan 回收。
 - recovery 只重放有完整 commit record 的事务；重复重放必须幂等。
+
+### 当前完成（shard-43 foundation）
+
+- 新增 `src/hfs_meta_v5.[ch]`，实现显式 little-endian superblock A/B、4 KiB
+  inode page、固定字段 WAL record、checksum 和 newest-generation 选择。
+- WAL recovery 已按 transaction id 暂存 SET_INODE，只在 commit marker 的记录数
+  完全匹配时应用；缺少 commit、页损坏和单个 superblock 损坏均有离线校验覆盖。
+- 新增 `scripts/db/metadata_v5_format_test.sh` 与
+  `scripts/db/metadata_wal_recovery_test.sh`，VM 上 v5 round-trip/WAL recovery、
+  Make 强制构建和 CMake Release 均通过。
+- 该提交尚未切换当前挂载格式；v4 仍是运行时格式，v4→v5 copy-on-write 迁移、
+  SPDK metadata blob 提交和 dirty-page checkpoint 留在后续实现，不能宣称 shard-43
+  的迁移验收已完成。
 
 ### 迁移策略
 

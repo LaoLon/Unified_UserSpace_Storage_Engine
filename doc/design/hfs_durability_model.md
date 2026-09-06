@@ -1,6 +1,6 @@
 # HFS Durability Model
 
-> Status: shard-38 completed (2026-09-06)
+> Status: shard-43 v5 format foundation (runtime migration not enabled)
 > Scope: one HFS owner process mounted on one persistent SPDK bdev
 
 ## 1. Contract and terms
@@ -137,3 +137,30 @@ file's host cache and the VM do not make it a physical power-fail test.
 These limits keep Bug #50 in progress. Do not describe HFS as having a fully
 validated power-fail model until the above barriers, trace and recovery tests
 are implemented.
+
+## 7. v5 metadata format foundation
+
+The shard-43 foundation adds an offline, portable v5 image codec in
+`src/hfs_meta_v5.[ch]`. It is deliberately not selected by the current mount
+path yet; v4 remains the active on-device format until copy-on-write migration
+and a device-backed WAL commit path are complete.
+
+- Superblock A/B, page headers, inode fields and WAL headers are encoded as
+  explicit little-endian scalars; compiler padding and pointer width are not
+  part of the format.
+- Each 4 KiB inode page and each WAL record has an independent checksum. The
+  newest valid superblock generation is selected, with the other copy retained
+  for torn-write fallback.
+- WAL recovery stages SET_INODE records by transaction id and applies them only
+  after a matching commit marker with the declared record count. Incomplete
+  transactions are ignored, duplicate inode after-images are idempotent, and
+  zero alignment padding is excluded from logical payload validation while
+  remaining covered by the physical payload checksum.
+- `scripts/db/metadata_v5_format_test.sh` exercises round-trip load, committed
+  and incomplete WAL, page corruption rejection and superblock-A fallback. It
+  is an offline format test, not evidence that v5 is already mounted by HFS.
+
+The next durability step is v4-to-v5 copy-on-write migration: build and verify
+the v5 region, flush it, then publish one superblock generation while retaining
+the v4 stable copy until the switch is durable. A failed migration must leave
+the v4 image mountable.
