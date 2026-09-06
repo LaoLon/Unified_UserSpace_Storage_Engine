@@ -8,6 +8,7 @@
 #include <spdk/log.h>
 
 #include "hfs_internal.h"
+#include "hfs_inode_runtime.h"
 #include "hfs_io.h"
 #include "hfs_log.h"
 #include "hfs_stats.h"
@@ -261,6 +262,7 @@ static void hfsDoOpen(void *arg) {
 /* Open a fresh file: create blob -> open -> sync, with cleanup on failure. */
 int hfsOpen(HfsFile *file) {
 	HfsFileRequest request;
+	int rc;
 
 	if (file == NULL || file->fs == NULL) {
 		errno = EINVAL;
@@ -269,7 +271,16 @@ int hfsOpen(HfsFile *file) {
 	memset(&request, 0, sizeof(request));
 	request.file = file;
 	hfsRequestInit(&request.result, HFS_REQUEST_BLOB_CREATE);
-	return hfsRequestWait(&request.result, hfsDoOpen, &request) == 0;
+	rc = hfsRequestWait(&request.result, hfsDoOpen, &request);
+	if (rc == 0 && file->blob != NULL) {
+		file->runtime = hfsInodeRuntimeForFile(file);
+		if (file->runtime != NULL) {
+			atomic_store_explicit(&file->runtime->allocatedClusters,
+					      spdk_blob_get_num_clusters(file->blob),
+					      memory_order_release);
+		}
+	}
+	return rc == 0;
 }
 
 /* Complete an open-by-id request without publishing a failed blob handle. */
@@ -449,30 +460,69 @@ static int hfsBytesToClusters(HfsFile *file, uint64_t bytes,
 /* Resize the blob so it covers at least 'bytes' (grow only). */
 int hfsResizeTo(HfsFile *file, uint64_t bytes) {
 	uint64_t needClusters;
+	HfsInodeRuntime *runtime;
 	int rc;
 
 	if (hfsBytesToClusters(file, bytes, &needClusters) != 0) {
 		return -1;
 	}
 
-	pthread_mutex_lock(&file->fs->resizeLock);
+	runtime = hfsInodeRuntimeForFile(file);
+	if (runtime == NULL && file->inodeId != 0) {
+		return -1;
+	}
+	if (runtime != NULL &&
+	    atomic_load_explicit(&runtime->allocatedClusters,
+				 memory_order_acquire) >= needClusters) {
+		return 0;
+	}
+	if (runtime != NULL) {
+		pthread_mutex_lock(&runtime->resizeLock);
+	} else {
+		pthread_mutex_lock(&file->fs->compatibilityResizeLock);
+	}
 	rc = hfsResizeClusters(file, needClusters, true);
-	pthread_mutex_unlock(&file->fs->resizeLock);
+	if (rc == 0 && runtime != NULL) {
+		atomic_store_explicit(&runtime->allocatedClusters, needClusters,
+				      memory_order_release);
+	}
+	if (runtime != NULL) {
+		pthread_mutex_unlock(&runtime->resizeLock);
+	} else {
+		pthread_mutex_unlock(&file->fs->compatibilityResizeLock);
+	}
 	return rc;
 }
 
 /* Resize the blob exactly to the clusters required by a logical file size. */
 int hfsResizeExact(HfsFile *file, uint64_t bytes) {
 	uint64_t needClusters;
+	HfsInodeRuntime *runtime;
 	int rc;
 
 	if (hfsBytesToClusters(file, bytes, &needClusters) != 0) {
 		return -1;
 	}
 
-	pthread_mutex_lock(&file->fs->resizeLock);
+	runtime = hfsInodeRuntimeForFile(file);
+	if (runtime == NULL && file->inodeId != 0) {
+		return -1;
+	}
+	if (runtime != NULL) {
+		pthread_mutex_lock(&runtime->resizeLock);
+	} else {
+		pthread_mutex_lock(&file->fs->compatibilityResizeLock);
+	}
 	rc = hfsResizeClusters(file, needClusters, false);
-	pthread_mutex_unlock(&file->fs->resizeLock);
+	if (rc == 0 && runtime != NULL) {
+		atomic_store_explicit(&runtime->allocatedClusters, needClusters,
+				      memory_order_release);
+	}
+	if (runtime != NULL) {
+		pthread_mutex_unlock(&runtime->resizeLock);
+	} else {
+		pthread_mutex_unlock(&file->fs->compatibilityResizeLock);
+	}
 	return rc;
 }
 

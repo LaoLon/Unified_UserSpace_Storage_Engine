@@ -118,6 +118,7 @@ int hfsFdCreate(HfsOpenFile **out, HfsFile *file, uint64_t inodeId,
 		return -1;
 	}
 	openFile->file = file;
+	openFile->runtime = file != NULL ? file->runtime : NULL;
 	openFile->inodeId = inodeId;
 	openFile->flags = flags;
 	openFile->writable = writable;

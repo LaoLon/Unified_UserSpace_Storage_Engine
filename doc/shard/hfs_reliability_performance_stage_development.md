@@ -1,6 +1,6 @@
 # HFS 可靠性与性能优化阶段计划（shard-36 起）
 
-> 状态：shard-36～40 核心实现已完成，正确性闸门 A 已通过；下一步进入 shard-41 per-inode 状态与区间 I/O 并发<br>
+> 状态：shard-36～41 核心实现已完成，正确性闸门 A 已通过；shard-41 的 per-inode/区间锁已落地，4 线程扩展仍受单 owner 队列限制，下一步进入 shard-42 内存元数据索引<br>
 > 制定日期：2026-09-05  
 > 适用基线：`main@91db26a`（shard-36 已完成）
 > 输入文档：`review/hfs_architecture_performance_review_2026-09-05.md`  
@@ -353,6 +353,9 @@ queue wait 3.13 s，剩余主要瓶颈已从进程级 fd/runtime 锁转移到 ow
 
 ## 10. shard-41：per-inode 状态与区间 I/O 并发
 
+> 状态：核心实现已完成（2026-09-06）；正确性专项通过，性能扩展数据已记录；4 线程未达到
+> 3.0 倍目标，瓶颈证据指向单 SPDK owner 队列和 metadata 提交路径，不能提前宣称达标。
+
 ### 目标
 
 让不同文件以及同一文件不重叠区间的 I/O 并行执行，移除 mount 级 `ioLock`、`resizeLock` 和 `appendLock`。
@@ -367,12 +370,48 @@ queue wait 3.13 s，剩余主要瓶颈已从进程级 fd/runtime 锁转移到 ow
 - `O_APPEND` 在 inode 内原子分配逻辑 offset，再提交数据；失败时恢复或以可重放 sequence 处理空洞。
 - fsync 等待目标 inode 的提交序列，不阻塞无关 inode。
 
+本轮实现细节：
+
+- 新增 `src/hfs_inode_runtime.[ch]`。runtime registry 按 inode id 惰性创建，保存 resize/append
+  mutex、fsync/resize 的 `syncLock`、已分配 cluster cache；兼容独立 `HfsFile` 自测路径保留
+  单独 fallback runtime，不改变 v4 磁盘格式。
+- `Hfs` 不再保存 mount 级 `ioLock`/`resizeLock`；数据面使用 256 个 blob/unit 哈希的 rwlock
+  bucket，按升序获取并逆序释放，避免跨范围死锁。不同 inode 的 bucket 哈希通常分离，同一
+  unit 的非对齐 RMW 必须共享同一写锁。
+- aligned write 在已分配 cluster 范围内只读原子 cache，不再为每个请求进入 resize mutex；跨
+  cluster 扩展才进入该 inode 的 resize mutex。`O_APPEND` 改为 inode runtime append mutex。
+- `ftruncate`、punch、KEEP_SIZE 和 fsync 使用 inode `syncLock` 写侧屏障；普通 read/write
+  使用读侧并允许同一 inode 的不重叠区间并行，且不在持有 metadata lock 时等待 SPDK completion。
+
 ### 测试
 
 - 新增 `scripts/db/inode_io_concurrency_test.sh`。
+- 新增 `scripts/db/inode_io_benchmark.sh`，覆盖 1/2/4/8/16 线程、4 KiB randrw、CPU/RSS、
+  runtime queue peak 和 IO/meta/append contention。
 - 覆盖不同文件并发、同文件不重叠 aligned write、同 unit 非对齐 RMW、append+truncate、punch+write、fsync+write。
 - 每轮用确定性 pattern 和 checksum 验证不存在 torn RMW、交叉覆盖或错误 size。
 - 运行 1/2/4/8/16 线程扩展矩阵并导出锁等待直方图。
+
+VM 专项回归均通过：`INODE_RC=0 IO_RC=0 FD_RC=0 POSIX_RC=0 RUNTIME_RC=0`。同一 VM、持久化
+Aio bdev、4 KiB randrw、iodepth=1、runtime=1 s 的短矩阵如下；统计显式开启
+`HFS_STATS_TIMING=1`，错误数均为 0：
+
+| 线程 | IOPS | CPU | RSS (KiB) | runtime queue peak | IO contention | metadata contention |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 14,085.91 | 110% | 20,776 | 1 | 226 | 4 |
+| 2 | 24,451.55 | 114% | 20,648 | 2 | 299 | 14 |
+| 4 | 26,999.00 | 121% | 20,916 | 4 | 476 | 35 |
+| 8 | 29,893.11 | 122% | 21,028 | 7 | 866 | 50 |
+| 16 | 30,085.91 | 123% | 22,960 | 15 | 1,605 | 110 |
+
+4 线程相对 1 线程约 1.92 倍，仍低于闸门 B 的 3.0 倍扩展线；queue peak 随线程增长而增长，
+说明 fd 全局锁已不是主导，但同步 owner queue、单请求 completion 和 metadata write-back
+仍限制扩展。该结果用于指导 shard-42/45，不把未达标数字包装成性能收益。
+
+`inode_io_concurrency_test.sh` 还验证了 16 路不同 inode、同 inode 不重叠 aligned write、
+同 unit RMW、跨 fd append、punch+write 以及 fsync+write；`make -B app lib`、CMake Release
+和既有 I/O/fd/POSIX/runtime 回归均通过。SPDK 仍使用 VM 内仓库，commit 为
+`f0b63ed866f0e4d3c56e73bd4a98d0042956147a`。
 
 ### 验收
 

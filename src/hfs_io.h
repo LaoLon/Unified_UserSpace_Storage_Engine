@@ -18,7 +18,11 @@ ssize_t hfsIoWriteAt(HfsFile *file, const uint8_t *buffer, size_t count,
 		     uint64_t offset);
 /* Punch a byte range, using unmap for aligned units and zeroing edge units. */
 int hfsIoPunchHole(HfsFile *file, uint64_t offset, uint64_t length);
+/* Punch/zero a range while the caller already holds the inode sync write lock. */
+int hfsIoPunchHoleLocked(HfsFile *file, uint64_t offset, uint64_t length);
 /* Clear a byte range so a later file-size increase can never expose stale data. */
 int hfsIoZeroRange(HfsFile *file, uint64_t offset, uint64_t length);
+/* Zero a range while the caller already holds the inode sync write lock. */
+int hfsIoZeroRangeLocked(HfsFile *file, uint64_t offset, uint64_t length);
 
 #endif /* HFS_IO_H */

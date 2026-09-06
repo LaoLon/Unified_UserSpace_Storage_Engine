@@ -11,6 +11,7 @@
 #include <spdk/env.h>
 
 #include "hfs_internal.h"
+#include "hfs_inode_runtime.h"
 #include "hfs_io.h"
 #include "hfs_log.h"
 #include "hfs_stats.h"
@@ -38,15 +39,6 @@ struct hfs_io_pool {
 	bool closing;
 };
 
-/* Release the filesystem I/O lock and close its timing sample. */
-static int hfsIoRwlockUnlock(pthread_rwlock_t *lock) {
-	hfsStatsLockReleaseFast(HFS_STATS_LOCK_IO);
-	return pthread_rwlock_unlock(lock);
-}
-
-/* Keep every data-path rwlock release paired with the timing sample above. */
-#define pthread_rwlock_unlock(lock) hfsIoRwlockUnlock(lock)
-
 /* Operation submitted by one request-local SPDK transfer context. */
 typedef enum HfsIoOperation {
 	HFS_IO_READ,
@@ -64,6 +56,100 @@ typedef struct HfsIoRequest {
 	HfsIoOperation operation;
 	HfsRequestResult result;
 } HfsIoRequest;
+
+/* Set of hashed range buckets held by one request in ascending order. */
+typedef struct HfsIoRangeGuard {
+	uint16_t buckets[HFS_RANGE_LOCK_COUNT];
+	uint16_t count;
+	bool write;
+} HfsIoRangeGuard;
+
+/* Hash a blob/unit pair so unrelated files normally use independent locks. */
+static uint32_t hfsIoRangeBucket(const HfsFile *file, uint64_t unitIndex) {
+	uint64_t hash = (uint64_t)file->blobId ^ (unitIndex * UINT64_C(0x9e3779b97f4a7c15));
+
+	hash ^= hash >> 30;
+	hash *= UINT64_C(0xbf58476d1ce4e5b9);
+	hash ^= hash >> 27;
+	return (uint32_t)hash & (HFS_RANGE_LOCK_COUNT - 1U);
+}
+
+/* Lock all hashed buckets covering a byte range in a deadlock-free order. */
+static int hfsIoRangeLock(HfsFile *file, uint64_t offset, uint64_t length,
+			  bool write, HfsIoRangeGuard *guard) {
+	uint64_t firstUnit;
+	uint64_t lastUnit;
+	uint64_t unit;
+	uint64_t seen[HFS_RANGE_LOCK_COUNT / 64U] = {0};
+	uint32_t bucket;
+	uint32_t seenCount = 0;
+
+	if (file == NULL || file->fs == NULL || file->fs->unitSize == 0 ||
+	    guard == NULL || length == 0 || offset > UINT64_MAX - (length - 1)) {
+		errno = EINVAL;
+		return -1;
+	}
+	guard->count = 0;
+	firstUnit = offset / file->fs->unitSize;
+	lastUnit = (offset + length - 1) / file->fs->unitSize;
+	for (unit = firstUnit; unit <= lastUnit; unit++) {
+		bucket = hfsIoRangeBucket(file, unit);
+		if ((seen[bucket / 64U] & (UINT64_C(1) << (bucket % 64U))) == 0) {
+			seen[bucket / 64U] |= UINT64_C(1) << (bucket % 64U);
+			seenCount++;
+		}
+		if (unit == UINT64_MAX || seenCount == HFS_RANGE_LOCK_COUNT) {
+			break;
+		}
+	}
+	guard->write = write;
+	for (bucket = 0; bucket < HFS_RANGE_LOCK_COUNT; bucket++) {
+		if ((seen[bucket / 64U] & (UINT64_C(1) << (bucket % 64U))) == 0) {
+			continue;
+		}
+		guard->buckets[guard->count++] = (uint16_t)bucket;
+		hfsStatsLockBeforeFast(HFS_STATS_LOCK_IO);
+		if (write) {
+			pthread_rwlock_wrlock(&file->fs->rangeLocks[bucket]);
+		} else {
+			pthread_rwlock_rdlock(&file->fs->rangeLocks[bucket]);
+		}
+		hfsStatsLockAfterFast(HFS_STATS_LOCK_IO);
+	}
+	return 0;
+}
+
+/* Release all buckets acquired by one request. */
+static void hfsIoRangeUnlock(HfsFile *file, HfsIoRangeGuard *guard) {
+	uint16_t i;
+
+	if (file == NULL || file->fs == NULL || guard == NULL) {
+		return;
+	}
+	for (i = guard->count; i > 0; i--) {
+		hfsStatsLockReleaseFast(HFS_STATS_LOCK_IO);
+		pthread_rwlock_unlock(&file->fs->rangeLocks[guard->buckets[i - 1]]);
+	}
+	guard->count = 0;
+}
+
+/* Enter the per-inode read side so fsync/truncate can take an exclusive barrier. */
+static HfsInodeRuntime *hfsIoSyncReadLock(HfsFile *file) {
+	HfsInodeRuntime *runtime = hfsInodeRuntimeForFile(file);
+
+	if (runtime == NULL) {
+		return NULL;
+	}
+	pthread_rwlock_rdlock(&runtime->syncLock);
+	return runtime;
+}
+
+/* Leave the per-inode read side after a data operation. */
+static void hfsIoSyncReadUnlock(HfsInodeRuntime *runtime) {
+	if (runtime != NULL) {
+		pthread_rwlock_unlock(&runtime->syncLock);
+	}
+}
 
 /* Capture an SPDK completion code before waking the synchronous caller. */
 static void hfsIoDone(void *arg, int bserrno);
@@ -208,8 +294,8 @@ int hfsIoInit(Hfs *fs) {
 	size_t bufferBytes;
 	size_t storageBytes;
 	int rc;
-	bool ioLockReady = false;
-	bool resizeLockReady = false;
+	uint32_t rangeLocksReady = 0;
+	bool runtimeReady = false;
 
 	if (fs == NULL || fs->unitSize == 0 ||
 	    (size_t)fs->unitSize != fs->unitSize) {
@@ -231,18 +317,18 @@ int hfsIoInit(Hfs *fs) {
 		errno = rc;
 		goto fail_pool_mutex;
 	}
-	rc = pthread_rwlock_init(&fs->ioLock, NULL);
-	if (rc != 0) {
-		errno = rc;
-		goto fail_pool_cond;
+	for (rangeLocksReady = 0; rangeLocksReady < HFS_RANGE_LOCK_COUNT;
+	     rangeLocksReady++) {
+		rc = pthread_rwlock_init(&fs->rangeLocks[rangeLocksReady], NULL);
+		if (rc != 0) {
+			errno = rc;
+			goto fail_range_locks;
+		}
 	}
-	ioLockReady = true;
-	rc = pthread_mutex_init(&fs->resizeLock, NULL);
-	if (rc != 0) {
-		errno = rc;
-		goto fail_io_lock;
+	if (hfsInodeRuntimeInit(fs) != 0) {
+		goto fail_range_locks;
 	}
-	resizeLockReady = true;
+	runtimeReady = true;
 
 	bufferBytes = HFS_IO_BUFFER_BYTES;
 	if (bufferBytes < (size_t)fs->unitSize) {
@@ -251,14 +337,14 @@ int hfsIoInit(Hfs *fs) {
 	bufferBytes -= bufferBytes % (size_t)fs->unitSize;
 	if (bufferBytes == 0 || bufferBytes > SIZE_MAX / HFS_IO_POOL_COUNT) {
 		errno = EOVERFLOW;
-		goto fail_resize_lock;
+		goto fail_runtime;
 	}
 	storageBytes = bufferBytes * HFS_IO_POOL_COUNT;
 	pool->storage = spdk_malloc(storageBytes, 0x1000, NULL,
 				    SPDK_ENV_LCORE_ID_ANY, SPDK_MALLOC_DMA);
 	if (pool->storage == NULL) {
 		errno = ENOMEM;
-		goto fail_resize_lock;
+		goto fail_runtime;
 	}
 	pool->bufferBytes = bufferBytes;
 	pool->freeTop = HFS_IO_POOL_COUNT;
@@ -268,15 +354,15 @@ int hfsIoInit(Hfs *fs) {
 	fs->ioPool = pool;
 	return 0;
 
-fail_resize_lock:
-	if (resizeLockReady) {
-		pthread_mutex_destroy(&fs->resizeLock);
+fail_runtime:
+	if (runtimeReady) {
+		hfsInodeRuntimeFini(fs);
 	}
-fail_io_lock:
-	if (ioLockReady) {
-		pthread_rwlock_destroy(&fs->ioLock);
+fail_range_locks:
+	while (rangeLocksReady > 0) {
+		rangeLocksReady--;
+		pthread_rwlock_destroy(&fs->rangeLocks[rangeLocksReady]);
 	}
-fail_pool_cond:
 	pthread_cond_destroy(&pool->available);
 fail_pool_mutex:
 	pthread_mutex_destroy(&pool->lock);
@@ -305,8 +391,10 @@ void hfsIoFini(Hfs *fs) {
 	pthread_mutex_destroy(&pool->lock);
 	free(pool);
 	fs->ioPool = NULL;
-	pthread_mutex_destroy(&fs->resizeLock);
-	pthread_rwlock_destroy(&fs->ioLock);
+	hfsInodeRuntimeFini(fs);
+	for (uint32_t i = 0; i < HFS_RANGE_LOCK_COUNT; i++) {
+		pthread_rwlock_destroy(&fs->rangeLocks[i]);
+	}
 }
 
 /* Read one complete I/O unit into a leased DMA buffer. */
@@ -455,9 +543,6 @@ static ssize_t hfsIoWriteAtLocked(HfsFile *file, const uint8_t *buffer,
 	size_t remaining = count;
 	size_t done = 0;
 
-	if (hfsResizeTo(file, offset + count) != 0) {
-		return -1;
-	}
 	if (cursor % unitSize != 0) {
 		uint64_t unitOffset = cursor / unitSize;
 		size_t unitIndex = (size_t)(cursor % unitSize);
@@ -510,6 +595,8 @@ static ssize_t hfsIoWriteAtLocked(HfsFile *file, const uint8_t *buffer,
 /* Validate and read a positioned byte range through the bounded pool. */
 ssize_t hfsIoReadAt(HfsFile *file, uint8_t *buffer, size_t count,
 		    uint64_t offset) {
+	HfsInodeRuntime *runtime;
+	HfsIoRangeGuard guard = {0};
 	ssize_t result;
 	bool aligned;
 
@@ -529,16 +616,25 @@ ssize_t hfsIoReadAt(HfsFile *file, uint8_t *buffer, size_t count,
 	aligned = (offset % file->fs->unitSize) == 0 &&
 		(count % (size_t)file->fs->unitSize) == 0;
 	hfsStatsRecordIoFast(false, count, aligned);
-	hfsStatsLockBeforeFast(HFS_STATS_LOCK_IO);
-	pthread_rwlock_rdlock(&file->fs->ioLock);
+	runtime = hfsIoSyncReadLock(file);
+	if (runtime == NULL) {
+		return -1;
+	}
+	if (hfsIoRangeLock(file, offset, count, false, &guard) != 0) {
+		hfsIoSyncReadUnlock(runtime);
+		return -1;
+	}
 	result = hfsIoReadAtLocked(file, buffer, count, offset);
-	pthread_rwlock_unlock(&file->fs->ioLock);
+	hfsIoRangeUnlock(file, &guard);
+	hfsIoSyncReadUnlock(runtime);
 	return result;
 }
 
 /* Validate and write a positioned byte range with direct aligned writes. */
 ssize_t hfsIoWriteAt(HfsFile *file, const uint8_t *buffer, size_t count,
 		     uint64_t offset) {
+	HfsInodeRuntime *runtime;
+	HfsIoRangeGuard guard = {0};
 	ssize_t result;
 	bool aligned;
 
@@ -558,15 +654,21 @@ ssize_t hfsIoWriteAt(HfsFile *file, const uint8_t *buffer, size_t count,
 	aligned = (offset % file->fs->unitSize) == 0 &&
 		(count % (size_t)file->fs->unitSize) == 0;
 	hfsStatsRecordIoFast(true, count, aligned);
-	if (aligned) {
-		hfsStatsLockBeforeFast(HFS_STATS_LOCK_IO);
-		pthread_rwlock_rdlock(&file->fs->ioLock);
-	} else {
-		hfsStatsLockBeforeFast(HFS_STATS_LOCK_IO);
-		pthread_rwlock_wrlock(&file->fs->ioLock);
+	runtime = hfsIoSyncReadLock(file);
+	if (runtime == NULL) {
+		return -1;
+	}
+	if (hfsResizeTo(file, offset + count) != 0) {
+		hfsIoSyncReadUnlock(runtime);
+		return -1;
+	}
+	if (hfsIoRangeLock(file, offset, count, true, &guard) != 0) {
+		hfsIoSyncReadUnlock(runtime);
+		return -1;
 	}
 	result = hfsIoWriteAtLocked(file, buffer, count, offset);
-	pthread_rwlock_unlock(&file->fs->ioLock);
+	hfsIoRangeUnlock(file, &guard);
+	hfsIoSyncReadUnlock(runtime);
 	return result;
 }
 
@@ -611,11 +713,12 @@ static int hfsIoUnmapUnits(HfsFile *file, uint64_t offset, uint64_t units) {
 }
 
 /* Clear a range with edge-preserving zeroes and aligned unmap operations. */
-int hfsIoZeroRange(HfsFile *file, uint64_t offset, uint64_t length) {
+static int hfsIoZeroRangeCore(HfsFile *file, uint64_t offset, uint64_t length) {
 	uint64_t unitSize;
 	uint64_t end;
 	uint64_t cursor;
 	uint64_t alignedEnd;
+	HfsIoRangeGuard guard = {0};
 
 	if (length == 0) {
 		return 0;
@@ -628,8 +731,9 @@ int hfsIoZeroRange(HfsFile *file, uint64_t offset, uint64_t length) {
 	}
 	unitSize = file->fs->unitSize;
 	end = offset + length;
-	hfsStatsLockBeforeFast(HFS_STATS_LOCK_IO);
-	pthread_rwlock_wrlock(&file->fs->ioLock);
+	if (hfsIoRangeLock(file, offset, length, true, &guard) != 0) {
+		return -1;
+	}
 	cursor = offset;
 	if (cursor % unitSize != 0) {
 		size_t unitIndex = (size_t)(cursor % unitSize);
@@ -639,7 +743,7 @@ int hfsIoZeroRange(HfsFile *file, uint64_t offset, uint64_t length) {
 			take = (size_t)(end - cursor);
 		}
 		if (hfsIoZeroPartial(file, cursor / unitSize, unitIndex, take) != 0) {
-			pthread_rwlock_unlock(&file->fs->ioLock);
+			hfsIoRangeUnlock(file, &guard);
 			return -1;
 		}
 		cursor += take;
@@ -648,22 +752,49 @@ int hfsIoZeroRange(HfsFile *file, uint64_t offset, uint64_t length) {
 	if (cursor < alignedEnd) {
 		if (hfsIoUnmapUnits(file, cursor / unitSize,
 				    (alignedEnd - cursor) / unitSize) != 0) {
-			pthread_rwlock_unlock(&file->fs->ioLock);
-			return -1;
+				hfsIoRangeUnlock(file, &guard);
+				return -1;
 		}
 		cursor = alignedEnd;
 	}
 	if (cursor < end &&
 	    hfsIoZeroPartial(file, cursor / unitSize, 0,
 			     (size_t)(end - cursor)) != 0) {
-		pthread_rwlock_unlock(&file->fs->ioLock);
+		hfsIoRangeUnlock(file, &guard);
 		return -1;
 	}
-	pthread_rwlock_unlock(&file->fs->ioLock);
+	hfsIoRangeUnlock(file, &guard);
 	return 0;
+}
+
+/* Zero a range while the caller holds the inode synchronization barrier. */
+int hfsIoZeroRangeLocked(HfsFile *file, uint64_t offset, uint64_t length) {
+	return hfsIoZeroRangeCore(file, offset, length);
+}
+
+/* Zero a range under the inode read side for ordinary callers. */
+int hfsIoZeroRange(HfsFile *file, uint64_t offset, uint64_t length) {
+	HfsInodeRuntime *runtime;
+	int rc;
+
+	if (length == 0) {
+		return 0;
+	}
+	runtime = hfsIoSyncReadLock(file);
+	if (runtime == NULL) {
+		return -1;
+	}
+	rc = hfsIoZeroRangeCore(file, offset, length);
+	hfsIoSyncReadUnlock(runtime);
+	return rc;
 }
 
 /* Punching a logical hole uses the same zero-read guarantee as truncate. */
 int hfsIoPunchHole(HfsFile *file, uint64_t offset, uint64_t length) {
 	return hfsIoZeroRange(file, offset, length);
+}
+
+/* Punch a hole while the caller owns the inode synchronization barrier. */
+int hfsIoPunchHoleLocked(HfsFile *file, uint64_t offset, uint64_t length) {
+	return hfsIoZeroRangeCore(file, offset, length);
 }

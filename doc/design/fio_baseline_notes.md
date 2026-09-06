@@ -212,3 +212,22 @@ randread/4 threads/iodepth=1/5 s 口径重跑：baseline 31,131.97 IOPS，shard-
 fd wait/hold 196,381/196,381、contention 33，metadata contention 30/97,173，
 runtime queue wait 3.13 s；因此后续收益应从 owner 队列和 metadata/I/O 区间并发中取得，
 不将本轮结果解释为绝对吞吐提升。
+
+## shard-41 per-inode/区间 I/O 并发（2026-09-06）
+
+环境：同一 VM、8 vCPU、Ubuntu 6.8.0-138-generic、fio 3.42-139-gae35；持久化 Aio bdev，
+`LD_PRELOAD` + psync、O_DIRECT、4 KiB randrw、iodepth=1、每轮 1 s、16 MiB 文件；统计显式
+开启 `HFS_STATS_TIMING=1`。脚本为 `scripts/db/inode_io_benchmark.sh`，线程矩阵为 1/2/4/8/16。
+
+| 线程 | IOPS | CPU | RSS (KiB) | runtime queue peak | IO contention | metadata contention | error |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 14,085.91 | 110% | 20,776 | 1 | 226 | 4 | 0 |
+| 2 | 24,451.55 | 114% | 20,648 | 2 | 299 | 14 | 0 |
+| 4 | 26,999.00 | 121% | 20,916 | 4 | 476 | 35 | 0 |
+| 8 | 29,893.11 | 122% | 21,028 | 7 | 866 | 50 | 0 |
+| 16 | 30,085.91 | 123% | 22,960 | 15 | 1,605 | 110 | 0 |
+
+4 线程为 1 线程的约 1.92 倍，尚未达到阶段 3.0 倍扩展目标；queue peak、metadata contention
+随线程增加，表明主瓶颈已经从 fd 全局锁转移到同步 owner queue、逐请求 completion 和
+metadata write-back。该表与 shard-39/40 的 randread 基线不是同一 workload，不用于跨阶段
+绝对吞吐宣称；后续优化应优先处理 shard-42 的索引和 shard-45 的异步提交。

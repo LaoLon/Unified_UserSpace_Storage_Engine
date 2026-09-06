@@ -11,7 +11,13 @@
 
 struct hfs_inode;
 struct hfs_io_pool;
+struct hfs_inode_runtime;
 struct spdk_bdev_desc;
+
+/* Number of hashed range-lock buckets shared by all mounted inodes. */
+#define HFS_RANGE_LOCK_COUNT 256U
+/* Number of buckets used for the lazy per-inode runtime registry. */
+#define HFS_INODE_RUNTIME_BUCKET_COUNT 256U
 
 /* Completion state shared by one asynchronous SPDK request. */
 typedef struct HfsCompletion {
@@ -84,9 +90,12 @@ typedef struct Hfs {
 	bool metaDirty;			/* in-memory inode fields need commit */
 	bool metaRecoveryRequired;		/* uncertain transaction requires remount */
 
-	/* Request-local data I/O synchronization and DMA buffer pool. */
-	pthread_rwlock_t ioLock;		/* shared aligned I/O/RMW lock */
-	pthread_mutex_t resizeLock;		/* serializes blob growth decisions */
+	/* Request-local range synchronization and DMA buffer pool. */
+	pthread_rwlock_t rangeLocks[HFS_RANGE_LOCK_COUNT];
+	pthread_mutex_t inodeRuntimeLock;
+	struct hfs_inode_runtime *inodeRuntimeBuckets[HFS_INODE_RUNTIME_BUCKET_COUNT];
+	struct hfs_inode_runtime *compatibilityRuntime;
+	pthread_mutex_t compatibilityResizeLock;
 	struct hfs_io_pool *ioPool;		/* bounded DMA buffer pool */
 
 
@@ -109,6 +118,8 @@ typedef struct HfsFile {
 	spdk_blob_id blobId;			/* data blob id */
 	struct spdk_blob *blob;			/* opened data blob */
 	Hfs *fs;				/* owning filesystem */
+	uint64_t inodeId;			/* persistent inode id, zero for standalone tests */
+	struct hfs_inode_runtime *runtime;	/* per-inode runtime state */
 
 
 	uint64_t offset;			/* sequential I/O position */

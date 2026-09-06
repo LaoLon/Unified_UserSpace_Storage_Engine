@@ -10,6 +10,8 @@
 
 #include "hfs.h"
 
+struct hfs_inode_runtime;
+
 /* Metadata for one POSIX open-file description shared by dup'ed slots. */
 typedef struct HfsOpenFile HfsOpenFile;
 /* Deferred blob deletion state for an unlinked inode. */
@@ -17,6 +19,7 @@ typedef struct HfsOrphan HfsOrphan;
 
 struct HfsOpenFile {
 	HfsFile *file;
+	struct hfs_inode_runtime *runtime;
 	uint64_t inodeId;
 	int flags;
 	bool writable;
