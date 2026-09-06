@@ -873,4 +873,21 @@ Bug 等级：**致命 > 严重 > 一般**。
   24.73k（batch off），收益未宣称为绝对吞吐提升。单 owner 队列的结构性上限仍需 shard-45
   异步 API 和 shard-46 多 reactor/channel 解决。
 
+### 58. 错误注入测试仍假设 metadata blob 每次操作都会 open（已修复，一般级）
+
+- **状态**：已修复；测试改为注入实际存在的 metadata read-modify-write 请求
+- **时间**：2026-09-06（shard-44 脏范围 checkpoint 基础）
+- **等级**：一般（误报回归失败，不改变 HFS 数据正确性）
+- **现象**：`io_error_injection_test.sh` 最后一项对 `mkdir` 注入 `metadata-open`，但 shard-42
+  已将 metadata blob handle 提升为 mount 常驻句柄，正常元数据路径不再执行 open 请求，测试
+  因此报告“injected request returned success: metadata-open”。
+- **排查过程**：对照 `hfsMetaAcquireBlob` 的 resident 分支与错误注入操作表，确认该分支只
+  绑定常驻 handle，不调用 `hfsRequestWait`；本轮范围写入在非 unit 对齐边界会真实执行
+  `metadata-read` 的 RMW 请求。
+- **根因**：测试契约落后于 shard-42 的常驻 metadata handle 优化，注入点不再属于可达路径。
+- **修复**：将测试注入点改为 `metadata-read`，覆盖范围 checkpoint 的 RMW setup failure，
+  同时保留失败后目录项不落盘的断言。
+- **验证**：重新运行 `io_error_injection_test.sh` 后，提交失败、恢复、错误 bdev 和 metadata
+  RMW 注入均应分别报告 EIO；常驻 handle 不再被错误地要求执行 open。
+
 ## 通用经验总结

@@ -1,6 +1,6 @@
 # HFS Durability Model
 
-> Status: shard-43 v5 format foundation (runtime migration not enabled)
+> Status: shard-44 v4 dirty-range checkpoint foundation (v5 runtime migration not enabled)
 > Scope: one HFS owner process mounted on one persistent SPDK bdev
 
 ## 1. Contract and terms
@@ -14,7 +14,9 @@ prove.
 - **Data-blob metadata**: blob allocation and resize metadata made durable by
   `spdk_blob_sync_md`.
 - **HFS metadata transaction**: the v4 inode image transition
-  `intent -> stable image -> clear intent` in the metadata blob.
+  `intent -> stable image -> clear intent` in the metadata blob. The current
+  shard-44 foundation updates the stable image with aligned byte ranges; it
+  does not yet replace the protocol with the v5 WAL.
 - **Device barrier**: `spdk_bdev_flush` through the mount-owned descriptor and
   channel. A custom blobstore device uses its `flush` operation only when a
   bdev descriptor is unavailable.
@@ -32,8 +34,8 @@ while holding the open-file I/O lock and the mount I/O write lock:
 1. Complete the target file's `hfsSync`: synchronize its data-blob metadata,
    then issue the first device barrier.
 2. Under the metadata write lock, commit the dirty inode image through the
-   v4 transaction protocol: write an active intent, write the stable image,
-   then clear the intent.
+   v4 transaction protocol: write an active intent range, write the header and
+   changed inode ranges, sync the metadata blob, then clear the intent range.
 3. Release the metadata lock and repeat `hfsSync` for the target file. Its
    second device barrier is ordered after the metadata-blob writes and is the
    barrier required before returning success.

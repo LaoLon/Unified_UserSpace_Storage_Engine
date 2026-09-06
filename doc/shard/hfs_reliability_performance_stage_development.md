@@ -1,6 +1,6 @@
 # HFS 可靠性与性能优化阶段计划（shard-36 起）
 
-> 状态：shard-36～42 核心实现已完成，正确性闸门 A 已通过；shard-43 已先落地可移植 v5 页/WAL 格式基础和离线恢复校验，但运行时仍使用 v4，迁移与设备提交路径待继续完成<br>
+> 状态：shard-36～42 核心实现已完成，正确性闸门 A 已通过；shard-43 已先落地可移植 v5 页/WAL 格式基础和离线恢复校验，shard-44 已加入 v4 脏范围 checkpoint 基础，但运行时仍使用 v4，v5 迁移与设备 WAL 提交路径待继续完成<br>
 > 制定日期：2026-09-05  
 > 适用基线：`main@91db26a`（shard-36 已完成）
 > 输入文档：`review/hfs_architecture_performance_review_2026-09-05.md`  
@@ -551,6 +551,10 @@ shard-45 异步 API、shard-46 多 reactor/channel。
 
 ## 13. shard-44：脏页 checkpoint 与 group commit
 
+> 状态：第一阶段基础已完成（2026-09-06）；v4 事务协议保持不变，物理写入已收窄到
+> intent/header/受影响 inode 的对齐范围；完整 v5 WAL checkpoint、后台 group commit 和 WAL
+> 回收仍待后续迭代，不能提前宣称 shard-44 闸门 B 已通过。
+
 ### 目标
 
 用 WAL + dirty page checkpoint 替代整 metadata blob 的 pending/stable/clear 三次镜像提交，并在保持 shard-38 持久化语义的前提下降低 flush 和写放大。
@@ -564,12 +568,26 @@ shard-45 异步 API、shard-46 多 reactor/channel。
 - metadata 空间不足时优先 checkpoint/reclaim；失败必须回到可重试状态。
 - checkpoint 与 foreground lookup/update 不持有长时间全局 metadata write lock。
 
+本轮先落地兼容 v4 的脏范围写基础：`HfsMetaIoRequest` 支持 byte offset，范围写对首尾
+blobstore I/O unit 做 read-modify-write，中间对齐区直接写；单次元数据事务仍按现有
+`intent -> stable image -> clear intent` 顺序提交，但 stable image 不再为每个 mutation
+构造并写回整张 metadata blob。intent 发布后先写 header 和变更 inode，再进行一次 blob sync，
+最后只清除 intent 范围。旧 v4 镜像、回滚和崩溃重放路径保持兼容；当前事务为安全起见仍读取
+旧镜像用于失败回滚，尚未达到“成功路径完全不读整 blob”的最终验收口径。
+
 ### 测试
 
 - 新增 `scripts/db/metadata_checkpoint_test.sh`。
 - 覆盖 checkpoint 前/中/后 crash、WAL wrap、空间耗尽、重复 mount/replay、并发 rename/unlink/create。
 - 记录每个逻辑事务的 WAL bytes、page bytes、flush 数和 batch size。
 - 在 1K/10K/60K inode 下比较 v4 整镜像和 v5 WAL/page 写放大。
+
+本轮专项 smoke 使用 `HFS_STATS_PATH` 校验 mutation 过程中
+`metadata_image_bytes=0`、`metadata_page_bytes>0`，并覆盖 256 次 create/rename/unlink；
+`metadata_transaction_smoke.sh`、`metadata_path_concurrency_smoke.sh`、
+`io_error_injection_test.sh`、`durability_crash_recovery_test.sh`、fast I/O 和 runtime stress
+均作为兼容性回归。错误注入测试中的旧 `metadata-open` 断言已改为实际可达的
+`metadata-read` RMW 注入，详见 `doc/bug.md` #58。
 
 ### 验收
 

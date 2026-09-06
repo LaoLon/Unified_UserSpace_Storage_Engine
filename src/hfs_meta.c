@@ -219,6 +219,7 @@ typedef struct HfsMetaIoRequest {
 	struct spdk_blob *blob;
 	bool resident;
 	void *buffer;
+	uint64_t offset;
 	uint64_t units;
 	uint64_t clusters;
 	HfsRequestResult result;
@@ -408,7 +409,8 @@ static void hfsMetaDoWrite(void *arg) {
 		return;
 	}
 	spdk_blob_io_write(request->blob, request->fs->channel, request->buffer,
-		0, request->units, hfsMetaOpCb, request);
+		request->offset / request->fs->unitSize, request->units,
+		hfsMetaOpCb, request);
 }
 
 /* SPDK-thread task: read the metadata blob into the DMA buffer. */
@@ -420,7 +422,8 @@ static void hfsMetaDoRead(void *arg) {
 		return;
 	}
 	spdk_blob_io_read(request->blob, request->fs->channel, request->buffer,
-		0, request->units, hfsMetaOpCb, request);
+		request->offset / request->fs->unitSize, request->units,
+		hfsMetaOpCb, request);
 }
 
 /* SPDK-thread task: flush blob metadata to the backing device. */
@@ -534,6 +537,135 @@ static int hfsMetaBlobWrite(Hfs *fs, const void *buf, size_t len) {
 out:
 	if (rc != 0) {
 		hfsMetaCloseBestEffort(&request);
+	}
+	spdk_free(tmp);
+	return rc;
+}
+
+/* Flush a resident metadata handle after a group of range writes. */
+static int hfsMetaBlobSync(Hfs *fs) {
+	HfsMetaIoRequest request;
+
+	if (fs == NULL) {
+		errno = EINVAL;
+		return -1;
+	}
+	memset(&request, 0, sizeof(request));
+	request.fs = fs;
+	if (hfsMetaAcquireBlob(&request) != 0) {
+		return -1;
+	}
+	if (hfsMetaWait(&request, HFS_REQUEST_BLOB_SYNC,
+			 hfsMetaDoSync) != 0) {
+		hfsMetaCloseBestEffort(&request);
+		return -1;
+	}
+	if (!request.resident &&
+		hfsMetaWait(&request, HFS_REQUEST_BLOB_CLOSE,
+			     hfsMetaDoClose) != 0) {
+		return -1;
+	}
+	return 0;
+}
+
+/* Update a byte range with edge read-modify-write and one optional sync. */
+static int hfsMetaBlobWriteRange(Hfs *fs, const void *buf, size_t len,
+				 uint64_t offset, bool sync) {
+	uint64_t ioUnitSize;
+	uint64_t end;
+	uint64_t alignedOffset;
+	uint64_t alignedEnd;
+	uint64_t alignedLen;
+	uint64_t needClusters;
+	uint64_t clusterSize;
+	uint64_t currentClusters;
+	HfsMetaIoRequest request;
+	uint8_t *tmp;
+	size_t copyOffset;
+	int rc;
+
+	if (fs == NULL || buf == NULL || len == 0 || fs->unitSize == 0 ||
+		offset > UINT64_MAX - len) {
+		errno = EINVAL;
+		return -1;
+	}
+	ioUnitSize = fs->unitSize;
+	end = offset + len;
+	if (end > UINT64_MAX - (ioUnitSize - 1)) {
+		errno = EOVERFLOW;
+		return -1;
+	}
+	alignedOffset = offset - offset % ioUnitSize;
+	alignedEnd = (end + ioUnitSize - 1) / ioUnitSize * ioUnitSize;
+	if (alignedEnd < end || alignedEnd - alignedOffset > SIZE_MAX) {
+		errno = EOVERFLOW;
+		return -1;
+	}
+	alignedLen = alignedEnd - alignedOffset;
+	clusterSize = spdk_bs_get_cluster_size(fs->blobstore);
+	if (clusterSize == 0) {
+		errno = EIO;
+		return -1;
+	}
+	if (alignedEnd > UINT64_MAX - (clusterSize - 1)) {
+		errno = EOVERFLOW;
+		return -1;
+	}
+	needClusters = (alignedEnd + clusterSize - 1) / clusterSize;
+	if (needClusters == 0) {
+		errno = EOVERFLOW;
+		return -1;
+	}
+	tmp = spdk_malloc((size_t)alignedLen, 0x1000, NULL,
+			  SPDK_ENV_LCORE_ID_ANY, SPDK_MALLOC_DMA);
+	if (tmp == NULL) {
+		errno = ENOMEM;
+		return -1;
+	}
+	memset(tmp, 0, (size_t)alignedLen);
+	memset(&request, 0, sizeof(request));
+	request.fs = fs;
+	request.buffer = tmp;
+	request.offset = alignedOffset;
+	request.units = alignedLen / ioUnitSize;
+	currentClusters = fs->metaBlob != NULL
+		? spdk_blob_get_num_clusters(fs->metaBlob) : 0;
+	if (currentClusters < needClusters) {
+		request.clusters = needClusters;
+		if (hfsMetaAcquireBlob(&request) != 0 ||
+			hfsMetaWait(&request, HFS_REQUEST_BLOB_RESIZE,
+				    hfsMetaDoResize) != 0) {
+			hfsMetaCloseBestEffort(&request);
+			spdk_free(tmp);
+			return -1;
+		}
+	} else if (hfsMetaAcquireBlob(&request) != 0) {
+		spdk_free(tmp);
+		return -1;
+	}
+	if (alignedOffset != offset || alignedEnd != end) {
+		if (hfsMetaWait(&request, HFS_REQUEST_METADATA_READ,
+				 hfsMetaDoRead) != 0) {
+			hfsMetaCloseBestEffort(&request);
+			spdk_free(tmp);
+			return -1;
+		}
+	}
+	copyOffset = (size_t)(offset - alignedOffset);
+	memcpy(tmp + copyOffset, buf, len);
+	rc = hfsMetaWait(&request, HFS_REQUEST_METADATA_WRITE,
+			 hfsMetaDoWrite);
+	if (rc == 0 && sync) {
+		rc = hfsMetaWait(&request, HFS_REQUEST_BLOB_SYNC,
+				 hfsMetaDoSync);
+	}
+	if (!request.resident &&
+		hfsMetaWait(&request, HFS_REQUEST_BLOB_CLOSE,
+			     hfsMetaDoClose) != 0 && rc == 0) {
+		rc = -1;
+	}
+	if (rc == 0) {
+		hfsStatsRecordMetadataWriteFast(len, 0, alignedLen);
 	}
 	spdk_free(tmp);
 	return rc;
@@ -725,17 +857,14 @@ static void hfsMetaBuildIntent(Hfs *fs, uint64_t baseGeneration,
 static int hfsMetaCommit(Hfs *fs, const uint32_t *indices,
 				 uint32_t indexCount, bool retainRuntimeMutation) {
 	HfsMetaHeaderDisk oldHeader;
+	HfsMetaHeaderDisk newHeader;
 	HfsMetaIntentDisk intent;
 	uint8_t *oldBuf = NULL;
-	uint8_t *pendingBuf = NULL;
-	uint8_t *committedBuf = NULL;
-	uint8_t *stableBuf = NULL;
 	size_t oldLen;
-	size_t newLen;
-	size_t pendingLen;
 	uint64_t generation;
 	int rc = -1;
 	int savedErrno;
+	uint32_t i;
 	bool intentPublished = false;
 
 	if (hfsMetaEnsureWritable(fs) != 0) {
@@ -769,35 +898,48 @@ static int hfsMetaCommit(Hfs *fs, const uint32_t *indices,
 		errno = EINVAL;
 		goto out;
 	}
-	if (hfsMetaBuildStableImage(fs, generation, &stableBuf, &newLen) != 0) {
-		goto out;
-	}
-	pendingLen = oldLen > newLen ? oldLen : newLen;
-	pendingBuf = calloc(1, pendingLen);
-	if (pendingBuf == NULL) {
-		goto out;
-	}
-	memcpy(pendingBuf, oldBuf, oldLen);
+	memset(&newHeader, 0, sizeof(newHeader));
+	newHeader.magic = HFS_META_MAGIC;
+	newHeader.version = HFS_META_VERSION;
+	newHeader.generation = generation;
+	newHeader.nextInodeId = fs->nextInodeId;
+	newHeader.count = fs->inodeCount;
+	newHeader.checksum = hfsMetaImageChecksum(&newHeader, fs->inodes,
+						 fs->inodeCount);
 	hfsMetaBuildIntent(fs, oldHeader.generation, generation,
 				   oldHeader.count, indices, indexCount, &intent);
-	memcpy(pendingBuf + HFS_META_HEADER_SIZE, &intent, sizeof(intent));
-	hfsStatsRecordMetadataWriteFast(sizeof(intent), 0, 0);
-	if (hfsMetaBlobWrite(fs, pendingBuf, pendingLen) != 0) {
+	if (hfsMetaBlobWriteRange(fs, &intent, sizeof(intent),
+					 HFS_META_HEADER_SIZE, true) != 0) {
 		goto out;
 	}
 	intentPublished = true;
 	hfsMetaCrashPoint(1);
 
-	memcpy(stableBuf + HFS_META_HEADER_SIZE, &intent, sizeof(intent));
-	committedBuf = stableBuf;
-	if (hfsMetaBlobWrite(fs, committedBuf, newLen) != 0) {
+	if (hfsMetaBlobWriteRange(fs, &newHeader, sizeof(newHeader), 0, false) != 0) {
+		goto out;
+	}
+	for (i = 0; i < indexCount; i++) {
+		uint32_t index = indices[i];
+
+		if (index >= fs->inodeCount) {
+			continue;
+		}
+		if (hfsMetaBlobWriteRange(fs, &fs->inodes[index],
+					 sizeof(fs->inodes[index]),
+					 HFS_META_INODE_OFFSET +
+					 (uint64_t)index * sizeof(fs->inodes[index]), false) != 0) {
+			goto out;
+		}
+	}
+	if (hfsMetaBlobSync(fs) != 0) {
 		goto out;
 	}
 	hfsMetaCrashPoint(2);
 
-	memset(stableBuf + HFS_META_HEADER_SIZE, 0, sizeof(intent));
+	memset(&intent, 0, sizeof(intent));
 	hfsMetaCrashPoint(3);
-	if (hfsMetaBlobWrite(fs, stableBuf, newLen) != 0) {
+	if (hfsMetaBlobWriteRange(fs, &intent, sizeof(intent),
+					 HFS_META_HEADER_SIZE, true) != 0) {
 		goto out;
 	}
 	fs->metaGeneration = generation;
@@ -828,8 +970,6 @@ out:
 	if (oldBuf != NULL) {
 		spdk_free(oldBuf);
 	}
-	free(pendingBuf);
-	free(stableBuf);
 	return rc;
 }
 

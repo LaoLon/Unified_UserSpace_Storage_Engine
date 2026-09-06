@@ -156,9 +156,9 @@ expected_after_reclaim = os.statvfs(root).f_bfree + orphan_clusters
 with open(os.environ["HFS_TEST_STATE_FILE"], "w", encoding="ascii") as state:
     state.write(str(expected_after_reclaim))
 
-# A metadata-read setup failure must also be visible and leave no entry.
+# A metadata read-modify-write setup failure must also be visible and leave no entry.
 blocked_open = root + "/blocked-open"
-expect_eio("metadata-open", lambda: os.mkdir(blocked_open),
+expect_eio("metadata-read", lambda: os.mkdir(blocked_open),
            "HFS_TEST_FAIL_COMPLETE")
 print("IO ERROR INJECTION PHASE 1 OK")
 PYEOF
