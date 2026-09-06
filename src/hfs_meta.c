@@ -671,6 +671,84 @@ static int hfsMetaBlobWriteRange(Hfs *fs, const void *buf, size_t len,
 	return rc;
 }
 
+/* Read a byte range with aligned DMA I/O and no metadata image allocation. */
+static int hfsMetaBlobReadRange(Hfs *fs, void *buf, size_t len,
+				uint64_t offset) {
+	uint64_t ioUnitSize;
+	uint64_t end;
+	uint64_t alignedOffset;
+	uint64_t alignedEnd;
+	uint64_t alignedLen;
+	uint64_t clusterSize;
+	uint64_t clusters;
+	HfsMetaIoRequest request;
+	uint8_t *tmp;
+	size_t copyOffset;
+	int rc = -1;
+
+	if (fs == NULL || buf == NULL || len == 0 || fs->unitSize == 0 ||
+		offset > UINT64_MAX - len) {
+		errno = EINVAL;
+		return -1;
+	}
+	ioUnitSize = fs->unitSize;
+	end = offset + len;
+	if (end > UINT64_MAX - (ioUnitSize - 1)) {
+		errno = EOVERFLOW;
+		return -1;
+	}
+	alignedOffset = offset - offset % ioUnitSize;
+	alignedEnd = (end + ioUnitSize - 1) / ioUnitSize * ioUnitSize;
+	if (alignedEnd < end || alignedEnd - alignedOffset > SIZE_MAX) {
+		errno = EOVERFLOW;
+		return -1;
+	}
+	alignedLen = alignedEnd - alignedOffset;
+	clusterSize = spdk_bs_get_cluster_size(fs->blobstore);
+	if (clusterSize == 0) {
+		errno = EIO;
+		return -1;
+	}
+	memset(&request, 0, sizeof(request));
+	request.fs = fs;
+	if (hfsMetaAcquireBlob(&request) != 0) {
+		return -1;
+	}
+	clusters = spdk_blob_get_num_clusters(request.blob);
+	if (clusters == 0 || clusters > UINT64_MAX / clusterSize ||
+		alignedEnd > clusters * clusterSize) {
+		errno = EIO;
+		hfsMetaCloseBestEffort(&request);
+		return -1;
+	}
+	tmp = spdk_malloc((size_t)alignedLen, 0x1000, NULL,
+			  SPDK_ENV_LCORE_ID_ANY, SPDK_MALLOC_DMA);
+	if (tmp == NULL) {
+		errno = ENOMEM;
+		hfsMetaCloseBestEffort(&request);
+		return -1;
+	}
+	request.buffer = tmp;
+	request.offset = alignedOffset;
+	request.units = alignedLen / ioUnitSize;
+	if (hfsMetaWait(&request, HFS_REQUEST_METADATA_READ,
+			hfsMetaDoRead) == 0) {
+		copyOffset = (size_t)(offset - alignedOffset);
+		memcpy(buf, tmp + copyOffset, len);
+		rc = 0;
+	}
+	if (!request.resident &&
+		hfsMetaWait(&request, HFS_REQUEST_BLOB_CLOSE,
+			     hfsMetaDoClose) != 0 && rc == 0) {
+		rc = -1;
+	}
+	if (rc != 0) {
+		hfsMetaCloseBestEffort(&request);
+	}
+	spdk_free(tmp);
+	return rc;
+}
+
 /*
  * Read the whole metadata blob into a DMA buffer.
  * The caller receives the buffer via *outBuf and must release it with
@@ -769,41 +847,6 @@ static int hfsMetaBuildStableImage(Hfs *fs, uint64_t generation,
 	return 0;
 }
 
-/* Restore a validated v4 stable image after a failed in-memory mutation. */
-static int hfsMetaRestoreStableImage(Hfs *fs, const uint8_t *buf, size_t len) {
-	HfsMetaHeaderDisk header;
-	size_t inodeBytes;
-
-	if (buf == NULL || len < HFS_META_INODE_OFFSET) {
-		errno = EIO;
-		return -1;
-	}
-	memcpy(&header, buf, sizeof(header));
-	if (header.magic != HFS_META_MAGIC ||
-	    header.version != HFS_META_VERSION ||
-	    header.generation == 0 || header.count > HFS_MAX_INODES ||
-	    header.nextInodeId == 0) {
-		errno = EIO;
-		return -1;
-	}
-	inodeBytes = (size_t)header.count * sizeof(struct hfs_inode);
-	if (inodeBytes > len - HFS_META_INODE_OFFSET ||
-	    header.checksum != hfsMetaImageChecksum(
-		    &header, (const struct hfs_inode *)(buf + HFS_META_INODE_OFFSET),
-		    header.count)) {
-		errno = EIO;
-		return -1;
-	}
-	memcpy(fs->inodes, buf + HFS_META_INODE_OFFSET, inodeBytes);
-	fs->inodeCount = header.count;
-	fs->nextInodeId = header.nextInodeId;
-	fs->metaGeneration = header.generation;
-	fs->metaNeedsMigration = false;
-	fs->metaDirty = false;
-	hfsMetaIndexMarkDirty(fs);
-	return 0;
-}
-
 /* Reject another mutation once a failed transaction must be recovered by remount. */
 static int hfsMetaEnsureWritable(const Hfs *fs) {
 	if (fs == NULL) {
@@ -859,8 +902,6 @@ static int hfsMetaCommit(Hfs *fs, const uint32_t *indices,
 	HfsMetaHeaderDisk oldHeader;
 	HfsMetaHeaderDisk newHeader;
 	HfsMetaIntentDisk intent;
-	uint8_t *oldBuf = NULL;
-	size_t oldLen;
 	uint64_t generation;
 	int rc = -1;
 	int savedErrno;
@@ -884,15 +925,10 @@ static int hfsMetaCommit(Hfs *fs, const uint32_t *indices,
 	}
 	generation = fs->metaGeneration == 0 ? 1 : fs->metaGeneration + 1;
 
-	if (hfsMetaBlobRead(fs, (void **)&oldBuf, &oldLen) != 0) {
+	if (hfsMetaBlobReadRange(fs, &oldHeader, sizeof(oldHeader), 0) != 0) {
 		fs->metaRecoveryRequired = true;
 		goto out;
 	}
-	if (oldLen < HFS_META_INODE_OFFSET) {
-		errno = EIO;
-		goto out;
-	}
-	memcpy(&oldHeader, oldBuf, sizeof(oldHeader));
 	if (oldHeader.magic != HFS_META_MAGIC ||
 	    oldHeader.version != HFS_META_VERSION) {
 		errno = EINVAL;
@@ -958,17 +994,14 @@ out:
 		 * closed. Before publication, namespace mutations roll memory back;
 		 * a dirty data checkpoint instead remains visible and retryable.
 		 */
-		if (retainRuntimeMutation && oldBuf != NULL && !intentPublished) {
+		if (retainRuntimeMutation && !intentPublished) {
 			fs->metaDirty = true;
-		} else if (oldBuf == NULL ||
-			   hfsMetaRestoreStableImage(fs, oldBuf, oldLen) != 0 ||
-			   intentPublished) {
+		} else if (intentPublished) {
+			fs->metaRecoveryRequired = true;
+		} else if (hfsMetaLoadAll(fs) != 0) {
 			fs->metaRecoveryRequired = true;
 		}
 		errno = savedErrno;
-	}
-	if (oldBuf != NULL) {
-		spdk_free(oldBuf);
 	}
 	return rc;
 }

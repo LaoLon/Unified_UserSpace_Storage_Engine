@@ -572,8 +572,9 @@ shard-45 异步 API、shard-46 多 reactor/channel。
 blobstore I/O unit 做 read-modify-write，中间对齐区直接写；单次元数据事务仍按现有
 `intent -> stable image -> clear intent` 顺序提交，但 stable image 不再为每个 mutation
 构造并写回整张 metadata blob。intent 发布后先写 header 和变更 inode，再进行一次 blob sync，
-最后只清除 intent 范围。旧 v4 镜像、回滚和崩溃重放路径保持兼容；当前事务为安全起见仍读取
-旧镜像用于失败回滚，尚未达到“成功路径完全不读整 blob”的最终验收口径。
+最后只清除 intent 范围。旧 v4 镜像、回滚和崩溃重放路径保持兼容；成功路径只读取 header，
+只有事务尚未发布 intent 且需要恢复内存状态时才重新装载稳定镜像，已达到“成功路径不读整
+blob”的这一项基础口径。
 
 ### 测试
 
