@@ -88,6 +88,10 @@ void hfsStatsRecordRmw(uint64_t bytes);
 void hfsStatsRecordRuntimeSubmit(uint64_t queueDepth);
 void hfsStatsRecordRuntimeDispatch(uint64_t queueWaitNs,
 					   uint64_t ownerNs, uint64_t queueDepth);
+/* Record bounded async executor queue and completion activity. */
+void hfsStatsRecordAsyncSubmit(uint64_t queueDepth);
+void hfsStatsRecordAsyncComplete(void);
+void hfsStatsRecordAsyncCancel(void);
 
 /* Record metadata image/page/log writes and transaction batch size. */
 void hfsStatsRecordMetadataWrite(uint64_t bytes, uint64_t imageBytes,
@@ -126,6 +130,21 @@ static inline void hfsStatsRecordRuntimeDispatchFast(uint64_t queueWaitNs,
 									uint64_t queueDepth) {
 	if (hfsStatsEnabledFast()) {
 		hfsStatsRecordRuntimeDispatch(queueWaitNs, ownerNs, queueDepth);
+	}
+}
+static inline void hfsStatsRecordAsyncSubmitFast(uint64_t queueDepth) {
+	if (hfsStatsEnabledFast()) {
+		hfsStatsRecordAsyncSubmit(queueDepth);
+	}
+}
+static inline void hfsStatsRecordAsyncCompleteFast(void) {
+	if (hfsStatsEnabledFast()) {
+		hfsStatsRecordAsyncComplete();
+	}
+}
+static inline void hfsStatsRecordAsyncCancelFast(void) {
+	if (hfsStatsEnabledFast()) {
+		hfsStatsRecordAsyncCancel();
 	}
 }
 static inline void hfsStatsRecordMetadataWriteFast(uint64_t bytes,

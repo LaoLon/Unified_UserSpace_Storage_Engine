@@ -56,6 +56,10 @@ typedef struct HfsStatsShard {
 	uint64_t runtimeInflightPeak;
 	uint64_t runtimeQueueWaitNs;
 	uint64_t runtimeOwnerNs;
+	uint64_t asyncSubmit;
+	uint64_t asyncComplete;
+	uint64_t asyncCancel;
+	uint64_t asyncQueueDepthPeak;
 	uint64_t ioReadOps;
 	uint64_t ioWriteOps;
 	uint64_t ioReadBytes;
@@ -339,6 +343,36 @@ void hfsStatsRecordRuntimeDispatch(uint64_t queueWaitNs,
 	}
 }
 
+/* Record one async submission and its observed executor queue depth. */
+void hfsStatsRecordAsyncSubmit(uint64_t queueDepth) {
+	HfsStatsShard *shard = hfsStatsShardGet();
+
+	if (shard != NULL) {
+		shard->asyncSubmit++;
+		if (queueDepth > shard->asyncQueueDepthPeak) {
+			shard->asyncQueueDepthPeak = queueDepth;
+		}
+	}
+}
+
+/* Record one async request completion. */
+void hfsStatsRecordAsyncComplete(void) {
+	HfsStatsShard *shard = hfsStatsShardGet();
+
+	if (shard != NULL) {
+		shard->asyncComplete++;
+	}
+}
+
+/* Record cancellation observed by the async executor. */
+void hfsStatsRecordAsyncCancel(void) {
+	HfsStatsShard *shard = hfsStatsShardGet();
+
+	if (shard != NULL) {
+		shard->asyncCancel++;
+	}
+}
+
 /* Record serialized metadata bytes and the image/page split. */
 void hfsStatsRecordMetadataWrite(uint64_t bytes, uint64_t imageBytes,
 					 uint64_t pageBytes) {
@@ -431,6 +465,12 @@ static void hfsStatsAggregateShard(HfsStatsShard *total,
 	}
 	total->runtimeQueueWaitNs += shard->runtimeQueueWaitNs;
 	total->runtimeOwnerNs += shard->runtimeOwnerNs;
+	total->asyncSubmit += shard->asyncSubmit;
+	total->asyncComplete += shard->asyncComplete;
+	total->asyncCancel += shard->asyncCancel;
+	if (shard->asyncQueueDepthPeak > total->asyncQueueDepthPeak) {
+		total->asyncQueueDepthPeak = shard->asyncQueueDepthPeak;
+	}
 	total->ioReadOps += shard->ioReadOps;
 	total->ioWriteOps += shard->ioWriteOps;
 	total->ioReadBytes += shard->ioReadBytes;
@@ -556,6 +596,11 @@ static void hfsStatsWriteSnapshot(void) {
 	HFS_STATS_APPEND("runtime_queue_wait_ns=%"PRIu64"\n",
 		total.runtimeQueueWaitNs);
 	HFS_STATS_APPEND("runtime_owner_ns=%"PRIu64"\n", total.runtimeOwnerNs);
+	HFS_STATS_APPEND("async_submit=%"PRIu64"\n", total.asyncSubmit);
+	HFS_STATS_APPEND("async_complete=%"PRIu64"\n", total.asyncComplete);
+	HFS_STATS_APPEND("async_cancel=%"PRIu64"\n", total.asyncCancel);
+	HFS_STATS_APPEND("async_queue_depth_peak=%"PRIu64"\n",
+		total.asyncQueueDepthPeak);
 	HFS_STATS_APPEND("io_read_ops=%"PRIu64"\n", total.ioReadOps);
 	HFS_STATS_APPEND("io_write_ops=%"PRIu64"\n", total.ioWriteOps);
 	HFS_STATS_APPEND("io_read_bytes=%"PRIu64"\n", total.ioReadBytes);

@@ -15,6 +15,7 @@
 #include "hfs.h"
 #include "hfs_durability.h"
 #include "hfs_fd.h"
+#include "hfs_async.h"
 #include "hfs_internal.h"
 #include "hfs_inode_runtime.h"
 #include "hfs_io.h"
@@ -686,6 +687,19 @@ int hfs_lib_init(void) {
 		pthread_rwlock_unlock(&g_metaLock);
 		return -1;
 	}
+	if (hfsAsyncInit() != 0) {
+		HFS_LOG_ERROR("hfsAsyncInit failed");
+		hfsMetaFini(g_fs);
+		hfsIoFini(g_fs);
+		hfsUmount(g_fs);
+		free(g_fs);
+		g_fs = NULL;
+		hfsRuntimeStop();
+		hfs_release_backend_lock();
+		hfs_log_fini();
+		pthread_rwlock_unlock(&g_metaLock);
+		return -1;
+	}
 
 	hfsFdReset();
 	HFS_LOG_INFO("libhfs initialized");
@@ -729,6 +743,8 @@ void hfs_lib_fini(void) {
 	if (hfs_lib_is_fork_child()) {
 		return;
 	}
+	/* Stop new async work before taking the metadata write lock for teardown. */
+	hfsAsyncFini();
 	hfsMetaWriteLock();
 	if (g_fs == NULL) {
 		hfsDurabilityTraceFini();
@@ -763,6 +779,40 @@ void hfs_lib_fini(void) {
 	hfsStatsFini();
 	hfs_log_fini();
 	pthread_rwlock_unlock(&g_metaLock);
+}
+
+/* Submit a positioned read through the async core. */
+int hfs_lib_async_pread(int fd, void *buf, size_t count, off_t offset,
+			HfsAsyncCallback callback, void *context,
+			HfsAsyncRequest **requestOut) {
+	return hfsAsyncPread(fd, buf, count, offset, callback, context, requestOut);
+}
+
+/* Submit a positioned write through the async core. */
+int hfs_lib_async_pwrite(int fd, const void *buf, size_t count, off_t offset,
+			 HfsAsyncCallback callback, void *context,
+			 HfsAsyncRequest **requestOut) {
+	return hfsAsyncPwrite(fd, buf, count, offset, callback, context, requestOut);
+}
+
+/* Submit a positioned vector read through the async core. */
+int hfs_lib_async_preadv(int fd, const struct iovec *iov, int iovcnt,
+			 off_t offset, HfsAsyncCallback callback, void *context,
+			 HfsAsyncRequest **requestOut) {
+	return hfsAsyncPreadv(fd, iov, iovcnt, offset, callback, context, requestOut);
+}
+
+/* Submit a positioned vector write through the async core. */
+int hfs_lib_async_pwritev(int fd, const struct iovec *iov, int iovcnt,
+			  off_t offset, HfsAsyncCallback callback, void *context,
+			  HfsAsyncRequest **requestOut) {
+	return hfsAsyncPwritev(fd, iov, iovcnt, offset, callback, context, requestOut);
+}
+
+/* Submit an fsync through the async core. */
+int hfs_lib_async_fsync(int fd, HfsAsyncCallback callback, void *context,
+			 HfsAsyncRequest **requestOut) {
+	return hfsAsyncFsync(fd, callback, context, requestOut);
 }
 
 /*

@@ -12,6 +12,7 @@
 #include <time.h>
 
 #include "hfs.h"
+#include "hfs_async.h"
 
 /* Size of the fd table shared by all HFS file descriptors. */
 #define HFS_FD_TABLE_SIZE	65536
@@ -119,5 +120,21 @@ int hfs_lib_futimens(int fd, const struct timespec times[2]);
 int hfs_lib_posix_fadvise(int fd, off_t offset, off_t len, int advice);
 /* fcntl for HFS fds: flags and fd duplication. */
 int hfs_lib_fcntl(int fd, int cmd, long arg);
+
+/* Submit positioned I/O and fsync through the bounded async executor. */
+int hfs_lib_async_pread(int fd, void *buf, size_t count, off_t offset,
+			HfsAsyncCallback callback, void *context,
+			HfsAsyncRequest **requestOut);
+int hfs_lib_async_pwrite(int fd, const void *buf, size_t count, off_t offset,
+			 HfsAsyncCallback callback, void *context,
+			 HfsAsyncRequest **requestOut);
+int hfs_lib_async_preadv(int fd, const struct iovec *iov, int iovcnt,
+			 off_t offset, HfsAsyncCallback callback, void *context,
+			 HfsAsyncRequest **requestOut);
+int hfs_lib_async_pwritev(int fd, const struct iovec *iov, int iovcnt,
+			  off_t offset, HfsAsyncCallback callback, void *context,
+			  HfsAsyncRequest **requestOut);
+int hfs_lib_async_fsync(int fd, HfsAsyncCallback callback, void *context,
+			 HfsAsyncRequest **requestOut);
 
 #endif /* HFS_LIB_H */

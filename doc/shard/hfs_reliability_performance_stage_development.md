@@ -1,6 +1,6 @@
 # HFS 可靠性与性能优化阶段计划（shard-36 起）
 
-> 状态：shard-36～42 核心实现已完成，正确性闸门 A 已通过；shard-43 已先落地可移植 v5 页/WAL 格式基础和离线恢复校验，shard-44 已加入 v4 脏范围 checkpoint 与受限 group commit 基础，但运行时仍使用 v4，v5 迁移与设备 WAL 提交路径待继续完成<br>
+> 状态：shard-36～42 核心实现已完成，正确性闸门 A 已通过；shard-43 已先落地可移植 v5 页/WAL 格式基础和离线恢复校验，shard-44 已加入 v4 脏范围 checkpoint 与受限 group commit 基础，shard-45 已加入第一阶段异步 libhfs 请求执行器；运行时仍使用 v4，v5 迁移、设备 WAL 提交和 SPDK 原生异步子请求路径待继续完成<br>
 > 制定日期：2026-09-05  
 > 适用基线：`main@91db26a`（shard-36 已完成）
 > 输入文档：`review/hfs_architecture_performance_review_2026-09-05.md`  
@@ -613,28 +613,46 @@ mount 上的其他 dirty inode 合并为一个受 v4 intent 四槽位约束的 d
 
 ## 14. shard-45：异步 libhfs 核心 API
 
+> 状态：第一阶段基础已完成（2026-09-06）<br>
+> 已提供有界 worker executor、request-private context、callback/wait/result/cancel ABI，以及
+> positioned read/write、readv/writev 和 fsync；同步 preload 入口保持不变。当前 worker 仍调用
+> 已验证的同步 libhfs 路径，因此能让调用方并发排队，但还不能宣称 SPDK 子请求已完全异步化或
+> 已达到 C 闸门的 QD/吞吐目标。
+
 ### 目标
 
 让单线程调用者能够维持 QD>1，把同步 POSIX/preload 入口变成异步核心之上的兼容封装。
 
 ### 主要改动
 
-- 新增异步请求 API：read、write、readv、writev、fsync、metadata mutation。
-- 每个请求使用独立 context/mempool，包含 buffer ownership、callback/future、deadline、result 和 cancellation state。
-- 同步 `hfsRead/hfsWrite/...` 仅负责 submit 后等待对应 future，不再要求 owner 串行执行完整调用。
-- 支持一个请求拆成多个 SPDK 子请求，并在父请求聚合实际字节数和首个错误。
-- cancellation 只改变回调交付，不提前释放仍由 SPDK 持有的资源。
+- 新增 `src/hfs_async.[ch]` 和 `hfs_lib_async_*` C ABI：positioned read、write、readv、writev、
+  fsync；每个请求拥有独立的参数、完成状态、错误码和生命周期引用。
+- 增加有界 executor：`HFS_ASYNC_WORKERS`（默认 4，最大 32）和
+  `HFS_ASYNC_QUEUE_DEPTH`（默认 256，最大 4096）控制 worker 数和排队上限；队列满时明确返回
+  `EAGAIN`，不会无限制分配请求上下文。
+- `hfsAsyncWait` 只等待请求完成，`hfsAsyncResult` 返回结果/errno；`hfsAsyncCancel` 只抑制回调
+  交付，已开始的 I/O 不提前释放 buffer、iovec 或 fd 相关资源。
+- 增加 `async_submit/complete/cancel/queue_depth_peak` 统计，专项脚本验证 submit/complete
+  闭合、vector I/O、回调、取消和 fsync。
 - 提供最小稳定 C ABI 和示例，preload 继续使用同步 wrapper。
+- 父/子 SPDK 请求聚合、deadline/cancellation state 和同步入口改为等待 future，保留为下一阶段；
+  当前 worker 只复用已验证的同步调用，不把 executor 并发当作 SPDK 子请求并发。
 
 ### 测试与基准
 
-- 新增 `scripts/db/async_io_test.sh` 和异步 microbenchmark/测试程序。
+- 新增 `scripts/db/async_io_test.sh`，覆盖 16 路 positioned write、vector write、callback、
+  wait/result、取消和 fsync；验证 async 统计 submit=complete 且 queue peak>1。
+- 后续 microbenchmark 必须把“executor QD”和“SPDK owner/channel QD”分开报告；本阶段专项只验证
+  API/lifecycle，不把 worker 并发误报成设备层异步收益。
 - 单线程 QD=1/4/16/32，覆盖 aligned/unaligned、read/write/vector、错误注入和取消竞争。
 - 对比相同 QD 下 raw SPDK 与 async libhfs 的吞吐、延迟和 CPU。
 
 ### 验收
 
-- 单线程 async libhfs 能维持 QD>1，观测到的 inflight 与配置相符。
+- 第一阶段：单线程 async libhfs 能维持 executor QD>1，request callback/result 生命周期和
+  submit/complete 计数闭合。
+- 完整阶段：单线程 async libhfs 能维持 SPDK 子请求 QD>1，观测到的 SPDK inflight 与配置相符；
+  该项留给后续把 `hfsIoRequest` 拆成父/子请求后验收。
 - QD=1 不回退超过 5%；QD=16 吞吐明显高于同步 QD≈1，除非设备已在 QD=1 饱和。
 - submit、子请求完成、父请求完成和 callback 各执行一次，错误不丢失。
 - 本 shard 只宣称 async libhfs API；不得宣称 native libaio/io_uring 已支持。
