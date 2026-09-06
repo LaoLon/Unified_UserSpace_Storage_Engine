@@ -88,9 +88,12 @@ typedef struct Hfs {
 	uint32_t inodeCount;			/* number of used inodes */
 	uint64_t nextInodeId;			/* next persistent inode id */
 	uint64_t metaGeneration;			/* committed metadata generation */
+	uint64_t metaDurableEpoch;			/* last generation durable on the metadata blob */
 	bool metaNeedsMigration;			/* old metadata layout needs upgrade */
 	bool metaDirty;			/* in-memory inode fields need commit */
 	bool metaRecoveryRequired;		/* uncertain transaction requires remount */
+	uint64_t *metaDirtyInodeIds;		/* data inodes waiting for a checkpoint */
+	uint32_t metaDirtyInodeCount;		/* number of entries in metaDirtyInodeIds */
 	struct spdk_blob *metaBlob;		/* resident metadata blob handle */
 
 	/* Request-local range synchronization and DMA buffer pool. */

@@ -890,4 +890,25 @@ Bug 等级：**致命 > 严重 > 一般**。
 - **验证**：重新运行 `io_error_injection_test.sh` 后，提交失败、恢复、错误 bdev 和 metadata
   RMW 注入均应分别报告 EIO；常驻 handle 不再被错误地要求执行 open。
 
+### 59. fsync 单文件提交会清除其他 inode 的脏状态（已修复，严重级）
+
+- **状态**：已修复；数据 inode 以 ID 记录并在一个受限 metadata epoch 中合并提交
+- **时间**：2026-09-06（shard-44 group commit 基础）
+- **等级**：严重（跨文件 fsync 顺序可能导致已成功写入的数据在重启后丢失）
+- **现象**：进程先写文件 B，再对文件 A 调用 `fsync(A)`。旧实现只把 A 传给
+  `hfsMetaCommitInode`，但提交成功后直接把全局 `metaDirty` 清零；随后 `fsync(B)`
+  看到“没有脏元数据”而跳过，B 的 size/mtime 仍只存在内存中，进程异常退出或重启后丢失。
+- **排查过程**：审查 `hfs_lib_fsync`、`hfsPublishWriteEnd` 和 `hfsMetaCommit` 的状态流，
+  确认 dirty 标记只有一个全局布尔值，而 v4 header checksum 却覆盖完整 inode 表；若只写
+  一个 inode，还会让 header checksum 与磁盘上的其他脏 inode 不匹配。
+- **根因**：没有按 inode 记录 dirty 集合，也没有把同步调用与一次 durable metadata epoch
+  绑定；单 inode 提交错误地承担了全局 dirty 清理职责。
+- **修复**：新增 mount 内的 dirty inode ID 集合和 `metaDurableEpoch`。每次成功数据写入
+  登记 inode；`fsync` 把显式 inode 与其他 dirty inode 合并，在 v4 intent 的四个 after-image
+  槽位内一次提交并只在该 epoch 成功后清空集合。超过四个槽位时走已有完整镜像保存路径，
+  避免发布未受 intent 保护的 header checksum；inode 不存在（orphan）时仍可提交其他脏 inode。
+  同时新增 `metadata_sync_count` 统计，区分 metadata blob sync 与设备 flush。
+- **验证**：新增跨文件 fsync/reopen smoke，要求只 fsync A 后 B 仍可恢复；并复跑 metadata
+  checkpoint、事务、路径并发、错误注入、崩溃恢复、fast I/O 与 runtime stress。
+
 ## 通用经验总结

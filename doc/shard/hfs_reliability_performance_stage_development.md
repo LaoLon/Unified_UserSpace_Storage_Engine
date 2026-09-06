@@ -1,6 +1,6 @@
 # HFS 可靠性与性能优化阶段计划（shard-36 起）
 
-> 状态：shard-36～42 核心实现已完成，正确性闸门 A 已通过；shard-43 已先落地可移植 v5 页/WAL 格式基础和离线恢复校验，shard-44 已加入 v4 脏范围 checkpoint 基础，但运行时仍使用 v4，v5 迁移与设备 WAL 提交路径待继续完成<br>
+> 状态：shard-36～42 核心实现已完成，正确性闸门 A 已通过；shard-43 已先落地可移植 v5 页/WAL 格式基础和离线恢复校验，shard-44 已加入 v4 脏范围 checkpoint 与受限 group commit 基础，但运行时仍使用 v4，v5 迁移与设备 WAL 提交路径待继续完成<br>
 > 制定日期：2026-09-05  
 > 适用基线：`main@91db26a`（shard-36 已完成）
 > 输入文档：`review/hfs_architecture_performance_review_2026-09-05.md`  
@@ -551,9 +551,10 @@ shard-45 异步 API、shard-46 多 reactor/channel。
 
 ## 13. shard-44：脏页 checkpoint 与 group commit
 
-> 状态：第一阶段基础已完成（2026-09-06）；v4 事务协议保持不变，物理写入已收窄到
-> intent/header/受影响 inode 的对齐范围；完整 v5 WAL checkpoint、后台 group commit 和 WAL
-> 回收仍待后续迭代，不能提前宣称 shard-44 闸门 B 已通过。
+> 状态：第一阶段基础已完成（2026-09-06），本轮补齐 v4 受限 group commit 与同步 epoch
+> 约束；v4 事务协议保持不变，物理写入已收窄到 intent/header/受影响 inode 的对齐范围；
+> 完整 v5 WAL checkpoint、后台 group commit 和 WAL 回收仍待后续迭代，不能提前宣称 shard-44
+> 闸门 B 已通过。
 
 ### 目标
 
@@ -576,9 +577,17 @@ blobstore I/O unit 做 read-modify-write，中间对齐区直接写；单次元�
 只有事务尚未发布 intent 且需要恢复内存状态时才重新装载稳定镜像，已达到“成功路径不读整
 blob”的这一项基础口径。
 
+本轮继续补齐同步边界：运行时按 inode ID 维护 dirty 集合，`fsync` 将显式 inode 与同一
+mount 上的其他 dirty inode 合并为一个受 v4 intent 四槽位约束的 durable epoch；成功后才
+清空集合，避免单文件 `fsync` 清除其他文件的脏状态。超过四个 after-image 槽位时回退到
+已有完整镜像保存路径，保证 header checksum 始终覆盖已写入的 inode 集合。统计新增
+`metadata_sync_count`，与设备 `flush_count` 分开，能直接解释 group commit 的 barrier 成本。
+
 ### 测试
 
 - 新增 `scripts/db/metadata_checkpoint_test.sh`。
+- 新增 `scripts/db/metadata_group_commit_test.sh`，覆盖只 `fsync(A)` 后 B 的 dirty inode
+  仍可跨进程恢复，并校验 `metadata_batch_max>=2`。
 - 覆盖 checkpoint 前/中/后 crash、WAL wrap、空间耗尽、重复 mount/replay、并发 rename/unlink/create。
 - 记录每个逻辑事务的 WAL bytes、page bytes、flush 数和 batch size。
 - 在 1K/10K/60K inode 下比较 v4 整镜像和 v5 WAL/page 写放大。

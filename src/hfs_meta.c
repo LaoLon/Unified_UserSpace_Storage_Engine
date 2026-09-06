@@ -527,6 +527,7 @@ static int hfsMetaBlobWrite(Hfs *fs, const void *buf, size_t len) {
 			hfsMetaDoWrite) != 0) goto out;
 	if (hfsMetaWait(&request, HFS_REQUEST_BLOB_SYNC,
 			hfsMetaDoSync) != 0) goto out;
+	hfsStatsRecordMetadataSyncFast();
 	if (!request.resident &&
 	    hfsMetaWait(&request, HFS_REQUEST_BLOB_CLOSE,
 			hfsMetaDoClose) != 0) goto out;
@@ -560,6 +561,7 @@ static int hfsMetaBlobSync(Hfs *fs) {
 		hfsMetaCloseBestEffort(&request);
 		return -1;
 	}
+	hfsStatsRecordMetadataSyncFast();
 	if (!request.resident &&
 		hfsMetaWait(&request, HFS_REQUEST_BLOB_CLOSE,
 			     hfsMetaDoClose) != 0) {
@@ -658,6 +660,9 @@ static int hfsMetaBlobWriteRange(Hfs *fs, const void *buf, size_t len,
 	if (rc == 0 && sync) {
 		rc = hfsMetaWait(&request, HFS_REQUEST_BLOB_SYNC,
 				 hfsMetaDoSync);
+		if (rc == 0) {
+			hfsStatsRecordMetadataSyncFast();
+		}
 	}
 	if (!request.resident &&
 		hfsMetaWait(&request, HFS_REQUEST_BLOB_CLOSE,
@@ -860,6 +865,102 @@ static int hfsMetaEnsureWritable(const Hfs *fs) {
 	return 0;
 }
 
+/* Return true when one inode id is already waiting for a checkpoint. */
+static bool hfsMetaDirtyContains(const Hfs *fs, uint64_t inodeId) {
+	uint32_t i;
+
+	if (fs == NULL || fs->metaDirtyInodeIds == NULL) {
+		return false;
+	}
+	for (i = 0; i < fs->metaDirtyInodeCount; i++) {
+		if (fs->metaDirtyInodeIds[i] == inodeId) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/* Clear the in-memory dirty set after a stable metadata epoch is durable. */
+static void hfsMetaDirtyClear(Hfs *fs) {
+	if (fs == NULL) {
+		return;
+	}
+	fs->metaDirtyInodeCount = 0;
+	fs->metaDirty = false;
+}
+
+/* Mark one data inode for the next metadata group commit. */
+void hfsMetaMarkInodeDirty(Hfs *fs, uint64_t inodeId) {
+	uint64_t *ids;
+
+	if (fs == NULL || inodeId == 0) {
+		return;
+	}
+	fs->metaDirty = true;
+	if (hfsMetaDirtyContains(fs, inodeId)) {
+		return;
+	}
+	if (fs->metaDirtyInodeCount >= HFS_MAX_INODES) {
+		return;
+	}
+	if (fs->metaDirtyInodeIds == NULL) {
+		fs->metaDirtyInodeIds = calloc(HFS_MAX_INODES,
+					       sizeof(*fs->metaDirtyInodeIds));
+		if (fs->metaDirtyInodeIds == NULL) {
+			return;
+		}
+	}
+	ids = fs->metaDirtyInodeIds;
+	ids[fs->metaDirtyInodeCount++] = inodeId;
+}
+
+/* Append one inode table index exactly once to a bounded v4 transaction. */
+static bool hfsMetaAppendCommitIndex(uint32_t *indices, uint32_t *count,
+					     uint32_t index) {
+	uint32_t i;
+
+	for (i = 0; i < *count; i++) {
+		if (indices[i] == index) {
+			return true;
+		}
+	}
+	if (*count >= HFS_META_INTENT_MAX_SLOTS) {
+		return false;
+	}
+	indices[(*count)++] = index;
+	return true;
+}
+
+/* Merge explicit namespace changes with dirty data inodes for group commit. */
+static bool hfsMetaCollectCommitIndices(Hfs *fs, const uint32_t *indices,
+					uint32_t indexCount,
+					uint32_t *selected,
+					uint32_t *selectedCount) {
+	uint32_t i;
+
+	*selectedCount = 0;
+	for (i = 0; i < indexCount; i++) {
+		if (indices[i] >= fs->inodeCount ||
+		    !hfsMetaAppendCommitIndex(selected, selectedCount, indices[i])) {
+			return false;
+		}
+	}
+	for (i = 0; i < fs->metaDirtyInodeCount; i++) {
+		struct hfs_inode *inode = hfsMetaFindById(fs,
+						 fs->metaDirtyInodeIds[i]);
+		uint32_t index;
+
+		if (inode == NULL) {
+			continue;
+		}
+		index = (uint32_t)(inode - fs->inodes);
+		if (!hfsMetaAppendCommitIndex(selected, selectedCount, index)) {
+			return false;
+		}
+	}
+	return true;
+}
+
 /* Build the fixed-size intent after-image for a metadata transaction. */
 static void hfsMetaBuildIntent(Hfs *fs, uint64_t baseGeneration,
 				       uint64_t generation, uint32_t baseCount,
@@ -902,6 +1003,9 @@ static int hfsMetaCommit(Hfs *fs, const uint32_t *indices,
 	HfsMetaHeaderDisk oldHeader;
 	HfsMetaHeaderDisk newHeader;
 	HfsMetaIntentDisk intent;
+	uint32_t selectedIndices[HFS_META_INTENT_MAX_SLOTS];
+	uint32_t selectedCount;
+	uint32_t fallbackBatch;
 	uint64_t generation;
 	int rc = -1;
 	int savedErrno;
@@ -915,6 +1019,33 @@ static int hfsMetaCommit(Hfs *fs, const uint32_t *indices,
 		errno = E2BIG;
 		return -1;
 	}
+	/* Allocation failure while recording a dirty id must not drop that write. */
+	if (fs->metaDirty && fs->metaDirtyInodeCount == 0) {
+		if (hfsMetaSaveAll(fs) == 0) {
+			return 0;
+		}
+		fs->metaRecoveryRequired = true;
+		return -1;
+	}
+	/*
+	 * The v4 intent has four after-image slots. If concurrent dirty writes
+	 * exceed that bound, use the established full-image path rather than
+	 * publishing a header checksum for inode ranges that are not protected by
+	 * the intent record.
+	 */
+	if (!hfsMetaCollectCommitIndices(fs, indices, indexCount,
+					 selectedIndices, &selectedCount)) {
+		fallbackBatch = fs->metaDirtyInodeCount + indexCount;
+		if (hfsMetaSaveAll(fs) == 0) {
+			hfsStatsRecordMetadataTransactionFast(fallbackBatch != 0 ?
+							      fallbackBatch : 1);
+			return 0;
+		}
+		fs->metaRecoveryRequired = true;
+		return -1;
+	}
+	indices = selectedIndices;
+	indexCount = selectedCount;
 	if (fs->metaNeedsMigration && hfsMetaSaveAll(fs) != 0) {
 		fs->metaRecoveryRequired = true;
 		return -1;
@@ -979,9 +1110,10 @@ static int hfsMetaCommit(Hfs *fs, const uint32_t *indices,
 		goto out;
 	}
 	fs->metaGeneration = generation;
+	fs->metaDurableEpoch = generation;
 	fs->metaNeedsMigration = false;
-	fs->metaDirty = false;
-	hfsStatsRecordMetadataTransactionFast(indexCount);
+	hfsMetaDirtyClear(fs);
+	hfsStatsRecordMetadataTransactionFast(indexCount == 0 ? 1 : indexCount);
 	if (!hfsMetaIndexReady(fs) && hfsMetaIndexRebuild(fs) != 0) {
 		HFS_LOG_ERROR("metadata index rebuild deferred: %s", strerror(errno));
 	}
@@ -1023,8 +1155,9 @@ int hfsMetaSaveAll(Hfs *fs) {
 	free(buf);
 	if (rc == 0) {
 		fs->metaGeneration = generation;
+		fs->metaDurableEpoch = generation;
 		fs->metaNeedsMigration = false;
-		fs->metaDirty = false;
+		hfsMetaDirtyClear(fs);
 	}
 	return rc;
 }
@@ -1208,7 +1341,8 @@ int hfsMetaLoadAll(Hfs *fs) {
 		fs->metaNeedsMigration = true;
 	}
 	fs->nextInodeId = nextInodeId;
-	fs->metaDirty = false;
+	fs->metaDurableEpoch = fs->metaGeneration;
+	hfsMetaDirtyClear(fs);
 
 	if (currentFormat && len >= HFS_META_INODE_OFFSET + sizeof(intent)) {
 		bool matchesPendingImage;
@@ -1919,7 +2053,24 @@ int hfsMetaCommitInode(Hfs *fs, uint64_t inodeId) {
 		return -1;
 	}
 	index = (uint32_t)(in - fs->inodes);
+	hfsMetaMarkInodeDirty(fs, inodeId);
 	return hfsMetaCommit(fs, &index, 1, true);
+}
+
+/* Commit all dirty data inodes, allowing one fsync to serve its peers. */
+int hfsMetaCommitDirty(Hfs *fs) {
+	if (hfsMetaEnsureWritable(fs) != 0) {
+		return -1;
+	}
+	if (!fs->metaDirty) {
+		return 0;
+	}
+	return hfsMetaCommit(fs, NULL, 0, true);
+}
+
+/* Return the last metadata generation known durable to this mount. */
+uint64_t hfsMetaDurableEpoch(const Hfs *fs) {
+	return fs == NULL ? 0 : fs->metaDurableEpoch;
 }
 
 /* Request state used while loading or creating the blobstore super blob. */
@@ -2114,6 +2265,9 @@ void hfsMetaFini(Hfs *fs) {
 	hfsMetaIndexFini(fs);
 	free(fs->inodes);
 	fs->inodes = NULL;
+	free(fs->metaDirtyInodeIds);
+	fs->metaDirtyInodeIds = NULL;
+	fs->metaDirtyInodeCount = 0;
 	fs->inodeCount = 0;
 	errno = savedErrno;
 }

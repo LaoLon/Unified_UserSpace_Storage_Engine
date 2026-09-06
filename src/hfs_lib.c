@@ -543,7 +543,7 @@ static void hfsPublishWriteEnd(HfsOpenFile *openFile, uint64_t end) {
 		/* Every successful content write changes mtime and ctime. */
 		in->mtimeNs = nowNs;
 		in->ctimeNs = nowNs;
-		g_fs->metaDirty = true;
+		hfsMetaMarkInodeDirty(g_fs, in->id);
 		atomic_store_explicit(&openFile->size, in->size,
 				      memory_order_relaxed);
 		atomic_store_explicit(&openFile->mtimeNs, in->mtimeNs,
@@ -2246,7 +2246,9 @@ int hfs_lib_fsync(int fd) {
 		return 0;
 	}
 	inode = hfsMetaFindById(g_fs, openFile->inodeId);
-	if (inode != NULL && hfsMetaCommitInode(g_fs, openFile->inodeId) != 0) {
+	if ((inode != NULL
+		? hfsMetaCommitInode(g_fs, openFile->inodeId)
+		: hfsMetaCommitDirty(g_fs)) != 0) {
 		savedErrno = errno;
 		hfsDurabilityTraceRecord(openFile->inodeId, "metadata-commit",
 					savedErrno != 0 ? -savedErrno : -EIO);

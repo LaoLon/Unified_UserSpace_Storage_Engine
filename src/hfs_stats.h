@@ -95,6 +95,8 @@ void hfsStatsRecordMetadataWrite(uint64_t bytes, uint64_t imageBytes,
 void hfsStatsRecordMetadataTransaction(uint32_t batchSize);
 /* Record one device or blobstore durability flush attempt. */
 void hfsStatsRecordFlush(void);
+/* Record one metadata blob sync that orders a metadata range write. */
+void hfsStatsRecordMetadataSync(void);
 
 /* Record a DMA size class, wait event and active high-water mark. */
 void hfsStatsRecordDma(size_t bytes, bool waited, uint64_t active);
@@ -141,6 +143,11 @@ static inline void hfsStatsRecordMetadataTransactionFast(uint32_t batchSize) {
 static inline void hfsStatsRecordFlushFast(void) {
 	if (hfsStatsEnabledFast()) {
 		hfsStatsRecordFlush();
+	}
+}
+static inline void hfsStatsRecordMetadataSyncFast(void) {
+	if (hfsStatsEnabledFast()) {
+		hfsStatsRecordMetadataSync();
 	}
 }
 static inline void hfsStatsRecordDmaFast(size_t bytes, bool waited,

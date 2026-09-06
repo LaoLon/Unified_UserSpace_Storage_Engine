@@ -73,6 +73,7 @@ typedef struct HfsStatsShard {
 	uint64_t metadataTransactions;
 	uint64_t metadataBatchTotal;
 	uint64_t metadataBatchMax;
+	uint64_t metadataSyncCount;
 	uint64_t flushCount;
 	uint64_t dmaSizeClass[HFS_STATS_DMA_SIZE_CLASSES];
 	uint64_t dmaWaits;
@@ -372,6 +373,15 @@ void hfsStatsRecordFlush(void) {
 	}
 }
 
+/* Record one metadata blob sync separately from the device flush counter. */
+void hfsStatsRecordMetadataSync(void) {
+	HfsStatsShard *shard = hfsStatsShardGet();
+
+	if (shard != NULL) {
+		shard->metadataSyncCount++;
+	}
+}
+
 /* Record a DMA size class, wait, and active high-water mark. */
 void hfsStatsRecordDma(size_t bytes, bool waited, uint64_t active) {
 	HfsStatsShard *shard = hfsStatsShardGet();
@@ -442,6 +452,7 @@ static void hfsStatsAggregateShard(HfsStatsShard *total,
 	if (shard->metadataBatchMax > total->metadataBatchMax) {
 		total->metadataBatchMax = shard->metadataBatchMax;
 	}
+	total->metadataSyncCount += shard->metadataSyncCount;
 	total->flushCount += shard->flushCount;
 	for (i = 0; i < HFS_STATS_DMA_SIZE_CLASSES; i++) {
 		total->dmaSizeClass[i] += shard->dmaSizeClass[i];
@@ -571,6 +582,8 @@ static void hfsStatsWriteSnapshot(void) {
 		total.metadataBatchTotal);
 	HFS_STATS_APPEND("metadata_batch_max=%"PRIu64"\n",
 		total.metadataBatchMax);
+	HFS_STATS_APPEND("metadata_sync_count=%"PRIu64"\n",
+		total.metadataSyncCount);
 	HFS_STATS_APPEND("flush_count=%"PRIu64"\n", total.flushCount);
 	HFS_STATS_APPEND("dma_wait_shard=%"PRIu64"\n", total.dmaWaits);
 	HFS_STATS_APPEND("dma_active_peak_shard=%"PRIu64"\n",

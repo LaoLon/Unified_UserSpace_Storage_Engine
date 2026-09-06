@@ -1,6 +1,6 @@
 # HFS Durability Model
 
-> Status: shard-44 v4 dirty-range checkpoint foundation (v5 runtime migration not enabled)
+> Status: shard-44 v4 dirty-range checkpoint and bounded group-commit foundation (v5 runtime migration not enabled)
 > Scope: one HFS owner process mounted on one persistent SPDK bdev
 
 ## 1. Contract and terms
@@ -23,8 +23,8 @@ prove.
 
 The implementation treats a successful `fsync` and `fdatasync` as the same,
 stronger operation for now: data, data-blob metadata, inode size, mtime and
-ctime are all included. This is intentionally conservative until dirty fields
-and sync epochs are split per inode.
+ctime are all included. Dirty inode IDs are collected into one bounded metadata
+epoch, so a synchronous caller may also make peer dirty inodes durable.
 
 ## 2. Current `fsync` order
 
@@ -43,8 +43,9 @@ while holding the open-file I/O lock and the mount I/O write lock:
 The second `hfsSync` may redundantly synchronize the unchanged file data blob;
 this is deliberate in the first correct implementation. It gives the device
 flush an existing `HfsFile` anchor and avoids adding a separate, unverified
-metadata-only flush path. Group commit and a dedicated metadata flush epoch
-are later optimizations, not present behavior.
+metadata-only flush path. The group-commit foundation is bounded by the four
+v4 intent slots; larger dirty sets use the existing full-image fallback. A
+dedicated v5 WAL flush epoch remains a later optimization.
 
 ```text
 file data / allocation writes
@@ -127,9 +128,10 @@ file's host cache and the VM do not make it a physical power-fail test.
    by individual device barriers. The second barrier protects the completed
    transaction, but the exact device-cache/power-fail matrix still needs a
    controllable write-cache test environment.
-2. There are no per-inode dirty masks or sync epochs. The mount-wide
-   `metaDirty` flag makes current `fdatasync` conservative and prevents a
-   precise per-file durable epoch claim.
+2. Runtime now tracks dirty inode IDs and a mount-local durable metadata epoch.
+   The v4 implementation can merge a bounded set of dirty inodes; it still
+   lacks the v5 WAL epoch, background checkpoint, and per-file waiter queues
+   needed for a fully asynchronous group-commit contract.
 3. The trace and process-crash hook verify API-level phase order and the three
    fsync boundaries, not the device's physical cache order. They still need
    per-submit/per-completion coverage and a controllable power-fail backend.

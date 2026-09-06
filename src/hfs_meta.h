@@ -152,6 +152,15 @@ int hfsMetaSetSize(Hfs *fs, struct hfs_inode *in, uint64_t size);
 /* Commit metadata changes for the inode identified by 'inodeId'. */
 int hfsMetaCommitInode(Hfs *fs, uint64_t inodeId);
 
+/* Commit all currently dirty inodes as one bounded metadata epoch. */
+int hfsMetaCommitDirty(Hfs *fs);
+
+/* Mark a successfully written inode for the next metadata checkpoint. */
+void hfsMetaMarkInodeDirty(Hfs *fs, uint64_t inodeId);
+
+/* Return the last metadata generation known durable on the mounted blob. */
+uint64_t hfsMetaDurableEpoch(const Hfs *fs);
+
 /* Update the stored permission bits and status-change time. */
 int hfsMetaSetMode(Hfs *fs, struct hfs_inode *in, uint32_t mode);
 /* Update the stored owner ids and status-change time. */

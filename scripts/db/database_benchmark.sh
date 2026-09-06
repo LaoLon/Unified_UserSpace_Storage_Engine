@@ -201,6 +201,7 @@ def parse_case(name):
         "metadata_image_bytes": int(stats.get("metadata_image_bytes", "0")),
         "metadata_page_bytes": int(stats.get("metadata_page_bytes", "0")),
         "metadata_batch_max": int(stats.get("metadata_batch_max", "0")),
+        "metadata_sync_count": int(stats.get("metadata_sync_count", "0")),
         "flush_count": int(stats.get("flush_count", "0")),
         "lock_fd_contention": int(stats.get("lock_fd_contention", "0")),
         "lock_meta_contention": int(stats.get("lock_meta_contention", "0")),
@@ -220,7 +221,8 @@ columns = [
     "spdk_submit", "spdk_complete", "spdk_reject", "effective_qd",
     "io_read_bytes", "io_write_bytes", "io_rmw_ops", "io_copy_bytes",
     "metadata_image_bytes", "metadata_page_bytes", "metadata_batch_max",
-    "flush_count", "lock_fd_contention", "lock_meta_contention", "dma_active_peak",
+    "metadata_sync_count", "flush_count", "lock_fd_contention", "lock_meta_contention",
+    "dma_active_peak",
 ]
 with (out / "summary.tsv").open("w", encoding="utf-8") as stream:
     stream.write("\t".join(columns) + "\n")
