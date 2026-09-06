@@ -550,7 +550,7 @@ static void hfsPublishWriteEnd(HfsOpenFile *openFile, uint64_t end) {
 				      memory_order_relaxed);
 		atomic_store_explicit(&openFile->mtimeNs, in->mtimeNs,
 				      memory_order_relaxed);
-		openFile->ctimeNs = nowNs;
+		atomic_store_explicit(&openFile->ctimeNs, nowNs, memory_order_relaxed);
 	} else if (in == NULL && hfsFdGetOrphanInfo(openFile, NULL, NULL, NULL)) {
 		uint64_t size = atomic_load_explicit(&openFile->size,
 					     memory_order_relaxed);
@@ -561,7 +561,7 @@ static void hfsPublishWriteEnd(HfsOpenFile *openFile, uint64_t end) {
 		}
 		atomic_store_explicit(&openFile->mtimeNs, nowNs,
 				      memory_order_relaxed);
-		openFile->ctimeNs = nowNs;
+		atomic_store_explicit(&openFile->ctimeNs, nowNs, memory_order_relaxed);
 	}
 	pthread_rwlock_unlock(&g_metaLock);
 }
@@ -841,7 +841,8 @@ int hfs_lib_open(const char *path, int flags, mode_t mode) {
 			pthread_rwlock_unlock(&g_metaLock);
 			return -1;
 		}
-		openFile->ctimeNs = in->ctimeNs;
+		atomic_store_explicit(&openFile->ctimeNs, in->ctimeNs,
+				      memory_order_relaxed);
 		openFile->mode = in->mode;
 		openFile->uid = in->uid;
 		openFile->gid = in->gid;
@@ -926,7 +927,8 @@ int hfs_lib_open(const char *path, int flags, mode_t mode) {
 	if ((flags & O_APPEND) != 0) {
 		openFile->offset = in->size;
 	}
-	openFile->ctimeNs = in->ctimeNs;
+	atomic_store_explicit(&openFile->ctimeNs, in->ctimeNs,
+			      memory_order_relaxed);
 	openFile->mode = in->mode;
 	openFile->uid = in->uid;
 	openFile->gid = in->gid;
@@ -2033,7 +2035,8 @@ int hfs_lib_futimens(int fd, const struct timespec times[2]) {
 				atomic_store_explicit(&openFile->mtimeNs, in->mtimeNs,
 						      memory_order_relaxed);
 			}
-			openFile->ctimeNs = in->ctimeNs;
+			atomic_store_explicit(&openFile->ctimeNs, in->ctimeNs,
+				      memory_order_relaxed);
 		}
 	} else if (hfsFdGetOrphanInfo(openFile, NULL, NULL, NULL)) {
 		if (setAtime) {
@@ -2044,7 +2047,8 @@ int hfs_lib_futimens(int fd, const struct timespec times[2]) {
 					      memory_order_relaxed);
 		}
 		if (setAtime || setMtime) {
-			openFile->ctimeNs = hfs_now_ns();
+			atomic_store_explicit(&openFile->ctimeNs, hfs_now_ns(),
+				      memory_order_relaxed);
 		}
 		rc = 0;
 	} else {

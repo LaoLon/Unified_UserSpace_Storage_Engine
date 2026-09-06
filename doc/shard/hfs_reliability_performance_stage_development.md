@@ -1,6 +1,6 @@
 # HFS 可靠性与性能优化阶段计划（shard-36 起）
 
-> 状态：shard-36～39 已完成，正确性闸门 A 已通过；下一步进入 shard-40 fd/runtime 热路径去全局锁<br>
+> 状态：shard-36～40 核心实现已完成，正确性闸门 A 已通过；下一步进入 shard-41 per-inode 状态与区间 I/O 并发<br>
 > 制定日期：2026-09-05  
 > 适用基线：`main@91db26a`（shard-36 已完成）
 > 输入文档：`review/hfs_architecture_performance_review_2026-09-05.md`  
@@ -293,6 +293,11 @@ log/image/page bytes 均已落盘。
 
 ## 9. shard-40：fd 注册表与 runtime 热路径去全局锁
 
+> 状态：核心实现已完成（2026-09-06）；同口径吞吐未宣称提升，后续瓶颈继续由 shard-41 处理<br>
+> 验收：VM 上 Make/CMake Release、I/O/fd/POSIX/runtime 回归、详细 timing、64 线程
+> fd lookup smoke 均通过；SPDK 仍由 VM 内仓库提供，commit 为
+> `f0b63ed866f0e4d3c56e73bd4a98d0042956147a`。
+
 ### 目标
 
 移除每次 I/O 都经过的 fd 全局 rwlock 和 runtime submit/complete 全局 mutex，使不同请求至少能并发排队和完成。
@@ -322,6 +327,25 @@ log/image/page bytes 均已落盘。
 - runtime submit 和 owner-thread completion 不再共享同一个全局 mutex。
 - 64 线程压力下无 double close、悬挂指针、引用泄漏和请求丢失。
 - 相对 shard-39，同口径 4 线程 4 KiB workload 吞吐至少提升 20%，或用 profile 证明剩余主瓶颈已转移到文件/元数据锁。
+
+本轮实现采用 256 分桶 mutex（仅同一 fd bucket 互斥），slot 指针使用原子 exchange，generation
+在每次替换/摘除时递增；acquire 在 bucket 保护下执行 increment-if-not-zero CAS 并复查
+指针/generation，close 先摘槽，最后引用负责析构。runtime submit 使用原子 submitter admission
+计数与 accepting 状态，stop 等待已进入 submit 的请求后再把 stop 消息排到 owner 队列；owner
+completion 通过 TLS 身份判断，不再获取 runtime state mutex。
+
+新增 `scripts/db/fd_lookup_benchmark.sh`，覆盖 1/4/16/64 线程；本轮 VM 1 秒烟测吞吐为
+15,971 / 31,687 / 33,928 / 27,049 IOPS，错误数均为 0。扩展 `fd_lifecycle_smoke.sh`
+增加 64 线程、每线程 250 次 open/pread/close 的 fd 复用与 lookup churn；回归中
+`IO_RC=0 FD_RC=0 POSIX_RC=0 RUNTIME_RC=0`。详细 timing 仍能观察 `stats_shards=6`、
+runtime submit/complete 一致以及 fd/meta/runtime lock wait/hold 数据。
+
+为避免把设备或 owner-thread 噪声误判为收益，使用 shard-39 提交前的源码在 VM 复用同一
+SPDK、同一 4 KiB randread/4 threads/iodepth=1/5 s 口径重跑：baseline 31,131.97 IOPS，
+当前 31,062.79 IOPS（-0.22%，两者 error=0）。因此本 shard 不宣称达到“提升 20%”门槛；
+详细 timing 显示 fd contention 33/196,381、metadata contention 30/97,173，runtime
+queue wait 3.13 s，剩余主要瓶颈已从进程级 fd/runtime 锁转移到 owner 队列与 metadata/I/O
+路径，后续按 shard-41 的 per-inode/区间并发方案继续消除串行化。
 
 ### 提交建议
 

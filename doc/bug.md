@@ -797,4 +797,20 @@ Bug 等级：**致命 > 严重 > 一般**。
   MariaDB/MySQL 持久化恢复、RocksDB WAL/一致性恢复和数据库性能基准，全部通过；CMake
   Release 最终链接命令已包含 `-llz4`。
 
+### 54. scaling smoke 的 stats-off 样本可继承外部统计环境（已修复，一般级）
+
+- **状态**：已修复
+- **时间**：2026-09-06（shard-39 收尾与 shard-40 基线）
+- **等级**：一般（会污染统计开销对照，但不改变 HFS 数据正确性）
+- **现象**：`scripts/db/hfs_scaling_benchmark.sh` 的 stats-off 运行只设置了
+  `HFS_STATS_DISABLED=1`，而 HFS 初始化实际依据 `HFS_STATS_PATH`/`HFS_STATS` 判断是否启用；
+  若调用环境预先导出了任一变量，所谓 off 样本仍会开启统计，导致 overhead 结果失真。
+- **排查过程**：对照脚本的 `run_fio` 环境数组与 `hfsStatsInit` 的环境解析逻辑，发现
+  `HFS_STATS_DISABLED` 并不是库支持的控制变量；在继承 `HFS_STATS_PATH` 的环境中可复现。
+- **根因**：基准脚本没有清理继承的统计开关，把脚本内部标签误当成库侧禁用语义。
+- **修复**：stats-off 分支显式通过 `env -u HFS_STATS_PATH -u HFS_STATS -u HFS_STATS_TIMING`
+  清理所有统计开关；stats-on 仍使用本轮生成的独立报告路径。
+- **验证**：脚本 `bash -n`、VM Make/CMake Release 和 fd/I/O/POSIX/runtime 回归均通过；
+  stats-off/on 配对仍可输出可复现的独立样本。
+
 ## 通用经验总结

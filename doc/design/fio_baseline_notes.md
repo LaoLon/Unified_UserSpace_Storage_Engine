@@ -190,3 +190,25 @@ Metadata count=1 measured create/stat/readdir/rename/unlink as 0.000740/0.000007
 instrumentation overhead. With `HFS_STATS_TIMING=1`, a 2-job 1 s run emitted six per-thread
 shards, runtime queue peak 2, lock wait/hold histograms, and metadata log/image/page bytes;
 default timing remains off to keep the stats-on hot path within the 3% budget.
+
+## shard-40 fd lookup smoke（2026-09-06）
+
+在同一 VM、同一持久化 Aio bdev 上，使用 `scripts/db/fd_lookup_benchmark.sh`，4 KiB
+randread、iodepth=1、每轮 1 秒、16 MiB 文件，统计 1/4/16/64 个 fio 线程。结果为：
+
+| 线程数 | IOPS | error | CPU | RSS (KiB) |
+|---:|---:|---:|---:|---:|
+| 1 | 15,971.03 | 0 | 110% | 20,680 |
+| 4 | 31,687.31 | 0 | 116% | 20,936 |
+| 16 | 33,928.07 | 0 | 119% | 22,840 |
+| 64 | 27,048.76 | 0 | 215% | 34,488 |
+
+该烟测用于确认分桶 fd registry 在高并发和 fd 复用下没有错误或请求丢失，不作为跨硬件
+绝对性能承诺；完整对比仍需固定 CPU 亲和、bdev 类型和 fio 版本后执行。
+
+额外用 shard-39 源码作为 baseline，在 VM 复用同一 SPDK、同一持久化 Aio、4 KiB
+randread/4 threads/iodepth=1/5 s 口径重跑：baseline 31,131.97 IOPS，shard-40 为
+31,062.79 IOPS（-0.22%，error 均为 0）。`HFS_STATS_TIMING=1` 的 4 线程样本记录
+fd wait/hold 196,381/196,381、contention 33，metadata contention 30/97,173，
+runtime queue wait 3.13 s；因此后续收益应从 owner 队列和 metadata/I/O 区间并发中取得，
+不将本轮结果解释为绝对吞吐提升。

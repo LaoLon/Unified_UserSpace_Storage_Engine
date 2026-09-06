@@ -4,6 +4,7 @@
 #include <signal.h>
 #include <stdatomic.h>
 #include <stdlib.h>
+#include <sched.h>
 #include <sys/syscall.h>
 #include <linux/futex.h>
 #include <time.h>
@@ -28,16 +29,17 @@ struct hfs_runtime_state {
 	pthread_mutex_t lock;
 	pthread_cond_t stateChanged;
 	pthread_t owner;
-	struct spdk_thread *spdkThread;
+	_Atomic(struct spdk_thread *) spdkThread;
 	bool threadCreated;
 	bool ready;
-	bool accepting;
+	_Atomic bool accepting;
 	bool stopSubmitted;
-	bool subsystemsReady;
+	_Atomic bool subsystemsReady;
 	int initRc;
 	_Atomic pid_t ownerPid;
 	_Atomic uint64_t queued;
 	_Atomic uint64_t inflight;
+	_Atomic uint32_t submitters;
 };
 
 static struct hfs_runtime_state g_runtime = {
@@ -45,6 +47,9 @@ static struct hfs_runtime_state g_runtime = {
 	.stateChanged = PTHREAD_COND_INITIALIZER,
 };
 static _Atomic bool g_ownerViolationLogged;
+
+/* Owner identity is immutable for a runtime generation and needs no mutex lookup. */
+static _Thread_local bool g_hfsRuntimeOwnerThread;
 
 /* Instrument the runtime state mutex while keeping the fast path lock-free in stats-off mode. */
 static int hfsRuntimeMutexLock(pthread_mutex_t *lock) {
@@ -63,8 +68,8 @@ static int hfsRuntimeMutexUnlock(pthread_mutex_t *lock) {
 }
 
 /* Keep every runtime state mutex operation paired with its timing sample. */
-#define pthread_mutex_lock(lock) hfsRuntimeMutexLock(lock)
-#define pthread_mutex_unlock(lock) hfsRuntimeMutexUnlock(lock)
+#define HFS_RUNTIME_STATE_LOCK(lock) hfsRuntimeMutexLock(lock)
+#define HFS_RUNTIME_STATE_UNLOCK(lock) hfsRuntimeMutexUnlock(lock)
 
 /* Optional wrapper retained only while statistics are enabled. */
 typedef struct HfsRuntimeMessage {
@@ -123,7 +128,7 @@ static void hfsRuntimeSubsystemFiniDone(void *arg) {
 static void hfsRuntimeStopMessage(void *arg) {
 	struct hfs_runtime_state *runtime = arg;
 
-	if (runtime->subsystemsReady) {
+	if (atomic_load_explicit(&runtime->subsystemsReady, memory_order_acquire)) {
 		spdk_subsystem_fini(hfsRuntimeSubsystemFiniDone, runtime);
 	} else {
 		spdk_thread_exit(runtime->spdkThread);
@@ -153,12 +158,13 @@ static void hfsRuntimeDispatchMessage(void *arg) {
 
 /* Publish owner initialization state to hfsRuntimeStart. */
 static void hfsRuntimePublishReady(int rc) {
-	pthread_mutex_lock(&g_runtime.lock);
+	HFS_RUNTIME_STATE_LOCK(&g_runtime.lock);
 	g_runtime.initRc = rc;
 	g_runtime.ready = true;
-	g_runtime.accepting = rc == 0;
+	atomic_store_explicit(&g_runtime.accepting, rc == 0,
+		memory_order_release);
 	pthread_cond_broadcast(&g_runtime.stateChanged);
-	pthread_mutex_unlock(&g_runtime.lock);
+	HFS_RUNTIME_STATE_UNLOCK(&g_runtime.lock);
 }
 
 /* Block signals reserved for the host process signal-management thread. */
@@ -225,13 +231,14 @@ static void *hfsRuntimeOwnerMain(void *arg) {
 		return NULL;
 	}
 
-	pthread_mutex_lock(&g_runtime.lock);
-	g_runtime.spdkThread = thread;
+	HFS_RUNTIME_STATE_LOCK(&g_runtime.lock);
+	atomic_store_explicit(&g_runtime.spdkThread, thread, memory_order_release);
 	globalThread = thread;
 	g_runtime.threadCreated = true;
 	atomic_store_explicit(&g_runtime.ownerPid, getpid(), memory_order_release);
-	pthread_mutex_unlock(&g_runtime.lock);
+	HFS_RUNTIME_STATE_UNLOCK(&g_runtime.lock);
 	spdk_set_thread(thread);
+	g_hfsRuntimeOwnerThread = true;
 	hfsRuntimePublishReady(0);
 
 	while (!spdk_thread_is_exited(thread)) {
@@ -246,13 +253,14 @@ static void *hfsRuntimeOwnerMain(void *arg) {
 		pthread_sigmask(SIG_SETMASK, &previousSignalMask, NULL);
 	}
 
-	pthread_mutex_lock(&g_runtime.lock);
+	HFS_RUNTIME_STATE_LOCK(&g_runtime.lock);
 	globalThread = NULL;
-	g_runtime.spdkThread = NULL;
-	g_runtime.accepting = false;
+	atomic_store_explicit(&g_runtime.spdkThread, NULL, memory_order_release);
+	atomic_store_explicit(&g_runtime.accepting, false, memory_order_release);
 	atomic_store_explicit(&g_runtime.ownerPid, 0, memory_order_release);
 	pthread_cond_broadcast(&g_runtime.stateChanged);
-	pthread_mutex_unlock(&g_runtime.lock);
+	HFS_RUNTIME_STATE_UNLOCK(&g_runtime.lock);
+	g_hfsRuntimeOwnerThread = false;
 	return NULL;
 }
 
@@ -260,26 +268,27 @@ static void *hfsRuntimeOwnerMain(void *arg) {
 int hfsRuntimeStart(void) {
 	int rc;
 
-	pthread_mutex_lock(&g_runtime.lock);
-	if (g_runtime.threadCreated && g_runtime.accepting) {
-		pthread_mutex_unlock(&g_runtime.lock);
+	HFS_RUNTIME_STATE_LOCK(&g_runtime.lock);
+	if (g_runtime.threadCreated &&
+	    atomic_load_explicit(&g_runtime.accepting, memory_order_acquire)) {
+		HFS_RUNTIME_STATE_UNLOCK(&g_runtime.lock);
 		return 0;
 	}
 	if (g_runtime.threadCreated || g_runtime.ready) {
-		pthread_mutex_unlock(&g_runtime.lock);
+		HFS_RUNTIME_STATE_UNLOCK(&g_runtime.lock);
 		return -ESHUTDOWN;
 	}
 
 	rc = pthread_create(&g_runtime.owner, NULL, hfsRuntimeOwnerMain, NULL);
 	if (rc != 0) {
-		pthread_mutex_unlock(&g_runtime.lock);
+		HFS_RUNTIME_STATE_UNLOCK(&g_runtime.lock);
 		return -rc;
 	}
 	while (!g_runtime.ready) {
 		pthread_cond_wait(&g_runtime.stateChanged, &g_runtime.lock);
 	}
 	rc = g_runtime.initRc;
-	pthread_mutex_unlock(&g_runtime.lock);
+	HFS_RUNTIME_STATE_UNLOCK(&g_runtime.lock);
 
 	if (rc != 0) {
 		pthread_join(g_runtime.owner, NULL);
@@ -290,6 +299,7 @@ int hfsRuntimeStart(void) {
 /* Submit a message while preventing a concurrent runtime stop race. */
 int hfsRuntimeSubmit(spdk_msg_fn fn, void *ctx) {
 	HfsRuntimeMessage *message = NULL;
+	struct spdk_thread *thread;
 	uint64_t queueDepth;
 	int rc = 0;
 
@@ -298,20 +308,33 @@ int hfsRuntimeSubmit(spdk_msg_fn fn, void *ctx) {
 		HFS_STATS_SPDK_REJECT();
 		return -ECHILD;
 	}
+	/* Admission count closes the stop-vs-submit race without taking state.lock. */
+	atomic_fetch_add_explicit(&g_runtime.submitters, 1,
+		memory_order_acquire);
+	if (!atomic_load_explicit(&g_runtime.accepting, memory_order_acquire)) {
+		rc = -ESHUTDOWN;
+		goto submit_done;
+	}
+	thread = atomic_load_explicit(&g_runtime.spdkThread, memory_order_acquire);
+	if (thread == NULL) {
+		rc = -ESHUTDOWN;
+		goto submit_done;
+	}
 	if (hfsStatsTimingFastEnabled()) {
 		message = calloc(1, sizeof(*message));
 		if (message == NULL) {
 			HFS_STATS_ERROR();
-			return -ENOMEM;
+			rc = -ENOMEM;
+			goto submit_done;
 		}
 		message->fn = fn;
 		message->ctx = ctx;
 		message->enqueueNs = hfsStatsNowNs();
 	}
-	pthread_mutex_lock(&g_runtime.lock);
+	/* Recheck after allocation so stop cannot admit a late request. */
 	if (hfsRuntimeIsForkChild()) {
 		rc = -ECHILD;
-	} else if (!g_runtime.accepting || g_runtime.spdkThread == NULL) {
+	} else if (!atomic_load_explicit(&g_runtime.accepting, memory_order_acquire)) {
 		rc = -ESHUTDOWN;
 	} else {
 		HFS_STATS_SPDK_SUBMIT();
@@ -319,39 +342,36 @@ int hfsRuntimeSubmit(spdk_msg_fn fn, void *ctx) {
 			queueDepth = atomic_fetch_add_explicit(&g_runtime.queued, 1,
 				memory_order_relaxed) + 1U;
 			hfsStatsRecordRuntimeSubmitFast(queueDepth);
-			spdk_thread_send_msg(g_runtime.spdkThread,
+			spdk_thread_send_msg(thread,
 				hfsRuntimeDispatchMessage, message);
 			message = NULL;
 		} else {
-			spdk_thread_send_msg(g_runtime.spdkThread, fn, ctx);
+			spdk_thread_send_msg(thread, fn, ctx);
 		}
 	}
+
+submit_done:
 	if (rc != 0) {
 		HFS_STATS_SPDK_REJECT();
 	}
-	pthread_mutex_unlock(&g_runtime.lock);
 	free(message);
+	atomic_fetch_sub_explicit(&g_runtime.submitters, 1,
+		memory_order_release);
 	return rc;
 }
 
 /* Mark subsystem setup complete so shutdown can run the matching finalizer. */
 void hfsRuntimeMarkSubsystemReady(void) {
-	pthread_mutex_lock(&g_runtime.lock);
-	g_runtime.subsystemsReady = true;
-	pthread_mutex_unlock(&g_runtime.lock);
+	atomic_store_explicit(&g_runtime.subsystemsReady, true,
+		memory_order_release);
 }
 
 /* Return true only for the dedicated SPDK owner pthread. */
 bool hfsRuntimeIsOwnerThread(void) {
-	bool owner;
-
 	if (hfsRuntimeIsForkChild()) {
 		return false;
 	}
-	pthread_mutex_lock(&g_runtime.lock);
-	owner = g_runtime.threadCreated && pthread_equal(pthread_self(), g_runtime.owner);
-	pthread_mutex_unlock(&g_runtime.lock);
-	return owner;
+	return g_hfsRuntimeOwnerThread;
 }
 
 /* Return true when this process inherited the runtime from a different PID. */
@@ -364,29 +384,66 @@ bool hfsRuntimeIsForkChild(void) {
 
 /* Stop the runtime after callers have released all HFS resources. */
 int hfsRuntimeStop(void) {
+	struct spdk_thread *thread;
+	bool submitStop = false;
+	uint64_t queued;
+	uint64_t inflight;
+
 	if (hfsRuntimeIsForkChild()) {
 		return -ECHILD;
 	}
-	pthread_mutex_lock(&g_runtime.lock);
+	HFS_RUNTIME_STATE_LOCK(&g_runtime.lock);
 	if (!g_runtime.threadCreated) {
-		pthread_mutex_unlock(&g_runtime.lock);
+		HFS_RUNTIME_STATE_UNLOCK(&g_runtime.lock);
 		return 0;
 	}
-	if (!g_runtime.stopSubmitted && g_runtime.spdkThread != NULL) {
-		g_runtime.stopSubmitted = true;
-		g_runtime.accepting = false;
-		spdk_thread_send_msg(g_runtime.spdkThread, hfsRuntimeStopMessage, &g_runtime);
+	if (g_runtime.stopSubmitted) {
+		/* A concurrent stopper waits for the first stopper to finish joining. */
+		while (g_runtime.threadCreated) {
+			pthread_cond_wait(&g_runtime.stateChanged, &g_runtime.lock);
+		}
+		HFS_RUNTIME_STATE_UNLOCK(&g_runtime.lock);
+		return 0;
 	}
-	pthread_mutex_unlock(&g_runtime.lock);
+	thread = atomic_load_explicit(&g_runtime.spdkThread, memory_order_acquire);
+	if (!g_runtime.stopSubmitted) {
+		g_runtime.stopSubmitted = true;
+		atomic_store_explicit(&g_runtime.accepting, false, memory_order_release);
+		submitStop = thread != NULL;
+	}
+	HFS_RUNTIME_STATE_UNLOCK(&g_runtime.lock);
+
+	if (submitStop) {
+		/* Drain submitters before placing stop behind every admitted message. */
+		while (atomic_load_explicit(&g_runtime.submitters,
+				memory_order_acquire) != 0) {
+			sched_yield();
+		}
+		/* Detailed timing mode also waits for wrapped callbacks to retire. */
+		do {
+			queued = atomic_load_explicit(&g_runtime.queued,
+				memory_order_acquire);
+			inflight = atomic_load_explicit(&g_runtime.inflight,
+				memory_order_acquire);
+			if (!hfsStatsTimingFastEnabled() ||
+			    (queued == 0 && inflight == 0)) {
+				break;
+			}
+			sched_yield();
+		} while (true);
+		spdk_thread_send_msg(thread, hfsRuntimeStopMessage, &g_runtime);
+	}
 
 	pthread_join(g_runtime.owner, NULL);
-	pthread_mutex_lock(&g_runtime.lock);
+	HFS_RUNTIME_STATE_LOCK(&g_runtime.lock);
 	g_runtime.threadCreated = false;
 	g_runtime.ready = false;
 	g_runtime.stopSubmitted = false;
-	g_runtime.subsystemsReady = false;
+	atomic_store_explicit(&g_runtime.subsystemsReady, false,
+		memory_order_relaxed);
 	g_runtime.initRc = 0;
-	pthread_mutex_unlock(&g_runtime.lock);
+	pthread_cond_broadcast(&g_runtime.stateChanged);
+	HFS_RUNTIME_STATE_UNLOCK(&g_runtime.lock);
 	return 0;
 }
 

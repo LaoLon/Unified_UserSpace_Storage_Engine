@@ -137,6 +137,34 @@ for thread in threads:
     thread.join()
 assert not errors, errors
 
+# Churn one path from many threads to exercise bucket lookup and fd reuse.
+churn_path = root + "/lookup-churn"
+seed_fd = os.open(churn_path, os.O_CREAT | os.O_RDWR, 0o600)
+try:
+    assert os.pwrite(seed_fd, b"lookup" * 1024, 0) == 6 * 1024
+finally:
+    os.close(seed_fd)
+churn_errors = []
+churn_barrier = threading.Barrier(64)
+
+def churn_worker(index):
+    try:
+        churn_barrier.wait()
+        for _ in range(250):
+            local_fd = os.open(churn_path, os.O_RDONLY)
+            assert os.pread(local_fd, 6, (index % 1024) * 6) == b"lookup"
+            os.close(local_fd)
+    except BaseException as exc:
+        churn_errors.append((index, repr(exc)))
+
+churn_threads = [threading.Thread(target=churn_worker, args=(i,))
+                 for i in range(64)]
+for thread in churn_threads:
+    thread.start()
+for thread in churn_threads:
+    thread.join()
+assert not churn_errors, churn_errors
+
 print("FD LIFECYCLE OK")
 PYEOF
 

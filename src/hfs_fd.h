@@ -28,10 +28,11 @@ struct HfsOpenFile {
 	uint32_t gid;
 	uint64_t atimeNs;
 	_Atomic uint64_t mtimeNs;
-	uint64_t ctimeNs;
+	_Atomic uint64_t ctimeNs;
 	char dirPath[PATH_MAX];
 	pthread_mutex_t ioLock;
-	uint32_t refs;
+	pthread_mutex_t orphanLock;
+	_Atomic uint32_t refs;
 	HfsOrphan *orphan;
 	HfsOpenFile *deferredNext;
 };
@@ -39,7 +40,8 @@ struct HfsOpenFile {
 struct HfsOrphan {
 	uint64_t inodeId;
 	uint64_t blobId;
-	uint32_t openRefs;
+	_Atomic bool cancelled;
+	_Atomic uint32_t openRefs;
 };
 
 /* Allocate one open-file description with one owning reference. */
@@ -69,7 +71,7 @@ int hfsFdMarkOrphan(uint64_t inodeId, uint64_t blobId,
 		   HfsOrphan **orphanOut);
 /* Undo a provisional orphan mark when its metadata transaction did not publish. */
 void hfsFdClearOrphan(HfsOrphan *orphan);
-/* Read orphan metadata while holding the fd registry read lock. */
+/* Read orphan metadata while holding the description's orphan lock. */
 bool hfsFdGetOrphanInfo(HfsOpenFile *openFile, uint64_t *size,
 			uint64_t *ctimeNs, uint64_t *mtimeNs);
 /* Release an orphan descriptor after its blob has been deleted. */
