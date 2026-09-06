@@ -16,14 +16,27 @@ static HfsOpenFile *g_fdSlots[HFS_FD_TABLE_SIZE];
 /* Count fd registry lock acquisitions while preserving short lock scopes. */
 static void hfsFdReadLock(void) {
 	HFS_STATS_FD_READ_LOCK();
+	hfsStatsLockBeforeFast(HFS_STATS_LOCK_FD);
 	pthread_rwlock_rdlock(&g_fdLock);
+	hfsStatsLockAfterFast(HFS_STATS_LOCK_FD);
 }
 
 /* Count fd registry write lock acquisitions while preserving short lock scopes. */
 static void hfsFdWriteLock(void) {
 	HFS_STATS_FD_WRITE_LOCK();
+	hfsStatsLockBeforeFast(HFS_STATS_LOCK_FD);
 	pthread_rwlock_wrlock(&g_fdLock);
+	hfsStatsLockAfterFast(HFS_STATS_LOCK_FD);
 }
+
+/* Release the registry lock and close its timing sample. */
+static int hfsFdRwlockUnlock(pthread_rwlock_t *lock) {
+	hfsStatsLockReleaseFast(HFS_STATS_LOCK_FD);
+	return pthread_rwlock_unlock(lock);
+}
+
+/* Keep every fd registry unlock paired with the timing sample above. */
+#define pthread_rwlock_unlock(lock) hfsFdRwlockUnlock(lock)
 
 /* Allocate a description shared by all duplicate fd slots. */
 int hfsFdCreate(HfsOpenFile **out, HfsFile *file, uint64_t inodeId,

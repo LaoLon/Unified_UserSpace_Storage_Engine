@@ -10,6 +10,7 @@
 #include "hfs_internal.h"
 #include "hfs_io.h"
 #include "hfs_log.h"
+#include "hfs_stats.h"
 
 /* Request state used by blob lifecycle and fsync operation chains. */
 typedef struct HfsFileRequest {
@@ -110,6 +111,8 @@ static void hfsSubmitFsyncFlush(HfsFileRequest *request) {
 	HfsFile *file = request->file;
 	int rc;
 
+	/* Count both real and injected barriers so failure ratios remain visible. */
+	hfsStatsRecordFlushFast();
 	if (hfsRequestCompletionInjected(request->flushOperation)) {
 		hfsRequestComplete(&request->result, -EIO, 0);
 		return;

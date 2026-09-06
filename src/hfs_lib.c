@@ -33,14 +33,73 @@ static pthread_mutex_t g_deferredCloseLock = PTHREAD_MUTEX_INITIALIZER;
 /* Count metadata read-lock acquisitions without extending lock ownership. */
 static void hfsMetaReadLock(void) {
 	HFS_STATS_META_READ_LOCK();
+	hfsStatsLockBeforeFast(HFS_STATS_LOCK_META);
 	pthread_rwlock_rdlock(&g_metaLock);
+	hfsStatsLockAfterFast(HFS_STATS_LOCK_META);
 }
 
 /* Count metadata write-lock acquisitions without extending lock ownership. */
 static void hfsMetaWriteLock(void) {
 	HFS_STATS_META_WRITE_LOCK();
+	hfsStatsLockBeforeFast(HFS_STATS_LOCK_META);
 	pthread_rwlock_wrlock(&g_metaLock);
+	hfsStatsLockAfterFast(HFS_STATS_LOCK_META);
 }
+
+/* Classify a rwlock release so metadata and data-path hold times stay separate. */
+static HfsStatsLockClass hfsLibRwlockClass(pthread_rwlock_t *lock) {
+	return lock == &g_metaLock ? HFS_STATS_LOCK_META : HFS_STATS_LOCK_IO;
+}
+
+/* Instrument write rwlock acquisition without changing lock ownership. */
+static int hfsLibRwlockWrlock(pthread_rwlock_t *lock) {
+	HfsStatsLockClass lockClass = hfsLibRwlockClass(lock);
+	int rc;
+
+	hfsStatsLockBeforeFast(lockClass);
+	rc = pthread_rwlock_wrlock(lock);
+	hfsStatsLockAfterFast(lockClass);
+	return rc;
+}
+
+/* Release a rwlock and account for the protected section duration. */
+static int hfsLibRwlockUnlock(pthread_rwlock_t *lock) {
+	HfsStatsLockClass lockClass = hfsLibRwlockClass(lock);
+
+	hfsStatsLockReleaseFast(lockClass);
+	return pthread_rwlock_unlock(lock);
+}
+
+/* Instrument process mutexes; append receives its own contention class. */
+static HfsStatsLockClass hfsLibMutexClass(pthread_mutex_t *lock) {
+	return lock == &g_appendLock ? HFS_STATS_LOCK_APPEND :
+		HFS_STATS_LOCK_OTHER;
+}
+
+/* Instrument mutex acquisition without serializing independent statistics. */
+static int hfsLibMutexLock(pthread_mutex_t *lock) {
+	HfsStatsLockClass lockClass = hfsLibMutexClass(lock);
+	int rc;
+
+	hfsStatsLockBeforeFast(lockClass);
+	rc = pthread_mutex_lock(lock);
+	hfsStatsLockAfterFast(lockClass);
+	return rc;
+}
+
+/* Release a mutex and account for hold time. */
+static int hfsLibMutexUnlock(pthread_mutex_t *lock) {
+	HfsStatsLockClass lockClass = hfsLibMutexClass(lock);
+
+	hfsStatsLockReleaseFast(lockClass);
+	return pthread_mutex_unlock(lock);
+}
+
+/* Keep every library lock operation paired with its statistics frame. */
+#define pthread_rwlock_wrlock(lock) hfsLibRwlockWrlock(lock)
+#define pthread_rwlock_unlock(lock) hfsLibRwlockUnlock(lock)
+#define pthread_mutex_lock(lock) hfsLibMutexLock(lock)
+#define pthread_mutex_unlock(lock) hfsLibMutexUnlock(lock)
 
 /* The single mounted filesystem instance (one per process). */
 static Hfs *g_fs;

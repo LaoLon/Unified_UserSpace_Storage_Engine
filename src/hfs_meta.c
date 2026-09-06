@@ -12,6 +12,7 @@
 #include "hfs_internal.h"
 #include "hfs_log.h"
 #include "hfs_meta.h"
+#include "hfs_stats.h"
 
 /* Versioned metadata header used to keep inode IDs stable across compaction. */
 #define HFS_META_MAGIC		0x32465348U
@@ -511,6 +512,8 @@ static int hfsMetaBlobWrite(Hfs *fs, const void *buf, size_t len) {
 			hfsMetaDoClose) != 0) goto out;
 
 	rc = 0;
+	/* The v4 image is currently the physical page write; log bytes are tracked separately. */
+	hfsStatsRecordMetadataWriteFast(0, len, needUnits * ioUnitSize);
 out:
 	if (rc != 0) {
 		hfsMetaCloseBestEffort(&request);
@@ -760,6 +763,7 @@ static int hfsMetaCommit(Hfs *fs, const uint32_t *indices,
 	hfsMetaBuildIntent(fs, oldHeader.generation, generation,
 				   oldHeader.count, indices, indexCount, &intent);
 	memcpy(pendingBuf + HFS_META_HEADER_SIZE, &intent, sizeof(intent));
+	hfsStatsRecordMetadataWriteFast(sizeof(intent), 0, 0);
 	if (hfsMetaBlobWrite(fs, pendingBuf, pendingLen) != 0) {
 		goto out;
 	}
@@ -781,6 +785,7 @@ static int hfsMetaCommit(Hfs *fs, const uint32_t *indices,
 	fs->metaGeneration = generation;
 	fs->metaNeedsMigration = false;
 	fs->metaDirty = false;
+	hfsStatsRecordMetadataTransactionFast(indexCount);
 	rc = 0;
 out:
 	savedErrno = errno;

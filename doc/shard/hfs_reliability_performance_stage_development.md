@@ -1,6 +1,6 @@
 # HFS 可靠性与性能优化阶段计划（shard-36 起）
 
-> 状态：shard-36～38 已完成，正确性闸门 A 已通过；下一步进入 shard-39 可观测性与公平性能基线<br>
+> 状态：shard-36～39 已完成，正确性闸门 A 已通过；下一步进入 shard-40 fd/runtime 热路径去全局锁<br>
 > 制定日期：2026-09-05  
 > 适用基线：`main@91db26a`（shard-36 已完成）
 > 输入文档：`review/hfs_architecture_performance_review_2026-09-05.md`  
@@ -244,6 +244,11 @@ unmap 下发为底层 UNMAP，因此 unmap/write-zeroes/delete/unload 的真实�
 
 ## 8. shard-39：可观测性与公平性能基线
 
+> 状态：已完成（2026-09-06）<br>
+> 验收：VM 上 Make/CMake Release、默认 stats-on/off 开销对照、详细 timing 统计、scaling
+> smoke、I/O/fd/POSIX/runtime 回归和短时 RocksDB 数据库 benchmark 均通过；VM 内 SPDK
+> 保持在 `f0b63ed866f0e4d3c56e73bd4a98d0042956147a`，未从 Windows 同步。
+
 ### 目标
 
 建立能够区分锁、队列、copy、RMW、元数据写放大和设备延迟的测量体系，避免用 HFS QD≈1 与裸 SPDK QD=32 的结果直接归因。
@@ -265,12 +270,22 @@ unmap 下发为底层 UNMAP，因此 unmap/write-zeroes/delete/unload 的真实�
   - inode 数=1K/10K/60K 的 create/open/stat/readdir/rename/unlink。
 - 把结果追加到 `doc/design/fio_baseline_notes.md`，不得覆盖历史 shard-31/35 数据。
 
+详细锁 wait/hold 计时和 runtime 消息包装由 `HFS_STATS_TIMING=1` 显式开启；普通
+`HFS_STATS_PATH` 只执行 per-thread 低成本计数，避免观测代码改变被测热路径。
+
 ### 验收
 
 - stats 关闭时，4 KiB IOPS 下降不超过 1%；开启完整统计时下降不超过 3%。
 - 所有报告同时包含吞吐、延迟、CPU、RSS、错误、submit/complete 和有效 QD。
 - 每个全局锁都能给出 wait/hold 数据；每次 metadata mutation 都能给出实际写入字节。
 - 同一 bdev 上补齐 raw SPDK QD=1 对照，形成可复现的公平基线。
+
+本轮 VM 烟测使用 16 MiB、runtime 5 s、HFS 1 线程和 raw QD=1，覆盖 4 KiB 随机读/写/混合、
+128 KiB 顺序读/写、CPU/RSS、错误数、SPDK submit/complete、有效 QD 和 metadata 字节；
+脚本默认参数仍提供线程 `1/2/4/8/16`、raw QD `1/4/16/32` 及 inode `1K/10K/60K` 的完整矩阵。
+stats-off/on 配对为 63,446.91/62,540.80 IOPS，测得开销 1.43%；详细模式观察到
+`stats_shards=6`、runtime queue peak=2、lock/runtime wait/hold 直方图及 metadata
+log/image/page bytes 均已落盘。
 
 ### 提交建议
 

@@ -163,3 +163,30 @@ preload/fd/元数据/I/O/POSIX/runtime 回归。
 阶段结论：性能回归门槛满足，MySQL/MariaDB-compatible server 与 RocksDB 的单进程持久化
 兼容路径可以标记为 supported；多个 HFS 进程同时挂载同一后端、mmap、native libaio 和
 io_uring 仍明确不支持。
+
+## shard-39 可观测性与公平 scaling smoke（2026-09-06）
+
+脚本：`scripts/db/hfs_scaling_benchmark.sh`。VM 为 Ubuntu 6.8.0-138-generic、8 vCPU、
+fio 3.42-139-gae35；HFS 使用 `build/cmake-release/libhfs.so`、Malloc bdev、LD_PRELOAD
+同步 `psync`，raw 使用 VM 内 `/root/code/spdk/build/fio/spdk_bdev`。SPDK 固定为
+`f0b63ed866f0e4d3c56e73bd4a98d0042956147a`，HFS 与 raw 均为独立进程，raw QD=1 与 HFS
+有效 QD=1 对齐。为快速验收，本轮采用 16 MiB、5 s、HFS 线程 1、raw QD 1、metadata count 1；
+脚本默认值仍覆盖线程 1/2/4/8/16、QD 1/4/16/32、metadata 1K/10K/60K。
+
+| engine/workload | bs | threads/QD | IOPS | p50/p99 (ns) | CPU | RSS (KiB) | errors | submit/complete | effective QD |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| HFS randread | 4K | 1 | 62,815 | 14,912/38,144 | 129% | 20,404 | 0 | 318,346/318,346 | 1 |
+| HFS randrw | 4K | 1 | 62,248 | 14,912/40,704; write 14,784/42,240 | 129% | 20,404 | 0 | 315,453/315,453 | 1 |
+| HFS randwrite | 4K | 1 | 62,190 | — | 128% | 20,396 | 0 | 311,090/311,090 | 1 |
+| HFS seqread | 128K | 1 | 40,600 | 22,400/67,072 | 131% | 20,788 | 0 | 203,281/203,281 | 1 |
+| HFS seqwrite | 128K | 1 | 40,343 | — | 130% | 20,660 | 0 | 201,793/201,793 | 1 |
+| raw read | 4K | QD 1 | 2,939,094 | 9,096/402 | 95% | 20,476 | 0 | — | 1 |
+| raw write | 4K | QD 1 | 2,951,115 | — | 95% | 20,352 | 0 | — | 1 |
+| raw read | 128K | QD 1 | 347,815 | 1,116/322 | 95% | 20,592 | 0 | — | 1 |
+| raw write | 128K | QD 1 | 254,172 | — | 95% | 20,468 | 0 | — | 1 |
+
+Metadata count=1 measured create/stat/readdir/rename/unlink as 0.000740/0.000007/0.000008/
+0.000621/0.000664 s. The stats-off/on pair was 63,446.91/62,540.80 IOPS, or 1.43% measured
+instrumentation overhead. With `HFS_STATS_TIMING=1`, a 2-job 1 s run emitted six per-thread
+shards, runtime queue peak 2, lock wait/hold histograms, and metadata log/image/page bytes;
+default timing remains off to keep the stats-on hot path within the 3% budget.

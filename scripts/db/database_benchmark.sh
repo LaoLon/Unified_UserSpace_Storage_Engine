@@ -15,6 +15,9 @@ EFFECTIVE_CONFIG="$OUT/hfs_db_aio.json"
 NUM="${HFS_BENCH_NUM:-20000}"
 VALUE_SIZE="${HFS_BENCH_VALUE_SIZE:-256}"
 DURATION="${HFS_BENCH_DURATION_SECONDS:-60}"
+CPU_AFFINITY="${HFS_CPU_AFFINITY:-all}"
+BDEV_TYPE="${HFS_BENCH_BDEV_TYPE:-persistent-aio}"
+RAW_REFERENCE="${HFS_BENCH_RAW_REFERENCE:-not-run}"
 
 if [[ ! -f "$HFS_LIB" || ! -f "$CONFIG" ]]; then
 	echo "usage: $0 [libhfs.so] [mount prefix] [config] [image] [output dir]" >&2
@@ -52,6 +55,13 @@ HFS_RECREATE=1 bash "$ROOT/scripts/db/prepare_hfs_db_bdev.sh" "$IMAGE" 1G
 	echo "num=$NUM"
 	echo "value_size=$VALUE_SIZE"
 	echo "duration_seconds=$DURATION"
+	echo "cpu_affinity=$CPU_AFFINITY"
+	echo "bdev_type=$BDEV_TYPE"
+	echo "test_scope=hfs-preload"
+	echo "raw_reference=$RAW_REFERENCE"
+	echo "stats_timing=${HFS_STATS_TIMING:-0}"
+	echo "git_commit=$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
+	echo "spdk_commit=$(git -C "$ROOT/spdk" rev-parse HEAD 2>/dev/null || echo unknown)"
 	echo "latency_metric=rocksdb.db.write.micros (microseconds)"
 	echo "db=$DBDIR"
 	echo "image=$IMAGE"
@@ -72,12 +82,25 @@ run_bench() {
 		format=1
 	fi
 	set +e
-	/usr/bin/time -f 'elapsed_seconds=%e\nuser_seconds=%U\nsys_seconds=%S\ncpu_percent=%P\nmax_rss_kb=%M' \
-		-o "$timeLog" timeout --signal=TERM --kill-after=5s 180s \
-		env LD_PRELOAD="$HFS_LIB" HFS_CONFIG_PATH="$EFFECTIVE_CONFIG" \
-		HFS_BDEV_NAME=Aio0 HFS_LOCK_PATH="$LOCK_PATH" HFS_FORMAT="$format" \
-		HFS_LOG_LEVEL=error HFS_STATS_PATH="$stats" HFS_AUTO_MKDIRS=/rocks \
-		db_bench "$@" >"$log" 2>&1
+	if [[ "$CPU_AFFINITY" != "all" ]]; then
+		if ! command -v taskset >/dev/null 2>&1; then
+			echo "ERROR: HFS_CPU_AFFINITY requires taskset" >&2
+			return 2
+		fi
+		/usr/bin/time -f 'elapsed_seconds=%e\nuser_seconds=%U\nsys_seconds=%S\ncpu_percent=%P\nmax_rss_kb=%M' \
+			-o "$timeLog" timeout --signal=TERM --kill-after=5s 180s \
+			env LD_PRELOAD="$HFS_LIB" HFS_CONFIG_PATH="$EFFECTIVE_CONFIG" \
+			HFS_BDEV_NAME=Aio0 HFS_LOCK_PATH="$LOCK_PATH" HFS_FORMAT="$format" \
+			HFS_LOG_LEVEL=error HFS_STATS_PATH="$stats" HFS_AUTO_MKDIRS=/rocks \
+			taskset -c "$CPU_AFFINITY" db_bench "$@" >"$log" 2>&1
+	else
+		/usr/bin/time -f 'elapsed_seconds=%e\nuser_seconds=%U\nsys_seconds=%S\ncpu_percent=%P\nmax_rss_kb=%M' \
+			-o "$timeLog" timeout --signal=TERM --kill-after=5s 180s \
+			env LD_PRELOAD="$HFS_LIB" HFS_CONFIG_PATH="$EFFECTIVE_CONFIG" \
+			HFS_BDEV_NAME=Aio0 HFS_LOCK_PATH="$LOCK_PATH" HFS_FORMAT="$format" \
+			HFS_LOG_LEVEL=error HFS_STATS_PATH="$stats" HFS_AUTO_MKDIRS=/rocks \
+			db_bench "$@" >"$log" 2>&1
+	fi
 	rc=$?
 	set -e
 	if [[ "$rc" -ne 0 ]]; then
@@ -152,6 +175,7 @@ def parse_case(name):
     ))
     timing = read_key_value(out / (name + ".time"))
     stats = read_key_value(out / (name + ".stats"))
+    runtime_qd = int(stats.get("runtime_queue_depth_peak", "0"))
     return {
         "case": name,
         "ops_per_sec": float(ops[-1]) if ops else None,
@@ -163,6 +187,24 @@ def parse_case(name):
         "cpu_percent": timing.get("cpu_percent", "n/a"),
         "max_rss_kb": int(timing.get("max_rss_kb", "0")),
         "errors": errors + int(stats.get("errors", "0")),
+        "runtime_queue_depth_peak": int(stats.get("runtime_queue_depth_peak", "0")),
+        "runtime_queue_wait_ns": int(stats.get("runtime_queue_wait_ns", "0")),
+        "runtime_owner_ns": int(stats.get("runtime_owner_ns", "0")),
+        "spdk_submit": int(stats.get("spdk_submit", "0")),
+        "spdk_complete": int(stats.get("spdk_complete", "0")),
+        "spdk_reject": int(stats.get("spdk_reject", "0")),
+        "effective_qd": runtime_qd if runtime_qd else 1,
+        "io_read_bytes": int(stats.get("io_read_bytes", "0")),
+        "io_write_bytes": int(stats.get("io_write_bytes", "0")),
+        "io_rmw_ops": int(stats.get("io_rmw_ops", "0")),
+        "io_copy_bytes": int(stats.get("io_copy_bytes", "0")),
+        "metadata_image_bytes": int(stats.get("metadata_image_bytes", "0")),
+        "metadata_page_bytes": int(stats.get("metadata_page_bytes", "0")),
+        "metadata_batch_max": int(stats.get("metadata_batch_max", "0")),
+        "flush_count": int(stats.get("flush_count", "0")),
+        "lock_fd_contention": int(stats.get("lock_fd_contention", "0")),
+        "lock_meta_contention": int(stats.get("lock_meta_contention", "0")),
+        "dma_active_peak": int(stats.get("dma_active_peak_shard", "0")),
         "stats": stats,
     }
 
@@ -174,6 +216,11 @@ if any(row["ops_per_sec"] is None or row["ops_per_sec"] <= 0 for row in rows):
 columns = [
     "case", "ops_per_sec", "p50_us", "p99_us", "elapsed_seconds", "user_seconds",
     "sys_seconds", "cpu_percent", "max_rss_kb", "errors",
+    "runtime_queue_depth_peak", "runtime_queue_wait_ns", "runtime_owner_ns",
+    "spdk_submit", "spdk_complete", "spdk_reject", "effective_qd",
+    "io_read_bytes", "io_write_bytes", "io_rmw_ops", "io_copy_bytes",
+    "metadata_image_bytes", "metadata_page_bytes", "metadata_batch_max",
+    "flush_count", "lock_fd_contention", "lock_meta_contention", "dma_active_peak",
 ]
 with (out / "summary.tsv").open("w", encoding="utf-8") as stream:
     stream.write("\t".join(columns) + "\n")

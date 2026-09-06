@@ -38,6 +38,15 @@ struct hfs_io_pool {
 	bool closing;
 };
 
+/* Release the filesystem I/O lock and close its timing sample. */
+static int hfsIoRwlockUnlock(pthread_rwlock_t *lock) {
+	hfsStatsLockReleaseFast(HFS_STATS_LOCK_IO);
+	return pthread_rwlock_unlock(lock);
+}
+
+/* Keep every data-path rwlock release paired with the timing sample above. */
+#define pthread_rwlock_unlock(lock) hfsIoRwlockUnlock(lock)
+
 /* Operation submitted by one request-local SPDK transfer context. */
 typedef enum HfsIoOperation {
 	HFS_IO_READ,
@@ -83,11 +92,13 @@ static uint64_t hfsIoMaxUnits(const Hfs *fs) {
 /* Acquire one bounded DMA buffer, waiting until a request returns one. */
 static int hfsIoAcquire(Hfs *fs, HfsIoLease *lease) {
 	struct hfs_io_pool *pool = fs->ioPool;
+	bool waited = false;
 
 	HFS_STATS_DMA_ACQUIRE();
 	memset(lease, 0, sizeof(*lease));
 	pthread_mutex_lock(&pool->lock);
 	if (pool->freeTop == 0 && !pool->closing) {
+		waited = true;
 		HFS_STATS_DMA_WAIT();
 	}
 	while (pool->freeTop == 0 && !pool->closing) {
@@ -104,6 +115,7 @@ static int hfsIoAcquire(Hfs *fs, HfsIoLease *lease) {
 		(size_t)lease->slot * pool->bufferBytes;
 	pool->active++;
 	HFS_STATS_DMA_ACTIVE(pool->active);
+	hfsStatsRecordDmaFast(pool->bufferBytes, waited, pool->active);
 	pthread_mutex_unlock(&pool->lock);
 	return 0;
 }
@@ -321,7 +333,9 @@ static int hfsIoModifyPartial(HfsFile *file, uint64_t unitOffset,
 	}
 	rc = hfsIoReadUnit(file, &lease, unitOffset);
 	if (rc == 0) {
+		hfsStatsRecordRmwFast(file->fs->unitSize);
 		memcpy(lease.buffer + unitIndex, source, length);
+		hfsStatsRecordCopyFast(length);
 		rc = hfsIoWriteUnit(file, &lease, unitOffset);
 	}
 	hfsIoRelease(&lease);
@@ -381,6 +395,7 @@ static ssize_t hfsIoReadAtLocked(HfsFile *file, uint8_t *buffer,
 			return -1;
 		}
 		memcpy(buffer, lease.buffer + unitIndex, take);
+		hfsStatsRecordCopyFast(take);
 		hfsIoRelease(&lease);
 		cursor += take;
 		buffer += take;
@@ -406,6 +421,7 @@ static ssize_t hfsIoReadAtLocked(HfsFile *file, uint8_t *buffer,
 		}
 		memcpy(buffer, lease.buffer,
 		       (size_t)(chunkUnits * unitSize));
+		hfsStatsRecordCopyFast(chunkUnits * unitSize);
 		hfsIoRelease(&lease);
 		cursor += chunkUnits * unitSize;
 		buffer += (size_t)(chunkUnits * unitSize);
@@ -424,6 +440,7 @@ static ssize_t hfsIoReadAtLocked(HfsFile *file, uint8_t *buffer,
 			return -1;
 		}
 		memcpy(buffer, lease.buffer, remaining);
+		hfsStatsRecordCopyFast(remaining);
 		hfsIoRelease(&lease);
 		done += remaining;
 	}
@@ -470,6 +487,7 @@ static ssize_t hfsIoWriteAtLocked(HfsFile *file, const uint8_t *buffer,
 			return -1;
 		}
 		memcpy(lease.buffer, buffer, (size_t)(chunkUnits * unitSize));
+		hfsStatsRecordCopyFast(chunkUnits * unitSize);
 		if (hfsIoSubmit(file, lease.buffer, cursor / unitSize, chunkUnits,
 				HFS_IO_WRITE) != 0) {
 			hfsIoRelease(&lease);
@@ -493,6 +511,7 @@ static ssize_t hfsIoWriteAtLocked(HfsFile *file, const uint8_t *buffer,
 ssize_t hfsIoReadAt(HfsFile *file, uint8_t *buffer, size_t count,
 		    uint64_t offset) {
 	ssize_t result;
+	bool aligned;
 
 	if (count == 0) {
 		return 0;
@@ -507,6 +526,10 @@ ssize_t hfsIoReadAt(HfsFile *file, uint8_t *buffer, size_t count,
 		errno = EOVERFLOW;
 		return -1;
 	}
+	aligned = (offset % file->fs->unitSize) == 0 &&
+		(count % (size_t)file->fs->unitSize) == 0;
+	hfsStatsRecordIoFast(false, count, aligned);
+	hfsStatsLockBeforeFast(HFS_STATS_LOCK_IO);
 	pthread_rwlock_rdlock(&file->fs->ioLock);
 	result = hfsIoReadAtLocked(file, buffer, count, offset);
 	pthread_rwlock_unlock(&file->fs->ioLock);
@@ -534,9 +557,12 @@ ssize_t hfsIoWriteAt(HfsFile *file, const uint8_t *buffer, size_t count,
 	}
 	aligned = (offset % file->fs->unitSize) == 0 &&
 		(count % (size_t)file->fs->unitSize) == 0;
+	hfsStatsRecordIoFast(true, count, aligned);
 	if (aligned) {
+		hfsStatsLockBeforeFast(HFS_STATS_LOCK_IO);
 		pthread_rwlock_rdlock(&file->fs->ioLock);
 	} else {
+		hfsStatsLockBeforeFast(HFS_STATS_LOCK_IO);
 		pthread_rwlock_wrlock(&file->fs->ioLock);
 	}
 	result = hfsIoWriteAtLocked(file, buffer, count, offset);
@@ -555,6 +581,7 @@ static int hfsIoZeroPartial(HfsFile *file, uint64_t unitOffset,
 	}
 	rc = hfsIoReadUnit(file, &lease, unitOffset);
 	if (rc == 0) {
+		hfsStatsRecordRmwFast(file->fs->unitSize);
 		memset(lease.buffer + unitIndex, 0, length);
 		rc = hfsIoWriteUnit(file, &lease, unitOffset);
 	}
@@ -601,6 +628,7 @@ int hfsIoZeroRange(HfsFile *file, uint64_t offset, uint64_t length) {
 	}
 	unitSize = file->fs->unitSize;
 	end = offset + length;
+	hfsStatsLockBeforeFast(HFS_STATS_LOCK_IO);
 	pthread_rwlock_wrlock(&file->fs->ioLock);
 	cursor = offset;
 	if (cursor % unitSize != 0) {

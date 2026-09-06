@@ -3,6 +3,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <stdatomic.h>
+#include <stdlib.h>
 #include <sys/syscall.h>
 #include <linux/futex.h>
 #include <time.h>
@@ -35,6 +36,8 @@ struct hfs_runtime_state {
 	bool subsystemsReady;
 	int initRc;
 	_Atomic pid_t ownerPid;
+	_Atomic uint64_t queued;
+	_Atomic uint64_t inflight;
 };
 
 static struct hfs_runtime_state g_runtime = {
@@ -42,6 +45,33 @@ static struct hfs_runtime_state g_runtime = {
 	.stateChanged = PTHREAD_COND_INITIALIZER,
 };
 static _Atomic bool g_ownerViolationLogged;
+
+/* Instrument the runtime state mutex while keeping the fast path lock-free in stats-off mode. */
+static int hfsRuntimeMutexLock(pthread_mutex_t *lock) {
+	int rc;
+
+	hfsStatsLockBeforeFast(HFS_STATS_LOCK_RUNTIME);
+	rc = pthread_mutex_lock(lock);
+	hfsStatsLockAfterFast(HFS_STATS_LOCK_RUNTIME);
+	return rc;
+}
+
+/* Release the runtime state mutex and account for its hold duration. */
+static int hfsRuntimeMutexUnlock(pthread_mutex_t *lock) {
+	hfsStatsLockReleaseFast(HFS_STATS_LOCK_RUNTIME);
+	return pthread_mutex_unlock(lock);
+}
+
+/* Keep every runtime state mutex operation paired with its timing sample. */
+#define pthread_mutex_lock(lock) hfsRuntimeMutexLock(lock)
+#define pthread_mutex_unlock(lock) hfsRuntimeMutexUnlock(lock)
+
+/* Optional wrapper retained only while statistics are enabled. */
+typedef struct HfsRuntimeMessage {
+	spdk_msg_fn fn;
+	void *ctx;
+	uint64_t enqueueNs;
+} HfsRuntimeMessage;
 
 /* SPDK thread that receives every HFS operation message. */
 struct spdk_thread *globalThread;
@@ -98,6 +128,27 @@ static void hfsRuntimeStopMessage(void *arg) {
 	} else {
 		spdk_thread_exit(runtime->spdkThread);
 	}
+}
+
+/* Dispatch a statistics-wrapped message on the SPDK owner thread. */
+static void hfsRuntimeDispatchMessage(void *arg) {
+	HfsRuntimeMessage *message = arg;
+	uint64_t queueWaitNs;
+	uint64_t ownerStartNs;
+	uint64_t ownerNs;
+	uint64_t depth;
+
+	depth = atomic_fetch_sub_explicit(&g_runtime.queued, 1,
+		memory_order_relaxed) - 1U;
+	atomic_fetch_add_explicit(&g_runtime.inflight, 1, memory_order_relaxed);
+	queueWaitNs = hfsStatsNowNs() - message->enqueueNs;
+	ownerStartNs = hfsStatsNowNs();
+	message->fn(message->ctx);
+	ownerNs = hfsStatsNowNs() - ownerStartNs;
+	depth = atomic_fetch_sub_explicit(&g_runtime.inflight, 1,
+		memory_order_relaxed);
+	hfsStatsRecordRuntimeDispatchFast(queueWaitNs, ownerNs, depth);
+	free(message);
 }
 
 /* Publish owner initialization state to hfsRuntimeStart. */
@@ -238,12 +289,24 @@ int hfsRuntimeStart(void) {
 
 /* Submit a message while preventing a concurrent runtime stop race. */
 int hfsRuntimeSubmit(spdk_msg_fn fn, void *ctx) {
+	HfsRuntimeMessage *message = NULL;
+	uint64_t queueDepth;
 	int rc = 0;
 
 	/* A fork child must never enqueue a pointer into the parent's SPDK queue. */
 	if (hfsRuntimeIsForkChild()) {
 		HFS_STATS_SPDK_REJECT();
 		return -ECHILD;
+	}
+	if (hfsStatsTimingFastEnabled()) {
+		message = calloc(1, sizeof(*message));
+		if (message == NULL) {
+			HFS_STATS_ERROR();
+			return -ENOMEM;
+		}
+		message->fn = fn;
+		message->ctx = ctx;
+		message->enqueueNs = hfsStatsNowNs();
 	}
 	pthread_mutex_lock(&g_runtime.lock);
 	if (hfsRuntimeIsForkChild()) {
@@ -252,12 +315,22 @@ int hfsRuntimeSubmit(spdk_msg_fn fn, void *ctx) {
 		rc = -ESHUTDOWN;
 	} else {
 		HFS_STATS_SPDK_SUBMIT();
-		spdk_thread_send_msg(g_runtime.spdkThread, fn, ctx);
+		if (message != NULL) {
+			queueDepth = atomic_fetch_add_explicit(&g_runtime.queued, 1,
+				memory_order_relaxed) + 1U;
+			hfsStatsRecordRuntimeSubmitFast(queueDepth);
+			spdk_thread_send_msg(g_runtime.spdkThread,
+				hfsRuntimeDispatchMessage, message);
+			message = NULL;
+		} else {
+			spdk_thread_send_msg(g_runtime.spdkThread, fn, ctx);
+		}
 	}
 	if (rc != 0) {
 		HFS_STATS_SPDK_REJECT();
 	}
 	pthread_mutex_unlock(&g_runtime.lock);
+	free(message);
 	return rc;
 }
 
