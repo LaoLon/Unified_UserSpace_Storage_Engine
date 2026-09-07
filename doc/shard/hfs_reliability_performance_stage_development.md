@@ -1,6 +1,6 @@
 # HFS 可靠性与性能优化阶段计划（shard-36 起）
 
-> 状态：shard-36～42 核心实现已完成，正确性闸门 A 已通过；shard-43 已先落地可移植 v5 页/WAL 格式基础和离线恢复校验，shard-44 已加入 v4 脏范围 checkpoint 与受限 group commit 基础，shard-45 已完成 async libhfs executor 及公开 aligned positioned direct child path，shard-46 已完成可选多 data reactor/channel 基础与跨 reactor 完成顺序修复，shard-47 第一阶段已完成分级 DMA pool、DMA-capable direct path 和 native vector 尝试；运行时仍使用 v4，v5 迁移、设备 WAL 提交和 SPDK 原生 libaio/io_uring ABI 仍待后续阶段<br>
+> 状态：shard-36～42 核心实现已完成，正确性闸门 A 已通过；shard-43 已先落地可移植 v5 页/WAL 格式基础和离线恢复校验，shard-44 已加入 v4 脏范围 checkpoint 与受限 group commit 基础，shard-45 已完成 async libhfs executor 及公开 aligned positioned direct child path，shard-46 已完成可选多 data reactor/channel 基础与跨 reactor 完成顺序修复，shard-47 第一阶段已完成分级 DMA pool、DMA-capable direct path 和 native vector 尝试，后续又将 async batch 规划从 O(n²) 降为 O(n)；shard-48 已开始收口，新增三轮数据库 benchmark 汇总和单进程加速库产品决策；运行时仍使用 v4，v5 迁移、设备 WAL 提交和 SPDK 原生 libaio/io_uring ABI 仍待后续阶段<br>
 > 制定日期：2026-09-05  
 > 适用基线：`main@91db26a`（shard-36 已完成）
 > 输入文档：`review/hfs_architecture_performance_review_2026-09-05.md`  
@@ -750,6 +750,8 @@ mount 上的其他 dirty inode 合并为一个受 v4 intent 四槽位约束的 d
 
 ## 17. shard-48：数据库、真实 NVMe 与阶段收口
 
+> 状态：收口工作已开始（2026-09-07）。新增 `scripts/db/stage48_matrix.sh`，对现有数据库 benchmark 做多轮原始结果留存、错误/submit-complete 校验和中位数汇总；新增 `doc/design/hfs_product_architecture_decision.md`，当前选择单进程数据库加速库方向。真实 NVMe 矩阵与最终阶段结论仍待完成。
+
 ### 目标
 
 在 Malloc、持久化 AIO 和真实 NVMe 上完成全量回归，确认优化收益不依赖模拟后端，并明确下一阶段产品形态。
@@ -769,6 +771,10 @@ mount 上的其他 dirty inode 合并为一个受 v4 intent 四槽位约束的 d
   - 4 KiB random、128 KiB sequential、metadata 1K/10K/60K。
   - 吞吐、p50/p99/p99.9、CPU、RSS、锁等待、queue depth、copy/RMW、metadata bytes、flush、错误。
 - 正式结果至少连续 3 轮，记录中位数和离散度，不只保留最好一轮。
+
+`scripts/db/stage48_matrix.sh` 会保留每轮的 `summary.tsv`、原始数据库日志和环境信息，生成
+`runs.tsv` 与 `summary.tsv/summary.json`；脚本拒绝 errors、SPDK submit/complete 不闭合或
+非正吞吐的轮次，避免把不完整结果纳入中位数。
 
 ### 产品决策输出
 

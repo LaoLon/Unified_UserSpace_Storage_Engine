@@ -116,6 +116,10 @@ throughput, write latency p50/p99, CPU time, RSS, HFS lock/I/O counters, and err
 counters are enabled only when `HFS_STATS_PATH` (or `HFS_STATS=1`) is set; the default runtime path
 keeps them disabled.
 
+For a repeatable three-round stage result with raw logs and median aggregation, use
+`scripts/db/stage48_matrix.sh`. It validates zero errors and matching SPDK submit/complete counts
+before including a round in the summary.
+
 Known limitations:
 
 - External shell commands (`mkdir`, `cat`, `dd`, ...) run in fork+exec children that
