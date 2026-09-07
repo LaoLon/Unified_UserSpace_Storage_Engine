@@ -833,88 +833,79 @@ static int hfsIoAsyncStartBatch(HfsIoAsyncParent *parent) {
 	pthread_mutex_unlock(&parent->lock);
 
 	/* Reserve the complete batch before submitting the first child. */
-	for (i = 0; i < count; i++) {
+	{
 		uint64_t relativeUnit = batchStart;
-		uint64_t prior = 0;
-		uint64_t units;
-		size_t bytes;
 
-		while (prior < i) {
-			units = parent->totalUnits - (batchStart + prior);
+		for (i = 0; i < count; i++) {
+			uint64_t units;
+			size_t bytes;
+
+			units = parent->totalUnits - relativeUnit;
 			if (units > maxUnits) {
 				units = maxUnits;
 			}
+			bytes = (size_t)(units * parent->file->fs->unitSize);
+			if (hfsIoTryAcquire(parent->file->fs, &parent->leases[i], bytes) != 0) {
+				savedErrno = errno != 0 ? errno : EAGAIN;
+				hfsIoReleasePipeline(parent->leases, i);
+				pthread_mutex_lock(&parent->lock);
+				parent->nextUnit = batchStart;
+				parent->launching = false;
+				pthread_mutex_unlock(&parent->lock);
+				errno = savedErrno;
+				return -1;
+			}
 			relativeUnit += units;
-			prior++;
-		}
-		units = parent->totalUnits - relativeUnit;
-		if (units > maxUnits) {
-			units = maxUnits;
-		}
-		bytes = (size_t)(units * parent->file->fs->unitSize);
-		if (hfsIoTryAcquire(parent->file->fs, &parent->leases[i], bytes) != 0) {
-			savedErrno = errno != 0 ? errno : EAGAIN;
-			hfsIoReleasePipeline(parent->leases, i);
-			pthread_mutex_lock(&parent->lock);
-			parent->nextUnit = batchStart;
-			parent->launching = false;
-			pthread_mutex_unlock(&parent->lock);
-			errno = savedErrno;
-			return -1;
 		}
 	}
 
-	for (i = 0; i < count; i++) {
+	/* Reuse the same linear cursor while assigning each child range. */
+	{
 		uint64_t relativeUnit = batchStart;
-		uint64_t prior = 0;
-		uint64_t units;
-		size_t bytes;
 
-		while (prior < i) {
-			units = parent->totalUnits - (batchStart + prior);
+		for (i = 0; i < count; i++) {
+			uint64_t units;
+			size_t bytes;
+
+			units = parent->totalUnits - relativeUnit;
 			if (units > maxUnits) {
 				units = maxUnits;
 			}
-			relativeUnit += units;
-			prior++;
-		}
-		units = parent->totalUnits - relativeUnit;
-		if (units > maxUnits) {
-			units = maxUnits;
-		}
-		bytes = (size_t)(units * parent->file->fs->unitSize);
-		memset(&parent->requests[i], 0, sizeof(parent->requests[i]));
-		parent->requests[i].file = parent->file;
-		parent->requests[i].buffer = parent->leases[i].buffer;
-		parent->requests[i].offset = parent->offset /
-			parent->file->fs->unitSize + relativeUnit;
-		parent->requests[i].units = units;
-		parent->requests[i].operation = parent->write ? HFS_IO_WRITE : HFS_IO_READ;
-		parent->requests[i].channel = parent->channel;
-		parent->requests[i].dataReactor = parent->dataReactor;
-		parent->requests[i].dataPath = true;
-		parent->requests[i].asyncMagic = HFS_IO_ASYNC_MAGIC;
-		parent->requests[i].asyncDone = hfsIoAsyncChildDone;
-		parent->requests[i].asyncContext = parent;
-		parent->requests[i].asyncIndex = i;
-		if (parent->write) {
-			memcpy(parent->leases[i].buffer,
-			       parent->writeBuffer + (size_t)(relativeUnit *
-					parent->file->fs->unitSize), bytes);
-			hfsStatsRecordCopyFast(bytes);
-		}
-		pthread_mutex_lock(&parent->lock);
-		parent->pending++;
-		pthread_mutex_unlock(&parent->lock);
-		if (hfsIoStartRequest(&parent->requests[i]) != 0) {
-			savedErrno = errno != 0 ? errno : EIO;
-			hfsIoRelease(&parent->leases[i]);
-			pthread_mutex_lock(&parent->lock);
-			parent->pending--;
-			if (parent->firstError == 0) {
-				parent->firstError = savedErrno;
+			bytes = (size_t)(units * parent->file->fs->unitSize);
+			memset(&parent->requests[i], 0, sizeof(parent->requests[i]));
+			parent->requests[i].file = parent->file;
+			parent->requests[i].buffer = parent->leases[i].buffer;
+			parent->requests[i].offset = parent->offset /
+				parent->file->fs->unitSize + relativeUnit;
+			parent->requests[i].units = units;
+			parent->requests[i].operation = parent->write ? HFS_IO_WRITE : HFS_IO_READ;
+			parent->requests[i].channel = parent->channel;
+			parent->requests[i].dataReactor = parent->dataReactor;
+			parent->requests[i].dataPath = true;
+			parent->requests[i].asyncMagic = HFS_IO_ASYNC_MAGIC;
+			parent->requests[i].asyncDone = hfsIoAsyncChildDone;
+			parent->requests[i].asyncContext = parent;
+			parent->requests[i].asyncIndex = i;
+			if (parent->write) {
+				memcpy(parent->leases[i].buffer,
+				       parent->writeBuffer + (size_t)(relativeUnit *
+						parent->file->fs->unitSize), bytes);
+				hfsStatsRecordCopyFast(bytes);
 			}
+			pthread_mutex_lock(&parent->lock);
+			parent->pending++;
 			pthread_mutex_unlock(&parent->lock);
+			if (hfsIoStartRequest(&parent->requests[i]) != 0) {
+				savedErrno = errno != 0 ? errno : EIO;
+				hfsIoRelease(&parent->leases[i]);
+				pthread_mutex_lock(&parent->lock);
+				parent->pending--;
+				if (parent->firstError == 0) {
+					parent->firstError = savedErrno;
+				}
+				pthread_mutex_unlock(&parent->lock);
+			}
+			relativeUnit += units;
 		}
 	}
 	hfsStatsRecordIoPipelineFast(count);
