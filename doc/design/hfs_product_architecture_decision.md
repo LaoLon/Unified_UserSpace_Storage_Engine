@@ -52,3 +52,7 @@ daemon 方案需要一次性定义跨进程协议，而当前收益主要来自�
 下一阶段应先完成真实 NVMe 上的 QD/线程/reactor 矩阵，并将 raw SPDK、sync preload 和
 async libhfs 分开报告。若业务明确要求多进程共享挂载，再另开 daemon 阶段，先冻结 IPC、
 权限、故障恢复和元数据一致性协议，不能把 daemon 作为当前 shard-48 的隐式扩展。
+
+当前 VM 可见一块未挂载的 VMware NVMe 设备（约 30 GiB），但它是原始块设备，尚未被指定为
+可擦除的 HFS 测试盘。本阶段不对该设备执行 format、写入或 fio，以免破坏宿主数据；真实 NVMe
+结论需要用户明确提供可覆盖设备后再纳入验收。

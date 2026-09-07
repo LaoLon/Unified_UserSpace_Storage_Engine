@@ -750,7 +750,7 @@ mount 上的其他 dirty inode 合并为一个受 v4 intent 四槽位约束的 d
 
 ## 17. shard-48：数据库、真实 NVMe 与阶段收口
 
-> 状态：收口工作已开始（2026-09-07）。新增 `scripts/db/stage48_matrix.sh`，对现有数据库 benchmark 做多轮原始结果留存、错误/submit-complete 校验和中位数汇总；新增 `doc/design/hfs_product_architecture_decision.md`，当前选择单进程数据库加速库方向。真实 NVMe 矩阵与最终阶段结论仍待完成。
+> 状态：收口工作已开始（2026-09-07）。新增 `scripts/db/stage48_matrix.sh`，对现有数据库 benchmark 做多轮原始结果留存、错误/submit-complete 校验和中位数汇总；新增 `doc/design/hfs_product_architecture_decision.md`，当前选择单进程数据库加速库方向。VM 虽可见未挂载 NVMe，但尚未授权为可擦除测试盘，因此真实 NVMe 矩阵与最终阶段结论仍待完成。
 
 ### 目标
 
