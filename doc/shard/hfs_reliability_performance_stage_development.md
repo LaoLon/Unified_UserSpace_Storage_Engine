@@ -773,8 +773,8 @@ mount 上的其他 dirty inode 合并为一个受 v4 intent 四槽位约束的 d
 - 正式结果至少连续 3 轮，记录中位数和离散度，不只保留最好一轮。
 
 `scripts/db/stage48_matrix.sh` 会保留每轮的 `summary.tsv`、原始数据库日志和环境信息，生成
-`runs.tsv` 与 `summary.tsv/summary.json`；脚本拒绝 errors、SPDK submit/complete 不闭合或
-非正吞吐的轮次，避免把不完整结果纳入中位数。
+`runs.tsv` 与 `summary.tsv/summary.json`；汇总同时记录 median、min、max 和总体标准差，脚本
+拒绝 errors、SPDK submit/complete 不闭合或非正吞吐的轮次，避免把不完整结果纳入统计。
 
 ### 产品决策输出
 

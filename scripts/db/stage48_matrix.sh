@@ -114,25 +114,36 @@ for row in rows:
             f"errors={errors} rejects={rejects} submit={submits} complete={completes}"
         )
 
-def metric(rows_for_case, key):
+def metric_values(rows_for_case, key):
     values = [as_float(row, key) for row in rows_for_case]
-    values = [value for value in values if value is not None]
-    return statistics.median(values) if values else None
+    return [value for value in values if value is not None]
+
+
+def metric_summary(rows_for_case, key):
+    values = metric_values(rows_for_case, key)
+    if not values:
+        return {
+            f"{key}_median": None,
+            f"{key}_min": None,
+            f"{key}_max": None,
+            f"{key}_stdev": None,
+        }
+    return {
+        f"{key}_median": statistics.median(values),
+        f"{key}_min": min(values),
+        f"{key}_max": max(values),
+        f"{key}_stdev": statistics.pstdev(values),
+    }
 
 summary = []
 for case in sorted(required_cases):
     case_rows = [row for row in rows if row["case"] == case]
-    item = {
-        "case": case,
-        "rounds": len(case_rows),
-        "ops_per_sec_median": metric(case_rows, "ops_per_sec"),
-        "p50_us_median": metric(case_rows, "p50_us"),
-        "p99_us_median": metric(case_rows, "p99_us"),
-        "elapsed_seconds_median": metric(case_rows, "elapsed_seconds"),
-        "cpu_percent_median": metric(case_rows, "cpu_percent"),
-        "max_rss_kb_median": metric(case_rows, "max_rss_kb"),
-        "effective_qd_median": metric(case_rows, "effective_qd"),
-    }
+    item = {"case": case, "rounds": len(case_rows)}
+    for key in (
+        "ops_per_sec", "p50_us", "p99_us", "elapsed_seconds",
+        "cpu_percent", "max_rss_kb", "effective_qd",
+    ):
+        item.update(metric_summary(case_rows, key))
     summary.append(item)
 
 raw_columns = ["round"] + [key for key in rows[0] if key != "round"]
@@ -148,12 +159,13 @@ with (out / "summary.tsv").open("w", newline="", encoding="utf-8") as stream:
     writer.writerows(summary)
 (out / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
 
-print("case\trounds\tops/sec median\tp50_us median\tp99_us median\tRSS KiB median")
+print("case\trounds\tops/sec median\tops/sec min\tops/sec max\tops/sec stdev\tp99_us median\tp99_us stdev\tRSS KiB median")
 for item in summary:
-    print("%s\t%s\t%s\t%s\t%s\t%s" % (
+    print("%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s" % (
         item["case"], item["rounds"], item["ops_per_sec_median"],
-        item["p50_us_median"], item["p99_us_median"],
-        item["max_rss_kb_median"],
+        item["ops_per_sec_min"], item["ops_per_sec_max"],
+        item["ops_per_sec_stdev"], item["p99_us_median"],
+        item["p99_us_stdev"], item["max_rss_kb_median"],
     ))
 PYEOF
 
