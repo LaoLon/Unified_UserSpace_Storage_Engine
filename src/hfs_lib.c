@@ -479,6 +479,16 @@ static ssize_t hfsReadvAt(HfsOpenFile *openFile, const struct iovec *iov,
 			  uint64_t fileSize) {
 	size_t done = 0;
 	int i;
+	ssize_t direct;
+
+	/* Use SPDK native vector I/O when every segment is DMA-addressable. */
+	if (offset % openFile->file->fs->unitSize == 0 && offset <= fileSize &&
+	    (uint64_t)total <= fileSize - offset) {
+		direct = hfsIoReadvAt(openFile->file, iov, iovcnt, total, offset);
+		if (direct >= 0 || errno != EAGAIN) {
+			return direct;
+		}
+	}
 
 	for (i = 0; i < iovcnt && done < total; i++) {
 		size_t want = iov[i].iov_len;
@@ -511,6 +521,15 @@ static ssize_t hfsWritevAt(HfsOpenFile *openFile, const struct iovec *iov,
 			   int iovcnt, size_t total, uint64_t offset) {
 	size_t done = 0;
 	int i;
+	ssize_t direct;
+
+	/* Use SPDK native vector I/O before falling back to per-segment copies. */
+	if (offset % openFile->file->fs->unitSize == 0) {
+		direct = hfsIoWritevAt(openFile->file, iov, iovcnt, total, offset);
+		if (direct >= 0 || errno != EAGAIN) {
+			return direct;
+		}
+	}
 
 	for (i = 0; i < iovcnt && done < total; i++) {
 		size_t want = iov[i].iov_len;

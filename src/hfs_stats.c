@@ -19,6 +19,7 @@
 #define HFS_STATS_HIST_BUCKETS 16U
 #define HFS_STATS_IO_SIZE_BUCKETS 16U
 #define HFS_STATS_DMA_SIZE_CLASSES 8U
+#define HFS_STATS_DMA_POOL_CLASSES 4U
 #define HFS_STATS_MAX_DATA_REACTORS 8U
 #define HFS_STATS_MAX_LOCK_DEPTH 8U
 #define HFS_STATS_SNAPSHOT_BYTES (128U * 1024U)
@@ -74,6 +75,10 @@ typedef struct HfsStatsShard {
 	uint64_t ioRmwBytes;
 	uint64_t ioCopyBytes;
 	uint64_t ioCopyOps;
+	uint64_t ioDirectBytes;
+	uint64_t ioDirectOps;
+	uint64_t ioVectorBytes;
+	uint64_t ioVectorOps;
 	uint64_t ioSizeHist[HFS_STATS_IO_SIZE_BUCKETS];
 	uint64_t metadataLogBytes;
 	uint64_t metadataImageBytes;
@@ -84,6 +89,7 @@ typedef struct HfsStatsShard {
 	uint64_t metadataSyncCount;
 	uint64_t flushCount;
 	uint64_t dmaSizeClass[HFS_STATS_DMA_SIZE_CLASSES];
+	uint64_t dmaPoolClass[HFS_STATS_DMA_POOL_CLASSES];
 	uint64_t dmaWaits;
 	uint64_t dmaActivePeak;
 } HfsStatsShard;
@@ -299,6 +305,26 @@ void hfsStatsRecordIo(bool write, size_t bytes, bool aligned) {
 	shard->ioSizeHist[bucket]++;
 }
 
+/* Record a DMA-capable caller buffer that bypassed the bounce pool. */
+void hfsStatsRecordIoDirect(uint64_t bytes) {
+	HfsStatsShard *shard = hfsStatsShardGet();
+
+	if (shard != NULL) {
+		shard->ioDirectOps++;
+		shard->ioDirectBytes += bytes;
+	}
+}
+
+/* Record one native vector submission and its covered bytes. */
+void hfsStatsRecordIoVector(uint64_t bytes) {
+	HfsStatsShard *shard = hfsStatsShardGet();
+
+	if (shard != NULL) {
+		shard->ioVectorOps++;
+		shard->ioVectorBytes += bytes;
+	}
+}
+
 /* Record user/DMA copies, which are often the hidden cost of the fast path. */
 void hfsStatsRecordCopy(uint64_t bytes) {
 	HfsStatsShard *shard = hfsStatsShardGet();
@@ -459,6 +485,7 @@ void hfsStatsRecordMetadataSync(void) {
 void hfsStatsRecordDma(size_t bytes, bool waited, uint64_t active) {
 	HfsStatsShard *shard = hfsStatsShardGet();
 	unsigned int bucket;
+	unsigned int poolClass;
 
 	if (shard == NULL) {
 		return;
@@ -468,6 +495,16 @@ void hfsStatsRecordDma(size_t bytes, bool waited, uint64_t active) {
 		bucket = HFS_STATS_DMA_SIZE_CLASSES - 1U;
 	}
 	shard->dmaSizeClass[bucket]++;
+	if (bytes <= (4U << 10)) {
+		poolClass = 0;
+	} else if (bytes <= (16U << 10)) {
+		poolClass = 1;
+	} else if (bytes <= (64U << 10)) {
+		poolClass = 2;
+	} else {
+		poolClass = 3;
+	}
+	shard->dmaPoolClass[poolClass]++;
 	if (waited) {
 		shard->dmaWaits++;
 	}
@@ -527,6 +564,10 @@ static void hfsStatsAggregateShard(HfsStatsShard *total,
 	total->ioRmwBytes += shard->ioRmwBytes;
 	total->ioCopyBytes += shard->ioCopyBytes;
 	total->ioCopyOps += shard->ioCopyOps;
+	total->ioDirectBytes += shard->ioDirectBytes;
+	total->ioDirectOps += shard->ioDirectOps;
+	total->ioVectorBytes += shard->ioVectorBytes;
+	total->ioVectorOps += shard->ioVectorOps;
 	for (i = 0; i < HFS_STATS_IO_SIZE_BUCKETS; i++) {
 		total->ioSizeHist[i] += shard->ioSizeHist[i];
 	}
@@ -546,6 +587,9 @@ static void hfsStatsAggregateShard(HfsStatsShard *total,
 	total->dmaWaits += shard->dmaWaits;
 	if (shard->dmaActivePeak > total->dmaActivePeak) {
 		total->dmaActivePeak = shard->dmaActivePeak;
+	}
+	for (i = 0; i < HFS_STATS_DMA_POOL_CLASSES; i++) {
+		total->dmaPoolClass[i] += shard->dmaPoolClass[i];
 	}
 }
 
@@ -665,6 +709,10 @@ static void hfsStatsWriteSnapshot(void) {
 	HFS_STATS_APPEND("io_rmw_bytes=%"PRIu64"\n", total.ioRmwBytes);
 	HFS_STATS_APPEND("io_copy_bytes=%"PRIu64"\n", total.ioCopyBytes);
 	HFS_STATS_APPEND("io_copy_ops=%"PRIu64"\n", total.ioCopyOps);
+	HFS_STATS_APPEND("io_direct_bytes=%"PRIu64"\n", total.ioDirectBytes);
+	HFS_STATS_APPEND("io_direct_ops=%"PRIu64"\n", total.ioDirectOps);
+	HFS_STATS_APPEND("io_vector_bytes=%"PRIu64"\n", total.ioVectorBytes);
+	HFS_STATS_APPEND("io_vector_ops=%"PRIu64"\n", total.ioVectorOps);
 	for (i = 0; i < HFS_STATS_IO_SIZE_BUCKETS; i++) {
 		HFS_STATS_APPEND("io_size_hist_%u=%"PRIu64"\n", i,
 			total.ioSizeHist[i]);
@@ -690,6 +738,10 @@ static void hfsStatsWriteSnapshot(void) {
 	for (i = 0; i < HFS_STATS_DMA_SIZE_CLASSES; i++) {
 		HFS_STATS_APPEND("dma_size_class_%u=%"PRIu64"\n", i,
 			total.dmaSizeClass[i]);
+	}
+	for (i = 0; i < HFS_STATS_DMA_POOL_CLASSES; i++) {
+		HFS_STATS_APPEND("dma_pool_class_%u=%"PRIu64"\n", i,
+			total.dmaPoolClass[i]);
 	}
 #undef HFS_STATS_APPEND
 	if (used > HFS_STATS_SNAPSHOT_BYTES) {

@@ -1,6 +1,6 @@
 # HFS 可靠性与性能优化阶段计划（shard-36 起）
 
-> 状态：shard-36～42 核心实现已完成，正确性闸门 A 已通过；shard-43 已先落地可移植 v5 页/WAL 格式基础和离线恢复校验，shard-44 已加入 v4 脏范围 checkpoint 与受限 group commit 基础，shard-45 已完成 async libhfs executor 及公开 aligned positioned direct child path，shard-46 已完成可选多 data reactor/channel 基础与跨 reactor 完成顺序修复；运行时仍使用 v4，v5 迁移、设备 WAL 提交和 SPDK 原生 libaio/io_uring ABI 仍待后续阶段<br>
+> 状态：shard-36～42 核心实现已完成，正确性闸门 A 已通过；shard-43 已先落地可移植 v5 页/WAL 格式基础和离线恢复校验，shard-44 已加入 v4 脏范围 checkpoint 与受限 group commit 基础，shard-45 已完成 async libhfs executor 及公开 aligned positioned direct child path，shard-46 已完成可选多 data reactor/channel 基础与跨 reactor 完成顺序修复，shard-47 第一阶段已完成分级 DMA pool、DMA-capable direct path 和 native vector 尝试；运行时仍使用 v4，v5 迁移、设备 WAL 提交和 SPDK 原生 libaio/io_uring ABI 仍待后续阶段<br>
 > 制定日期：2026-09-05  
 > 适用基线：`main@91db26a`（shard-36 已完成）
 > 输入文档：`review/hfs_architecture_performance_review_2026-09-05.md`  
@@ -712,6 +712,8 @@ mount 上的其他 dirty inode 合并为一个受 v4 intent 四槽位约束的 d
 
 ## 16. shard-47：DMA、vector I/O、RMW 与空间管理优化
 
+> 状态：第一阶段已完成（2026-09-07）。DMA pool 已按请求大小选择 4 KiB/16 KiB/64 KiB/1 MiB class；对齐且可由 SPDK 地址转换的连续 buffer 走 direct submit，满足同样条件的 vector 尝试一次 native `spdk_blob_io_*v`，否则保留原有 bounce/fallback 路径。hole extent 和 registered-memory API 仍未宣称完成。
+
 ### 目标
 
 降低固定 1 MiB bounce buffer 的内存与 copy 成本，利用 SPDK vector/memory-domain 能力，并避免 punch hole 后重新写零。
@@ -730,14 +732,15 @@ mount 上的其他 dirty inode 合并为一个受 v4 intent 四槽位约束的 d
 ### 测试
 
 - 新增 `scripts/db/data_path_efficiency_test.sh`。
+- 当前实现已覆盖分级 DMA class、连续 DMA buffer direct path 和 native vector 尝试；非 DMA 用户 buffer 会验证兼容 fallback，并导出 `io_direct_*`/`io_vector_*` 计数。
 - 覆盖 4 KiB～4 MiB、aligned/unaligned、single buffer/vector、direct/bounce、punch/read-zero、池耗尽和 backpressure。
 - 导出 copy bytes、RMW bytes、DMA 等待、vector submit、unmap/write-zeroes 和有效 QD。
 
 ### 验收
 
-- 4 KiB workload 不再为每个 inflight 请求长期占用 1 MiB DMA buffer。
-- 合法 aligned vector I/O 不经用户态拼接 buffer；实际 submit 数受硬件 iovec 限制而不是固定逐段同步。
-- aligned direct path 的 copy bytes 接近零；bounce 原因可观测。
+- 4 KiB workload 不再为每个 inflight 请求长期占用 1 MiB DMA buffer；当前 smoke 已验证四个 class 均有命中。
+- 合法 aligned vector I/O 尝试 native submit；非 DMA 用户 buffer 保持兼容 fallback，实际 NVMe vector 收益留待真实硬件矩阵。
+- aligned direct path 的 copy bytes 接近零；`io_direct_*`/`io_vector_*` 和 DMA class 计数可观测。
 - punch 后读取为零，且支持 unmap 的后端不再无条件执行等长写零。
 - 与 shard-39 基线相比，4 KiB CPU/IOP 和 128 KiB 吞吐有量化改善，正确性测试无回退。
 

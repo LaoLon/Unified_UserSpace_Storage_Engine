@@ -1,6 +1,6 @@
 # HFS asynchronous request model
 
-> Status: shard-46 public direct path with optional data reactors (2026-09-07). Large, full-unit aligned positioned I/O
+> Status: shard-47 DMA/vector first phase with optional data reactors (2026-09-07). Large, full-unit aligned positioned I/O
 > binds a public request directly to a bounded SPDK child parent; unsupported shapes retain the
 > bounded executor fallback.
 
@@ -66,3 +66,9 @@ separately from executor queue depth; `async_submit`/`async_complete` include bo
 fallback public requests. Direct mode deliberately returns `EAGAIN` to the wrapper when it would
 need resize or cannot reserve its bounded resources, allowing the compatibility fallback to retain
 the existing metadata and RMW semantics.
+
+The request-local DMA pool now selects a 4 KiB, 16 KiB, 64 KiB, or 1 MiB class from the child
+size, so small requests do not pin a 1 MiB buffer. Synchronous aligned ranges first probe
+`spdk_vtophys` and submit caller memory directly when the full span is DMA-addressable. Vector
+read/write uses the same probe and attempts one native `spdk_blob_io_*v`; ordinary heap buffers
+continue through the existing bounded bounce path.

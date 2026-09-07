@@ -79,6 +79,10 @@ static inline void hfsStatsLockReleaseFast(HfsStatsLockClass lockClass) {
 
 /* Record one public data I/O request and its copy/RMW accounting. */
 void hfsStatsRecordIo(bool write, size_t bytes, bool aligned);
+/* Record a request that used caller-provided DMA memory without a bounce copy. */
+void hfsStatsRecordIoDirect(uint64_t bytes);
+/* Record one native vector submission and its covered bytes. */
+void hfsStatsRecordIoVector(uint64_t bytes);
 /* Record bytes copied between user memory and a DMA buffer. */
 void hfsStatsRecordCopy(uint64_t bytes);
 /* Record one read-modify-write unit and its byte cost. */
@@ -118,6 +122,16 @@ static inline void hfsStatsRecordIoFast(bool write, size_t bytes, bool aligned) 
 static inline void hfsStatsRecordCopyFast(uint64_t bytes) {
 	if (hfsStatsEnabledFast()) {
 		hfsStatsRecordCopy(bytes);
+	}
+}
+static inline void hfsStatsRecordIoDirectFast(uint64_t bytes) {
+	if (hfsStatsEnabledFast()) {
+		hfsStatsRecordIoDirect(bytes);
+	}
+}
+static inline void hfsStatsRecordIoVectorFast(uint64_t bytes) {
+	if (hfsStatsEnabledFast()) {
+		hfsStatsRecordIoVector(bytes);
 	}
 }
 static inline void hfsStatsRecordRmwFast(uint64_t bytes) {

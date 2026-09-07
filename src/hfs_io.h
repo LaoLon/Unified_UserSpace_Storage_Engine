@@ -18,7 +18,13 @@ ssize_t hfsIoReadAt(HfsFile *file, uint8_t *buffer, size_t count,
 		    uint64_t offset);
 /* Write a byte range with aligned direct writes and edge read-modify-write. */
 ssize_t hfsIoWriteAt(HfsFile *file, const uint8_t *buffer, size_t count,
-		     uint64_t offset);
+			     uint64_t offset);
+/* Attempt one native SPDK vector read; EAGAIN requests the compatibility fallback. */
+ssize_t hfsIoReadvAt(HfsFile *file, const struct iovec *iov, int iovcnt,
+			     size_t total, uint64_t offset);
+/* Attempt one native SPDK vector write; EAGAIN requests the compatibility fallback. */
+ssize_t hfsIoWritevAt(HfsFile *file, const struct iovec *iov, int iovcnt,
+			      size_t total, uint64_t offset);
 /* Submit an aligned positioned read without occupying an executor worker. */
 int hfsIoReadAtAsync(HfsFile *file, uint8_t *buffer, size_t count,
 		     uint64_t offset, HfsIoAsyncCallback callback, void *context);
