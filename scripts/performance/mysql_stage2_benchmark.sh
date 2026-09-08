@@ -9,6 +9,10 @@ IMAGE="${3:-/var/tmp/hfs-stage2-mysql.img}"
 OUT="${4:-$ROOT/build/performance-stage2-mysql}"
 COUNT="${HFS_MYSQLSLAP_QUERIES:-2000}"
 ITERATIONS="${HFS_MYSQLSLAP_ITERATIONS:-3}"
+HFS_BDEV_TYPE="${HFS_MYSQL_BDEV_TYPE:-persistent-aio}"
+HFS_BDEV_NAME="${HFS_MYSQL_BDEV_NAME:-Aio0}"
+BOOTSTRAP_SIGNAL_TIMEOUT="${HFS_MYSQL_BOOTSTRAP_SIGNAL_TIMEOUT:-0}"
+SPDK_PCI_BDF="${HFS_MYSQL_SPDK_PCI_BDF:-}"
 HFS_LIB="$(realpath "$LIB")"
 HFS_PREFIX="/hfs"
 HFS_DATADIR="$HFS_PREFIX/mysql"
@@ -25,12 +29,20 @@ fi
 mkdir -p "$OUT"
 rm -f "$OUT/results.tsv" "$OUT"/*.log "$HFS_SOCK" "$NATIVE_SOCK"
 EFFECTIVE_CONFIG="$OUT/hfs_db_aio.json"
-sed "s#\"filename\": \"[^\"]*\"#\"filename\": \"${IMAGE}\"#" "$CONFIG" > "$EFFECTIVE_CONFIG"
-HFS_RECREATE=1 bash "$ROOT/scripts/db/prepare_hfs_db_bdev.sh" "$IMAGE" 1G
+if [[ "$HFS_BDEV_TYPE" == "direct-nvme" ]]; then
+	EFFECTIVE_CONFIG="$CONFIG"
+else
+	sed "s#\"filename\": \"[^\"]*\"#\"filename\": \"${IMAGE}\"#" "$CONFIG" > "$EFFECTIVE_CONFIG"
+	HFS_RECREATE=1 bash "$ROOT/scripts/db/prepare_hfs_db_bdev.sh" "$IMAGE" 1G
+fi
 
 cleanup() {
 	if [[ -n "$HFS_PID" ]]; then
-		mysqladmin --protocol=SOCKET --socket="$HFS_SOCK" -uroot shutdown >/dev/null 2>&1 || kill "$HFS_PID" 2>/dev/null || true
+		if ! timeout 10 mysqladmin --protocol=SOCKET --socket="$HFS_SOCK" -uroot shutdown >/dev/null 2>&1; then
+			kill -TERM -- -"$HFS_PID" 2>/dev/null || kill -TERM "$HFS_PID" 2>/dev/null || true
+			sleep 1
+			kill -KILL -- -"$HFS_PID" 2>/dev/null || true
+		fi
 		wait "$HFS_PID" 2>/dev/null || true
 	fi
 	if [[ -n "$NATIVE_PID" ]]; then
@@ -59,7 +71,7 @@ wait_ready() {
 start_hfs() {
 	rm -f "$HFS_SOCK"
 	setsid env LD_PRELOAD="$HFS_LIB" HFS_CONFIG_PATH="$EFFECTIVE_CONFIG" \
-		HFS_BDEV_NAME=Aio0 HFS_LOCK_PATH="$OUT/hfs.lock" HFS_AUTO_MKDIRS=/mysql \
+		HFS_BDEV_NAME="$HFS_BDEV_NAME" HFS_LOCK_PATH="$OUT/hfs.lock" HFS_AUTO_MKDIRS=/mysql \
 		mariadbd --datadir="$HFS_DATADIR" --socket="$HFS_SOCK" --port=3307 \
 			--bind-address=127.0.0.1 --skip-networking=0 --pid-file="$OUT/hfs.pid" \
 			--log-error="$OUT/hfs-server.log" --console --user=root --skip-name-resolve \
@@ -125,6 +137,10 @@ printf "layer\tworkload\tconcurrency\tavg_seconds\tqps\n" > "$OUT/results.tsv"
 	echo "hostname=$(hostname)"
 	echo "hfs_lib=$HFS_LIB"
 	echo "config=$EFFECTIVE_CONFIG"
+	echo "backend=$HFS_BDEV_TYPE"
+	echo "bdev_name=$HFS_BDEV_NAME"
+	echo "bootstrap_signal_timeout=$BOOTSTRAP_SIGNAL_TIMEOUT"
+	echo "spdk_pci_bdf=$SPDK_PCI_BDF"
 	echo "image=$IMAGE"
 	echo "queries=$COUNT"
 	echo "iterations=$ITERATIONS"
@@ -147,16 +163,44 @@ mysqladmin --protocol=SOCKET --socket="$NATIVE_SOCK" -uroot shutdown >/dev/null
 wait "$NATIVE_PID" 2>/dev/null || true
 NATIVE_PID=""
 
-echo "== MariaDB stage-two HFS persistent Aio =="
+echo "== MariaDB stage-two HFS backend=$HFS_BDEV_TYPE =="
 set +e
 setsid env -u LD_PRELOAD MYSQLD_BOOTSTRAP="$ROOT/scripts/db/mariadb_bootstrap_wrapper.sh" \
-	HFS_LIB="$HFS_LIB" HFS_CONFIG_PATH="$EFFECTIVE_CONFIG" HFS_BDEV_NAME=Aio0 \
+	HFS_LIB="$HFS_LIB" HFS_CONFIG_PATH="$EFFECTIVE_CONFIG" HFS_BDEV_NAME="$HFS_BDEV_NAME" \
 	HFS_LOCK_PATH="$OUT/hfs.lock" HFS_FORMAT=1 HFS_AUTO_MKDIRS=/mysql \
 	HFS_VIRTUAL_DATADIR="$HFS_DATADIR" HFS_MYSQLD_BIN="$(command -v mariadbd)" \
 	mariadb-install-db --datadir="$OUT/datadir-shadow" --auth-root-authentication-method=normal \
 		--skip-test-db --skip-name-resolve --innodb-use-native-aio=0 \
-		--innodb-flush-method=fsync >"$OUT/hfs-install.log" 2>&1
+		--innodb-flush-method=fsync >"$OUT/hfs-install.log" 2>&1 &
+bootstrap_pid=$!
+bootstrap_forced_stop=0
+if [[ "$BOOTSTRAP_SIGNAL_TIMEOUT" == "1" ]]; then
+	for _ in $(seq 1 180); do
+		if grep -q 'Signal handler thread did not exit in a timely manner' "$OUT/hfs-install.log" 2>/dev/null; then
+			# MariaDB has already committed the system tables; stop its known shutdown hang.
+			kill -TERM -- -"$bootstrap_pid" 2>/dev/null || true
+			sleep 1
+			kill -KILL -- -"$bootstrap_pid" 2>/dev/null || true
+			bootstrap_forced_stop=1
+			break
+		fi
+		if ! kill -0 "$bootstrap_pid" 2>/dev/null; then
+			break
+		fi
+		sleep 1
+	done
+fi
+set +e
+wait "$bootstrap_pid"
 bootstrap_rc=$?
+set -e
+if [[ "$bootstrap_forced_stop" == "1" ]]; then
+	bootstrap_rc=0
+	if [[ -n "$SPDK_PCI_BDF" ]]; then
+		# A SIGKILLed SPDK owner cannot unlink its PCI lock; no peer may be active here.
+		rm -f -- "/var/tmp/spdk_pci_lock_${SPDK_PCI_BDF}"
+	fi
+fi
 set -e
 if [[ "$bootstrap_rc" -ne 0 ]]; then
 	tail -120 "$OUT/hfs-install.log" >&2

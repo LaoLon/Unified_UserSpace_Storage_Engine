@@ -602,6 +602,13 @@ Bug 等级：**致命 > 严重 > 一般**。
   区分 open 路径语义缺口和 runtime teardown 竞态。
 - **后续**：用 syscall 级 trace 对该次 `openat/openat64`、目录 inode 状态和 HFS runtime
   teardown 顺序做最小复现；修复前不将 buffer pool dump 视为 HFS MariaDB 退出阶段完全兼容。
+- **真实 NVMe 复现（2026-09-08）**：在 SPDK 直连 `0000:0b:00.0` 的 raw NVMe
+  bdev 上重复出现 `Signal handler thread did not exit in a timely manner`；系统表已提交、
+  服务可启动且 12 个 mysqlslap workload 全部返回，但正常 `mysqladmin shutdown` 仍可能
+  长时间等待。为完成性能采集，测试器在检测到该警告后回收 bootstrap/server 进程组；
+  SIGKILL 会留下 `/var/tmp/spdk_pci_lock_<BDF>`，下次挂载前必须确认无 SPDK peer 后清理，
+  否则 HFS 路由表现为 `ENODEV`。这属于退出时序/测试清理缺陷，不影响本轮 SQL 结果，
+  但当前不能宣称 direct-NVMe 下 MariaDB 正常退出完全兼容。
 
 ### 45. truncate 缩短后再扩展读回历史数据（shard-36 修复，严重级）
 

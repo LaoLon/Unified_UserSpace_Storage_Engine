@@ -18,6 +18,7 @@ DURATION="${HFS_BENCH_DURATION_SECONDS:-60}"
 CPU_AFFINITY="${HFS_CPU_AFFINITY:-all}"
 BDEV_TYPE="${HFS_BENCH_BDEV_TYPE:-persistent-aio}"
 RAW_REFERENCE="${HFS_BENCH_RAW_REFERENCE:-not-run}"
+BDEV_NAME="${HFS_BENCH_BDEV_NAME:-Aio0}"
 
 if [[ ! -f "$HFS_LIB" || ! -f "$CONFIG" ]]; then
 	echo "usage: $0 [libhfs.so] [mount prefix] [config] [image] [output dir]" >&2
@@ -37,10 +38,14 @@ for name in fillseq readwhilewriting-1t readwhilewriting-4t; do
 	rm -f "$OUT/${name}.log" "$OUT/${name}.time" "$OUT/${name}.stats"
 done
 rm -f "$OUT/summary.tsv" "$OUT/summary.json" "$OUT/environment.txt"
-sed "s#\"filename\": \"[^\"]*\"#\"filename\": \"${IMAGE}\"#" \
-	"$CONFIG" > "$EFFECTIVE_CONFIG"
+if [[ "$BDEV_TYPE" == "direct-nvme" ]]; then
+	EFFECTIVE_CONFIG="$CONFIG"
+else
+	sed "s#\"filename\": \"[^\"]*\"#\"filename\": \"${IMAGE}\"#" \
+		"$CONFIG" > "$EFFECTIVE_CONFIG"
+	HFS_RECREATE=1 bash "$ROOT/scripts/db/prepare_hfs_db_bdev.sh" "$IMAGE" 1G
+fi
 cp "$EFFECTIVE_CONFIG" "$OUT/config.json"
-HFS_RECREATE=1 bash "$ROOT/scripts/db/prepare_hfs_db_bdev.sh" "$IMAGE" 1G
 
 # Preserve the exact host and benchmark inputs beside all raw measurements.
 {
@@ -64,6 +69,7 @@ HFS_RECREATE=1 bash "$ROOT/scripts/db/prepare_hfs_db_bdev.sh" "$IMAGE" 1G
 	echo "spdk_commit=$(git -C "$ROOT/spdk" rev-parse HEAD 2>/dev/null || echo unknown)"
 	echo "latency_metric=rocksdb.db.write.micros (microseconds)"
 	echo "db=$DBDIR"
+	echo "bdev_name=$BDEV_NAME"
 	echo "image=$IMAGE"
 	echo "config=$EFFECTIVE_CONFIG"
 	cat "$EFFECTIVE_CONFIG"
@@ -90,14 +96,14 @@ run_bench() {
 		/usr/bin/time -f 'elapsed_seconds=%e\nuser_seconds=%U\nsys_seconds=%S\ncpu_percent=%P\nmax_rss_kb=%M' \
 			-o "$timeLog" timeout --signal=TERM --kill-after=5s 180s \
 			env LD_PRELOAD="$HFS_LIB" HFS_CONFIG_PATH="$EFFECTIVE_CONFIG" \
-			HFS_BDEV_NAME=Aio0 HFS_LOCK_PATH="$LOCK_PATH" HFS_FORMAT="$format" \
+			HFS_BDEV_NAME="$BDEV_NAME" HFS_LOCK_PATH="$LOCK_PATH" HFS_FORMAT="$format" \
 			HFS_LOG_LEVEL=error HFS_STATS_PATH="$stats" HFS_AUTO_MKDIRS=/rocks \
 			taskset -c "$CPU_AFFINITY" db_bench "$@" >"$log" 2>&1
 	else
 		/usr/bin/time -f 'elapsed_seconds=%e\nuser_seconds=%U\nsys_seconds=%S\ncpu_percent=%P\nmax_rss_kb=%M' \
 			-o "$timeLog" timeout --signal=TERM --kill-after=5s 180s \
 			env LD_PRELOAD="$HFS_LIB" HFS_CONFIG_PATH="$EFFECTIVE_CONFIG" \
-			HFS_BDEV_NAME=Aio0 HFS_LOCK_PATH="$LOCK_PATH" HFS_FORMAT="$format" \
+			HFS_BDEV_NAME="$BDEV_NAME" HFS_LOCK_PATH="$LOCK_PATH" HFS_FORMAT="$format" \
 			HFS_LOG_LEVEL=error HFS_STATS_PATH="$stats" HFS_AUTO_MKDIRS=/rocks \
 			db_bench "$@" >"$log" 2>&1
 	fi
