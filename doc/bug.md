@@ -966,4 +966,43 @@ Bug 等级：**致命 > 严重 > 一般**。
 - **修复**：为 `HfsInodeRuntime` 增加 `rangeGate`。当请求覆盖至少四分之一 bucket 时仅获取该 inode 的 gate 写锁，不再抓取全局 bucket；小范围请求先获取 gate 读锁，再按 bucket 编号升序加锁，释放时反序释放，保留交叉区间的死锁顺序保证。
 - **验证**：reactor=2（16 文件，64/64 submit-complete）与 reactor=4（32 文件，128/128，3 个 data reactor 均有计数）通过，既有 fast path、crash、stress 和数据库回归无回退。
 
+### 63. HFS 数据面仍明显慢于原生 SPDK direct NVMe（待修复，严重级）
+
+- **状态**：已定位，尚未修复
+- **时间**：2026-09-08（direct-NVMe 读写分离专项）
+- **等级**：严重（不影响数据正确性，但限制读写吞吐和尾延迟）
+- **现象**：在同一块 `/dev/nvme0n1` 上，关闭重型 timing 统计后做等口径对照，4 KiB
+  QD1 的 HFS 读/写分别为 17.1k/15.8k IOPS，原生 SPDK 分别为 24.9k/22.6k，
+  HFS 低约 30%；QD32 的 HFS 读/写为 74.8k/32.7k，原生 SPDK 为 122.1k/87.9k，
+  HFS 低约 39%/63%。64 KiB QD32 时 HFS 读/写仅 11.2k/10.3k，原生 SPDK 为
+  44.7k/35.7k，HFS p99 延迟约 79–98 ms，而原生 SPDK 约 1.8–2.0 ms。所有样本
+  errors=0。
+- **排查过程**：
+  1. 旧阶段脚本存在口径差异：HFS 使用 `psync`，原生 SPDK 使用单 job
+     `iodepth=32`。改为 HFS `numjobs=1/32` 对齐 SPDK `iodepth=1/32` 后，差距仍稳定存在。
+  2. 低开销 HFS 统计显示 `io_direct_ops=0`，而 `io_copy_ops` 与 I/O 操作数完全相等，
+     说明普通 FIO 用户缓冲区没有通过 `spdk_vtophys`，每个请求都走 DMA pool 和一次
+     用户缓冲区拷贝；原生 SPDK FIO 使用 DMA 缓冲区并直接异步提交。
+  3. `hfsIoReadAt`/`hfsIoWriteAt` 每个请求都获取 inode sync/range 锁，经 owner/batch
+     队列提交后同步等待 completion；这与原生 SPDK 的异步 outstanding queue 不同。
+  4. `hfsPublishWriteEnd` 在每次成功写入后获取全局 metadata 写锁、更新时间戳并标记
+     dirty；统计中 `meta_write_lock` 基本等于 `io_write_ops`，即使文件容量已经预分配也
+     重复执行。
+  5. 64 KiB 请求覆盖多个 unit；固定 64 KiB DMA class 的目标 buffer 数只有 8 个，且
+     每个请求持有多个 range bucket，QD32 时形成明显排队和尾延迟放大。
+- **根因**：HFS 数据面是“普通用户缓冲区 bounce copy + POSIX 锁/元数据语义 + owner
+  同步等待”的组合路径；原生 SPDK 是“DMA buffer + 异步队列 + 无文件级元数据/范围锁”。
+  因此当前差距主要来自 HFS 上层路径和并发模型，而不是 NVMe 设备或 SPDK bdev 本身。
+- **修复方向**：
+  1. 为可验证的 DMA-capable 用户缓冲区增加真正的异步 direct path；普通缓冲区保留
+     bounce fallback，并提供足够的 pipeline/outstanding depth。
+  2. 将数据 I/O 与 mtime/ctime、dirty 标记解耦，采用按 inode/version 的延迟元数据发布，
+     避免每次写入获取全局 metadata 写锁。
+  3. 增大或改造 range lock 粒度，优先使用 per-inode/finer stripe；对已证明不重叠的
+     aligned I/O 避免长时间持锁跨越设备 completion。
+  4. 重新评估 DMA pool 各 size class 的 buffer 数和 backpressure，特别是 64 KiB 以上
+     请求；所有读写对比必须使用相同 QD/并发和 stats-off 口径。
+- **验证**：新增的 VM 专项结果位于 `/mnt/hfs-data/performance-hfs-vs-spdk-rw-notiming`
+  和 `/mnt/hfs-data/performance-hfs-vs-spdk-64k`；本轮只做定位，尚未提交代码修复。
+
 ## 通用经验总结
