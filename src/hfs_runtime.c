@@ -26,6 +26,9 @@
 #define HFS_COMPLETION_DONE 1
 #define HFS_COMPLETION_TIMED_OUT 2
 #define HFS_RUNTIME_MAX_DATA_REACTORS 8U
+#define HFS_RUNTIME_DEFAULT_STRIPE_KIB 1024UL
+#define HFS_RUNTIME_MIN_STRIPE_KIB 64UL
+#define HFS_RUNTIME_MAX_STRIPE_KIB 16384UL
 
 /* One optional SPDK data reactor; reactor zero remains the metadata owner. */
 typedef struct HfsRuntimeDataReactor {
@@ -67,6 +70,7 @@ struct hfs_runtime_state {
 	_Atomic uint32_t submitters;
 	HfsRuntimeDataReactor *dataReactors;
 	uint32_t dataReactorCount;
+	uint64_t dataStripeBytes;
 };
 
 static struct hfs_runtime_state g_runtime = {
@@ -385,6 +389,24 @@ static uint32_t hfsRuntimeDataReactorCountEnv(void) {
 	return (uint32_t)parsed;
 }
 
+/* Parse the configured logical stripe size used for data-reactor routing. */
+static uint64_t hfsRuntimeDataStripeBytesEnv(void) {
+	const char *value = getenv("HFS_DATA_STRIPE_KIB");
+	char *end = NULL;
+	unsigned long parsed;
+
+	if (value == NULL || value[0] == '\0') {
+		return HFS_RUNTIME_DEFAULT_STRIPE_KIB << 10;
+	}
+	parsed = strtoul(value, &end, 10);
+	if (end == value || *end != '\0' ||
+	    parsed < HFS_RUNTIME_MIN_STRIPE_KIB ||
+	    parsed > HFS_RUNTIME_MAX_STRIPE_KIB) {
+		return HFS_RUNTIME_DEFAULT_STRIPE_KIB << 10;
+	}
+	return (uint64_t)parsed << 10;
+}
+
 /* Return the optional CPU affinity entry for one data reactor. */
 static int hfsRuntimeDataCpuEnv(unsigned int index) {
 	const char *value = getenv("HFS_DATA_REACTOR_CPUS");
@@ -617,6 +639,7 @@ int hfsRuntimeStart(void) {
 	}
 	batchEnv = getenv("HFS_RUNTIME_BATCH");
 	g_runtime.batchEnabled = batchEnv == NULL || strcmp(batchEnv, "0") != 0;
+	g_runtime.dataStripeBytes = hfsRuntimeDataStripeBytesEnv();
 
 	rc = pthread_create(&g_runtime.owner, NULL, hfsRuntimeOwnerMain, NULL);
 	if (rc != 0) {
@@ -1023,15 +1046,27 @@ int hfsRuntimeDataFini(Hfs *fs) {
 	return 0;
 }
 
-/* Select a stable reactor by blob id while keeping reactor zero as fallback. */
-uint32_t hfsRuntimeDataReactorFor(const Hfs *fs, uint64_t blobId) {
+/* Select a stable reactor by blob stripe while keeping reactor zero as fallback. */
+uint32_t hfsRuntimeDataReactorFor(const Hfs *fs, uint64_t blobId,
+					 uint64_t logicalUnit) {
 	uint64_t hash;
+	uint64_t stripeUnits;
+	uint64_t stripe;
 
 	if (fs == NULL || fs->dataReactorCount == 0) {
 		return 0;
 	}
-	/* Mix blob ids because SPDK may allocate ids with a fixed low-bit stride. */
-	hash = blobId;
+	if (fs->unitSize == 0 || g_runtime.dataStripeBytes == 0) {
+		return 0;
+	}
+	stripeUnits = (g_runtime.dataStripeBytes + fs->unitSize - 1U) /
+		fs->unitSize;
+	if (stripeUnits == 0) {
+		stripeUnits = 1;
+	}
+	stripe = logicalUnit / stripeUnits;
+	/* Mix blob ids and stripes so adjacent stripes spread across reactors. */
+	hash = blobId ^ (stripe * UINT64_C(0x9e3779b97f4a7c15));
 	hash ^= hash >> 30;
 	hash *= UINT64_C(0xbf58476d1ce4e5b9);
 	hash ^= hash >> 27;

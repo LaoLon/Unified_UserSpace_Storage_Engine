@@ -928,7 +928,9 @@ static void hfs_lib_async_direct_done(void *context, ssize_t result, int error) 
 	HfsLibAsyncDirectCommit *commit;
 
 	dataReactor = hfsRuntimeDataReactorFor(direct->openFile->file->fs,
-					      direct->openFile->file->blobId);
+					      direct->openFile->file->blobId,
+					      direct->writeOffset /
+					      direct->openFile->file->fs->unitSize);
 	if (!direct->write || dataReactor == 0) {
 		if (direct->write && error == 0 && result > 0) {
 			hfsPublishWriteEnd(direct->openFile,

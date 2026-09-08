@@ -1,6 +1,6 @@
 # HFS 数据面性能优化阶段计划（shard-49～53）
 
-> 状态：计划稿，基于 `main@3b5898a` 制定（2026-09-09）  
+> 状态：shard-49 已完成，shard-50～53 待实施；基于 `main@3b5898a` 制定（2026-09-09）
 > 前置阶段：shard-45 async libhfs、shard-46 多 reactor/channel、shard-47 DMA/vector、当前 shard-48 性能回归收口  
 > 输入依据：`doc/bug.md` #63/#64、`doc/design/fio_baseline_notes.md`、VM 最新 NVMe FIO 对比结果  
 > 适用范围：单 HFS 进程、持久化 AIO/NVMe bdev；不扩大多进程、mmap、native libaio/io_uring 支持边界
@@ -147,6 +147,20 @@ blobId -> stable hash -> reactor
 - 单 reactor 结果与当前基线无回退超过 5%。
 - 多 reactor 不出现 wrong-thread、completion 泄漏、数据校验错误和 shutdown 超时。
 - 在设备未饱和时，4K QD32 write 相对原生 SPDK 达到至少 45%，作为中间闸门。
+
+### 4.6 shard-49 实施结果（2026-09-09）
+
+- `hfsRuntimeDataReactorFor()` 现在按 `(blobId, logicalUnit / stripeUnits)` 选择 reactor，默认
+  stripe 为 1 MiB，可通过 `HFS_DATA_STRIPE_KIB` 配置；`HFS_DATA_REACTORS=1` 仍回退到 reactor 0。
+- direct、bounce、vector、pipeline 和 async child 均使用同一逻辑 stripe 选择器；跨 stripe 的单个请求
+  仍由起始 stripe 选择一个 channel，避免一个请求跨多个 SPDK completion 域。
+- 新增 `scripts/db/data_reactor_stripe_test.sh`，覆盖单 blob 128 个 stripe 的并行写读、同 stripe 顺序写、
+  punch+write，以及每 reactor submit/complete 对账。
+- VM 验收：`make -B app lib`、CMake Release 均通过；专项测试在 4 个 reactor 下激活 3 个 data reactor，
+  266 次 submit/complete 完全一致；旧异步多 reactor 回归在 2/4/8 reactor 下均通过，8 reactor 激活 7 个
+  data reactor，所有 submit/complete 完全一致。
+- shard-50 的 per-reactor DMA pool、backpressure 和队列深度优化尚未开始；本 shard 未宣称达到阶段性能目标，
+  性能对比留到 shard-53 统一回归。
 
 ## 5. shard-50：per-reactor DMA pool 与 backpressure
 

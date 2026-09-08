@@ -1042,4 +1042,21 @@ Bug 等级：**致命 > 严重 > 一般**。
 - **验证**：修复后孤立 4 KiB read QD32 达到 `115.4k IOPS`、p99 `528 µs`；完整对照
   达到 `110.4k IOPS`，errors=0；reactor=4 多文件专项 `192/192` 闭合。
 
+### 65. shard-49 vector I/O 使用字节偏移选择 stripe（已修复，一般级）
+
+- **状态**：已修复；vector 路径现在把字节偏移转换为 logical unit 后再调用 stripe 选择器
+- **时间**：2026-09-09（shard-49 stripe-to-reactor 开发）
+- **等级**：一般（不直接破坏数据，但会让 vector 与 direct/pipeline 路径进入不同的 reactor 同步域）
+- **现象**：stripe 选择器的接口语义是 `logicalUnit`，新增 vector 路由初版却直接传入了 `offset` 字节值；
+  对 4 KiB unit 的 vector I/O，选择器会把偏移放大 4096 倍计算 stripe，导致同一逻辑 stripe 的
+  vector/direct 请求路由不一致。
+- **排查过程**：逐一核对 direct、bounce、vector、pipeline 和 async child 的调用点，发现 vector
+  请求结构内部使用 `offset / unitSize`，但调用选择器的位置仍保留字节偏移；`git diff --check` 无法发现
+  这种单位错误，需结合接口注释和 request 字段语义检查。
+- **根因**：路由接口新增后缺少统一的单位命名/转换约束，调用方混用了 public byte offset 和内部 logical unit。
+- **修复**：vector 调用改为 `offset / file->fs->unitSize`；其它 direct、pipeline、async child 和
+  metadata publish 调用均确认使用 logical unit。
+- **验证**：VM 上 `make -B app lib`、CMake Release、单 blob stripe 并行读写/punch 测试，以及
+  2/4/8 reactor 异步多文件回归全部通过，submit/complete 无差异。
+
 ## 通用经验总结

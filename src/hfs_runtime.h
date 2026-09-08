@@ -32,8 +32,9 @@ int hfsRuntimeSubmitDataBatch(uint32_t reactorId, HfsRuntimeBatchItem *item,
 /* Allocate and release per-reactor blobstore channels after mount. */
 int hfsRuntimeDataInit(Hfs *fs);
 int hfsRuntimeDataFini(Hfs *fs);
-/* Select the stable reactor/channel for one blob. */
-uint32_t hfsRuntimeDataReactorFor(const Hfs *fs, uint64_t blobId);
+/* Select the stable reactor/channel for one blob stripe and logical unit. */
+uint32_t hfsRuntimeDataReactorFor(const Hfs *fs, uint64_t blobId,
+					 uint64_t logicalUnit);
 struct spdk_io_channel *hfsRuntimeDataChannel(const Hfs *fs,
 						 uint32_t reactorId);
 /* Stop accepting work, drain SPDK state, and join the owner pthread. */

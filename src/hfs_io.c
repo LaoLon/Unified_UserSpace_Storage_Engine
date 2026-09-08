@@ -605,9 +605,9 @@ static int hfsIoSubmitDirect(HfsFile *file, void *buffer, uint64_t offset,
 	request.offset = offset;
 	request.units = units;
 	request.operation = write ? HFS_IO_WRITE : HFS_IO_READ;
-	request.channel = hfsRuntimeDataChannel(file->fs,
-		hfsRuntimeDataReactorFor(file->fs, file->blobId));
-	request.dataReactor = hfsRuntimeDataReactorFor(file->fs, file->blobId);
+	request.dataReactor = hfsRuntimeDataReactorFor(file->fs, file->blobId,
+								 offset);
+	request.channel = hfsRuntimeDataChannel(file->fs, request.dataReactor);
 	request.dataPath = true;
 	if (request.channel == NULL || hfsIoStartRequest(&request) != 0 ||
 	    hfsIoWaitRequest(&request) != 0) {
@@ -645,7 +645,8 @@ static int hfsIoSubmitVector(HfsFile *file, const struct iovec *iov,
 		hfsIoSyncReadUnlock(runtime);
 		return -1;
 	}
-	dataReactor = hfsRuntimeDataReactorFor(file->fs, file->blobId);
+	dataReactor = hfsRuntimeDataReactorFor(file->fs, file->blobId,
+							 offset / file->fs->unitSize);
 	memset(&request, 0, sizeof(request));
 	request.file = file;
 	request.iov = vector;
@@ -721,8 +722,9 @@ static int hfsIoSubmit(HfsFile *file, void *buffer, uint64_t offset,
 
 	/* The callback owns only this request, so the HfsFile has no I/O scratch state. */
 	memset(&request, 0, sizeof(request));
-	/* Keep bounce-buffer I/O on the same per-blob data reactor as direct I/O. */
-	dataReactor = hfsRuntimeDataReactorFor(file->fs, file->blobId);
+	/* Keep bounce-buffer I/O on the same logical stripe as direct I/O. */
+	dataReactor = hfsRuntimeDataReactorFor(file->fs, file->blobId,
+							 offset);
 	request.file = file;
 	request.buffer = buffer;
 	request.offset = offset;
@@ -890,8 +892,12 @@ static int hfsIoAsyncStartBatch(HfsIoAsyncParent *parent) {
 				parent->file->fs->unitSize + relativeUnit;
 			parent->requests[i].units = units;
 			parent->requests[i].operation = parent->write ? HFS_IO_WRITE : HFS_IO_READ;
-			parent->requests[i].channel = parent->channel;
-			parent->requests[i].dataReactor = parent->dataReactor;
+			/* Route each child by its logical stripe, not only by blob id. */
+			parent->requests[i].dataReactor = hfsRuntimeDataReactorFor(
+				parent->file->fs, parent->file->blobId,
+				parent->requests[i].offset);
+			parent->requests[i].channel = hfsRuntimeDataChannel(
+				parent->file->fs, parent->requests[i].dataReactor);
 			parent->requests[i].dataPath = true;
 			parent->requests[i].asyncMagic = HFS_IO_ASYNC_MAGIC;
 			parent->requests[i].asyncDone = hfsIoAsyncChildDone;
@@ -979,7 +985,8 @@ int hfsIoReadAtAsync(HfsFile *file, uint8_t *buffer, size_t count,
 		return -1;
 	}
 	parent->file = file;
-	parent->dataReactor = hfsRuntimeDataReactorFor(file->fs, file->blobId);
+	parent->dataReactor = hfsRuntimeDataReactorFor(file->fs, file->blobId,
+							 offset / file->fs->unitSize);
 	parent->channel = hfsRuntimeDataChannel(file->fs, parent->dataReactor);
 	if (parent->channel == NULL) {
 		free(parent);
@@ -1060,7 +1067,8 @@ int hfsIoWriteAtAsync(HfsFile *file, const uint8_t *buffer, size_t count,
 		return -1;
 	}
 	parent->file = file;
-	parent->dataReactor = hfsRuntimeDataReactorFor(file->fs, file->blobId);
+	parent->dataReactor = hfsRuntimeDataReactorFor(file->fs, file->blobId,
+							 offset / file->fs->unitSize);
 	parent->channel = hfsRuntimeDataChannel(file->fs, parent->dataReactor);
 	if (parent->channel == NULL) {
 		free(parent);
@@ -1302,8 +1310,6 @@ static ssize_t hfsIoReadAtLocked(HfsFile *file, uint8_t *buffer,
 	uint64_t cursor = offset;
 	size_t remaining = count;
 	size_t done = 0;
-	uint32_t dataReactor = hfsRuntimeDataReactorFor(file->fs,
-									 file->blobId);
 	if (offset % unitSize == 0 && count % (size_t)unitSize == 0 &&
 	    hfsIoBufferDmaCapable(buffer, count)) {
 		uint64_t maxUnits = hfsIoMaxUnits(file->fs);
@@ -1378,9 +1384,10 @@ static ssize_t hfsIoReadAtLocked(HfsFile *file, uint8_t *buffer,
 			requests[requestCount].offset = cursor / unitSize + pendingUnits;
 			requests[requestCount].units = chunkUnits;
 			requests[requestCount].operation = HFS_IO_READ;
+			requests[requestCount].dataReactor = hfsRuntimeDataReactorFor(
+				file->fs, file->blobId, requests[requestCount].offset);
 			requests[requestCount].channel = hfsRuntimeDataChannel(file->fs,
-											 dataReactor);
-			requests[requestCount].dataReactor = dataReactor;
+											 requests[requestCount].dataReactor);
 			requests[requestCount].dataPath = true;
 			if (hfsIoStartRequest(&requests[requestCount]) != 0) {
 				hfsIoRelease(&leases[requestCount]);
@@ -1434,8 +1441,6 @@ static ssize_t hfsIoWriteAtLocked(HfsFile *file, const uint8_t *buffer,
 	uint64_t cursor = offset;
 	size_t remaining = count;
 	size_t done = 0;
-	uint32_t dataReactor = hfsRuntimeDataReactorFor(file->fs,
-									  file->blobId);
 	if (offset % unitSize == 0 && count % (size_t)unitSize == 0 &&
 	    hfsIoBufferDmaCapable(buffer, count)) {
 		uint64_t maxUnits = hfsIoMaxUnits(file->fs);
@@ -1506,9 +1511,10 @@ static ssize_t hfsIoWriteAtLocked(HfsFile *file, const uint8_t *buffer,
 			requests[requestCount].offset = cursor / unitSize + pendingUnits;
 			requests[requestCount].units = chunkUnits;
 			requests[requestCount].operation = HFS_IO_WRITE;
+			requests[requestCount].dataReactor = hfsRuntimeDataReactorFor(
+				file->fs, file->blobId, requests[requestCount].offset);
 			requests[requestCount].channel = hfsRuntimeDataChannel(file->fs,
-											  dataReactor);
-			requests[requestCount].dataReactor = dataReactor;
+											  requests[requestCount].dataReactor);
 			requests[requestCount].dataPath = true;
 			if (hfsIoStartRequest(&requests[requestCount]) != 0) {
 				hfsIoRelease(&leases[requestCount]);
