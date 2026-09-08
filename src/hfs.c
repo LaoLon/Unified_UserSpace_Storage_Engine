@@ -170,6 +170,25 @@ int hfsRequestSubmitData(HfsRequestResult *result, spdk_msg_fn startFn,
 	return 0;
 }
 
+/* Submit a data child through the selected reactor's coalescing queue. */
+int hfsRequestSubmitDataBatch(HfsRequestResult *result, spdk_msg_fn startFn,
+				      void *ctx, uint32_t reactorId,
+				      HfsRuntimeBatchItem *batchItem) {
+	int rc;
+
+	hfsRuntimeCompletionReset(&result->completion);
+	if (hfsRequestSubmitInjected(result->operation)) {
+		result->submitRc = -EIO;
+		return hfsRequestSetError(result->submitRc);
+	}
+	rc = hfsRuntimeSubmitDataBatch(reactorId, batchItem, startFn, ctx);
+	result->submitRc = rc;
+	if (rc != 0) {
+		return hfsRequestSetError(rc);
+	}
+	return 0;
+}
+
 /* Wait for a submitted request and translate timeout or SPDK errors. */
 int hfsRequestWaitResult(HfsRequestResult *result) {
 	if (!hfsRuntimeCompletionWait(&result->completion,

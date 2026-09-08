@@ -27,6 +27,10 @@ int hfsRequestSubmitBatch(HfsRequestResult *result, spdk_msg_fn startFn,
 /* Submit a data child to a selected reactor without waiting. */
 int hfsRequestSubmitData(HfsRequestResult *result, spdk_msg_fn startFn,
 			 void *ctx, uint32_t reactorId);
+/* Submit a data child through the selected reactor's batch dispatcher. */
+int hfsRequestSubmitDataBatch(HfsRequestResult *result, spdk_msg_fn startFn,
+				      void *ctx, uint32_t reactorId,
+				      HfsRuntimeBatchItem *batchItem);
 /* Wait for a previously submitted request and translate its completion error. */
 int hfsRequestWaitResult(HfsRequestResult *result);
 int hfsRequestWaitBatch(HfsRequestResult *result, spdk_msg_fn startFn, void *ctx,

@@ -545,8 +545,9 @@ static int hfsIoStartRequest(HfsIoRequest *request) {
 
 	hfsRequestInit(&request->result, hfsIoRequestOperation(request->operation));
 	if (request->dataPath && request->dataReactor != 0) {
-		rc = hfsRequestSubmitData(&request->result, hfsIoStart, request,
-					   request->dataReactor);
+		rc = hfsRequestSubmitDataBatch(&request->result, hfsIoStart,
+						request, request->dataReactor,
+						&request->batchItem);
 	} else {
 		rc = hfsRequestSubmitBatch(&request->result, hfsIoStart, request,
 					     &request->batchItem);
@@ -716,14 +717,24 @@ static void hfsIoReleasePipeline(HfsIoLease *leases, uint32_t count) {
 static int hfsIoSubmit(HfsFile *file, void *buffer, uint64_t offset,
 		       uint64_t units, HfsIoOperation operation) {
 	HfsIoRequest request;
+	uint32_t dataReactor;
 
 	/* The callback owns only this request, so the HfsFile has no I/O scratch state. */
 	memset(&request, 0, sizeof(request));
+	/* Keep bounce-buffer I/O on the same per-blob data reactor as direct I/O. */
+	dataReactor = hfsRuntimeDataReactorFor(file->fs, file->blobId);
 	request.file = file;
 	request.buffer = buffer;
 	request.offset = offset;
 	request.units = units;
 	request.operation = operation;
+	request.channel = hfsRuntimeDataChannel(file->fs, dataReactor);
+	request.dataReactor = dataReactor;
+	request.dataPath = true;
+	if (request.channel == NULL) {
+		errno = EIO;
+		return -1;
+	}
 	if (hfsIoStartRequest(&request) != 0) {
 		HFS_STATS_ERROR();
 		return -1;
@@ -1291,6 +1302,8 @@ static ssize_t hfsIoReadAtLocked(HfsFile *file, uint8_t *buffer,
 	uint64_t cursor = offset;
 	size_t remaining = count;
 	size_t done = 0;
+	uint32_t dataReactor = hfsRuntimeDataReactorFor(file->fs,
+									 file->blobId);
 	if (offset % unitSize == 0 && count % (size_t)unitSize == 0 &&
 	    hfsIoBufferDmaCapable(buffer, count)) {
 		uint64_t maxUnits = hfsIoMaxUnits(file->fs);
@@ -1365,6 +1378,10 @@ static ssize_t hfsIoReadAtLocked(HfsFile *file, uint8_t *buffer,
 			requests[requestCount].offset = cursor / unitSize + pendingUnits;
 			requests[requestCount].units = chunkUnits;
 			requests[requestCount].operation = HFS_IO_READ;
+			requests[requestCount].channel = hfsRuntimeDataChannel(file->fs,
+											 dataReactor);
+			requests[requestCount].dataReactor = dataReactor;
+			requests[requestCount].dataPath = true;
 			if (hfsIoStartRequest(&requests[requestCount]) != 0) {
 				hfsIoRelease(&leases[requestCount]);
 				hfsIoWaitPipeline(requests, requestCount);
@@ -1417,6 +1434,8 @@ static ssize_t hfsIoWriteAtLocked(HfsFile *file, const uint8_t *buffer,
 	uint64_t cursor = offset;
 	size_t remaining = count;
 	size_t done = 0;
+	uint32_t dataReactor = hfsRuntimeDataReactorFor(file->fs,
+									  file->blobId);
 	if (offset % unitSize == 0 && count % (size_t)unitSize == 0 &&
 	    hfsIoBufferDmaCapable(buffer, count)) {
 		uint64_t maxUnits = hfsIoMaxUnits(file->fs);
@@ -1487,6 +1506,10 @@ static ssize_t hfsIoWriteAtLocked(HfsFile *file, const uint8_t *buffer,
 			requests[requestCount].offset = cursor / unitSize + pendingUnits;
 			requests[requestCount].units = chunkUnits;
 			requests[requestCount].operation = HFS_IO_WRITE;
+			requests[requestCount].channel = hfsRuntimeDataChannel(file->fs,
+											  dataReactor);
+			requests[requestCount].dataReactor = dataReactor;
+			requests[requestCount].dataPath = true;
 			if (hfsIoStartRequest(&requests[requestCount]) != 0) {
 				hfsIoRelease(&leases[requestCount]);
 				hfsIoWaitPipeline(requests, requestCount);

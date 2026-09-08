@@ -33,6 +33,10 @@ typedef struct HfsRuntimeDataReactor {
 	_Atomic(struct spdk_thread *) spdkThread;
 	pthread_mutex_t lock;
 	pthread_cond_t stateChanged;
+	pthread_mutex_t batchLock;
+	HfsRuntimeBatchItem *batchHead;
+	HfsRuntimeBatchItem *batchTail;
+	bool batchScheduled;
 	unsigned int index;
 	int cpu;
 	bool threadCreated;
@@ -215,6 +219,40 @@ static void hfsRuntimeDispatchBatch(void *arg) {
 			depth = atomic_fetch_sub_explicit(&g_runtime.inflight, 1,
 				memory_order_relaxed);
 			hfsStatsRecordRuntimeDispatchFast(queueWaitNs, ownerNs, depth);
+		} else {
+			item->fn(item->ctx);
+		}
+		item = next;
+	}
+}
+
+/* Drain one data-reactor batch after one notification instead of one message per I/O. */
+static void hfsRuntimeDispatchDataBatch(void *arg) {
+	HfsRuntimeDataReactor *reactor = arg;
+	HfsRuntimeBatchItem *item;
+	HfsRuntimeBatchItem *next;
+	bool timing = hfsStatsTimingFastEnabled();
+
+	pthread_mutex_lock(&reactor->batchLock);
+	item = reactor->batchHead;
+	reactor->batchHead = NULL;
+	reactor->batchTail = NULL;
+	reactor->batchScheduled = false;
+	pthread_mutex_unlock(&reactor->batchLock);
+	while (item != NULL) {
+		next = item->next;
+		if (timing) {
+			uint64_t depth = atomic_fetch_sub_explicit(&g_runtime.queued, 1,
+					memory_order_relaxed) - 1U;
+			uint64_t queueWaitNs = hfsStatsNowNs() - item->enqueueNs;
+			uint64_t ownerStartNs = hfsStatsNowNs();
+			atomic_fetch_add_explicit(&g_runtime.inflight, 1,
+					memory_order_relaxed);
+			item->fn(item->ctx);
+			depth = atomic_fetch_sub_explicit(&g_runtime.inflight, 1,
+					memory_order_relaxed);
+			hfsStatsRecordRuntimeDispatchFast(queueWaitNs,
+					hfsStatsNowNs() - ownerStartNs, depth);
 		} else {
 			item->fn(item->ctx);
 		}
@@ -482,6 +520,7 @@ static int hfsRuntimeStartDataReactors(void) {
 		reactor->cpu = hfsRuntimeDataCpuEnv(i - 1U);
 		pthread_mutex_init(&reactor->lock, NULL);
 		pthread_cond_init(&reactor->stateChanged, NULL);
+		pthread_mutex_init(&reactor->batchLock, NULL);
 		initialized = i;
 		rc = pthread_create(&reactor->owner, NULL, hfsRuntimeDataMain,
 				    reactor);
@@ -520,6 +559,7 @@ static int hfsRuntimeStartDataReactors(void) {
 			HfsRuntimeDataReactor *reactor =
 				&g_runtime.dataReactors[j - 1U];
 			pthread_cond_destroy(&reactor->stateChanged);
+			pthread_mutex_destroy(&reactor->batchLock);
 			pthread_mutex_destroy(&reactor->lock);
 		}
 		free(g_runtime.dataReactors);
@@ -552,6 +592,7 @@ static void hfsRuntimeStopDataReactors(void) {
 
 		pthread_join(reactor->owner, NULL);
 		pthread_cond_destroy(&reactor->stateChanged);
+		pthread_mutex_destroy(&reactor->batchLock);
 		pthread_mutex_destroy(&reactor->lock);
 	}
 	free(g_runtime.dataReactors);
@@ -732,6 +773,76 @@ data_submit_done:
 	free(message);
 	atomic_fetch_sub_explicit(&g_runtime.submitters, 1,
 					memory_order_release);
+	return rc;
+}
+
+/* Queue one request on a data reactor and coalesce concurrent submissions. */
+int hfsRuntimeSubmitDataBatch(uint32_t reactorId, HfsRuntimeBatchItem *item,
+				      spdk_msg_fn fn, void *ctx) {
+	HfsRuntimeDataReactor *reactor;
+	struct spdk_thread *thread;
+	bool notify = false;
+	bool timing;
+	int rc = 0;
+
+	if (reactorId == 0) {
+		return hfsRuntimeSubmitBatch(item, fn, ctx);
+	}
+	if (item == NULL || fn == NULL || g_runtime.dataReactors == NULL ||
+	    reactorId >= g_runtime.dataReactorCount) {
+		HFS_STATS_SPDK_REJECT();
+		return -EINVAL;
+	}
+	if (!g_runtime.batchEnabled) {
+		return hfsRuntimeSubmitData(reactorId, fn, ctx);
+	}
+	if (hfsRuntimeIsForkChild()) {
+		HFS_STATS_SPDK_REJECT();
+		return -ECHILD;
+	}
+	reactor = &g_runtime.dataReactors[reactorId - 1U];
+	atomic_fetch_add_explicit(&g_runtime.submitters, 1, memory_order_acquire);
+	if (!atomic_load_explicit(&g_runtime.accepting, memory_order_acquire)) {
+		rc = -ESHUTDOWN;
+		goto data_batch_done;
+	}
+	thread = atomic_load_explicit(&reactor->spdkThread, memory_order_acquire);
+	if (thread == NULL) {
+		rc = -ESHUTDOWN;
+		goto data_batch_done;
+	}
+	timing = hfsStatsTimingFastEnabled();
+	item->fn = fn;
+	item->ctx = ctx;
+	item->enqueueNs = timing ? hfsStatsNowNs() : 0;
+	item->next = NULL;
+	if (timing) {
+		uint64_t depth = atomic_fetch_add_explicit(&g_runtime.queued, 1,
+				memory_order_relaxed) + 1U;
+		hfsStatsRecordRuntimeSubmitFast(depth);
+	}
+	pthread_mutex_lock(&reactor->batchLock);
+	if (reactor->batchTail != NULL) {
+		reactor->batchTail->next = item;
+	} else {
+		reactor->batchHead = item;
+	}
+	reactor->batchTail = item;
+	if (!reactor->batchScheduled) {
+		reactor->batchScheduled = true;
+		notify = true;
+	}
+	pthread_mutex_unlock(&reactor->batchLock);
+	HFS_STATS_SPDK_SUBMIT();
+	if (notify) {
+		spdk_thread_send_msg(thread, hfsRuntimeDispatchDataBatch, reactor);
+	}
+
+data_batch_done:
+	if (rc != 0) {
+		HFS_STATS_SPDK_REJECT();
+	}
+	atomic_fetch_sub_explicit(&g_runtime.submitters, 1, memory_order_release);
 	return rc;
 }
 

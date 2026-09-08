@@ -966,9 +966,9 @@ Bug 等级：**致命 > 严重 > 一般**。
 - **修复**：为 `HfsInodeRuntime` 增加 `rangeGate`。当请求覆盖至少四分之一 bucket 时仅获取该 inode 的 gate 写锁，不再抓取全局 bucket；小范围请求先获取 gate 读锁，再按 bucket 编号升序加锁，释放时反序释放，保留交叉区间的死锁顺序保证。
 - **验证**：reactor=2（16 文件，64/64 submit-complete）与 reactor=4（32 文件，128/128，3 个 data reactor 均有计数）通过，既有 fast path、crash、stress 和数据库回归无回退。
 
-### 63. HFS 数据面仍明显慢于原生 SPDK direct NVMe（待修复，严重级）
+### 63. HFS 数据面仍明显慢于原生 SPDK direct NVMe（第一轮已修复，仍有残余优化项，严重级）
 
-- **状态**：已定位，尚未修复
+- **状态**：第一轮修复已完成；普通 bounce I/O 已接入 data reactor，写入元数据发布已延迟合并；DMA direct path、range lock 和 64 KiB 尾延迟仍需后续优化
 - **时间**：2026-09-08（direct-NVMe 读写分离专项）
 - **等级**：严重（不影响数据正确性，但限制读写吞吐和尾延迟）
 - **现象**：在同一块 `/dev/nvme0n1` 上，关闭重型 timing 统计后做等口径对照，4 KiB
@@ -993,6 +993,24 @@ Bug 等级：**致命 > 严重 > 一般**。
 - **根因**：HFS 数据面是“普通用户缓冲区 bounce copy + POSIX 锁/元数据语义 + owner
   同步等待”的组合路径；原生 SPDK 是“DMA buffer + 异步队列 + 无文件级元数据/范围锁”。
   因此当前差距主要来自 HFS 上层路径和并发模型，而不是 NVMe 设备或 SPDK bdev 本身。
+- **本轮修复**：
+  1. `hfsIoSubmit` 及 read/write pipeline 的 bounce request 统一选择
+     `hfsRuntimeDataReactorFor(blobId)` 对应的 channel；data reactor 新增 batch dispatcher，
+     避免逐请求 `spdk_thread_send_msg` 破坏原有批处理。
+  2. 为 inode runtime 增加 logical EOF 与 pending mtime/ctime 原子状态；不扩展文件的
+     write 只记录延迟元数据，不再每次获取全局 metadata 写锁；`fsync` 批量 drain/commit，
+     `stat/fstat` 在提交前叠加 pending 时间戳，扩展写、truncate 仍走锁保护路径。
+- **本轮验证**：
+  1. `HFS_DATA_REACTORS=4` 的多 reactor accounting 为 `192/192`，32 线程 runtime stress、
+     fast I/O、POSIX data contract、metadata recovery 全部通过。
+  2. 4 KiB NVMe 对照（stats-off）：HFS QD32 read/write/randrw 为
+     `110.4k/37.0k/40.2k IOPS`，原生 SPDK 为 `164.2k/114.9k/111.4k IOPS`；
+     HFS QD1 read/write 为 `22.0k/21.0k`，原生为 `33.0k/30.8k`，所有 errors=0。
+  3. `hfs_write_qd32` 的 `meta_write_lock=337` 对 `io_write_ops=369,579`，已从“每次写锁”
+     降为批量级；`data_reactor_2_submit/complete=369,579/369,578` 的差异仅发生在统计快照
+     与退出并发窗口，专项多 reactor 测试仍严格闭合。
+  4. 64 KiB QD32 HFS read/write 为 `14.9k/13.5k IOPS`，相比旧基线 `11.2k/10.3k` 有
+     改善，但仍明显落后原生 `60.6k/46.6k`，且 p99 仍在 `72–85 ms`，不能视为最终收口。
 - **修复方向**：
   1. 为可验证的 DMA-capable 用户缓冲区增加真正的异步 direct path；普通缓冲区保留
      bounce fallback，并提供足够的 pipeline/outstanding depth。
@@ -1002,7 +1020,26 @@ Bug 等级：**致命 > 严重 > 一般**。
      aligned I/O 避免长时间持锁跨越设备 completion。
   4. 重新评估 DMA pool 各 size class 的 buffer 数和 backpressure，特别是 64 KiB 以上
      请求；所有读写对比必须使用相同 QD/并发和 stats-off 口径。
-- **验证**：新增的 VM 专项结果位于 `/mnt/hfs-data/performance-hfs-vs-spdk-rw-notiming`
-  和 `/mnt/hfs-data/performance-hfs-vs-spdk-64k`；本轮只做定位，尚未提交代码修复。
+- **验证**：最新 VM 专项结果位于 `/mnt/hfs-data/performance-hfs-vs-spdk-rw-notiming`
+  和 `/mnt/hfs-data/performance-hfs-vs-spdk-64k`；第一轮代码修复待提交后继续做 direct DMA、
+  range lock 和 64 KiB buffer/backpressure 优化。
+
+### 64. data reactor 逐请求投递导致 bounce read 队头阻塞（已修复，严重级）
+
+- **状态**：已修复；data reactor 增加与 owner 等价的 batch dispatcher
+- **时间**：2026-09-08（shard-47 性能回归）
+- **等级**：严重（无数据错误，但会使开启多 reactor 的读吞吐崩溃）
+- **现象**：首次把 pipeline bounce request 直接切换到 data reactor 后，4 KiB QD32 read
+  从约 85.6k IOPS 降至约 1.1k IOPS，p99 超过 170 ms；write 受影响较小。
+- **排查过程**：多 reactor accounting 和 completion 均正常，确认不是 NVMe 错误或未完成请求；
+  对比 owner-side batch 与 data-side 单消息路径后，发现原 owner 路径会把并发请求合并为一次
+  `spdk_thread_send_msg`，而 data reactor 改动按请求发送消息，导致 reactor 消息调度和同步
+  completion 成为队头瓶颈。
+- **根因**：data reactor 只提供逐消息提交接口，没有对应的批量队列；高并发 bounce read
+  的消息数与 I/O 数相同，放大跨线程唤醒、锁和 futex completion 成本。
+- **修复**：为每个 data reactor 增加独立 batch queue/dispatcher；`hfsIoStartRequest`
+  通过 `hfsRequestSubmitDataBatch` 投递，保留 `HFS_RUNTIME_BATCH=0` 的逐请求回退语义。
+- **验证**：修复后孤立 4 KiB read QD32 达到 `115.4k IOPS`、p99 `528 µs`；完整对照
+  达到 `110.4k IOPS`，errors=0；reactor=4 多文件专项 `192/192` 闭合。
 
 ## 通用经验总结

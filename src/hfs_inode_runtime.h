@@ -11,6 +11,12 @@
 typedef struct hfs_inode_runtime {
 	uint64_t inodeId;
 	_Atomic uint64_t allocatedClusters;
+	/* Logical EOF shared by all open descriptions of this inode. */
+	_Atomic uint64_t logicalSize;
+	/* Coalesce write timestamps until the next metadata checkpoint. */
+	_Atomic uint64_t pendingMtimeNs;
+	_Atomic uint64_t pendingCtimeNs;
+	_Atomic bool pendingMetadata;
 	pthread_mutex_t resizeLock;
 	pthread_mutex_t appendLock;
 	pthread_rwlock_t syncLock;
@@ -27,5 +33,18 @@ void hfsInodeRuntimeFini(Hfs *fs);
 HfsInodeRuntime *hfsInodeRuntimeGet(Hfs *fs, uint64_t inodeId);
 /* Return the runtime state attached to an open file, if any. */
 HfsInodeRuntime *hfsInodeRuntimeForFile(HfsFile *file);
+/* Publish one write's timestamp without taking the global metadata lock. */
+void hfsInodeRuntimeRecordMetadata(HfsInodeRuntime *runtime,
+					   uint64_t mtimeNs, uint64_t ctimeNs);
+/* Publish or read the shared logical EOF used by the write fast path. */
+void hfsInodeRuntimeSetLogicalSize(HfsInodeRuntime *runtime, uint64_t size);
+uint64_t hfsInodeRuntimeGetLogicalSize(const HfsInodeRuntime *runtime);
+/* Read a pending timestamp overlay for stat-style metadata snapshots. */
+bool hfsInodeRuntimeGetPendingMetadata(const HfsInodeRuntime *runtime,
+					       uint64_t *mtimeNs, uint64_t *ctimeNs);
+/* Drop pending timestamps after a size-changing write is committed directly. */
+void hfsInodeRuntimeDiscardPending(HfsInodeRuntime *runtime);
+/* Apply all pending timestamp overlays while the metadata write lock is held. */
+void hfsInodeRuntimeDrainPendingLocked(Hfs *fs);
 
 #endif /* HFS_INODE_RUNTIME_H */

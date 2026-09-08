@@ -551,10 +551,38 @@ static ssize_t hfsWritevAt(HfsOpenFile *openFile, const struct iovec *iov,
 	return (ssize_t)done;
 }
 
+/* Publish a non-extending write through runtime state without global locking. */
+static bool hfsPublishWriteEndFast(HfsOpenFile *openFile, uint64_t end) {
+	HfsInodeRuntime *runtime;
+	uint64_t logicalSize;
+	uint64_t nowNs;
+
+	if (openFile == NULL) {
+		return false;
+	}
+	runtime = openFile->runtime;
+	if (runtime == NULL) {
+		return false;
+	}
+	logicalSize = hfsInodeRuntimeGetLogicalSize(runtime);
+	if (end > logicalSize) {
+		return false;
+	}
+	nowNs = hfs_now_ns();
+	/* The data path is complete; only timestamp publication is deferred. */
+	hfsInodeRuntimeRecordMetadata(runtime, nowNs, nowNs);
+	atomic_store_explicit(&openFile->mtimeNs, nowNs, memory_order_release);
+	atomic_store_explicit(&openFile->ctimeNs, nowNs, memory_order_release);
+	return true;
+}
+
 /* Update the in-memory inode while the metadata write lock is held. */
 static void hfsPublishWriteEndLocked(HfsOpenFile *openFile, uint64_t end) {
 	struct hfs_inode *in;
 	uint64_t nowNs = hfs_now_ns();
+
+	/* A size-changing write supersedes any older deferred timestamp. */
+	hfsInodeRuntimeDiscardPending(openFile == NULL ? NULL : openFile->runtime);
 
 	in = g_fs == NULL ? NULL : hfsMetaFindById(g_fs, openFile->inodeId);
 	if (in != NULL) {
@@ -565,6 +593,7 @@ static void hfsPublishWriteEndLocked(HfsOpenFile *openFile, uint64_t end) {
 		in->mtimeNs = nowNs;
 		in->ctimeNs = nowNs;
 		hfsMetaMarkInodeDirty(g_fs, in->id);
+		hfsInodeRuntimeSetLogicalSize(openFile->runtime, in->size);
 		atomic_store_explicit(&openFile->size, in->size,
 				      memory_order_relaxed);
 		atomic_store_explicit(&openFile->mtimeNs, in->mtimeNs,
@@ -578,6 +607,9 @@ static void hfsPublishWriteEndLocked(HfsOpenFile *openFile, uint64_t end) {
 			atomic_store_explicit(&openFile->size, end,
 					      memory_order_relaxed);
 		}
+		hfsInodeRuntimeSetLogicalSize(openFile->runtime,
+					      atomic_load_explicit(&openFile->size,
+								memory_order_relaxed));
 		atomic_store_explicit(&openFile->mtimeNs, nowNs,
 				      memory_order_relaxed);
 		atomic_store_explicit(&openFile->ctimeNs, nowNs, memory_order_relaxed);
@@ -586,6 +618,9 @@ static void hfsPublishWriteEndLocked(HfsOpenFile *openFile, uint64_t end) {
 
 /* Publish a successful write end for both linked and unlinked open files. */
 static void hfsPublishWriteEnd(HfsOpenFile *openFile, uint64_t end) {
+	if (hfsPublishWriteEndFast(openFile, end)) {
+		return;
+	}
 	hfsMetaWriteLock();
 	hfsPublishWriteEndLocked(openFile, end);
 	pthread_rwlock_unlock(&g_metaLock);
@@ -593,6 +628,9 @@ static void hfsPublishWriteEnd(HfsOpenFile *openFile, uint64_t end) {
 
 /* Try to publish a write without blocking the SPDK owner thread. */
 static bool hfsTryPublishWriteEnd(HfsOpenFile *openFile, uint64_t end) {
+	if (hfsPublishWriteEndFast(openFile, end)) {
+		return true;
+	}
 	if (pthread_rwlock_trywrlock(&g_metaLock) != 0) {
 		return false;
 	}
@@ -1291,6 +1329,11 @@ int hfs_lib_open(const char *path, int flags, mode_t mode) {
 			errno = savedErrno;
 			return -1;
 		}
+		hfsInodeRuntimeDiscardPending(file->runtime);
+	}
+	if (current != NULL) {
+		/* Seed the shared EOF before publishing the new open description. */
+		hfsInodeRuntimeSetLogicalSize(file->runtime, current->size);
 	}
 	if (hfsFdCreate(&openFile, file, file->inodeId, flags,
 			((flags & O_ACCMODE) != O_RDONLY), false, NULL) != 0 ||
@@ -2090,12 +2133,16 @@ int hfs_lib_ftruncate(int fd, off_t length) {
 	if (in != NULL) {
 		rc = hfsMetaSetSize(g_fs, in, (uint64_t)length);
 		if (rc == 0) {
+			hfsInodeRuntimeDiscardPending(runtime);
+			hfsInodeRuntimeSetLogicalSize(runtime, (uint64_t)length);
 			atomic_store_explicit(&openFile->size, (uint64_t)length,
 					      memory_order_relaxed);
 			atomic_store_explicit(&openFile->mtimeNs, in->mtimeNs,
 					      memory_order_relaxed);
 		}
 	} else if (hfsFdGetOrphanInfo(openFile, NULL, NULL, NULL)) {
+		hfsInodeRuntimeDiscardPending(runtime);
+		hfsInodeRuntimeSetLogicalSize(runtime, (uint64_t)length);
 		atomic_store_explicit(&openFile->size, (uint64_t)length,
 				      memory_order_relaxed);
 		atomic_store_explicit(&openFile->mtimeNs, hfs_now_ns(),
@@ -2120,6 +2167,7 @@ int hfs_lib_ftruncate(int fd, off_t length) {
 int hfs_lib_fstat(int fd, struct stat *st) {
 	struct hfs_inode *in;
 	HfsOpenFile *openFile;
+	HfsInodeRuntime *runtime;
 	struct hfs_inode snapshot;
 	uint64_t orphanSize;
 	uint64_t orphanCtimeNs;
@@ -2146,6 +2194,26 @@ int hfs_lib_fstat(int fd, struct stat *st) {
 	}
 	if (in != NULL) {
 		snapshot = *in;
+		runtime = openFile->runtime;
+		if (runtime != NULL) {
+			uint64_t logicalSize = hfsInodeRuntimeGetLogicalSize(runtime);
+			uint64_t pendingMtimeNs;
+			uint64_t pendingCtimeNs;
+
+			if (logicalSize > snapshot.size) {
+				snapshot.size = logicalSize;
+			}
+			if (hfsInodeRuntimeGetPendingMetadata(runtime,
+						       &pendingMtimeNs,
+						       &pendingCtimeNs)) {
+				if (pendingMtimeNs > snapshot.mtimeNs) {
+					snapshot.mtimeNs = pendingMtimeNs;
+				}
+				if (pendingCtimeNs > snapshot.ctimeNs) {
+					snapshot.ctimeNs = pendingCtimeNs;
+				}
+			}
+		}
 	} else {
 		memset(&snapshot, 0, sizeof(snapshot));
 		snapshot.id = openFile->inodeId;
@@ -2596,6 +2664,8 @@ int hfs_lib_fsync(int fd) {
 		errno = ENODEV;
 		return -1;
 	}
+	/* Fold lock-free write timestamps into the next durable metadata epoch. */
+	hfsInodeRuntimeDrainPendingLocked(g_fs);
 	if (!g_fs->metaDirty) {
 		hfsDurabilityTraceRecord(openFile->inodeId, "metadata-skip", 0);
 		pthread_rwlock_unlock(&g_metaLock);
@@ -2980,6 +3050,7 @@ int hfs_lib_closedir(struct hfs_dir *dir) {
  */
 int hfs_lib_stat(const char *path, struct stat *st) {
 	struct hfs_inode *in;
+	HfsInodeRuntime *runtime;
 	struct hfs_inode snapshot;
 
 	if (st == NULL) {
@@ -3000,6 +3071,21 @@ int hfs_lib_stat(const char *path, struct stat *st) {
 		return -1;
 	}
 	snapshot = *in;
+	runtime = hfsInodeRuntimeGet(g_fs, in->id);
+	if (runtime != NULL) {
+		uint64_t pendingMtimeNs;
+		uint64_t pendingCtimeNs;
+
+		if (hfsInodeRuntimeGetPendingMetadata(runtime, &pendingMtimeNs,
+						       &pendingCtimeNs)) {
+			if (pendingMtimeNs > snapshot.mtimeNs) {
+				snapshot.mtimeNs = pendingMtimeNs;
+			}
+			if (pendingCtimeNs > snapshot.ctimeNs) {
+				snapshot.ctimeNs = pendingCtimeNs;
+			}
+		}
+	}
 	pthread_rwlock_unlock(&g_metaLock);
 	in = &snapshot;
 

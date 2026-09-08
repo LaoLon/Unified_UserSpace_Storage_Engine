@@ -26,6 +26,9 @@ typedef struct HfsRuntimeBatchItem {
 } HfsRuntimeBatchItem;
 /* Queue one request and coalesce concurrent submissions into one owner message. */
 int hfsRuntimeSubmitBatch(HfsRuntimeBatchItem *item, spdk_msg_fn fn, void *ctx);
+/* Queue one request and coalesce concurrent submissions on a data reactor. */
+int hfsRuntimeSubmitDataBatch(uint32_t reactorId, HfsRuntimeBatchItem *item,
+				      spdk_msg_fn fn, void *ctx);
 /* Allocate and release per-reactor blobstore channels after mount. */
 int hfsRuntimeDataInit(Hfs *fs);
 int hfsRuntimeDataFini(Hfs *fs);
