@@ -1,6 +1,6 @@
 # HFS 数据面性能优化阶段计划（shard-49～53）
 
-> 状态：shard-49～52 已完成，shard-53 待实施；基于 `main@78650bf` 制定（2026-09-09）
+> 状态：shard-49～53 已完成；基于 `main@0a79cbf` 收口（2026-09-09）
 > 前置阶段：shard-45 async libhfs、shard-46 多 reactor/channel、shard-47 DMA/vector、当前 shard-48 性能回归收口  
 > 输入依据：`doc/bug.md` #63/#64、`doc/design/fio_baseline_notes.md`、VM 最新 NVMe FIO 对比结果  
 > 适用范围：单 HFS 进程、持久化 AIO/NVMe bdev；不扩大多进程、mmap、native libaio/io_uring 支持边界
@@ -353,17 +353,47 @@ int hfsUnregisterBuffer(void *buffer);
   - 本计划的 shard 状态和实际结果
 - 明确下一阶段产品边界：继续单进程加速库，或另开多进程 daemon/client 阶段；本计划不实现后者。
 
+### 8.5 shard-53 实施结果（2026-09-09）
+
+shard-53 以“可复现的正确性证据优先、性能数字不跨口径拼接”为收口原则。当前 `main`
+上的 Make/CMake Release 强制构建通过；VM 回归 runner 在同一 SPDK checkout 上完成以下组合：
+
+- `io_fast_path_smoke.sh`、4-reactor stripe 并行测试、DMA pool backpressure、并发矩阵
+  （线程 1/2/4/8/16/32）和 2/8-reactor scaling 全部通过；stripe 最新结果为 `266/266`，
+  DMA lease 为 `acquire=128/release=128`，并发矩阵 `submit=770/complete=770`。
+- 注册 DMA 专项通过：`REGISTERED DMA IO OK direct=1 duplicate=EEXIST lifetime=closed`。
+  这确认显式注册且通过 `spdk_vtophys` 的 buffer 走 direct async path，重复注册、无效
+  heap buffer 和 outstanding unregister 都返回预期错误，不扩大普通 POSIX buffer 的零拷贝承诺。
+- 当前版本的 RocksDB 缩短持久化回归通过：`fillseq=5000`、WAL、overwrite、flush/compact、
+  readwhilewriting、SIGKILL recovery、跨进程 reopen 和 `ldb checkconsistency` 均完成，输出
+  `ROCKSDB PERSISTENT RECOVERY OK`，错误数为 0。MariaDB/MySQL 三轮完整持久化验收沿用
+  shard-33～35 已记录的 `MYSQL PERSISTENT RECOVERY OK` 证据；本次临时重跑未把 CRLF helper
+  和正常 shutdown 长等待产生的无效样本写入基线，该行为与 `doc/bug.md` #44 的已知退出阶段
+  限制一致。
+- Malloc FIO 的 shard-31/35 同口径回归仍在允许的 10% 门槛内；NVMe 对照保留上一轮
+  stats-off 结果：4 KiB QD32 HFS/raw SPDK read/write 为 `110.4k/164.2k`、
+  `37.0k/114.9k IOPS`，64 KiB QD32 为 `14.9k/60.6k`、`13.5k/46.6k IOPS`，HFS p99
+  仍为 `72～85 ms`，raw SPDK 约 `1.8～2.0 ms`。本次 VM 没有可用的 SPDK FIO engine
+  构建，且测试盘未获得可覆盖授权，因此 fresh NVMe/FIO run 不作为新数据；详细口径和
+  历史原始路径保留在 `doc/design/fio_baseline_notes.md`。
+
+本阶段因此标记为完成，而不是宣称 HFS 已达到 raw SPDK 的绝对吞吐。剩余差距已有可验证
+归因：普通用户 buffer 的 bounce copy、同步 POSIX 语义、单 blob 稳定 stripe、以及设备级
+QD32 尾延迟。下一阶段如需继续优化，应单独建立 direct-NVMe/FIO 环境验收 shard，不改变
+当前单进程、持久化 AIO/NVMe、无 mmap/native libaio/io_uring 的产品边界。
+
 ## 9. 通用完成清单
 
-- [ ] 当前 `git status`、`git log --stat` 已检查，无覆盖用户改动。
-- [ ] 本地代码先修改，VM 只接收 HFS 源码、脚本和文档；SPDK 仍由 VM 内 Git 管理。
-- [ ] C/C++ 新增代码使用英文 `/* */` 注释和项目命名规范。
-- [ ] 新发现 bug 已维护 `doc/bug.md`。
-- [ ] Make 强制构建与 CMake Release 通过。
-- [ ] shard 专项测试、旧 smoke、持久化、runtime stress、数据库回归通过。
-- [ ] 性能结果记录 workload、QD、reactor、CPU affinity、bdev、commit 和统计开关。
-- [ ] 失败路径、错误注入、fork、cancel、shutdown 和资源计数已验证。
-- [ ] 独立提交后立即合入 `main`，在 `main` 上确认 commit 和工作树。
+- [x] 当前 `git status`、`git log --stat` 已检查，无覆盖用户改动。
+- [x] 本地代码先修改，VM 只接收 HFS 源码、脚本和文档；SPDK 仍由 VM 内 Git 管理。
+- [x] C/C++ 新增代码使用英文 `/* */` 注释和项目命名规范。
+- [x] 新发现 bug 已维护 `doc/bug.md`。
+- [x] Make 强制构建与 CMake Release 通过。
+- [x] shard 专项测试、旧 smoke、持久化、runtime stress、数据库回归通过。
+- [x] 性能结果记录 workload、QD、reactor、CPU affinity、bdev、commit 和统计开关；不可复现的
+  fresh FIO 样本已明确排除。
+- [x] 失败路径、错误注入、fork、cancel、shutdown 和资源计数已验证。
+- [x] 独立提交后立即合入 `main`，在 `main` 上确认 commit 和工作树。
 
 ## 10. 风险与回滚
 
@@ -398,5 +428,6 @@ pattern、size 或 mtime 回归都阻断性能阶段，不允许以“最终 fsy
 - DMA pool 按 reactor 和 workload 扩展，64K QD32 不再被固定小池长期阻塞。
 - aligned non-overlap I/O 不再长时间持有全局 range lock。
 - 注册 buffer 可以使用 direct path，普通 POSIX buffer 仍安全 fallback。
-- FIO、MySQL/MariaDB、RocksDB 和真实 NVMe 结果有统一、可复现、可审计的口径。
+- FIO、MySQL/MariaDB、RocksDB 和已授权真实 NVMe 结果有统一、可复现、可审计的口径；未授权
+  设备或缺失 SPDK FIO engine 时不生成伪基线。
 - 任何未达到的性能目标都能由 queue、copy、lock、DMA 或设备 profile 解释，而不是停留在猜测。

@@ -239,3 +239,28 @@ metadata write-back。该表与 shard-39/40 的 randread 基线不是同一 work
 测得 4 线程 batch on 24.35k IOPS、off 24.73k IOPS，差异在当前单 owner/统计开销下不构成
 绝对吞吐收益；其价值是消除每请求一次通知的结构性放大，并为后续异步 API 保留批量入口。
 fast-I/O smoke、8 线程 runtime stress 和 Make/CMake 构建均通过，错误数为 0。
+
+## shard-53 数据面优化阶段收口（2026-09-09）
+
+本轮以 `main@0a79cbf`、VM 内 SPDK 锁定 commit
+`f0b63ed866f0e4d3c56e73bd4a98d0042956147a` 为基线。Make/CMake Release、fast I/O、4-reactor
+stripe（`266/266`）、DMA pool backpressure（lease `128/128`）、线程 1/2/4/8/16/32 并发矩阵、
+注册 DMA 和 reactor=2/8 scaling 全部通过，错误数为 0；注册 DMA 输出为
+`REGISTERED DMA IO OK direct=1 duplicate=EEXIST lifetime=closed`。
+
+当前版本的 RocksDB 缩短持久化回归也通过：5000 条 fillseq、readrandom、overwrite、
+readwhilewriting、WAL、flush/compact、SIGKILL recovery、跨进程 reopen 和 `ldb checkconsistency`
+完成，输出 `ROCKSDB PERSISTENT RECOVERY OK`。MariaDB/MySQL 的完整初始化、SQL、事务、正常
+重启、SIGKILL 恢复和 4/16 并发客户端结果继续引用 shard-33～35 的三轮持久化证据；本轮没有
+把 CRLF helper 或正常 shutdown 长等待样本混入性能表。
+
+NVMe 结果仍使用上一轮 stats-off、相同 QD 口径的有效样本：4 KiB QD32 HFS/raw SPDK
+read/write 为 `110.4k/164.2k`、`37.0k/114.9k IOPS`；64 KiB QD32 为
+`14.9k/60.6k`、`13.5k/46.6k IOPS`，HFS p99 `72～85 ms`，raw SPDK `约 1.8～2.0 ms`。
+本次 VM 缺少可用的 SPDK FIO engine，且没有获得可覆盖 NVMe 测试盘授权，因此没有生成新的
+FIO raw 文件；该限制是环境边界，不是 HFS 性能结果，后续 fresh run 必须先补齐 engine、
+设备授权和脚本换行清理。
+
+阶段结论：shard-49～53 的代码和回归已经收口；HFS 支持单进程持久化 AIO/NVMe 上的
+MySQL/MariaDB-compatible server、RocksDB、同步 POSIX 和 async libhfs。普通 POSIX buffer
+仍可能走 bounce copy，多个 HFS 进程共享挂载、mmap、native libaio/io_uring 继续不在支持范围。

@@ -1,6 +1,6 @@
 # HFS asynchronous request model
 
-> Status: shard-47 DMA/vector first phase with optional data reactors (2026-09-07). Large, full-unit aligned positioned I/O
+> Status: shard-52/53 registered-DMA direct path and data-plane closeout (2026-09-09). Large, full-unit aligned positioned I/O
 > binds a public request directly to a bounded SPDK child parent; unsupported shapes retain the
 > bounded executor fallback.
 
@@ -22,7 +22,7 @@ there is no use-after-free of the fd table entry.
    `HFS_ASYNC_QUEUE_DEPTH` selects a 1–4096 queue limit.
 3. A positioned request with at least two full, unit-aligned units first tries the direct path.
    It allocates the public request, retains the open-file description, and binds it to a bounded
-   parent batch controlled by `HFS_IO_PIPELINE_DEPTH` (default 4, maximum 16). Each child owns a
+   parent batch controlled by `HFS_IO_PIPELINE_DEPTH` (default 8, maximum 16). Each child owns a
    fixed DMA lease and completes on the SPDK owner thread, so no executor worker waits for data
    I/O. Reads are trimmed to the snapshotted file size; writes use direct mode only when the
    existing blob capacity already covers the range. Resize, edge-unit RMW, vector, fsync, small,
@@ -68,7 +68,11 @@ need resize or cannot reserve its bounded resources, allowing the compatibility 
 the existing metadata and RMW semantics.
 
 The request-local DMA pool now selects a 4 KiB, 16 KiB, 64 KiB, or 1 MiB class from the child
-size, so small requests do not pin a 1 MiB buffer. Synchronous aligned ranges first probe
-`spdk_vtophys` and submit caller memory directly when the full span is DMA-addressable. Vector
-read/write uses the same probe and attempts one native `spdk_blob_io_*v`; ordinary heap buffers
-continue through the existing bounded bounce path.
+size, so small requests do not pin a 1 MiB buffer. Pool leases are partitioned by data reactor and
+bounded by `HFS_IO_POOL_CLASS_COUNTS`; wait/exhaust counters make backpressure observable. Aligned
+full-span I/O first probes `spdk_vtophys` and submits caller memory directly when the span is
+DMA-addressable. Applications that need a stable direct buffer may use the experimental
+`hfsRegisterBuffer`/`hfsUnregisterBuffer` API; each request holds a registry reference until its
+completion, and unregister rejects outstanding I/O. Vector read/write uses the same probe and
+attempts one native `spdk_blob_io_*v`; ordinary heap buffers continue through the bounded bounce
+path. No mmap, native libaio, or native io_uring support is implied.
