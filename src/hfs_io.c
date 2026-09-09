@@ -16,6 +16,7 @@
 #include "hfs_io.h"
 #include "hfs_log.h"
 #include "hfs_stats.h"
+#include "hfs_trace.h"
 
 /* Keep the hot path bounded while avoiding a 1 MiB lease for tiny requests. */
 #define HFS_IO_POOL_CLASS_COUNT	4U
@@ -40,6 +41,7 @@ typedef struct HfsIoLease {
 	HfsIoPoolClass *classPool;
 	uint32_t slot;
 	uint8_t *buffer;
+	uint8_t poolClass;
 } HfsIoLease;
 
 /* Registered DMA memory range with an outstanding-request reference count. */
@@ -105,6 +107,9 @@ typedef struct HfsIoRequest {
 	bool dataPath;
 	HfsRuntimeBatchItem batchItem;
 	HfsRequestResult result;
+	uint64_t traceParentId;
+	uint64_t traceSubmitNs;
+	HfsTraceBufferKind traceBufferKind;
 	/* Distinguish worker-free child requests from synchronous stack requests. */
 	uint64_t asyncMagic;
 	void (*asyncDone)(struct HfsIoRequest *request);
@@ -115,6 +120,20 @@ typedef struct HfsIoRequest {
 
 static pthread_mutex_t g_hfsIoBufferLock = PTHREAD_MUTEX_INITIALIZER;
 static HfsIoBufferRegistration *g_hfsIoBuffers;
+static _Thread_local uint64_t g_hfsIoTraceParentId;
+static _Thread_local HfsTraceOperation g_hfsIoTraceOperation;
+
+/* Convert an internal I/O operation to the stable trace vocabulary. */
+static HfsTraceOperation hfsIoTraceOperation(HfsIoOperation operation)
+{
+	switch (operation) {
+	case HFS_IO_READ: return HFS_TRACE_OPERATION_READ;
+	case HFS_IO_WRITE: return HFS_TRACE_OPERATION_WRITE;
+	case HFS_IO_UNMAP: return HFS_TRACE_OPERATION_UNMAP;
+	case HFS_IO_WRITE_ZEROES: return HFS_TRACE_OPERATION_WRITE_ZEROES;
+	default: return HFS_TRACE_OPERATION_NONE;
+	}
+}
 
 static HfsIoBufferRegistration *hfsIoBufferAcquire(const void *buffer,
 						 size_t bytes);
@@ -162,6 +181,7 @@ typedef struct HfsIoAsyncParent {
 	HfsInodeRuntime *runtime;
 	struct spdk_io_channel *channel;
 	uint32_t dataReactor;
+	uint64_t traceParentId;
 	HfsIoRangeGuard guard;
 	HfsIoRequest requests[HFS_IO_MAX_PIPELINE];
 	HfsIoLease leases[HFS_IO_MAX_PIPELINE];
@@ -525,6 +545,11 @@ static int hfsIoAcquire(Hfs *fs, HfsIoLease *lease, size_t requestedBytes,
 		waited = true;
 		waitStartNs = hfsStatsNowNs();
 		HFS_STATS_DMA_WAIT();
+		hfsTraceEmit(HFS_TRACE_LEASE_WAIT_BEGIN, g_hfsIoTraceOperation,
+			     HFS_TRACE_BUFFER_DMA_LEASE, 0, g_hfsIoTraceParentId,
+			     0, 0, requestedBytes, 0, shard->active,
+			     reactorId, 0,
+			     (uint32_t)(classPool - shard->classes), 0, 0);
 	}
 	while (classPool->freeTop == 0 && !shard->closing) {
 		pthread_cond_wait(&shard->available, &shard->lock);
@@ -537,6 +562,7 @@ static int hfsIoAcquire(Hfs *fs, HfsIoLease *lease, size_t requestedBytes,
 	lease->pool = pool;
 	lease->shard = shard;
 	lease->classPool = classPool;
+	lease->poolClass = (uint8_t)(classPool - shard->classes);
 	lease->slot = classPool->freeSlots[--classPool->freeTop];
 	lease->buffer = classPool->storage +
 		(size_t)lease->slot * classPool->bufferBytes;
@@ -545,7 +571,16 @@ static int hfsIoAcquire(Hfs *fs, HfsIoLease *lease, size_t requestedBytes,
 	hfsStatsRecordDmaFast(classPool->bufferBytes, waited, shard->active);
 	if (waited) {
 		hfsStatsRecordDmaWaitNs(hfsStatsNowNs() - waitStartNs);
+		hfsTraceEmit(HFS_TRACE_LEASE_WAIT_END, g_hfsIoTraceOperation,
+			     HFS_TRACE_BUFFER_DMA_LEASE, 0, g_hfsIoTraceParentId,
+			     0, 0, classPool->bufferBytes, 0, shard->active,
+			     reactorId, 0, lease->poolClass,
+			     hfsStatsNowNs() - waitStartNs, 0);
 	}
+	hfsTraceEmit(HFS_TRACE_LEASE_ACQUIRE, g_hfsIoTraceOperation,
+		     HFS_TRACE_BUFFER_DMA_LEASE, 0, g_hfsIoTraceParentId,
+		     0, 0, classPool->bufferBytes, 0, shard->active,
+		     reactorId, 0, lease->poolClass, 0, 0);
 	pthread_mutex_unlock(&shard->lock);
 	return 0;
 }
@@ -583,12 +618,17 @@ static int hfsIoTryAcquire(Hfs *fs, HfsIoLease *lease, size_t requestedBytes,
 	lease->pool = pool;
 	lease->shard = shard;
 	lease->classPool = classPool;
+	lease->poolClass = (uint8_t)(classPool - shard->classes);
 	lease->slot = classPool->freeSlots[--classPool->freeTop];
 	lease->buffer = classPool->storage +
 		(size_t)lease->slot * classPool->bufferBytes;
 	shard->active++;
 	HFS_STATS_DMA_ACTIVE(shard->active);
 	hfsStatsRecordDmaFast(classPool->bufferBytes, false, shard->active);
+	hfsTraceEmit(HFS_TRACE_LEASE_ACQUIRE, g_hfsIoTraceOperation,
+		     HFS_TRACE_BUFFER_DMA_LEASE, 0, g_hfsIoTraceParentId,
+		     0, 0, classPool->bufferBytes, 0, shard->active,
+		     reactorId, 0, lease->poolClass, 0, 0);
 	pthread_mutex_unlock(&shard->lock);
 	return 0;
 }
@@ -611,6 +651,10 @@ static void hfsIoRelease(HfsIoLease *lease) {
 		lease->shard->active--;
 	}
 	HFS_STATS_DMA_RELEASE();
+	hfsTraceEmit(HFS_TRACE_LEASE_RELEASE, g_hfsIoTraceOperation,
+		     HFS_TRACE_BUFFER_DMA_LEASE, 0, g_hfsIoTraceParentId,
+		     0, 0, lease->classPool->bufferBytes, 0, lease->shard->active,
+		     0, 0, lease->poolClass, 0, 0);
 	pthread_cond_broadcast(&lease->shard->available);
 	pthread_mutex_unlock(&lease->shard->lock);
 	memset(lease, 0, sizeof(*lease));
@@ -687,6 +731,7 @@ static void hfsIoStart(void *arg) {
 /* Capture an SPDK completion code before waking the synchronous caller. */
 static void hfsIoDone(void *arg, int bserrno) {
 	HfsIoRequest *request = arg;
+	uint64_t durationNs = 0;
 
 	/* Publish reactor accounting before waking waiters or shutdown snapshots. */
 	if (request->dataPath) {
@@ -695,6 +740,22 @@ static void hfsIoDone(void *arg, int bserrno) {
 	hfsIoBufferRelease(request->registeredBuffer);
 	request->registeredBuffer = NULL;
 	hfsRequestComplete(&request->result, bserrno, request->units);
+	if (request->traceSubmitNs != 0) {
+		uint64_t nowNs = hfsTraceNowNs();
+		if (nowNs >= request->traceSubmitNs) {
+			durationNs = nowNs - request->traceSubmitNs;
+		}
+	}
+	hfsTraceEmit(HFS_TRACE_SPDK_COMPLETE,
+		     hfsIoTraceOperation(request->operation),
+		     request->traceBufferKind,
+		     request->result.requestId, request->traceParentId,
+		     request->file != NULL ? request->file->inodeId : 0,
+		     request->offset,
+		     request->units *
+		     (request->file != NULL ? request->file->fs->unitSize : 0),
+		     (uint32_t)request->units, 0, request->dataReactor, 0,
+		     0, durationNs, bserrno);
 	if (request->asyncMagic == HFS_IO_ASYNC_MAGIC && request->asyncDone != NULL) {
 		request->asyncDone(request);
 	}
@@ -715,7 +776,24 @@ static int hfsIoStartRequest(HfsIoRequest *request) {
 		request->registeredBuffer = hfsIoBufferAcquire(request->buffer,
 								 requestBytes);
 	}
+	if (request->traceParentId == 0) {
+		request->traceParentId = g_hfsIoTraceParentId;
+	}
+	if (request->traceBufferKind == HFS_TRACE_BUFFER_NONE) {
+		request->traceBufferKind = request->buffer != NULL ?
+			HFS_TRACE_BUFFER_DMA_LEASE : HFS_TRACE_BUFFER_NONE;
+	}
 	hfsRequestInit(&request->result, hfsIoRequestOperation(request->operation));
+	request->traceSubmitNs = hfsTraceNowNs();
+	hfsTraceEmit(HFS_TRACE_SPDK_SUBMIT,
+		     hfsIoTraceOperation(request->operation),
+		     request->traceBufferKind,
+		     request->result.requestId, request->traceParentId,
+		     request->file->inodeId, request->offset,
+		     request->units * request->file->fs->unitSize,
+		     (uint32_t)request->units, 0, request->dataReactor, 0,
+		     0, 0, 0);
+	request->batchItem.traceParentId = request->traceParentId;
 	if (request->dataPath && request->dataReactor != 0) {
 		rc = hfsRequestSubmitDataBatch(&request->result, hfsIoStart,
 						request, request->dataReactor,
@@ -924,6 +1002,7 @@ static int hfsIoSubmitDirect(HfsFile *file, void *buffer, uint64_t offset,
 	request.offset = offset;
 	request.units = units;
 	request.operation = write ? HFS_IO_WRITE : HFS_IO_READ;
+	request.traceBufferKind = HFS_TRACE_BUFFER_CALLER;
 	request.dataReactor = hfsRuntimeDataReactorFor(file->fs, file->blobId,
 								 offset);
 	request.channel = hfsRuntimeDataChannel(file->fs, request.dataReactor);
@@ -987,6 +1066,8 @@ static int hfsIoSubmitDirectAsync(HfsFile *file, void *buffer, size_t count,
 	direct->request.offset = offset / file->fs->unitSize;
 	direct->request.units = units;
 	direct->request.operation = HFS_IO_READ;
+	direct->request.traceBufferKind = HFS_TRACE_BUFFER_CALLER;
+	direct->request.traceParentId = hfsTraceNextRequestId();
 	direct->request.dataReactor = hfsRuntimeDataReactorFor(file->fs,
 								file->blobId,
 								direct->request.offset);
@@ -1040,6 +1121,8 @@ static int hfsIoSubmitDirectWriteAsync(HfsFile *file, const void *buffer,
 	direct->request.offset = offset / file->fs->unitSize;
 	direct->request.units = units;
 	direct->request.operation = HFS_IO_WRITE;
+	direct->request.traceBufferKind = HFS_TRACE_BUFFER_CALLER;
+	direct->request.traceParentId = hfsTraceNextRequestId();
 	direct->request.dataReactor = hfsRuntimeDataReactorFor(file->fs,
 								file->blobId,
 								direct->request.offset);
@@ -1336,6 +1419,8 @@ static int hfsIoAsyncStartBatch(HfsIoAsyncParent *parent) {
 				parent->file->fs->unitSize + relativeUnit;
 			parent->requests[i].units = units;
 			parent->requests[i].operation = parent->write ? HFS_IO_WRITE : HFS_IO_READ;
+			parent->requests[i].traceParentId = parent->traceParentId;
+			parent->requests[i].traceBufferKind = HFS_TRACE_BUFFER_DMA_LEASE;
 			/* Route each child by its logical stripe, not only by blob id. */
 			parent->requests[i].dataReactor = hfsRuntimeDataReactorFor(
 				parent->file->fs, parent->file->blobId,
@@ -1443,6 +1528,7 @@ int hfsIoReadAtAsync(HfsFile *file, uint8_t *buffer, size_t count,
 		return -1;
 	}
 	parent->readBuffer = buffer;
+	parent->traceParentId = hfsTraceNextRequestId();
 	parent->count = count;
 	parent->offset = offset;
 	parent->totalUnits = count / file->fs->unitSize;
@@ -1530,6 +1616,7 @@ int hfsIoWriteAtAsync(HfsFile *file, const uint8_t *buffer, size_t count,
 		return -1;
 	}
 	parent->writeBuffer = buffer;
+	parent->traceParentId = hfsTraceNextRequestId();
 	parent->count = count;
 	parent->offset = offset;
 	parent->totalUnits = count / file->fs->unitSize;
@@ -1791,9 +1878,19 @@ static int hfsIoModifyPartial(HfsFile *file, uint64_t unitOffset,
 	}
 	rc = hfsIoReadUnit(file, &lease, unitOffset);
 	if (rc == 0) {
+		uint64_t copyStartNs = hfsTraceNowNs();
+		hfsTraceEmit(HFS_TRACE_COPY_IN_BEGIN, HFS_TRACE_OPERATION_WRITE,
+			     HFS_TRACE_BUFFER_RMW, 0, g_hfsIoTraceParentId,
+			     file->inodeId, unitOffset * file->fs->unitSize,
+			     length, 0, 0, 0, 0, lease.poolClass, 0, 0);
 		hfsStatsRecordRmwFast(file->fs->unitSize);
 		memcpy(lease.buffer + unitIndex, source, length);
 		hfsStatsRecordCopyFast(length);
+		hfsTraceEmit(HFS_TRACE_COPY_IN_END, HFS_TRACE_OPERATION_WRITE,
+			     HFS_TRACE_BUFFER_RMW, 0, g_hfsIoTraceParentId,
+			     file->inodeId, unitOffset * file->fs->unitSize,
+			     length, 0, 0, 0, 0, lease.poolClass,
+			     hfsTraceNowNs() - copyStartNs, 0);
 		rc = hfsIoWriteUnit(file, &lease, unitOffset);
 	}
 	hfsIoRelease(&lease);
@@ -1832,13 +1929,13 @@ static int hfsIoWriteZeroUnits(HfsFile *file, uint64_t offset, uint64_t units) {
 /* Read a positioned range while the caller holds the filesystem read lock. */
 static ssize_t hfsIoReadAtLocked(HfsFile *file, uint8_t *buffer,
 				 size_t count, uint64_t offset,
-				 bool windowedReservation) {
+				 bool windowedReservation,
+				 bool directEligible) {
 	uint64_t unitSize = file->fs->unitSize;
 	uint64_t cursor = offset;
 	size_t remaining = count;
 	size_t done = 0;
-	if (offset % unitSize == 0 && count % (size_t)unitSize == 0 &&
-	    hfsIoBufferDmaCapable(buffer, count)) {
+	if (directEligible) {
 		uint64_t maxUnits = hfsIoMaxUnits(file->fs);
 		uint64_t units = count / unitSize;
 		uint64_t cursorUnit = offset / unitSize;
@@ -1887,7 +1984,18 @@ static ssize_t hfsIoReadAtLocked(HfsFile *file, uint8_t *buffer,
 			hfsIoRelease(&lease);
 			return -1;
 		}
-		memcpy(buffer, lease.buffer + unitIndex, take);
+		{
+			uint64_t copyStartNs = hfsTraceNowNs();
+			hfsTraceEmit(HFS_TRACE_COPY_OUT_BEGIN, HFS_TRACE_OPERATION_READ,
+				     HFS_TRACE_BUFFER_RMW, 0, g_hfsIoTraceParentId,
+				     file->inodeId, cursor, take, 0, 0, 0, 0,
+				     lease.poolClass, 0, 0);
+			memcpy(buffer, lease.buffer + unitIndex, take);
+			hfsTraceEmit(HFS_TRACE_COPY_OUT_END, HFS_TRACE_OPERATION_READ,
+				     HFS_TRACE_BUFFER_RMW, 0, g_hfsIoTraceParentId,
+				     file->inodeId, cursor, take, 0, 0, 0, 0,
+				     lease.poolClass, hfsTraceNowNs() - copyStartNs, 0);
+		}
 		hfsStatsRecordCopyFast(take);
 		hfsIoRelease(&lease);
 		cursor += take;
@@ -1905,6 +2013,7 @@ static ssize_t hfsIoReadAtLocked(HfsFile *file, uint8_t *buffer,
 		HfsIoRequest requests[HFS_IO_MAX_PIPELINE] = {0};
 		HfsIoLease leases[HFS_IO_MAX_PIPELINE] = {0};
 		uint32_t i;
+		uint64_t copyOffset;
 		HfsIoRangeGuard windowGuard = {0};
 		uint64_t windowUnits = fullUnits;
 
@@ -1963,12 +2072,30 @@ static ssize_t hfsIoReadAtLocked(HfsFile *file, uint8_t *buffer,
 			}
 			return -1;
 		}
+		copyOffset = cursor;
 		for (i = 0; i < requestCount; i++) {
 			size_t bytes = (size_t)(requests[i].units * unitSize);
 
-			memcpy(buffer, leases[i].buffer, bytes);
+			{
+				uint64_t copyStartNs = hfsTraceNowNs();
+				hfsTraceEmit(HFS_TRACE_COPY_OUT_BEGIN,
+					     HFS_TRACE_OPERATION_READ,
+					     HFS_TRACE_BUFFER_DMA_LEASE, 0,
+					     g_hfsIoTraceParentId, file->inodeId,
+					     copyOffset, bytes, 0, 0, 0, 0,
+					     leases[i].poolClass, 0, 0);
+				memcpy(buffer, leases[i].buffer, bytes);
+				hfsTraceEmit(HFS_TRACE_COPY_OUT_END,
+					     HFS_TRACE_OPERATION_READ,
+					     HFS_TRACE_BUFFER_DMA_LEASE, 0,
+					     g_hfsIoTraceParentId, file->inodeId,
+					     copyOffset, bytes, 0, 0, 0, 0,
+					     leases[i].poolClass,
+					     hfsTraceNowNs() - copyStartNs, 0);
+			}
 			hfsStatsRecordCopyFast(bytes);
 			buffer += bytes;
+			copyOffset += bytes;
 		}
 		hfsIoReleasePipeline(leases, requestCount);
 		if (windowedReservation) {
@@ -1990,7 +2117,18 @@ static ssize_t hfsIoReadAtLocked(HfsFile *file, uint8_t *buffer,
 			hfsIoRelease(&lease);
 			return -1;
 		}
-		memcpy(buffer, lease.buffer, remaining);
+		{
+			uint64_t copyStartNs = hfsTraceNowNs();
+			hfsTraceEmit(HFS_TRACE_COPY_OUT_BEGIN, HFS_TRACE_OPERATION_READ,
+				     HFS_TRACE_BUFFER_DMA_LEASE, 0, g_hfsIoTraceParentId,
+				     file->inodeId, cursor, remaining, 0, 0, 0, 0,
+				     lease.poolClass, 0, 0);
+			memcpy(buffer, lease.buffer, remaining);
+			hfsTraceEmit(HFS_TRACE_COPY_OUT_END, HFS_TRACE_OPERATION_READ,
+				     HFS_TRACE_BUFFER_DMA_LEASE, 0, g_hfsIoTraceParentId,
+				     file->inodeId, cursor, remaining, 0, 0, 0, 0,
+				     lease.poolClass, hfsTraceNowNs() - copyStartNs, 0);
+		}
 		hfsStatsRecordCopyFast(remaining);
 		hfsIoRelease(&lease);
 		done += remaining;
@@ -2001,13 +2139,13 @@ static ssize_t hfsIoReadAtLocked(HfsFile *file, uint8_t *buffer,
 /* Write a positioned range while the caller holds the selected data lock. */
 static ssize_t hfsIoWriteAtLocked(HfsFile *file, const uint8_t *buffer,
 				  size_t count, uint64_t offset,
-				  bool windowedReservation) {
+				  bool windowedReservation,
+				  bool directEligible) {
 	uint64_t unitSize = file->fs->unitSize;
 	uint64_t cursor = offset;
 	size_t remaining = count;
 	size_t done = 0;
-	if (offset % unitSize == 0 && count % (size_t)unitSize == 0 &&
-	    hfsIoBufferDmaCapable(buffer, count)) {
+	if (directEligible) {
 		uint64_t maxUnits = hfsIoMaxUnits(file->fs);
 		uint64_t units = count / unitSize;
 		uint64_t cursorUnit = offset / unitSize;
@@ -2094,8 +2232,26 @@ static ssize_t hfsIoWriteAtLocked(HfsFile *file, const uint8_t *buffer,
 				return -1;
 			}
 			bytes = (size_t)(chunkUnits * unitSize);
-			memcpy(leases[requestCount].buffer,
-			       buffer + (size_t)(pendingUnits * unitSize), bytes);
+			{
+				uint64_t copyStartNs = hfsTraceNowNs();
+				hfsTraceEmit(HFS_TRACE_COPY_IN_BEGIN,
+					     HFS_TRACE_OPERATION_WRITE,
+					     HFS_TRACE_BUFFER_DMA_LEASE, 0,
+					     g_hfsIoTraceParentId, file->inodeId,
+					     cursor + pendingUnits * unitSize, bytes,
+					     0, 0, 0, 0,
+					     leases[requestCount].poolClass, 0, 0);
+				memcpy(leases[requestCount].buffer,
+				       buffer + (size_t)(pendingUnits * unitSize), bytes);
+				hfsTraceEmit(HFS_TRACE_COPY_IN_END,
+					     HFS_TRACE_OPERATION_WRITE,
+					     HFS_TRACE_BUFFER_DMA_LEASE, 0,
+					     g_hfsIoTraceParentId, file->inodeId,
+					     cursor + pendingUnits * unitSize, bytes,
+					     0, 0, 0, 0,
+					     leases[requestCount].poolClass,
+					     hfsTraceNowNs() - copyStartNs, 0);
+			}
 			hfsStatsRecordCopyFast(bytes);
 			requests[requestCount].file = file;
 			requests[requestCount].buffer = leases[requestCount].buffer;
@@ -2151,6 +2307,11 @@ ssize_t hfsIoReadAt(HfsFile *file, uint8_t *buffer, size_t count,
 	HfsIoRangeGuard guard = {0};
 	ssize_t result;
 	bool aligned;
+	bool directEligible;
+	uint64_t traceId;
+	uint64_t traceStartNs;
+	uint64_t previousTraceParent;
+	HfsTraceOperation previousTraceOperation;
 
 	if (count == 0) {
 		return 0;
@@ -2167,20 +2328,57 @@ ssize_t hfsIoReadAt(HfsFile *file, uint8_t *buffer, size_t count,
 	}
 	aligned = (offset % file->fs->unitSize) == 0 &&
 		(count % (size_t)file->fs->unitSize) == 0;
+	directEligible = aligned && hfsIoBufferDmaCapable(buffer, count);
+	traceId = hfsTraceNextRequestId();
+	traceStartNs = hfsTraceNowNs();
+	previousTraceParent = g_hfsIoTraceParentId;
+	previousTraceOperation = g_hfsIoTraceOperation;
+	g_hfsIoTraceParentId = traceId;
+	g_hfsIoTraceOperation = HFS_TRACE_OPERATION_READ;
+	hfsTraceEmit(HFS_TRACE_IO_ENTER, HFS_TRACE_OPERATION_READ,
+		     directEligible ? HFS_TRACE_BUFFER_CALLER :
+		     (aligned ? HFS_TRACE_BUFFER_DMA_LEASE : HFS_TRACE_BUFFER_RMW),
+		     0, traceId, file->inodeId, offset, count,
+		     (uint32_t)(count / file->fs->unitSize), 0, 0, 0, 0, 0, 0);
+	hfsTraceEmit(HFS_TRACE_BUFFER_CLASSIFY, HFS_TRACE_OPERATION_READ,
+		     directEligible ? HFS_TRACE_BUFFER_CALLER :
+		     (aligned ? HFS_TRACE_BUFFER_DMA_LEASE : HFS_TRACE_BUFFER_RMW),
+		     0, traceId, file->inodeId, offset, count,
+		     (uint32_t)(count / file->fs->unitSize), 0, 0, 0, 0, 0, 0);
 	hfsStatsRecordIoFast(false, count, aligned);
 	runtime = hfsIoSyncReadLock(file);
 	if (runtime == NULL) {
+		hfsTraceEmit(HFS_TRACE_IO_EXIT, HFS_TRACE_OPERATION_READ,
+			     HFS_TRACE_BUFFER_NONE, 0, traceId, file->inodeId,
+			     offset, count, 0, 0, 0, 0, 0,
+			     hfsTraceNowNs() - traceStartNs, -1);
+		g_hfsIoTraceParentId = previousTraceParent;
+		g_hfsIoTraceOperation = previousTraceOperation;
 		return -1;
 	}
 	if (!aligned && hfsIoRangeLock(file, offset, count, false, &guard) != 0) {
 		hfsIoSyncReadUnlock(runtime);
+		hfsTraceEmit(HFS_TRACE_IO_EXIT, HFS_TRACE_OPERATION_READ,
+			     HFS_TRACE_BUFFER_RMW, 0, traceId, file->inodeId,
+			     offset, count, 0, 0, 0, 0, 0,
+			     hfsTraceNowNs() - traceStartNs, -1);
+		g_hfsIoTraceParentId = previousTraceParent;
+		g_hfsIoTraceOperation = previousTraceOperation;
 		return -1;
 	}
-	result = hfsIoReadAtLocked(file, buffer, count, offset, aligned);
+	result = hfsIoReadAtLocked(file, buffer, count, offset, aligned,
+				   directEligible);
 	if (!aligned) {
 		hfsIoRangeUnlock(file, &guard);
 	}
 	hfsIoSyncReadUnlock(runtime);
+	hfsTraceEmit(HFS_TRACE_IO_EXIT, HFS_TRACE_OPERATION_READ,
+		     directEligible ? HFS_TRACE_BUFFER_CALLER :
+		     (aligned ? HFS_TRACE_BUFFER_DMA_LEASE : HFS_TRACE_BUFFER_RMW),
+		     0, traceId, file->inodeId, offset, count, 0, 0, 0, 0, 0,
+		     hfsTraceNowNs() - traceStartNs, result < 0 ? -1 : 0);
+	g_hfsIoTraceParentId = previousTraceParent;
+	g_hfsIoTraceOperation = previousTraceOperation;
 	return result;
 }
 
@@ -2191,6 +2389,11 @@ ssize_t hfsIoWriteAt(HfsFile *file, const uint8_t *buffer, size_t count,
 	HfsIoRangeGuard guard = {0};
 	ssize_t result;
 	bool aligned;
+	bool directEligible;
+	uint64_t traceId;
+	uint64_t traceStartNs;
+	uint64_t previousTraceParent;
+	HfsTraceOperation previousTraceOperation;
 
 	if (count == 0) {
 		return 0;
@@ -2207,24 +2410,67 @@ ssize_t hfsIoWriteAt(HfsFile *file, const uint8_t *buffer, size_t count,
 	}
 	aligned = (offset % file->fs->unitSize) == 0 &&
 		(count % (size_t)file->fs->unitSize) == 0;
+	directEligible = aligned && hfsIoBufferDmaCapable(buffer, count);
+	traceId = hfsTraceNextRequestId();
+	traceStartNs = hfsTraceNowNs();
+	previousTraceParent = g_hfsIoTraceParentId;
+	previousTraceOperation = g_hfsIoTraceOperation;
+	g_hfsIoTraceParentId = traceId;
+	g_hfsIoTraceOperation = HFS_TRACE_OPERATION_WRITE;
+	hfsTraceEmit(HFS_TRACE_IO_ENTER, HFS_TRACE_OPERATION_WRITE,
+		     directEligible ? HFS_TRACE_BUFFER_CALLER :
+		     (aligned ? HFS_TRACE_BUFFER_DMA_LEASE : HFS_TRACE_BUFFER_RMW),
+		     0, traceId, file->inodeId, offset, count,
+		     (uint32_t)(count / file->fs->unitSize), 0, 0, 0, 0, 0, 0);
+	hfsTraceEmit(HFS_TRACE_BUFFER_CLASSIFY, HFS_TRACE_OPERATION_WRITE,
+		     directEligible ? HFS_TRACE_BUFFER_CALLER :
+		     (aligned ? HFS_TRACE_BUFFER_DMA_LEASE : HFS_TRACE_BUFFER_RMW),
+		     0, traceId, file->inodeId, offset, count,
+		     (uint32_t)(count / file->fs->unitSize), 0, 0, 0, 0, 0, 0);
 	hfsStatsRecordIoFast(true, count, aligned);
 	runtime = hfsIoSyncReadLock(file);
 	if (runtime == NULL) {
+		hfsTraceEmit(HFS_TRACE_IO_EXIT, HFS_TRACE_OPERATION_WRITE,
+			     HFS_TRACE_BUFFER_NONE, 0, traceId, file->inodeId,
+			     offset, count, 0, 0, 0, 0, 0,
+			     hfsTraceNowNs() - traceStartNs, -1);
+		g_hfsIoTraceParentId = previousTraceParent;
+		g_hfsIoTraceOperation = previousTraceOperation;
 		return -1;
 	}
 	if (hfsResizeTo(file, offset + count) != 0) {
 		hfsIoSyncReadUnlock(runtime);
+		hfsTraceEmit(HFS_TRACE_IO_EXIT, HFS_TRACE_OPERATION_WRITE,
+			     HFS_TRACE_BUFFER_NONE, 0, traceId, file->inodeId,
+			     offset, count, 0, 0, 0, 0, 0,
+			     hfsTraceNowNs() - traceStartNs, -1);
+		g_hfsIoTraceParentId = previousTraceParent;
+		g_hfsIoTraceOperation = previousTraceOperation;
 		return -1;
 	}
 	if (!aligned && hfsIoRangeLock(file, offset, count, true, &guard) != 0) {
 		hfsIoSyncReadUnlock(runtime);
+		hfsTraceEmit(HFS_TRACE_IO_EXIT, HFS_TRACE_OPERATION_WRITE,
+			     HFS_TRACE_BUFFER_RMW, 0, traceId, file->inodeId,
+			     offset, count, 0, 0, 0, 0, 0,
+			     hfsTraceNowNs() - traceStartNs, -1);
+		g_hfsIoTraceParentId = previousTraceParent;
+		g_hfsIoTraceOperation = previousTraceOperation;
 		return -1;
 	}
-	result = hfsIoWriteAtLocked(file, buffer, count, offset, aligned);
+	result = hfsIoWriteAtLocked(file, buffer, count, offset, aligned,
+				    directEligible);
 	if (!aligned) {
 		hfsIoRangeUnlock(file, &guard);
 	}
 	hfsIoSyncReadUnlock(runtime);
+	hfsTraceEmit(HFS_TRACE_IO_EXIT, HFS_TRACE_OPERATION_WRITE,
+		     directEligible ? HFS_TRACE_BUFFER_CALLER :
+		     (aligned ? HFS_TRACE_BUFFER_DMA_LEASE : HFS_TRACE_BUFFER_RMW),
+		     0, traceId, file->inodeId, offset, count, 0, 0, 0, 0, 0,
+		     hfsTraceNowNs() - traceStartNs, result < 0 ? -1 : 0);
+	g_hfsIoTraceParentId = previousTraceParent;
+	g_hfsIoTraceOperation = previousTraceOperation;
 	return result;
 }
 

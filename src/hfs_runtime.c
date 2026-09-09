@@ -20,6 +20,7 @@
 #include "hfs_log.h"
 #include "hfs_runtime.h"
 #include "hfs_stats.h"
+#include "hfs_trace.h"
 
 /* Completion states are intentionally simple for one-shot requests. */
 #define HFS_COMPLETION_PENDING 0
@@ -211,6 +212,18 @@ static void hfsRuntimeDispatchBatch(void *arg) {
 
 	while (item != NULL) {
 		next = item->next;
+		if (hfsTraceEnabledFast()) {
+			uint64_t nowNs = hfsTraceNowNs();
+			uint64_t waitNs = item->enqueueNs != 0 && nowNs >= item->enqueueNs ?
+					  nowNs - item->enqueueNs : 0;
+			hfsTraceEmit(HFS_TRACE_RUNTIME_DEQUEUE,
+				     HFS_TRACE_OPERATION_NONE,
+				     HFS_TRACE_BUFFER_NONE,
+				     0, item->traceParentId, 0, 0, 0, 0,
+				     (uint32_t)atomic_load_explicit(&g_runtime.queued,
+								    memory_order_relaxed),
+				     0, 0, 0, waitNs, 0);
+		}
 		if (timing) {
 			depth = atomic_fetch_sub_explicit(&g_runtime.queued, 1,
 				memory_order_relaxed) - 1U;
@@ -245,6 +258,18 @@ static void hfsRuntimeDispatchDataBatch(void *arg) {
 	pthread_mutex_unlock(&reactor->batchLock);
 	while (item != NULL) {
 		next = item->next;
+		if (hfsTraceEnabledFast()) {
+			uint64_t nowNs = hfsTraceNowNs();
+			uint64_t waitNs = item->enqueueNs != 0 && nowNs >= item->enqueueNs ?
+					  nowNs - item->enqueueNs : 0;
+			hfsTraceEmit(HFS_TRACE_RUNTIME_DEQUEUE,
+				     HFS_TRACE_OPERATION_NONE,
+				     HFS_TRACE_BUFFER_NONE,
+				     0, item->traceParentId, 0, 0, 0, 0,
+				     (uint32_t)atomic_load_explicit(&g_runtime.queued,
+								    memory_order_relaxed),
+				     reactor->index, 0, 0, waitNs, 0);
+		}
 		if (timing) {
 			uint64_t depth = atomic_fetch_sub_explicit(&g_runtime.queued, 1,
 					memory_order_relaxed) - 1U;
@@ -844,6 +869,12 @@ int hfsRuntimeSubmitDataBatch(uint32_t reactorId, HfsRuntimeBatchItem *item,
 				memory_order_relaxed) + 1U;
 		hfsStatsRecordRuntimeSubmitFast(depth);
 	}
+	hfsTraceEmit(HFS_TRACE_RUNTIME_ENQUEUE,
+		     HFS_TRACE_OPERATION_NONE, HFS_TRACE_BUFFER_NONE, 0,
+		     item->traceParentId, 0, 0, 0, 0,
+		     (uint32_t)atomic_load_explicit(&g_runtime.queued,
+						    memory_order_relaxed),
+		     reactorId, 0, 0, 0, 0);
 	pthread_mutex_lock(&reactor->batchLock);
 	if (reactor->batchTail != NULL) {
 		reactor->batchTail->next = item;
@@ -921,6 +952,12 @@ int hfsRuntimeSubmitBatch(HfsRuntimeBatchItem *item, spdk_msg_fn fn, void *ctx) 
 			memory_order_relaxed) + 1U;
 		hfsStatsRecordRuntimeSubmitFast(queueDepth);
 	}
+	hfsTraceEmit(HFS_TRACE_RUNTIME_ENQUEUE,
+		     HFS_TRACE_OPERATION_NONE, HFS_TRACE_BUFFER_NONE, 0,
+		     item->traceParentId, 0, 0, 0, 0,
+		     (uint32_t)atomic_load_explicit(&g_runtime.queued,
+						    memory_order_relaxed),
+		     0, 0, 0, 0, 0);
 	pthread_mutex_lock(&g_runtime.batchLock);
 	if (g_runtime.batchTail != NULL) {
 		g_runtime.batchTail->next = item;

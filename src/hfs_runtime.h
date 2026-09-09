@@ -22,6 +22,7 @@ typedef struct HfsRuntimeBatchItem {
 	spdk_msg_fn fn;
 	void *ctx;
 	uint64_t enqueueNs;
+	uint64_t traceParentId;
 	struct HfsRuntimeBatchItem *next;
 } HfsRuntimeBatchItem;
 /* Queue one request and coalesce concurrent submissions into one owner message. */

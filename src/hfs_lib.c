@@ -26,6 +26,7 @@
 #include "hfs_meta.h"
 #include "hfs_runtime.h"
 #include "hfs_stats.h"
+#include "hfs_trace.h"
 
 /* Protects the mounted inode table and metadata snapshots. */
 static pthread_rwlock_t g_metaLock = PTHREAD_RWLOCK_INITIALIZER;
@@ -681,6 +682,7 @@ int hfs_lib_init(void) {
 	}
 	hfsMetaWriteLock();
 	hfsStatsInit();
+	hfsTraceInit();
 	hfsDurabilityTraceInit();
 	if (g_fs != NULL) {
 		pthread_rwlock_unlock(&g_metaLock);
@@ -840,6 +842,7 @@ void hfs_lib_fini(void) {
 	hfsMetaWriteLock();
 	if (g_fs == NULL) {
 		hfsDurabilityTraceFini();
+		hfsTraceFini();
 		hfsStatsFini();
 		pthread_rwlock_unlock(&g_metaLock);
 		return;
@@ -868,6 +871,7 @@ void hfs_lib_fini(void) {
 	hfs_release_backend_lock();
 	HFS_LOG_DEBUG("libhfs finalized");
 	hfsDurabilityTraceFini();
+	hfsTraceFini();
 	hfsStatsFini();
 	hfs_log_fini();
 	pthread_rwlock_unlock(&g_metaLock);
