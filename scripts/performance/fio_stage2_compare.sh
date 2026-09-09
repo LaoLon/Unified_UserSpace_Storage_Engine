@@ -10,6 +10,8 @@ SPDK_PLUGIN="${4:-/root/code/spdk/build/fio/spdk_bdev}"
 SPDK_CONF="${5:-$ROOT/config/hfs.json}"
 HFS_CONFIG="${HFS_FIO_CONFIG:-$SPDK_CONF}"
 HFS_BDEV="${HFS_FIO_BDEV_NAME:-Malloc0}"
+SPDK_BDEV="${HFS_FIO_SPDK_BDEV_NAME:-Malloc0}"
+HFS_NUMJOBS="${HFS_FIO_NUMJOBS:-1}"
 SIZE="${HFS_FIO_SIZE:-256m}"
 RUNTIME="${HFS_FIO_RUNTIME_SECONDS:-15}"
 RUN_SPDK_REFERENCE="${HFS_FIO_RUN_SPDK_REFERENCE:-1}"
@@ -30,6 +32,8 @@ rm -f "$OUT"/*.json "$OUT"/*.log "$OUT/summary.tsv" "$OUT/environment.txt"
 	echo "hfs_lib=$HFS_LIB"
 	echo "spdk_plugin=$SPDK_PLUGIN"
 	echo "spdk_config=$SPDK_CONF"
+	echo "spdk_bdev=$SPDK_BDEV"
+	echo "hfs_numjobs=$HFS_NUMJOBS"
 	echo "size=$SIZE"
 	echo "runtime_seconds=$RUNTIME"
 	echo "spdk_reference=$RUN_SPDK_REFERENCE"
@@ -42,7 +46,7 @@ for BS in 4k 8k 16k 32k 64k; do
 	echo "== bs=$BS =="
 	timeout 300 env LD_PRELOAD="$HFS_LIB" HFS_CONFIG_PATH="$HFS_CONFIG" \
 		HFS_BDEV_NAME="$HFS_BDEV" HFS_FORMAT=1 HFS_AUTO_MKDIRS=/fio \
-		fio --name=rw --ioengine=psync --thread=1 --bs="$BS" --size="$SIZE" \
+		fio --name=rw --ioengine=psync --thread=1 --numjobs="$HFS_NUMJOBS" --bs="$BS" --size="$SIZE" \
 		--rw=randrw --rwmixread=50 --filename=/hfs/fio/rw.dat --direct=1 \
 		--group_reporting=1 --time_based=1 --runtime="$RUNTIME" \
 		--output="$OUT/hfs_${BS}.log" --output-format=json 2>/dev/null
@@ -53,7 +57,7 @@ for BS in 4k 8k 16k 32k 64k; do
 	if [[ "$RUN_SPDK_REFERENCE" == "1" ]]; then
 		timeout 300 env LD_PRELOAD="$SPDK_PLUGIN" \
 			fio --name=rw --ioengine=spdk_bdev --thread=1 --spdk_conf="$SPDK_CONF" \
-			--filename=Malloc0 --bs="$BS" --size="$SIZE" --rw=randrw --rwmixread=50 \
+			--filename="$SPDK_BDEV" --bs="$BS" --size="$SIZE" --rw=randrw --rwmixread=50 \
 			--direct=1 --iodepth=32 --group_reporting=1 --time_based=1 --runtime="$RUNTIME" \
 			--output="$OUT/spdk_${BS}.log" --output-format=json 2>/dev/null
 	fi

@@ -16,6 +16,10 @@ MYSQL_QUERIES="${HFS_SHARD59_MYSQL_QUERIES:-2000}"
 MYSQL_ITERATIONS="${HFS_SHARD59_MYSQL_ITERATIONS:-3}"
 SPDK_PLUGIN="${HFS_SHARD59_SPDK_PLUGIN:-$ROOT/spdk/build/fio/spdk_bdev}"
 NVME_CONFIG="${HFS_SHARD59_NVME_CONFIG:-$ROOT/config/hfs_nvme.json}"
+NVME_BDF=""
+if [[ -f "$NVME_CONFIG" ]]; then
+	NVME_BDF="$(sed -n 's/.*\"traddr\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p' "$NVME_CONFIG" | head -1)"
+fi
 
 if [[ ! -f "$LIB" || ! -f "$CONFIG" ]]; then
 	echo "usage: $0 [libhfs.so] [aio-config] [image] [output dir]" >&2
@@ -64,6 +68,8 @@ HFS_RECREATE=1 bash "$ROOT/scripts/db/prepare_hfs_db_bdev.sh" "$IMAGE" 1G
 	echo "mysql_iterations=$MYSQL_ITERATIONS"
 	echo "aio_image=$IMAGE"
 	echo "nvme_device=$(compgen -G '/dev/nvme*' | tr '\n' ' ' || true)"
+	echo "nvme_pci_bdf=$NVME_BDF"
+	echo "nvme_pci_present=$(lspci -Dnn 2>/dev/null | awk '{print $1}' | grep -Fx "$NVME_BDF" >/dev/null && echo 1 || echo 0)"
 	echo "spdk_fio_plugin=$SPDK_PLUGIN"
 } > "$OUT/environment.txt"
 
@@ -96,11 +102,19 @@ for round in $(seq 1 "$ROUNDS"); do
 done
 
 NVME_REASON=""
-if [[ -f "$NVME_CONFIG" && -f "$SPDK_PLUGIN" && -n "$(compgen -G '/dev/nvme*' || true)" ]]; then
+NVME_DEVICE_PRESENT=0
+if [[ -n "$(compgen -G '/dev/nvme*' || true)" ]]; then
+	NVME_DEVICE_PRESENT=1
+elif [[ -n "$NVME_BDF" ]] && lspci -Dnn 2>/dev/null | awk '{print $1}' | grep -Fxq "$NVME_BDF"; then
+	# SPDK may own the PCI controller, so a kernel /dev/nvme node is optional.
+	NVME_DEVICE_PRESENT=1
+fi
+if [[ -f "$NVME_CONFIG" && -f "$SPDK_PLUGIN" && "$NVME_DEVICE_PRESENT" == "1" ]]; then
 	echo "== shard-59 direct NVMe FIO comparison =="
 	for round in $(seq 1 "$ROUNDS"); do
 		echo "== direct NVMe FIO round $round/$ROUNDS =="
 		HFS_FIO_CONFIG="$NVME_CONFIG" HFS_FIO_BDEV_NAME=Nvme0n1 \
+			HFS_FIO_SPDK_BDEV_NAME=Nvme0n1 \
 			HFS_FIO_SIZE="$FIO_SIZE" HFS_FIO_RUNTIME_SECONDS="$FIO_RUNTIME" \
 			HFS_FIO_RUN_SPDK_REFERENCE=1 \
 			bash "$ROOT/scripts/performance/fio_stage2_compare.sh" \
@@ -112,7 +126,7 @@ else
 	NVME_STATUS="SKIP"
 	if [[ ! -f "$NVME_CONFIG" ]]; then NVME_REASON+="nvme_config_missing; "; fi
 	if [[ ! -f "$SPDK_PLUGIN" ]]; then NVME_REASON+="spdk_fio_plugin_missing; "; fi
-	if [[ -z "$(compgen -G '/dev/nvme*' || true)" ]]; then NVME_REASON+="no_nvme_device; "; fi
+	if [[ "$NVME_DEVICE_PRESENT" != "1" ]]; then NVME_REASON+="no_nvme_device_or_pci_controller; "; fi
 	echo "SKIP direct NVMe: $NVME_REASON"
 fi
 

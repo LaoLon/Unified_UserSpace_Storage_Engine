@@ -10,7 +10,7 @@ Bug 等级：**致命 > 严重 > 一般**。
 
 ### 已修复
 
-1–5、8–10、10b、11–43、45–47、51–52、57、60–62、67–69。包括已由后续 shard 修复的历史记录；条目中的原始“遗留”描述保留用于复盘，当前状态以本汇总和条目状态字段为准。
+1–5、8–10、10b、11–43、45–47、51–52、57、60–62、67–70。包括已由后续 shard 修复的历史记录；条目中的原始“遗留”描述保留用于复盘，当前状态以本汇总和条目状态字段为准。
 
 ### 未修复
 
@@ -1139,5 +1139,26 @@ Bug 等级：**致命 > 严重 > 一般**。
   server；shard-59 同时规范化 wrapper 的换行并显式启用 signal 边界。
 - **验证**：干净 VM 上 shard-59 FIO、RocksDB、MariaDB/MySQL 矩阵全绿，输出
   `MYSQL STAGE2 OK`、`SHARD59 PERFORMANCE MATRIX OK`。
+
+### 70. NVMe FIO 对照脚本错误使用 Malloc0 且误判 SPDK PCI 设备缺失（已修复，一般级）
+
+- **状态**：已修复；raw SPDK bdev 和 NVMe 前置检查均按 SPDK 直通设备语义处理
+- **时间**：2026-09-09（当前 NVMe FIO 回归）
+- **等级**：一般（不影响 HFS 数据，但会使性能结论失真或跳过应执行的测试）
+- **现象**：`fio_stage2_compare.sh` 即使传入 `config/hfs_nvme.json`，raw SPDK 分支仍固定
+  使用 `--filename=Malloc0`；`shard59_performance_matrix.sh` 仅检查 `/dev/nvme*`，而 SPDK
+  绑定 PCI 控制器后内核节点本来就不存在，导致 direct NVMe 矩阵被错误标记为 SKIP。
+- **排查过程**：VM 上 `lsblk` 无 `/dev/nvme*`，但 `lspci -Dnn` 显示
+  `0000:0b:00.0 VMware NVMe SSD Controller`，SPDK plugin 和 NVMe JSON 均存在；首轮命令
+  因 library 路径不匹配退出后，核对 helper 发现 raw 文件名硬编码为 `Malloc0`。将 raw
+  目标改为可配置 bdev 后，HFS 与 raw 均成功访问 `Nvme0n1`，所有 FIO errors=0。
+- **根因**：测试脚本把“内核 NVMe 节点”错误当作“SPDK NVMe 可用”的必要条件，并遗留
+  Malloc 基线的固定 bdev 名称，未区分 SPDK PCI 直通模型。
+- **修复**：新增 `HFS_FIO_SPDK_BDEV_NAME`（默认保持 `Malloc0` 兼容），direct NVMe 分支
+  设置 `Nvme0n1`；前置检查接受配置中 `traddr` 对应的 PCI 控制器，并记录 BDF/存在性。
+  同时增加 `HFS_FIO_NUMJOBS`，用于 HFS `numjobs=32` 与 raw SPDK `iodepth=32` 的同盘对照。
+- **验证**：VM 上 `bash -n` 通过；NVMe 4K/8K/16K/32K/64K 两轮 FIO 均完成，HFS/raw
+  errors=0，结果保存在 `/var/tmp/hfs-fio-nvme-current-20260909-r1`（单线程）和
+  `r2`（HFS numjobs=32）。
 
 ## 通用经验总结
