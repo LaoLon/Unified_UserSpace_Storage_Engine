@@ -1,6 +1,6 @@
 # HFS 用户 Buffer Bounce Copy 优化 Shard 计划
 
-> **状态**：shard-54/55 已实现，等待 QD32 性能回归后进入 shard-56
+> **状态**：shard-54/55 已实现，shard-56 copy/lease lifetime 开发中
 > **计划范围**：shard-54 ～ shard-59
 > **输入评审**：[`review/hfs_user_buffer_bounce_copy_optimization.md`](../../review/hfs_user_buffer_bounce_copy_optimization.md)
 > **当前基线**：`main@4054111`，VM 内 SPDK 使用锁定 commit `f0b63ed866f0e4d3c56e73bd4a98d0042956147a`
@@ -282,6 +282,17 @@ registered buffer ref 保证用户内存生命周期。
 - pool 耗尽时无死锁、无静默丢 I/O；错误返回只使用明确 `EAGAIN`/`ENOMEM`。
 - trace 中 lease hold time 缩短，且 `lease acquire=release` 闭合。
 - `io_copy_bytes` 不得因为提前 release 发生遗漏，数据校验和 read-after-write 全部通过。
+
+### 6.4 当前实现记录（shard-56）
+
+- 同步 read pipeline 新增逐 child 完成处理：等待一个 SPDK child 后立即执行
+  DMA→user copy，并释放对应 lease；父请求仍等待所有 child，保持同步 API 语义。
+- read child 出错时先释放其 lease，再继续等待其余 child，最终返回首个错误；不会因
+  提前释放导致 pending child 使用已回收 buffer。
+- write pipeline 和 async read/write 的现有生命周期保持不变；copy 字节数和 request
+  fan-out 不变，便于与 shard-55 trace 基线比较。
+- VM 已通过 Make/CMake、request-local trace smoke、registered DMA lifetime 和 POSIX
+  contract 回归；QD32 NVMe 性能回归待下一步统一执行。
 
 ## 7. shard-57：Registered DMA 与 Direct Async Window
 

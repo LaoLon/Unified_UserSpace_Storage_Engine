@@ -1256,6 +1256,52 @@ static void hfsIoReleasePipeline(HfsIoLease *leases, uint32_t count) {
 	}
 }
 
+/* Wait for read children, copy each result, and release its lease immediately. */
+static int hfsIoWaitReadPipeline(HfsIoRequest *requests, HfsIoLease *leases,
+				 uint32_t count, uint8_t *buffer,
+				 uint64_t baseUnit, size_t unitSize) {
+	int rc = 0;
+	int firstErrno = 0;
+	uint32_t i;
+
+	for (i = 0; i < count; i++) {
+		size_t bytes = (size_t)(requests[i].units * unitSize);
+
+		if (hfsIoWaitRequest(&requests[i]) != 0) {
+			if (firstErrno == 0) {
+				firstErrno = errno;
+			}
+			hfsIoRelease(&leases[i]);
+			rc = -1;
+			continue;
+		}
+		{
+			uint64_t copyStartNs = hfsTraceNowNs();
+			size_t destinationOffset = (size_t)(requests[i].offset - baseUnit) *
+				unitSize;
+
+			hfsTraceEmit(HFS_TRACE_COPY_OUT_BEGIN, HFS_TRACE_OPERATION_READ,
+				     HFS_TRACE_BUFFER_DMA_LEASE, 0,
+				     g_hfsIoTraceParentId, requests[i].file->inodeId,
+				     requests[i].offset * unitSize, bytes, 0, 0, 0, 0,
+				     leases[i].poolClass, 0, 0);
+			memcpy(buffer + destinationOffset, leases[i].buffer, bytes);
+			hfsTraceEmit(HFS_TRACE_COPY_OUT_END, HFS_TRACE_OPERATION_READ,
+				     HFS_TRACE_BUFFER_DMA_LEASE, 0,
+				     g_hfsIoTraceParentId, requests[i].file->inodeId,
+				     requests[i].offset * unitSize, bytes, 0, 0, 0, 0,
+				     leases[i].poolClass,
+				     hfsTraceNowNs() - copyStartNs, 0);
+		}
+		hfsStatsRecordCopyFast(bytes);
+		hfsIoRelease(&leases[i]);
+	}
+	if (firstErrno != 0) {
+		errno = firstErrno;
+	}
+	return rc;
+}
+
 /* Start one request-local transfer and wait for its owner-thread callback. */
 static int hfsIoSubmit(HfsFile *file, void *buffer, uint64_t offset,
 		       uint64_t units, HfsIoOperation operation) {
@@ -2028,8 +2074,6 @@ static ssize_t hfsIoReadAtLocked(HfsFile *file, uint8_t *buffer,
 		uint32_t requestCount = 0;
 		HfsIoRequest requests[HFS_IO_MAX_PIPELINE] = {0};
 		HfsIoLease leases[HFS_IO_MAX_PIPELINE] = {0};
-		uint32_t i;
-		uint64_t copyOffset;
 		HfsIoRangeGuard windowGuard = {0};
 		uint64_t windowUnits = fullUnits;
 
@@ -2081,39 +2125,14 @@ static ssize_t hfsIoReadAtLocked(HfsFile *file, uint8_t *buffer,
 			pendingUnits += chunkUnits;
 		}
 		hfsStatsRecordIoPipelineFast(requestCount);
-		if (hfsIoWaitPipeline(requests, requestCount) != 0) {
-			hfsIoReleasePipeline(leases, requestCount);
+		if (hfsIoWaitReadPipeline(requests, leases, requestCount, buffer,
+				cursor / unitSize, (size_t)unitSize) != 0) {
 			if (windowedReservation) {
 				hfsIoRangeUnlock(file, &windowGuard);
 			}
 			return -1;
 		}
-		copyOffset = cursor;
-		for (i = 0; i < requestCount; i++) {
-			size_t bytes = (size_t)(requests[i].units * unitSize);
-
-			{
-				uint64_t copyStartNs = hfsTraceNowNs();
-				hfsTraceEmit(HFS_TRACE_COPY_OUT_BEGIN,
-					     HFS_TRACE_OPERATION_READ,
-					     HFS_TRACE_BUFFER_DMA_LEASE, 0,
-					     g_hfsIoTraceParentId, file->inodeId,
-					     copyOffset, bytes, 0, 0, 0, 0,
-					     leases[i].poolClass, 0, 0);
-				memcpy(buffer, leases[i].buffer, bytes);
-				hfsTraceEmit(HFS_TRACE_COPY_OUT_END,
-					     HFS_TRACE_OPERATION_READ,
-					     HFS_TRACE_BUFFER_DMA_LEASE, 0,
-					     g_hfsIoTraceParentId, file->inodeId,
-					     copyOffset, bytes, 0, 0, 0, 0,
-					     leases[i].poolClass,
-					     hfsTraceNowNs() - copyStartNs, 0);
-			}
-			hfsStatsRecordCopyFast(bytes);
-			buffer += bytes;
-			copyOffset += bytes;
-		}
-		hfsIoReleasePipeline(leases, requestCount);
+		buffer += (size_t)(pendingUnits * unitSize);
 		if (windowedReservation) {
 			hfsIoRangeUnlock(file, &windowGuard);
 		}
