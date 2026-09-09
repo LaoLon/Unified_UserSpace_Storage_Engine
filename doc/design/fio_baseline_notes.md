@@ -293,3 +293,16 @@ HFS 分别运行 `numjobs=1/32`，原生 SPDK 分别运行 `iodepth=1/32`；所�
 部分固定开销，却没有消除用户态排队和串行化造成的尾延迟。该轮结果是 NVMe 设备上的
 真实对照，应替代旧的 Malloc/Aio 或缺少 SPDK plugin 时的 SKIP 结果；10 秒样本用于回归
 定位，不作为硬件绝对规格。原始文件保留在 VM `/var/tmp/hfs-fio-nvme-full-20260909/`。
+
+## 2026-09-09 普通 POSIX buffer DMA/direct-async 桥接 A/B
+
+新增的 `HFS_POSIX_DIRECT_ASYNC=1` 仅用于实验：普通 POSIX buffer 先复制到 HFS DMA
+pool，再调用 direct async，完成后读路径复制回调用方。它不是零拷贝，也不能替代调用方
+使用 `hfsDmaAlloc` 的 registered-DMA API。NVMe `numjobs=32`、5 秒、4/8/16/32/64 KiB
+测试中，桥接开关相对原有同步 bounce 路径分别为 `-15.0%/-14.5%/-15.2%/-29.7%/-22.8%`
+IOPS，所有错误为 0。完整表格见
+[`performance/hfs_posix_dma_bridge_ab_20260909.md`](../../performance/hfs_posix_dma_bridge_ab_20260909.md)。
+
+该结果说明当前同步 POSIX 路径的固定开销低于“异步对象 + callback + condition wait”包装；
+后续性能主路径应是调用方显式 DMA buffer + 真正的多请求 async submit，普通 POSIX 桥接保持
+默认关闭。

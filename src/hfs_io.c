@@ -223,6 +223,15 @@ typedef struct HfsIoAsyncParent {
 	pthread_mutex_t lock;
 } HfsIoAsyncParent;
 
+/* Wait state used to expose the worker-free direct path through POSIX I/O. */
+typedef struct HfsIoPosixBridgeWait {
+	pthread_mutex_t lock;
+	pthread_cond_t done;
+	bool completed;
+	ssize_t result;
+	int error;
+} HfsIoPosixBridgeWait;
+
 /* Map logical units to a stable per-inode stripe. */
 static uint32_t hfsIoRangeBucket(const HfsFile *file, uint64_t unitIndex) {
 	(void)file;
@@ -566,6 +575,24 @@ static size_t hfsIoPoolBytesEnv(void) {
 
 static pthread_once_t g_hfsIoPipelineOnce = PTHREAD_ONCE_INIT;
 static uint32_t g_hfsIoPipelineConfigured;
+
+static pthread_once_t g_hfsIoPosixBridgeOnce = PTHREAD_ONCE_INIT;
+static bool g_hfsIoPosixBridgeConfigured;
+
+/* Parse the opt-in POSIX-to-direct-DMA bridge switch once per process. */
+static void hfsIoPosixBridgeInit(void) {
+	const char *value = getenv("HFS_POSIX_DIRECT_ASYNC");
+
+	g_hfsIoPosixBridgeConfigured = value != NULL &&
+		(!strcmp(value, "1") || !strcasecmp(value, "true") ||
+		 !strcasecmp(value, "yes") || !strcasecmp(value, "on"));
+}
+
+/* Return whether ordinary aligned POSIX buffers should use the direct bridge. */
+static bool hfsIoPosixBridgeEnabled(void) {
+	(void)pthread_once(&g_hfsIoPosixBridgeOnce, hfsIoPosixBridgeInit);
+	return g_hfsIoPosixBridgeConfigured;
+}
 
 /* Parse the bounded aligned-I/O child depth once per process. */
 static void hfsIoPipelineInit(void) {
@@ -1292,6 +1319,88 @@ static int hfsIoSubmitDirectWriteAsync(HfsFile *file, const void *buffer,
 		return -1;
 	}
 	return 0;
+}
+
+/* Wake the synchronous POSIX bridge after its direct request completes. */
+static void hfsIoPosixBridgeDone(void *context, ssize_t result, int error) {
+	HfsIoPosixBridgeWait *wait = context;
+
+	pthread_mutex_lock(&wait->lock);
+	wait->result = result;
+	wait->error = error;
+	wait->completed = true;
+	pthread_cond_signal(&wait->done);
+	pthread_mutex_unlock(&wait->lock);
+}
+
+/* Stage one ordinary POSIX buffer, then submit the staged range asynchronously. */
+static int hfsIoPosixBridge(HfsFile *file, void *buffer, size_t count,
+				    uint64_t offset, bool write, ssize_t *resultOut) {
+	HfsIoLease lease = {0};
+	HfsIoPosixBridgeWait wait;
+	uint32_t reactor;
+	int rc;
+	int savedErrno;
+
+	if (file == NULL || file->fs == NULL || buffer == NULL || count == 0 ||
+		count > hfsIoMaxUnits(file->fs) * (size_t)file->fs->unitSize) {
+		return 0;
+	}
+	reactor = hfsIoReactorForUnit(file, offset / file->fs->unitSize);
+	if (hfsIoAcquire(file->fs, &lease, count, reactor) != 0) {
+		return errno == E2BIG ? 0 : -1;
+	}
+	if (pthread_mutex_init(&wait.lock, NULL) != 0) {
+		hfsIoRelease(&lease);
+		errno = ENOMEM;
+		return -1;
+	}
+	if (pthread_cond_init(&wait.done, NULL) != 0) {
+		pthread_mutex_destroy(&wait.lock);
+		hfsIoRelease(&lease);
+		errno = ENOMEM;
+		return -1;
+	}
+	wait.completed = false;
+	wait.result = -1;
+	wait.error = EIO;
+	if (write) {
+		memcpy(lease.buffer, buffer, count);
+		hfsStatsRecordCopyFast(count);
+		rc = hfsIoWriteAtAsync(file, lease.buffer, count, offset,
+					hfsIoPosixBridgeDone, &wait);
+	} else {
+		rc = hfsIoReadAtAsync(file, lease.buffer, count, offset,
+					hfsIoPosixBridgeDone, &wait);
+	}
+	if (rc != 0) {
+		savedErrno = errno != 0 ? errno : EIO;
+		pthread_cond_destroy(&wait.done);
+		pthread_mutex_destroy(&wait.lock);
+		hfsIoRelease(&lease);
+		errno = savedErrno;
+		return savedErrno == EAGAIN ? 0 : -1;
+	}
+	pthread_mutex_lock(&wait.lock);
+	while (!wait.completed) {
+		pthread_cond_wait(&wait.done, &wait.lock);
+	}
+	pthread_mutex_unlock(&wait.lock);
+	if (wait.error == 0 && wait.result >= 0) {
+		if (!write) {
+			memcpy(buffer, lease.buffer, count);
+			hfsStatsRecordCopyFast(count);
+		}
+		*resultOut = wait.result;
+		rc = 1;
+	} else {
+		errno = wait.error != 0 ? wait.error : EIO;
+		rc = -1;
+	}
+	pthread_cond_destroy(&wait.done);
+	pthread_mutex_destroy(&wait.lock);
+	hfsIoRelease(&lease);
+	return rc;
 }
 
 /* Submit one native vector request while retaining inode/range ordering. */
@@ -2588,6 +2697,8 @@ ssize_t hfsIoReadAt(HfsFile *file, uint8_t *buffer, size_t count,
 	uint64_t traceStartNs;
 	uint64_t previousTraceParent;
 	HfsTraceOperation previousTraceOperation;
+	ssize_t bridgeResult;
+	int bridgeRc;
 
 	if (count == 0) {
 		return 0;
@@ -2622,6 +2733,21 @@ ssize_t hfsIoReadAt(HfsFile *file, uint8_t *buffer, size_t count,
 		     0, traceId, file->inodeId, offset, count,
 		     (uint32_t)(count / file->fs->unitSize), 0, 0, 0, 0, 0, 0);
 	hfsStatsRecordIoFast(false, count, aligned);
+	if (aligned && !directEligible && hfsIoPosixBridgeEnabled()) {
+		bridgeRc = hfsIoPosixBridge(file, buffer, count, offset, false,
+					   &bridgeResult);
+		if (bridgeRc != 0) {
+			hfsTraceEmit(HFS_TRACE_IO_EXIT, HFS_TRACE_OPERATION_READ,
+				     bridgeRc > 0 ? HFS_TRACE_BUFFER_DMA_LEASE :
+				     HFS_TRACE_BUFFER_NONE, 0, traceId, file->inodeId,
+				     offset, count, 0, 0, 0, 0, 0,
+				     hfsTraceNowNs() - traceStartNs,
+				     bridgeRc > 0 ? 0 : -1);
+			g_hfsIoTraceParentId = previousTraceParent;
+			g_hfsIoTraceOperation = previousTraceOperation;
+			return bridgeRc > 0 ? bridgeResult : -1;
+		}
+	}
 	runtime = hfsIoSyncReadLock(file);
 	if (runtime == NULL) {
 		hfsTraceEmit(HFS_TRACE_IO_EXIT, HFS_TRACE_OPERATION_READ,
@@ -2670,6 +2796,9 @@ ssize_t hfsIoWriteAt(HfsFile *file, const uint8_t *buffer, size_t count,
 	uint64_t traceStartNs;
 	uint64_t previousTraceParent;
 	HfsTraceOperation previousTraceOperation;
+	ssize_t bridgeResult;
+	int bridgeRc;
+	bool resized = false;
 
 	if (count == 0) {
 		return 0;
@@ -2704,6 +2833,32 @@ ssize_t hfsIoWriteAt(HfsFile *file, const uint8_t *buffer, size_t count,
 		     0, traceId, file->inodeId, offset, count,
 		     (uint32_t)(count / file->fs->unitSize), 0, 0, 0, 0, 0, 0);
 	hfsStatsRecordIoFast(true, count, aligned);
+	/* Grow before the bridge so the async direct request sees valid capacity. */
+	if (aligned && !directEligible && hfsIoPosixBridgeEnabled()) {
+		if (hfsResizeTo(file, offset + count) != 0) {
+			hfsTraceEmit(HFS_TRACE_IO_EXIT, HFS_TRACE_OPERATION_WRITE,
+				     HFS_TRACE_BUFFER_NONE, 0, traceId, file->inodeId,
+				     offset, count, 0, 0, 0, 0, 0,
+				     hfsTraceNowNs() - traceStartNs, -1);
+			g_hfsIoTraceParentId = previousTraceParent;
+			g_hfsIoTraceOperation = previousTraceOperation;
+			return -1;
+		}
+		resized = true;
+		bridgeRc = hfsIoPosixBridge(file, (void *)buffer, count, offset,
+					   true, &bridgeResult);
+		if (bridgeRc != 0) {
+			hfsTraceEmit(HFS_TRACE_IO_EXIT, HFS_TRACE_OPERATION_WRITE,
+				     bridgeRc > 0 ? HFS_TRACE_BUFFER_DMA_LEASE :
+				     HFS_TRACE_BUFFER_NONE, 0, traceId, file->inodeId,
+				     offset, count, 0, 0, 0, 0, 0,
+				     hfsTraceNowNs() - traceStartNs,
+				     bridgeRc > 0 ? 0 : -1);
+			g_hfsIoTraceParentId = previousTraceParent;
+			g_hfsIoTraceOperation = previousTraceOperation;
+			return bridgeRc > 0 ? bridgeResult : -1;
+		}
+	}
 	runtime = hfsIoSyncReadLock(file);
 	if (runtime == NULL) {
 		hfsTraceEmit(HFS_TRACE_IO_EXIT, HFS_TRACE_OPERATION_WRITE,
@@ -2714,7 +2869,7 @@ ssize_t hfsIoWriteAt(HfsFile *file, const uint8_t *buffer, size_t count,
 		g_hfsIoTraceOperation = previousTraceOperation;
 		return -1;
 	}
-	if (hfsResizeTo(file, offset + count) != 0) {
+	if (!resized && hfsResizeTo(file, offset + count) != 0) {
 		hfsIoSyncReadUnlock(runtime);
 		hfsTraceEmit(HFS_TRACE_IO_EXIT, HFS_TRACE_OPERATION_WRITE,
 			     HFS_TRACE_BUFFER_NONE, 0, traceId, file->inodeId,
