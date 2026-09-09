@@ -120,6 +120,7 @@ typedef struct HfsIoRequest {
 
 static pthread_mutex_t g_hfsIoBufferLock = PTHREAD_MUTEX_INITIALIZER;
 static HfsIoBufferRegistration *g_hfsIoBuffers;
+static _Atomic uint32_t g_hfsIoBufferCount;
 static _Thread_local uint64_t g_hfsIoTraceParentId;
 static _Thread_local HfsTraceOperation g_hfsIoTraceOperation;
 
@@ -770,18 +771,24 @@ static int hfsIoStartRequest(HfsIoRequest *request) {
 		errno = EINVAL;
 		return -1;
 	}
-	if (!request->vector && request->buffer != NULL &&
-		request->units <= SIZE_MAX / (size_t)request->file->fs->unitSize) {
-		requestBytes = (size_t)request->units * request->file->fs->unitSize;
-		request->registeredBuffer = hfsIoBufferAcquire(request->buffer,
-								 requestBytes);
-	}
 	if (request->traceParentId == 0) {
 		request->traceParentId = g_hfsIoTraceParentId;
 	}
 	if (request->traceBufferKind == HFS_TRACE_BUFFER_NONE) {
 		request->traceBufferKind = request->buffer != NULL ?
 			HFS_TRACE_BUFFER_DMA_LEASE : HFS_TRACE_BUFFER_NONE;
+	}
+	/* HFS-owned leases already have a lifetime owner and never need registry lookup. */
+	if (!request->vector && request->buffer != NULL &&
+		(request->traceBufferKind == HFS_TRACE_BUFFER_CALLER ||
+		 request->traceBufferKind == HFS_TRACE_BUFFER_REGISTERED) &&
+		request->units <= SIZE_MAX / (size_t)request->file->fs->unitSize) {
+		requestBytes = (size_t)request->units * request->file->fs->unitSize;
+		request->registeredBuffer = hfsIoBufferAcquire(request->buffer,
+								 requestBytes);
+		if (request->registeredBuffer != NULL) {
+			request->traceBufferKind = HFS_TRACE_BUFFER_REGISTERED;
+		}
 	}
 	hfsRequestInit(&request->result, hfsIoRequestOperation(request->operation));
 	request->traceSubmitNs = hfsTraceNowNs();
@@ -846,6 +853,10 @@ static HfsIoBufferRegistration *hfsIoBufferAcquire(const void *buffer,
 						 size_t bytes) {
 	HfsIoBufferRegistration *entry;
 
+	if (atomic_load_explicit(&g_hfsIoBufferCount,
+				 memory_order_acquire) == 0) {
+		return NULL;
+	}
 	pthread_mutex_lock(&g_hfsIoBufferLock);
 	entry = hfsIoFindBufferLocked(buffer, bytes);
 	if (entry != NULL) {
@@ -908,6 +919,7 @@ int hfsIoRegisterBuffer(void *buffer, size_t length) {
 	}
 	entry->next = g_hfsIoBuffers;
 	g_hfsIoBuffers = entry;
+	atomic_fetch_add_explicit(&g_hfsIoBufferCount, 1, memory_order_release);
 	pthread_mutex_unlock(&g_hfsIoBufferLock);
 	return 0;
 }
@@ -933,6 +945,8 @@ int hfsIoUnregisterBuffer(void *buffer) {
 			return -1;
 		}
 		*link = entry->next;
+		atomic_fetch_sub_explicit(&g_hfsIoBufferCount, 1,
+					 memory_order_release);
 		pthread_mutex_unlock(&g_hfsIoBufferLock);
 		free(entry);
 		return 0;
@@ -950,6 +964,7 @@ static void hfsIoClearBufferRegistry(void) {
 	pthread_mutex_lock(&g_hfsIoBufferLock);
 	entry = g_hfsIoBuffers;
 	g_hfsIoBuffers = NULL;
+	atomic_store_explicit(&g_hfsIoBufferCount, 0, memory_order_release);
 	pthread_mutex_unlock(&g_hfsIoBufferLock);
 	while (entry != NULL) {
 		next = entry->next;
@@ -1181,6 +1196,7 @@ static int hfsIoSubmitVector(HfsFile *file, const struct iovec *iov,
 	request.offset = offset / file->fs->unitSize;
 	request.units = total / file->fs->unitSize;
 	request.operation = write ? HFS_IO_WRITE : HFS_IO_READ;
+	request.traceBufferKind = HFS_TRACE_BUFFER_VECTOR;
 	request.channel = hfsRuntimeDataChannel(file->fs, dataReactor);
 	request.dataReactor = dataReactor;
 	request.dataPath = true;

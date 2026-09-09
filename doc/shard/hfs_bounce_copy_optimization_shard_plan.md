@@ -1,6 +1,6 @@
 # HFS 用户 Buffer Bounce Copy 优化 Shard 计划
 
-> **状态**：shard-54 tracepoint 已实现，正在完成回归后进入数据面优化
+> **状态**：shard-54/55 已实现，等待 QD32 性能回归后进入 shard-56
 > **计划范围**：shard-54 ～ shard-59
 > **输入评审**：[`review/hfs_user_buffer_bounce_copy_optimization.md`](../../review/hfs_user_buffer_bounce_copy_optimization.md)
 > **当前基线**：`main@4054111`，VM 内 SPDK 使用锁定 commit `f0b63ed866f0e4d3c56e73bd4a98d0042956147a`
@@ -226,6 +226,17 @@ VECTOR_BUFFER       iovec 生命周期由 request/调用者共同保证
 - fork child、close、cancel、shutdown 无 use-after-free。
 - Trace 显示 aligned bounce 每个 request 只有一次 buffer classify，不重复 probe。
 - 4K QD32 CPU 时间和 runtime queue wait 相比 shard-54 基线下降；不得以 p99 回退为代价。
+
+### 5.4 当前实现记录（shard-55）
+
+- HfsIoRequest 在进入 SPDK submit 前先确定 buffer kind；HFS 自有 DMA lease 标记为
+  DMA_LEASE，不会调用 caller registry 查询，也不会增加 registry active reference。
+- caller/registered buffer 仍通过同一生命周期引用路径；命中 registry 后 request kind
+  升级为 REGISTERED，completion 或 submit failure 统一释放引用。
+- 增加原子 registration count：无任何注册 buffer 时直接跳过全局 registry mutex；注册、
+  注销和 unmount 清理均在链表锁内更新 count。
+- vector request 明确标记为 VECTOR，避免误走 contiguous buffer registry 路径。
+- 下一步仍需用显式 DMA buffer 和 QD32 性能数据验证 registered 命中率及 mutex/CPU 降幅。
 
 ## 6. shard-56：Copy/Lease 生命周期与 Backpressure
 
