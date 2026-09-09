@@ -12,6 +12,7 @@ HFS_CONFIG="${HFS_FIO_CONFIG:-$SPDK_CONF}"
 HFS_BDEV="${HFS_FIO_BDEV_NAME:-Malloc0}"
 SPDK_BDEV="${HFS_FIO_SPDK_BDEV_NAME:-Malloc0}"
 HFS_NUMJOBS="${HFS_FIO_NUMJOBS:-1}"
+SPDK_IODEPTH="${HFS_FIO_SPDK_IODEPTH:-32}"
 SIZE="${HFS_FIO_SIZE:-256m}"
 RUNTIME="${HFS_FIO_RUNTIME_SECONDS:-15}"
 RUN_SPDK_REFERENCE="${HFS_FIO_RUN_SPDK_REFERENCE:-1}"
@@ -34,6 +35,7 @@ rm -f "$OUT"/*.json "$OUT"/*.log "$OUT/summary.tsv" "$OUT/environment.txt"
 	echo "spdk_config=$SPDK_CONF"
 	echo "spdk_bdev=$SPDK_BDEV"
 	echo "hfs_numjobs=$HFS_NUMJOBS"
+	echo "spdk_iodepth=$SPDK_IODEPTH"
 	echo "size=$SIZE"
 	echo "runtime_seconds=$RUNTIME"
 	echo "spdk_reference=$RUN_SPDK_REFERENCE"
@@ -58,7 +60,7 @@ for BS in 4k 8k 16k 32k 64k; do
 		timeout 300 env LD_PRELOAD="$SPDK_PLUGIN" \
 			fio --name=rw --ioengine=spdk_bdev --thread=1 --spdk_conf="$SPDK_CONF" \
 			--filename="$SPDK_BDEV" --bs="$BS" --size="$SIZE" --rw=randrw --rwmixread=50 \
-			--direct=1 --iodepth=32 --group_reporting=1 --time_based=1 --runtime="$RUNTIME" \
+			--direct=1 --iodepth="$SPDK_IODEPTH" --group_reporting=1 --time_based=1 --runtime="$RUNTIME" \
 			--output="$OUT/spdk_${BS}.log" --output-format=json 2>/dev/null
 	fi
 done

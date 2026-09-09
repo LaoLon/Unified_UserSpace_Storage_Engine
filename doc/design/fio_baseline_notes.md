@@ -275,3 +275,21 @@ FIO、RocksDB 和 MariaDB/MySQL 结果。三轮短样本使用 FIO 3 s、RocksDB
 本轮同时修复了 FIO JSON 收尾时 `hfsIoDone()` completion waiter 唤醒后的 request UAF，
 以及 MariaDB bootstrap 强制回收后的 backend flock 启动竞争。当前 VM 没有 NVMe 设备和
 SPDK FIO plugin，direct-NVMe 项按脚本输出 SKIP；不得把 Aio/Malloc 结果用作 NVMe 替代。
+
+## 2026-09-09 NVMe FIO 全矩阵：HFS vs 原生 SPDK
+
+本轮在 VM 上补齐了真实 NVMe 和 SPDK FIO plugin，使用同一 SPDK bdev `Nvme0n1`，FIO
+3.42，`randrw` 50/50，256 MiB，10 秒，块大小 4/8/16/32/64 KiB。为对齐有效并发度，
+HFS 分别运行 `numjobs=1/32`，原生 SPDK 分别运行 `iodepth=1/32`；所有样本 `errors=0`。
+完整读写 IOPS、带宽和 p50/p99 表格见
+[`performance/hfs_vs_native_spdk_fio_nvme_full_20260909.md`](../../performance/hfs_vs_native_spdk_fio_nvme_full_20260909.md)。
+
+| 并发口径 | HFS/raw 总 IOPS 比例 | 主要观察 |
+|---|---:|---|
+| HFS `numjobs=1` / SPDK `iodepth=1` | 69.24%～75.71% | 差距稳定，体现同步 POSIX 入口和每请求固定开销 |
+| HFS `numjobs=32` / SPDK `iodepth=32` | 45.45%～84.66% | 8/16 KiB 竞争最重；HFS p99 写延迟 5.73/5.80 ms，raw 约 1.47/1.50 ms |
+
+64 KiB 高并发吞吐差距收窄到 15.34%，但 HFS 写 p99 仍为 5.28 ms，说明大块请求摊薄了
+部分固定开销，却没有消除用户态排队和串行化造成的尾延迟。该轮结果是 NVMe 设备上的
+真实对照，应替代旧的 Malloc/Aio 或缺少 SPDK plugin 时的 SKIP 结果；10 秒样本用于回归
+定位，不作为硬件绝对规格。原始文件保留在 VM `/var/tmp/hfs-fio-nvme-full-20260909/`。
