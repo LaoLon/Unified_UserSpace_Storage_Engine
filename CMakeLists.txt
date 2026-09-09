@@ -40,6 +40,7 @@ set(HFS_CORE_SRC
   src/hfs_file.c
   src/hfs_io.c
   src/hfs_inode_runtime.c
+  src/hfs_range_lock.c
   src/hfs_meta_index.c
   src/hfs_log.c
   src/hfs_stats.c

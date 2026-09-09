@@ -9,6 +9,8 @@
 
 #include <spdk/blob.h>
 
+#include "hfs_range_lock.h"
+
 struct hfs_inode;
 struct hfs_io_pool;
 struct hfs_inode_runtime;
@@ -97,7 +99,7 @@ typedef struct Hfs {
 	struct spdk_blob *metaBlob;		/* resident metadata blob handle */
 
 	/* Request-local range synchronization and DMA buffer pool. */
-	pthread_rwlock_t rangeLocks[HFS_RANGE_LOCK_COUNT];
+	HfsRangeLock rangeLocks[HFS_RANGE_LOCK_COUNT];
 	pthread_mutex_t inodeRuntimeLock;
 	struct hfs_inode_runtime *inodeRuntimeBuckets[HFS_INODE_RUNTIME_BUCKET_COUNT];
 	struct hfs_inode_runtime *compatibilityRuntime;

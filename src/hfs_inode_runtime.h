@@ -21,7 +21,7 @@ typedef struct hfs_inode_runtime {
 	pthread_mutex_t appendLock;
 	pthread_rwlock_t syncLock;
 	/* Serialize large range operations without taking every global bucket. */
-	pthread_rwlock_t rangeGate;
+	HfsRangeLock rangeGate;
 	struct hfs_inode_runtime *next;
 } HfsInodeRuntime;
 

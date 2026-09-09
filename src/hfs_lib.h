@@ -41,6 +41,10 @@ Hfs *hfs_lib_get_fs(void);
 int hfsRegisterBuffer(void *buffer, size_t length);
 /* Unregister DMA memory; returns EBUSY while requests still reference it. */
 int hfsUnregisterBuffer(void *buffer);
+/* Allocate DMA memory for explicit zero-copy asynchronous I/O. */
+void *hfsDmaAlloc(size_t size, size_t alignment);
+/* Release memory returned by hfsDmaAlloc. */
+void hfsDmaFree(void *buffer);
 
 /* Open a file/dir under the HFS mount prefix. */
 int hfs_lib_open(const char *path, int flags, mode_t mode);

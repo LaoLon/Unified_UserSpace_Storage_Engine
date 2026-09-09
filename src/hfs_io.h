@@ -16,6 +16,10 @@ void hfsIoFini(Hfs *fs);
 int hfsIoRegisterBuffer(void *buffer, size_t length);
 /* Unregister a range after all outstanding direct requests have completed. */
 int hfsIoUnregisterBuffer(void *buffer);
+/* Allocate DMA-capable memory for callers that want an explicit zero-copy path. */
+void *hfsIoDmaAlloc(size_t size, size_t alignment);
+/* Release memory returned by hfsIoDmaAlloc. */
+void hfsIoDmaFree(void *buffer);
 
 /* Read a byte range through request-local DMA buffers. */
 ssize_t hfsIoReadAt(HfsFile *file, uint8_t *buffer, size_t count,

@@ -322,6 +322,25 @@ chunk、wait 一个 completion”升级为 bounded outstanding window。
   shutdown 全部通过。
 - 不宣称普通 heap、mmap、native io_uring 自动零拷贝。
 
+### 7.4 当前实现记录（shard-57）
+
+- 新增 `hfsDmaAlloc()`/`hfsDmaFree()`，使用 SPDK DMA allocator 暴露显式 buffer 生命周期；
+  仍保留 `hfsRegisterBuffer()` 的重复注册、活动注销和进程 teardown 保护。
+- registered buffer 在 parent 建立一次 registration 引用，direct child 只增加引用计数，
+  不再为每个 child 扫描全局 registry；512 KiB aligned I/O 在 VM 上被限制为有界的两个
+  64-unit child window，read/write 均直接使用用户 DMA buffer，trace 显示
+  `copy_in_bytes=0`、`copy_out_bytes=0`、`registered_children=4`（读写合计）。
+- 大块 aligned direct I/O 使用 `HFS_IO_PIPELINE_DEPTH` 控制 outstanding child 数，parent
+  在所有 child 完成后一次性发布结果；普通 heap/mmap/vector 混合 buffer 仍按原规则走
+  caller/bounce 或分段 fallback。
+- 发现并修复异步 range lock 的跨线程 `pthread_rwlock` unlock 缺陷：新增线程无关的
+  `HfsRangeLock`（mutex/condition + reader/writer 状态），mount hash bucket 与 per-inode
+  large-range gate 统一切换，保证 async completion 线程可安全释放锁而不改变冲突顺序。
+- VM 验收：强制 `make -B app lib`、CMake Release、registered direct window（write→read
+  async、active unregister 返回 `EBUSY`）、registered DMA lifetime、request-local trace、
+  DMA pool backpressure 和 POSIX contract 全部通过；SPDK submit/complete 闭合，direct
+  path copy operation 为 0。QD32/NVMe 长稳态性能留给后续统一 benchmark。
+
 ## 8. shard-58：冗余请求与请求放大收敛
 
 ### 8.1 目标

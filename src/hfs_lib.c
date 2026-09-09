@@ -816,6 +816,20 @@ int hfsUnregisterBuffer(void *buffer) {
 	return hfsIoUnregisterBuffer(buffer);
 }
 
+/* Allocate DMA memory through SPDK without overriding libc allocation. */
+void *hfsDmaAlloc(size_t size, size_t alignment) {
+	if (g_fs == NULL) {
+		errno = ENODEV;
+		return NULL;
+	}
+	return hfsIoDmaAlloc(size, alignment);
+}
+
+/* Free a buffer returned by hfsDmaAlloc after direct requests retire. */
+void hfsDmaFree(void *buffer) {
+	hfsIoDmaFree(buffer);
+}
+
 /* Runs before main(): proves the library was loaded by LD_PRELOAD. */
 __attribute__((constructor))
 static void hfs_preload_ctor(void) {

@@ -31,5 +31,5 @@ HFS_0.1 {
             hfs_lib_async_preadv; hfs_lib_async_pwritev;
             hfs_lib_async_fsync; hfsAsyncCancel; hfsAsyncWait;
             hfsAsyncResult; hfsAsyncRelease; hfsRegisterBuffer;
-            hfsUnregisterBuffer;
+            hfsUnregisterBuffer; hfsDmaAlloc; hfsDmaFree;
 };

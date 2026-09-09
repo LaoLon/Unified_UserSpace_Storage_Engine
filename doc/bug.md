@@ -6,11 +6,11 @@ Bug 等级：**致命 > 严重 > 一般**。
 
 ---
 
-## 状态汇总（截至 2026-09-06）
+## 状态汇总（截至 2026-09-09）
 
 ### 已修复
 
-1–5、8–10、10b、11–43、45–47、51–52、57、60–62。包括已由后续 shard 修复的历史记录；条目中的原始“遗留”描述保留用于复盘，当前状态以本汇总和条目状态字段为准。
+1–5、8–10、10b、11–43、45–47、51–52、57、60–62、67。包括已由后续 shard 修复的历史记录；条目中的原始“遗留”描述保留用于复盘，当前状态以本汇总和条目状态字段为准。
 
 ### 未修复
 
@@ -1077,5 +1077,29 @@ Bug 等级：**致命 > 严重 > 一般**。
 - **验证**：VM 上强制 Make/CMake、stripe accounting、DMA pool backpressure、request-local fast I/O
   和 reactor=2/8 多 reactor 回归通过；最新 4-reactor stripe 测试 `266/266`，DMA lease
   `128/128`，重复退出快照未再出现伪不平衡。
+
+### 67. 异步 range lock 跨线程释放导致后续 I/O 永久阻塞（已修复，严重级）
+
+- **状态**：已修复；同步/异步 I/O 共用线程无关的 range lock，直接窗口读写与既有契约回归通过
+- **时间**：2026-09-09（shard-57 registered direct window 开发）
+- **等级**：严重（不一定立即报错，但会使同一 inode 的后续读请求和进程退出永久卡住）
+- **现象**：registered DMA buffer 的异步 pwrite 完成后，紧随其后的同范围 async pread 不返回；
+  `hfsAsyncWait` 超时，进程退出时析构函数卡在等待后台 worker。问题只在异步路径出现，普通同步
+  I/O 和单独 write 回归可能掩盖它。
+- **排查过程**：gdb 检查卡住的 worker，确认它在 `hfsIoRangeLock` 等待 `runtime->rangeGate`；
+  主线程提交阶段先执行 `pthread_rwlock_try*`，SPDK completion 回调所在 reactor 线程随后执行
+  `pthread_rwlock_unlock`。glibc 的 rwlock 保留了提交线程的 writer owner/TID（`__cur_writer`
+  非零），跨线程释放后内部计数不再可用于下一次获取。临时 range-lock 诊断和同一进程 write→read
+  复现稳定重现该状态，排除了设备 completion 与 DMA buffer 生命周期问题。
+- **根因**：POSIX `pthread_rwlock_t` 要求锁的使用协议满足其实现的 owner/状态约束；HFS 却把
+  range lock 的获取放在调用线程、释放放在异步 completion 线程，形成未定义的跨线程 unlock。
+- **修复**：新增 `HfsRangeLock`，用 mutex/condition 维护 readers、writer 和 waiting writers，
+  解锁不依赖线程身份；mount 级 hash buckets 与 per-inode large-range gate 全部切换到该类型，
+  同步阻塞、异步 try-lock 和反序释放仍遵循原有冲突/死锁顺序。`syncLock` 等真正的线程归属锁
+  保持 pthread rwlock，不扩大替换范围。
+- **验证**：VM 上强制 Make/CMake Release、registered direct window（512 KiB read/write、
+  两个 direct children、`copy_ops=0`）、registered DMA 生命周期、request-local trace、DMA
+  pool backpressure、POSIX contract 全部通过；write→read async 回归不再阻塞，SPDK
+  submit/complete 保持闭合。
 
 ## 通用经验总结
