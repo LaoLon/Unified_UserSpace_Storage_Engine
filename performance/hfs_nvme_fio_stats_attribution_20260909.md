@@ -42,9 +42,11 @@ io_copy_ops   = io_read_ops + io_write_ops
 
 DMA 等待只在 8K、16K 出现，且没有 `dma_exhaust`。因此直接把 pool 数量加大，不能解决 4K～32K 的主要差距；应先缩短锁和同步 waiter 生命周期。
 
-### 5. 64K 统计存在盲区
+### 5. 64K 统计存在盲区（已补齐）
 
-64K 样本的 `lock_io_wait_ns` 近似为零并不代表没有锁等待。大范围请求会直接走 per-inode `rangeGate`，当前统计只包围 bucket lock，没有包围 gate lock。64K 的 41.7 ms p99 仍说明存在未被当前计数覆盖的串行化/排队成本；后续应单独增加 `range_gate_wait/hold`。
+64K 样本的 `lock_io_wait_ns` 近似为零并不代表没有锁等待。大范围请求会直接走 per-inode `rangeGate`，
+旧统计只包围 bucket lock，没有包围 gate lock。该缺口已在本轮补齐；修复后的同口径 64K 样本见
+`performance/hfs_range_gate_registered_direct_20260909.md`，记录到 `range_gate` 累计 wait/hold。
 
 ### 6. 请求放大不是主因
 
@@ -52,10 +54,9 @@ DMA 等待只在 8K、16K 出现，且没有 `dma_exhaust`。因此直接把 poo
 
 ## 下一步
 
-1. 为 `runtime->rangeGate` 增加独立等待/持有统计和 tracepoint，重跑 64K。
-2. 使用 SPDK DMA allocator 或 registered buffer 建立同口径 direct-DMA FIO，对比 `copy_ops=0` 时的收益。
-3. 将同步 preload 与 `hfs_lib_async_*` 分开测量，确认 waiter/queue 是吞吐上限还是仅影响尾延迟。
-4. 对 4K/32K 优先缩短 aligned I/O 的 lock 生命周期，并验证 overlapping write、RMW、truncate 语义不回退。
+1. 使用 SPDK DMA allocator 或 registered buffer 建立持续 direct-DMA 并发基准，对比 `copy_ops=0` 时的收益。
+2. 将同步 preload 与 `hfs_lib_async_*` 分开测量，确认 waiter/queue 是吞吐上限还是仅影响尾延迟。
+3. 对 4K/32K 优先缩短 aligned I/O 的 lock 生命周期，并验证 overlapping write、RMW、truncate 语义不回退。
 
 ## 原始结果
 

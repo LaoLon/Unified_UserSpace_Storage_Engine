@@ -176,6 +176,10 @@ typedef struct HfsIoRangeGuard {
 	uint16_t count;
 	bool write;
 	bool gateWrite;
+	/* Track whether the blocking per-inode gate has a timing frame. */
+	bool gateStatsTimed;
+	/* Preserve the gate hold start across submit/completion reactor threads. */
+	uint64_t gateHoldStartNs;
 	HfsInodeRuntime *runtime;
 } HfsIoRangeGuard;
 
@@ -249,6 +253,7 @@ static int hfsIoRangeLock(HfsFile *file, uint64_t offset, uint64_t length,
 		return -1;
 	}
 	guard->count = 0;
+	guard->gateHoldStartNs = 0;
 	runtime = hfsInodeRuntimeForFile(file);
 	if (runtime == NULL) {
 		return -1;
@@ -267,14 +272,33 @@ static int hfsIoRangeLock(HfsFile *file, uint64_t offset, uint64_t length,
 		}
 	}
 	guard->write = write;
+	guard->gateStatsTimed = false;
 	if (seenCount >= HFS_IO_RANGE_GATE_THRESHOLD) {
 		/* A large range is exclusive per inode, but does not block other files. */
 		guard->gateWrite = true;
+		guard->gateStatsTimed = hfsStatsTimingFastEnabled();
+		if (guard->gateStatsTimed) {
+			hfsStatsLockBeforeFast(HFS_STATS_LOCK_RANGE_GATE);
+		}
 		hfsRangeLockWriteLock(&runtime->rangeGate);
+		if (guard->gateStatsTimed) {
+			hfsStatsLockAfterFast(HFS_STATS_LOCK_RANGE_GATE);
+			guard->gateHoldStartNs = hfsStatsNowNs();
+			hfsStatsLockCancelFast(HFS_STATS_LOCK_RANGE_GATE);
+		}
 		return 0;
 	}
 	guard->gateWrite = false;
+	guard->gateStatsTimed = hfsStatsTimingFastEnabled();
+	if (guard->gateStatsTimed) {
+		hfsStatsLockBeforeFast(HFS_STATS_LOCK_RANGE_GATE);
+	}
 	hfsRangeLockReadLock(&runtime->rangeGate);
+	if (guard->gateStatsTimed) {
+		hfsStatsLockAfterFast(HFS_STATS_LOCK_RANGE_GATE);
+		guard->gateHoldStartNs = hfsStatsNowNs();
+		hfsStatsLockCancelFast(HFS_STATS_LOCK_RANGE_GATE);
+	}
 	for (bucket = 0; bucket < HFS_RANGE_LOCK_COUNT; bucket++) {
 		if ((seen[bucket / 64U] & (UINT64_C(1) << (bucket % 64U))) == 0) {
 			continue;
@@ -312,6 +336,8 @@ static int hfsIoRangeTryLock(HfsFile *file, uint64_t offset, uint64_t length,
 		return -1;
 	}
 	guard->count = 0;
+	guard->gateStatsTimed = false;
+	guard->gateHoldStartNs = 0;
 	runtime = hfsInodeRuntimeForFile(file);
 	if (runtime == NULL) {
 		return -1;
@@ -330,19 +356,44 @@ static int hfsIoRangeTryLock(HfsFile *file, uint64_t offset, uint64_t length,
 		}
 	}
 	guard->write = write;
+	guard->gateStatsTimed = hfsStatsTimingFastEnabled();
 	if (seenCount >= HFS_IO_RANGE_GATE_THRESHOLD) {
 		guard->gateWrite = true;
+		if (guard->gateStatsTimed) {
+			hfsStatsLockBeforeFast(HFS_STATS_LOCK_RANGE_GATE);
+		}
 		rc = hfsRangeLockTryWriteLock(&runtime->rangeGate);
 		if (rc != 0) {
+			if (guard->gateStatsTimed) {
+				hfsStatsLockCancelFast(HFS_STATS_LOCK_RANGE_GATE);
+				guard->gateStatsTimed = false;
+			}
 			errno = EAGAIN;
 			return -1;
 		}
+		if (guard->gateStatsTimed) {
+			hfsStatsLockAfterFast(HFS_STATS_LOCK_RANGE_GATE);
+			guard->gateHoldStartNs = hfsStatsNowNs();
+			hfsStatsLockCancelFast(HFS_STATS_LOCK_RANGE_GATE);
+		}
 		return 0;
+	}
+	if (guard->gateStatsTimed) {
+		hfsStatsLockBeforeFast(HFS_STATS_LOCK_RANGE_GATE);
 	}
 	rc = hfsRangeLockTryReadLock(&runtime->rangeGate);
 	if (rc != 0) {
+		if (guard->gateStatsTimed) {
+			hfsStatsLockCancelFast(HFS_STATS_LOCK_RANGE_GATE);
+			guard->gateStatsTimed = false;
+		}
 		errno = EAGAIN;
 		return -1;
+	}
+	if (guard->gateStatsTimed) {
+		hfsStatsLockAfterFast(HFS_STATS_LOCK_RANGE_GATE);
+		guard->gateHoldStartNs = hfsStatsNowNs();
+		hfsStatsLockCancelFast(HFS_STATS_LOCK_RANGE_GATE);
 	}
 	guard->gateWrite = false;
 	for (bucket = 0; bucket < HFS_RANGE_LOCK_COUNT; bucket++) {
@@ -353,6 +404,7 @@ static int hfsIoRangeTryLock(HfsFile *file, uint64_t offset, uint64_t length,
 		rc = write ? hfsRangeLockTryWriteLock(&file->fs->rangeLocks[bucket])
 			    : hfsRangeLockTryReadLock(&file->fs->rangeLocks[bucket]);
 		if (rc != 0) {
+			hfsStatsLockCancelFast(HFS_STATS_LOCK_IO);
 			hfsIoRangeUnlock(file, guard);
 			errno = EAGAIN;
 			return -1;
@@ -375,10 +427,21 @@ static void hfsIoRangeUnlock(HfsFile *file, HfsIoRangeGuard *guard) {
 		hfsRangeLockUnlock(&file->fs->rangeLocks[guard->buckets[i - 1]], guard->write);
 	}
 	if (guard->runtime != NULL) {
+		/* Close the gate timing frame before releasing the gate itself. */
+		if (guard->gateStatsTimed) {
+			uint64_t now = hfsStatsNowNs();
+
+			if (now >= guard->gateHoldStartNs) {
+				hfsStatsLockRecordHoldFast(HFS_STATS_LOCK_RANGE_GATE,
+					now - guard->gateHoldStartNs);
+			}
+		}
 		hfsRangeLockUnlock(&guard->runtime->rangeGate, guard->gateWrite);
 	}
 	guard->count = 0;
 	guard->gateWrite = false;
+	guard->gateStatsTimed = false;
+	guard->gateHoldStartNs = 0;
 	guard->runtime = NULL;
 }
 
@@ -1482,6 +1545,10 @@ static void hfsIoAsyncFinish(HfsIoAsyncParent *parent) {
 	result = parent->firstError == 0 ? (ssize_t)parent->count : -1;
 	error = parent->firstError;
 	pthread_mutex_unlock(&parent->lock);
+	if (parent->direct && error == 0) {
+		/* Account one completed registered-DMA request without any bounce copy. */
+		hfsStatsRecordIoDirectFast(parent->count);
+	}
 	hfsIoRangeUnlock(parent->file, &parent->guard);
 	hfsIoSyncReadUnlock(parent->runtime);
 	/* Drop the parent registration reference after every child has retired. */

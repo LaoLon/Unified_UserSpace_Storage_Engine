@@ -29,6 +29,7 @@ typedef enum HfsStatsLockClass {
 	HFS_STATS_LOCK_FD = 0,
 	HFS_STATS_LOCK_META,
 	HFS_STATS_LOCK_IO,
+	HFS_STATS_LOCK_RANGE_GATE,
 	HFS_STATS_LOCK_RESIZE,
 	HFS_STATS_LOCK_APPEND,
 	HFS_STATS_LOCK_RUNTIME,
@@ -60,6 +61,10 @@ uint64_t hfsStatsNowNs(void);
 void hfsStatsLockBefore(HfsStatsLockClass lockClass);
 /* Finish a lock acquisition and record wait time/contention. */
 void hfsStatsLockAfter(HfsStatsLockClass lockClass);
+/* Cancel a non-blocking lock timing frame without recording a hold. */
+void hfsStatsLockCancel(HfsStatsLockClass lockClass);
+/* Record a hold duration when lock acquisition and release use different threads. */
+void hfsStatsLockRecordHold(HfsStatsLockClass lockClass, uint64_t holdNs);
 /* Record lock hold time when the protected section is released. */
 void hfsStatsLockRelease(HfsStatsLockClass lockClass);
 static inline void hfsStatsLockBeforeFast(HfsStatsLockClass lockClass) {
@@ -70,6 +75,17 @@ static inline void hfsStatsLockBeforeFast(HfsStatsLockClass lockClass) {
 static inline void hfsStatsLockAfterFast(HfsStatsLockClass lockClass) {
 	if (hfsStatsTimingFastEnabled()) {
 		hfsStatsLockAfter(lockClass);
+	}
+}
+static inline void hfsStatsLockCancelFast(HfsStatsLockClass lockClass) {
+	if (hfsStatsTimingFastEnabled()) {
+		hfsStatsLockCancel(lockClass);
+	}
+}
+static inline void hfsStatsLockRecordHoldFast(HfsStatsLockClass lockClass,
+									 uint64_t holdNs) {
+	if (hfsStatsTimingFastEnabled()) {
+		hfsStatsLockRecordHold(lockClass, holdNs);
 	}
 }
 static inline void hfsStatsLockReleaseFast(HfsStatsLockClass lockClass) {

@@ -268,6 +268,38 @@ void hfsStatsLockAfter(HfsStatsLockClass lockClass) {
 	}
 }
 
+/* Drop a timing frame when a try-lock failed before the lock was acquired. */
+void hfsStatsLockCancel(HfsStatsLockClass lockClass) {
+	unsigned int depth;
+
+	if (!hfsStatsTimingEnabled() || lockClass >= HFS_STATS_LOCK_CLASS_COUNT) {
+		return;
+	}
+	depth = g_hfsStatsLockDepth[lockClass];
+	if (depth == 0) {
+		return;
+	}
+	depth--;
+	g_hfsStatsLockDepth[lockClass] = depth;
+	g_hfsStatsLockFrames[lockClass][depth].waitStartNs = 0;
+	g_hfsStatsLockFrames[lockClass][depth].holdStartNs = 0;
+}
+
+/* Record a hold duration on the releasing thread without using TLS frames. */
+void hfsStatsLockRecordHold(HfsStatsLockClass lockClass, uint64_t holdNs) {
+	HfsStatsShard *shard;
+
+	if (!hfsStatsTimingEnabled() || lockClass >= HFS_STATS_LOCK_CLASS_COUNT) {
+		return;
+	}
+	shard = hfsStatsShardGet();
+	if (shard != NULL) {
+		shard->lockHoldCount[lockClass]++;
+		shard->lockHoldNs[lockClass] += holdNs;
+		shard->lockHoldHist[lockClass][hfsStatsBucket(holdNs)]++;
+	}
+}
+
 /* Account for the protected section when the lock is released. */
 void hfsStatsLockRelease(HfsStatsLockClass lockClass) {
 	HfsStatsShard *shard;
@@ -673,7 +705,7 @@ static void hfsStatsAggregateShard(HfsStatsShard *total,
 /* Write an aggregated key-value report without depending on HFS logging. */
 static void hfsStatsWriteSnapshot(void) {
 	static const char *const lockNames[HFS_STATS_LOCK_CLASS_COUNT] = {
-		"fd", "meta", "io", "resize", "append", "runtime", "other"
+		"fd", "meta", "io", "range_gate", "resize", "append", "runtime", "other"
 	};
 	HfsStatsShard total = {0};
 	HfsStatsShard *shard;

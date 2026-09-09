@@ -1161,9 +1161,9 @@ Bug 等级：**致命 > 严重 > 一般**。
   errors=0，结果保存在 `/var/tmp/hfs-fio-nvme-current-20260909-r1`（单线程）和
   `r2`（HFS numjobs=32）。
 
-### 71. 大范围 I/O 的 rangeGate 未进入统计计时（待修复，一般级）
+### 71. 大范围 I/O 的 rangeGate 未进入统计计时（已修复，一般级）
 
-- **状态**：待修复；不影响数据正确性，但会让 64 KiB FIO 归因错误地显示为“无锁等待”
+- **状态**：已修复；新增独立 `range_gate` wait/hold 类别，并覆盖阻塞与跨线程释放的 try-lock direct async 路径
 - **时间**：2026-09-09（NVMe FIO stats attribution）
 - **等级**：一般（可观测性缺口）
 - **现象**：带 `HFS_STATS_TIMING=1` 的 `numjobs=32` NVMe FIO 中，64 KiB 样本的
@@ -1176,9 +1176,16 @@ Bug 等级：**致命 > 严重 > 一般**。
   并不能证明它没有等待锁。
 - **根因**：range bucket 和 per-inode rangeGate 复用了同一个逻辑 guard，但统计埋点只覆盖
   bucket 分支，未覆盖 gate 的阻塞/持有生命周期。
-- **处理**：当前先在归因报告中标记该缺口，不把 64 KiB 的零 `lock_io_wait_ns` 当作结论；
-  后续应增加独立 `range_gate_wait/hold` 计数和 tracepoint，并用同一 workload 复测。
-- **当前证据**：统计快照保存在 VM `/var/tmp/hfs-fio-nvme-stats-20260909/`；所有样本
-  `io_direct_ops=0`、`spdk_submit=spdk_complete`、`errors=0`。
+- **修复**：新增 `HFS_STATS_LOCK_RANGE_GATE` 与 `lock_range_gate_*` 快照字段；阻塞
+  `hfsRangeLockRead/WriteLock` 在获取前后记录 wait，释放时记录 hold。非阻塞 direct async
+  try-lock 增加失败取消 timing frame，成功路径把 hold 起点挂在 guard 上并在 completion
+  线程直接入 shard；同时修复失败 bucket try-lock 的 wait frame 泄漏。direct async parent
+  完成时补记 `io_direct_ops/io_direct_bytes`。
+- **验证**：VM 强制 `make -B lib` 通过。NVMe 64 KiB、numjobs=32、stats timing 样本得到
+  `lock_range_gate_wait_count=59588`、`lock_range_gate_hold_count=59588`、累计 wait
+  `465007278381 ns`、hold `6834935917 ns`，不再误报为零等待；`spdk_submit/complete`
+  `59757/59757`、errors=0。registered direct window 512 KiB read/write 通过，trace
+  `registered_children=4,copies=0`，统计 `io_direct_ops=2,io_direct_bytes=1048576`；
+  registered DMA 生命周期测试也通过。
 
 ## 通用经验总结
