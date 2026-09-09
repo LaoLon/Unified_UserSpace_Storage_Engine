@@ -1071,7 +1071,9 @@ Bug 等级：**致命 > 严重 > 一般**。
   线程读取，快照时机与 shard 合并存在竞态。该差异只出现在观测值，数据校验和实际请求状态不受影响。
 - **根因**：用非原子 thread-local 计数作为跨线程、跨 shard 的即时快照，缺少退出阶段的同步边界。
 - **修复**：增加按 reactor 的 `_Atomic uint_fast64_t` submit/complete 计数；记录路径同步更新原子值，
-  snapshot 直接读取原子数组，同时保留原 shard 字段供周期聚合和诊断使用。
+  snapshot 直接读取原子数组，同时保留原 shard 字段供周期聚合和诊断使用。随后发现 waiter 会在
+  `hfsIoDone` 的 reactor-complete 统计之前被唤醒，故将 complete 统计移到 completion wake 之前，
+  使统计闭合与请求生命周期具有同一发布顺序。
 - **验证**：VM 上强制 Make/CMake、stripe accounting、DMA pool backpressure、request-local fast I/O
   和 reactor=2/8 多 reactor 回归通过；最新 4-reactor stripe 测试 `266/266`，DMA lease
   `128/128`，重复退出快照未再出现伪不平衡。

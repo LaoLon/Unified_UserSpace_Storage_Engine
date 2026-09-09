@@ -1,6 +1,6 @@
 # HFS 数据面性能优化阶段计划（shard-49～53）
 
-> 状态：shard-49～50 已完成，shard-51～53 待实施；基于 `main@78650bf` 制定（2026-09-09）
+> 状态：shard-49～51 已完成，shard-52～53 待实施；基于 `main@78650bf` 制定（2026-09-09）
 > 前置阶段：shard-45 async libhfs、shard-46 多 reactor/channel、shard-47 DMA/vector、当前 shard-48 性能回归收口  
 > 输入依据：`doc/bug.md` #63/#64、`doc/design/fio_baseline_notes.md`、VM 最新 NVMe FIO 对比结果  
 > 适用范围：单 HFS 进程、持久化 AIO/NVMe bdev；不扩大多进程、mmap、native libaio/io_uring 支持边界
@@ -247,6 +247,21 @@ outstanding window。
 - 4K QD32 read 达到至少 80% 原生 SPDK，write 达到至少 60% 原生 SPDK，作为阶段闸门。
 - 64K QD32 read/write p99 不超过原生 SPDK 的 5 倍。
 - `lock_io_contention`、`runtime_queue_depth_peak` 和 `dma_wait_ns` 必须有可解释变化。
+
+### 6.5 shard-51 实施结果（2026-09-09）
+
+- 对齐的 full-unit read/write 不再在整个用户请求期间持有 range bucket；direct 路径按 DMA chunk
+  短 reservation，bounce pipeline 按当前 pipeline window reservation，完成并复制后立即释放，
+  再推进下一个 window。
+- 非对齐首尾、RMW、truncate、punch hole 和 async public request 保留原有整段/独占保护，避免
+  改变 POSIX 原子性；`HFS_IO_PIPELINE_DEPTH` 默认值 8、上限 16 继续由统一配置入口控制。
+- completion 统计在唤醒同步 waiter 之前发布 data-reactor complete，消除 shutdown snapshot 在
+  completion 已唤醒但回调统计尚未更新时的伪不平衡。
+- 新增 `scripts/db/io_concurrency_matrix.sh`，覆盖 1/2/4/8/16/32 线程、64 KiB aligned
+  write/read round-trip 和 reactor accounting。VM 上强制 Make/CMake、fast I/O、stripe、DMA pool、
+  concurrency matrix、reactor=2/8 回归全部通过；matrix `submit=770 complete=770`。
+- 本 shard 先收紧同步 aligned 数据面的 reservation；async/public path 的 registered DMA 和
+  跨 reactor buffer 生命周期留给 shard-52，最终 FIO/数据库收益留给 shard-53。
 
 ## 7. shard-52：registered DMA 与异步数据面
 

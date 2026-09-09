@@ -660,10 +660,11 @@ static void hfsIoStart(void *arg) {
 static void hfsIoDone(void *arg, int bserrno) {
 	HfsIoRequest *request = arg;
 
-	hfsRequestComplete(&request->result, bserrno, request->units);
+	/* Publish reactor accounting before waking waiters or shutdown snapshots. */
 	if (request->dataPath) {
 		hfsStatsRecordDataReactorCompleteFast(request->dataReactor);
 	}
+	hfsRequestComplete(&request->result, bserrno, request->units);
 	if (request->asyncMagic == HFS_IO_ASYNC_MAGIC && request->asyncDone != NULL) {
 		request->asyncDone(request);
 	}
@@ -1507,7 +1508,8 @@ static int hfsIoWriteZeroUnits(HfsFile *file, uint64_t offset, uint64_t units) {
 
 /* Read a positioned range while the caller holds the filesystem read lock. */
 static ssize_t hfsIoReadAtLocked(HfsFile *file, uint8_t *buffer,
-				 size_t count, uint64_t offset) {
+				 size_t count, uint64_t offset,
+				 bool windowedReservation) {
 	uint64_t unitSize = file->fs->unitSize;
 	uint64_t cursor = offset;
 	size_t remaining = count;
@@ -1522,9 +1524,20 @@ static ssize_t hfsIoReadAtLocked(HfsFile *file, uint8_t *buffer,
 		while (units != 0) {
 			uint64_t chunkUnits = units > maxUnits ? maxUnits : units;
 			size_t chunkBytes = (size_t)(chunkUnits * unitSize);
+			HfsIoRangeGuard windowGuard = {0};
+			int rc;
 
-			if (hfsIoSubmitDirect(file, buffer + bytesDone, cursorUnit,
-					      chunkUnits, false) != 0) {
+			if (windowedReservation && hfsIoRangeLock(file,
+					cursorUnit * unitSize, chunkBytes, false,
+					&windowGuard) != 0) {
+				return -1;
+			}
+			rc = hfsIoSubmitDirect(file, buffer + bytesDone, cursorUnit,
+					chunkUnits, false);
+			if (windowedReservation) {
+				hfsIoRangeUnlock(file, &windowGuard);
+			}
+			if (rc != 0) {
 				return -1;
 			}
 			cursorUnit += chunkUnits;
@@ -1569,6 +1582,17 @@ static ssize_t hfsIoReadAtLocked(HfsFile *file, uint8_t *buffer,
 		HfsIoRequest requests[HFS_IO_MAX_PIPELINE] = {0};
 		HfsIoLease leases[HFS_IO_MAX_PIPELINE] = {0};
 		uint32_t i;
+		HfsIoRangeGuard windowGuard = {0};
+		uint64_t windowUnits = fullUnits;
+
+		if (windowUnits > (uint64_t)pipelineDepth * maxUnits) {
+			windowUnits = (uint64_t)pipelineDepth * maxUnits;
+		}
+		if (windowedReservation && hfsIoRangeLock(file, cursor,
+				(size_t)(windowUnits * unitSize), false,
+				&windowGuard) != 0) {
+			return -1;
+		}
 
 		while (requestCount < pipelineDepth && pendingUnits < fullUnits) {
 			uint64_t chunkUnits = fullUnits - pendingUnits;
@@ -1579,8 +1603,11 @@ static ssize_t hfsIoReadAtLocked(HfsFile *file, uint8_t *buffer,
 			if (hfsIoAcquireAt(file, &leases[requestCount],
 					(size_t)(chunkUnits * unitSize),
 					cursor / unitSize + pendingUnits) != 0) {
-				hfsIoWaitPipeline(requests, requestCount);
+					hfsIoWaitPipeline(requests, requestCount);
 				hfsIoReleasePipeline(leases, requestCount);
+				if (windowedReservation) {
+					hfsIoRangeUnlock(file, &windowGuard);
+				}
 				return -1;
 			}
 			requests[requestCount].file = file;
@@ -1597,6 +1624,9 @@ static ssize_t hfsIoReadAtLocked(HfsFile *file, uint8_t *buffer,
 				hfsIoRelease(&leases[requestCount]);
 				hfsIoWaitPipeline(requests, requestCount);
 				hfsIoReleasePipeline(leases, requestCount);
+				if (windowedReservation) {
+					hfsIoRangeUnlock(file, &windowGuard);
+				}
 				return -1;
 			}
 			requestCount++;
@@ -1605,6 +1635,9 @@ static ssize_t hfsIoReadAtLocked(HfsFile *file, uint8_t *buffer,
 		hfsStatsRecordIoPipelineFast(requestCount);
 		if (hfsIoWaitPipeline(requests, requestCount) != 0) {
 			hfsIoReleasePipeline(leases, requestCount);
+			if (windowedReservation) {
+				hfsIoRangeUnlock(file, &windowGuard);
+			}
 			return -1;
 		}
 		for (i = 0; i < requestCount; i++) {
@@ -1615,6 +1648,9 @@ static ssize_t hfsIoReadAtLocked(HfsFile *file, uint8_t *buffer,
 			buffer += bytes;
 		}
 		hfsIoReleasePipeline(leases, requestCount);
+		if (windowedReservation) {
+			hfsIoRangeUnlock(file, &windowGuard);
+		}
 		cursor += pendingUnits * unitSize;
 		remaining -= (size_t)(pendingUnits * unitSize);
 		done += (size_t)(pendingUnits * unitSize);
@@ -1641,7 +1677,8 @@ static ssize_t hfsIoReadAtLocked(HfsFile *file, uint8_t *buffer,
 
 /* Write a positioned range while the caller holds the selected data lock. */
 static ssize_t hfsIoWriteAtLocked(HfsFile *file, const uint8_t *buffer,
-				  size_t count, uint64_t offset) {
+				  size_t count, uint64_t offset,
+				  bool windowedReservation) {
 	uint64_t unitSize = file->fs->unitSize;
 	uint64_t cursor = offset;
 	size_t remaining = count;
@@ -1656,9 +1693,20 @@ static ssize_t hfsIoWriteAtLocked(HfsFile *file, const uint8_t *buffer,
 		while (units != 0) {
 			uint64_t chunkUnits = units > maxUnits ? maxUnits : units;
 			size_t chunkBytes = (size_t)(chunkUnits * unitSize);
+			HfsIoRangeGuard windowGuard = {0};
+			int rc;
 
-			if (hfsIoSubmitDirect(file, (void *)(buffer + bytesDone),
-					      cursorUnit, chunkUnits, true) != 0) {
+			if (windowedReservation && hfsIoRangeLock(file,
+					cursorUnit * unitSize, chunkBytes, true,
+					&windowGuard) != 0) {
+				return -1;
+			}
+			rc = hfsIoSubmitDirect(file, (void *)(buffer + bytesDone),
+					cursorUnit, chunkUnits, true);
+			if (windowedReservation) {
+				hfsIoRangeUnlock(file, &windowGuard);
+			}
+			if (rc != 0) {
 				return -1;
 			}
 			cursorUnit += chunkUnits;
@@ -1693,6 +1741,17 @@ static ssize_t hfsIoWriteAtLocked(HfsFile *file, const uint8_t *buffer,
 		uint32_t requestCount = 0;
 		HfsIoRequest requests[HFS_IO_MAX_PIPELINE] = {0};
 		HfsIoLease leases[HFS_IO_MAX_PIPELINE] = {0};
+		HfsIoRangeGuard windowGuard = {0};
+		uint64_t windowUnits = fullUnits;
+
+		if (windowUnits > (uint64_t)pipelineDepth * maxUnits) {
+			windowUnits = (uint64_t)pipelineDepth * maxUnits;
+		}
+		if (windowedReservation && hfsIoRangeLock(file, cursor,
+				(size_t)(windowUnits * unitSize), true,
+				&windowGuard) != 0) {
+			return -1;
+		}
 
 		while (requestCount < pipelineDepth && pendingUnits < fullUnits) {
 			uint64_t chunkUnits = fullUnits - pendingUnits;
@@ -1706,6 +1765,9 @@ static ssize_t hfsIoWriteAtLocked(HfsFile *file, const uint8_t *buffer,
 					cursor / unitSize + pendingUnits) != 0) {
 				hfsIoWaitPipeline(requests, requestCount);
 				hfsIoReleasePipeline(leases, requestCount);
+				if (windowedReservation) {
+					hfsIoRangeUnlock(file, &windowGuard);
+				}
 				return -1;
 			}
 			bytes = (size_t)(chunkUnits * unitSize);
@@ -1726,6 +1788,9 @@ static ssize_t hfsIoWriteAtLocked(HfsFile *file, const uint8_t *buffer,
 				hfsIoRelease(&leases[requestCount]);
 				hfsIoWaitPipeline(requests, requestCount);
 				hfsIoReleasePipeline(leases, requestCount);
+				if (windowedReservation) {
+					hfsIoRangeUnlock(file, &windowGuard);
+				}
 				return -1;
 			}
 			requestCount++;
@@ -1734,9 +1799,15 @@ static ssize_t hfsIoWriteAtLocked(HfsFile *file, const uint8_t *buffer,
 		hfsStatsRecordIoPipelineFast(requestCount);
 		if (hfsIoWaitPipeline(requests, requestCount) != 0) {
 			hfsIoReleasePipeline(leases, requestCount);
+			if (windowedReservation) {
+				hfsIoRangeUnlock(file, &windowGuard);
+			}
 			return -1;
 		}
 		hfsIoReleasePipeline(leases, requestCount);
+		if (windowedReservation) {
+			hfsIoRangeUnlock(file, &windowGuard);
+		}
 		cursor += pendingUnits * unitSize;
 		buffer += (size_t)(pendingUnits * unitSize);
 		remaining -= (size_t)(pendingUnits * unitSize);
@@ -1778,12 +1849,14 @@ ssize_t hfsIoReadAt(HfsFile *file, uint8_t *buffer, size_t count,
 	if (runtime == NULL) {
 		return -1;
 	}
-	if (hfsIoRangeLock(file, offset, count, false, &guard) != 0) {
+	if (!aligned && hfsIoRangeLock(file, offset, count, false, &guard) != 0) {
 		hfsIoSyncReadUnlock(runtime);
 		return -1;
 	}
-	result = hfsIoReadAtLocked(file, buffer, count, offset);
-	hfsIoRangeUnlock(file, &guard);
+	result = hfsIoReadAtLocked(file, buffer, count, offset, aligned);
+	if (!aligned) {
+		hfsIoRangeUnlock(file, &guard);
+	}
 	hfsIoSyncReadUnlock(runtime);
 	return result;
 }
@@ -1820,12 +1893,14 @@ ssize_t hfsIoWriteAt(HfsFile *file, const uint8_t *buffer, size_t count,
 		hfsIoSyncReadUnlock(runtime);
 		return -1;
 	}
-	if (hfsIoRangeLock(file, offset, count, true, &guard) != 0) {
+	if (!aligned && hfsIoRangeLock(file, offset, count, true, &guard) != 0) {
 		hfsIoSyncReadUnlock(runtime);
 		return -1;
 	}
-	result = hfsIoWriteAtLocked(file, buffer, count, offset);
-	hfsIoRangeUnlock(file, &guard);
+	result = hfsIoWriteAtLocked(file, buffer, count, offset, aligned);
+	if (!aligned) {
+		hfsIoRangeUnlock(file, &guard);
+	}
 	hfsIoSyncReadUnlock(runtime);
 	return result;
 }
