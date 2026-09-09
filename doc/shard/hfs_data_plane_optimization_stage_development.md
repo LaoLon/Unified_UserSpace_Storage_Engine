@@ -1,6 +1,6 @@
 # HFS 数据面性能优化阶段计划（shard-49～53）
 
-> 状态：shard-49 已完成，shard-50～53 待实施；基于 `main@3b5898a` 制定（2026-09-09）
+> 状态：shard-49～50 已完成，shard-51～53 待实施；基于 `main@78650bf` 制定（2026-09-09）
 > 前置阶段：shard-45 async libhfs、shard-46 多 reactor/channel、shard-47 DMA/vector、当前 shard-48 性能回归收口  
 > 输入依据：`doc/bug.md` #63/#64、`doc/design/fio_baseline_notes.md`、VM 最新 NVMe FIO 对比结果  
 > 适用范围：单 HFS 进程、持久化 AIO/NVMe bdev；不扩大多进程、mmap、native libaio/io_uring 支持边界
@@ -198,6 +198,22 @@ blobId -> stable hash -> reactor
 - 64K QD32 p99 相比当前基线下降至少 30%。
 - 4K QD1 CPU/RSS 不得比当前基线增加超过 20%。
 - `fsync`、truncate、punch hole、RMW 仍保持数据正确。
+
+### 5.5 shard-50 实施结果（2026-09-09）
+
+- `HfsIoPool` 已改为按 data reactor 分片；每个分片独立持有 4K/16K/64K/1M class、mutex、条件变量、
+  active 计数和关闭状态，释放路径回到申请时的分片，避免跨 reactor 争用同一把全局池锁。
+- 默认每 reactor class 数为 `32,16,32,8`，分片数最多 8 个；新增 `HFS_IO_POOL_CLASS_COUNTS`
+  （四个逗号分隔的 class 数量）和 `HFS_IO_POOL_BYTES`（每 reactor 内存上限）配置，均有上限和失败回退。
+- 默认 pipeline depth 从 4 提升到 8，仍受 `HFS_IO_PIPELINE_DEPTH` 控制；请求按 stripe 选择的 reactor
+  获取 DMA lease，避免 lease 所属池与数据 reactor 不一致。
+- 新增 `dma_wait_ns`、`dma_exhaust` 统计，并将 data reactor submit/complete 快照改为原子计数，避免
+  线程退出时的统计快照竞态造成伪不平衡。
+- VM 回归：强制 Make、CMake Release、request-local fast I/O、stripe accounting、DMA pool backpressure
+  和 reactor=2/8 多 reactor 回归全部通过。DMA 专项 64 个请求共获得/释放 128 个 lease，
+  `dma_active_peak=3`、`dma_wait_ns=0`、`dma_exhaust=0`，submit/complete 与 lease acquire/release 均严格闭合。
+- 本 shard 验证了分片池与 backpressure 的正确性和可观测性；真实 NVMe/FIO 与数据库收益仍在 shard-53
+  统一口径回归，不提前宣称达到阶段性能目标。
 
 ## 6. shard-51：range reservation 与 pipeline/QD 优化
 

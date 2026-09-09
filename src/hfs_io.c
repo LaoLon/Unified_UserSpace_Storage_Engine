@@ -19,13 +19,14 @@
 /* Keep the hot path bounded while avoiding a 1 MiB lease for tiny requests. */
 #define HFS_IO_POOL_CLASS_COUNT	4U
 #define HFS_IO_POOL_CLASS_MAX_COUNT	32U
+#define HFS_IO_MAX_POOL_REACTORS	8U
 #define HFS_IO_POOL_4K_BYTES	(4U << 10)
 #define HFS_IO_POOL_16K_BYTES	(16U << 10)
 #define HFS_IO_POOL_64K_BYTES	(64U << 10)
 #define HFS_IO_POOL_1M_BYTES	(1U << 20)
 #define HFS_IO_MAX_PIPELINE	16U
 #define HFS_IO_MAX_VECTOR	32U
-#define HFS_IO_DEFAULT_PIPELINE	4U
+#define HFS_IO_DEFAULT_PIPELINE	8U
 #define HFS_IO_ASYNC_MAGIC	UINT64_C(0x4846534153594e43)
 
 /* One size-class DMA buffer leased by one request at a time. */
@@ -34,6 +35,7 @@ typedef struct hfs_io_pool HfsIoPool;
 
 typedef struct HfsIoLease {
 	HfsIoPool *pool;
+	struct HfsIoPoolShard *shard;
 	HfsIoPoolClass *classPool;
 	uint32_t slot;
 	uint8_t *buffer;
@@ -48,13 +50,19 @@ struct HfsIoPoolClass {
 	uint32_t freeSlots[HFS_IO_POOL_CLASS_MAX_COUNT];
 };
 
-/* Bounded DMA storage shared by all request-local data I/O. */
-struct hfs_io_pool {
+/* One reactor-local DMA pool with its own wait queue and free lists. */
+typedef struct HfsIoPoolShard {
 	pthread_mutex_t lock;
 	pthread_cond_t available;
 	HfsIoPoolClass classes[HFS_IO_POOL_CLASS_COUNT];
 	uint32_t active;
 	bool closing;
+} HfsIoPoolShard;
+
+/* Bounded DMA storage partitioned by the selected data reactor. */
+struct hfs_io_pool {
+	uint32_t shardCount;
+	HfsIoPoolShard shards[HFS_IO_MAX_POOL_REACTORS];
 };
 
 static const size_t g_hfsIoPoolTargetBytes[HFS_IO_POOL_CLASS_COUNT] = {
@@ -62,7 +70,7 @@ static const size_t g_hfsIoPoolTargetBytes[HFS_IO_POOL_CLASS_COUNT] = {
 	HFS_IO_POOL_64K_BYTES, HFS_IO_POOL_1M_BYTES
 };
 static const uint32_t g_hfsIoPoolTargetCounts[HFS_IO_POOL_CLASS_COUNT] = {
-	32U, 16U, 8U, 16U
+	32U, 16U, 32U, 8U
 };
 
 /* Operation submitted by one request-local SPDK transfer context. */
@@ -339,25 +347,107 @@ static HfsRequestOperation hfsIoRequestOperation(HfsIoOperation operation) {
 	}
 }
 
+/* Return the pool shard selected by a data reactor, with owner fallback. */
+static HfsIoPoolShard *hfsIoPoolShardFor(Hfs *fs, uint32_t reactorId) {
+	if (fs == NULL || fs->ioPool == NULL || fs->ioPool->shardCount == 0) {
+		return NULL;
+	}
+	if (reactorId >= fs->ioPool->shardCount) {
+		reactorId = 0;
+	}
+	return &fs->ioPool->shards[reactorId];
+}
+
 /* Return the number of complete I/O units one pool buffer can hold. */
 static uint64_t hfsIoMaxUnits(const Hfs *fs) {
-	return (uint64_t)(fs->ioPool->classes[HFS_IO_POOL_CLASS_COUNT - 1U].bufferBytes /
+	HfsIoPoolShard *shard = hfsIoPoolShardFor((Hfs *)fs, 0);
+
+	return shard == NULL ? 0 : (uint64_t)(
+		shard->classes[HFS_IO_POOL_CLASS_COUNT - 1U].bufferBytes /
 		(size_t)fs->unitSize);
 }
 
 /* Select the smallest DMA class that can hold one request. */
-static HfsIoPoolClass *hfsIoSelectClass(Hfs *fs, size_t requestedBytes) {
+static HfsIoPoolClass *hfsIoSelectClass(HfsIoPoolShard *shard,
+						 size_t requestedBytes) {
 	uint32_t i;
 
-	if (fs == NULL || fs->ioPool == NULL || requestedBytes == 0) {
+	if (shard == NULL || requestedBytes == 0) {
 		return NULL;
 	}
 	for (i = 0; i < HFS_IO_POOL_CLASS_COUNT; i++) {
-		if (requestedBytes <= fs->ioPool->classes[i].bufferBytes) {
-			return &fs->ioPool->classes[i];
+		if (requestedBytes <= shard->classes[i].bufferBytes) {
+			return &shard->classes[i];
 		}
 	}
 	return NULL;
+}
+
+/* Parse per-reactor class counts from HFS_IO_POOL_CLASS_COUNTS. */
+static int hfsIoPoolCountsEnv(uint32_t counts[HFS_IO_POOL_CLASS_COUNT]) {
+	const char *value = getenv("HFS_IO_POOL_CLASS_COUNTS");
+	char *end;
+	unsigned long parsed;
+	uint32_t i;
+
+	for (i = 0; i < HFS_IO_POOL_CLASS_COUNT; i++) {
+		counts[i] = g_hfsIoPoolTargetCounts[i];
+	}
+	if (value == NULL || value[0] == '\0') {
+		return 0;
+	}
+	for (i = 0; i < HFS_IO_POOL_CLASS_COUNT; i++) {
+		parsed = strtoul(value, &end, 10);
+		if (end == value || parsed == 0 ||
+		    parsed > HFS_IO_POOL_CLASS_MAX_COUNT) {
+			errno = EINVAL;
+			return -1;
+		}
+		counts[i] = (uint32_t)parsed;
+		if (i + 1U == HFS_IO_POOL_CLASS_COUNT) {
+			if (*end != '\0') {
+				errno = EINVAL;
+				return -1;
+			}
+			break;
+		}
+		if (*end != ',') {
+			errno = EINVAL;
+			return -1;
+		}
+		value = end + 1;
+	}
+	return 0;
+}
+
+/* Parse an optional per-reactor byte cap with K/M/G suffixes. */
+static size_t hfsIoPoolBytesEnv(void) {
+	const char *value = getenv("HFS_IO_POOL_BYTES");
+	char *end;
+	unsigned long long parsed;
+	unsigned long long multiplier = 1;
+
+	if (value == NULL || value[0] == '\0') {
+		return 0;
+	}
+	errno = 0;
+	parsed = strtoull(value, &end, 10);
+	if (errno != 0 || end == value) {
+		return 0;
+	}
+	if (*end == 'k' || *end == 'K') {
+		multiplier = 1ULL << 10;
+	} else if (*end == 'm' || *end == 'M') {
+		multiplier = 1ULL << 20;
+	} else if (*end == 'g' || *end == 'G') {
+		multiplier = 1ULL << 30;
+	} else if (*end != '\0') {
+		return 0;
+	}
+	if (parsed > SIZE_MAX / multiplier) {
+		return 0;
+	}
+	return (size_t)(parsed * multiplier);
 }
 
 static pthread_once_t g_hfsIoPipelineOnce = PTHREAD_ONCE_INIT;
@@ -387,11 +477,14 @@ static uint32_t hfsIoPipelineDepth(void) {
 	return g_hfsIoPipelineConfigured;
 }
 
-/* Acquire the smallest bounded DMA buffer, waiting until a matching buffer returns. */
-static int hfsIoAcquire(Hfs *fs, HfsIoLease *lease, size_t requestedBytes) {
+/* Acquire a reactor-local DMA buffer, waiting until its class has capacity. */
+static int hfsIoAcquire(Hfs *fs, HfsIoLease *lease, size_t requestedBytes,
+				uint32_t reactorId) {
 	HfsIoPool *pool = fs->ioPool;
-	HfsIoPoolClass *classPool = hfsIoSelectClass(fs, requestedBytes);
+	HfsIoPoolShard *shard = hfsIoPoolShardFor(fs, reactorId);
+	HfsIoPoolClass *classPool = hfsIoSelectClass(shard, requestedBytes);
 	bool waited = false;
+	uint64_t waitStartNs = 0;
 
 	if (classPool == NULL) {
 		errno = E2BIG;
@@ -399,35 +492,42 @@ static int hfsIoAcquire(Hfs *fs, HfsIoLease *lease, size_t requestedBytes) {
 	}
 	HFS_STATS_DMA_ACQUIRE();
 	memset(lease, 0, sizeof(*lease));
-	pthread_mutex_lock(&pool->lock);
-	if (classPool->freeTop == 0 && !pool->closing) {
+	pthread_mutex_lock(&shard->lock);
+	if (classPool->freeTop == 0 && !shard->closing) {
 		waited = true;
+		waitStartNs = hfsStatsNowNs();
 		HFS_STATS_DMA_WAIT();
 	}
-	while (classPool->freeTop == 0 && !pool->closing) {
-		pthread_cond_wait(&pool->available, &pool->lock);
+	while (classPool->freeTop == 0 && !shard->closing) {
+		pthread_cond_wait(&shard->available, &shard->lock);
 	}
-	if (pool->closing) {
-		pthread_mutex_unlock(&pool->lock);
+	if (shard->closing) {
+		pthread_mutex_unlock(&shard->lock);
 		errno = ESHUTDOWN;
 		return -1;
 	}
 	lease->pool = pool;
+	lease->shard = shard;
 	lease->classPool = classPool;
 	lease->slot = classPool->freeSlots[--classPool->freeTop];
 	lease->buffer = classPool->storage +
 		(size_t)lease->slot * classPool->bufferBytes;
-	pool->active++;
-	HFS_STATS_DMA_ACTIVE(pool->active);
-	hfsStatsRecordDmaFast(classPool->bufferBytes, waited, pool->active);
-	pthread_mutex_unlock(&pool->lock);
+	shard->active++;
+	HFS_STATS_DMA_ACTIVE(shard->active);
+	hfsStatsRecordDmaFast(classPool->bufferBytes, waited, shard->active);
+	if (waited) {
+		hfsStatsRecordDmaWaitNs(hfsStatsNowNs() - waitStartNs);
+	}
+	pthread_mutex_unlock(&shard->lock);
 	return 0;
 }
 
-/* Acquire the smallest DMA buffer without waiting for an async submit. */
-static int hfsIoTryAcquire(Hfs *fs, HfsIoLease *lease, size_t requestedBytes) {
+/* Acquire a reactor-local DMA buffer without waiting for an async submit. */
+static int hfsIoTryAcquire(Hfs *fs, HfsIoLease *lease, size_t requestedBytes,
+				   uint32_t reactorId) {
 	HfsIoPool *pool = fs->ioPool;
-	HfsIoPoolClass *classPool = hfsIoSelectClass(fs, requestedBytes);
+	HfsIoPoolShard *shard = hfsIoPoolShardFor(fs, reactorId);
+	HfsIoPoolClass *classPool = hfsIoSelectClass(shard, requestedBytes);
 	int rc;
 
 	if (classPool == NULL) {
@@ -436,48 +536,78 @@ static int hfsIoTryAcquire(Hfs *fs, HfsIoLease *lease, size_t requestedBytes) {
 	}
 	HFS_STATS_DMA_ACQUIRE();
 	memset(lease, 0, sizeof(*lease));
-	rc = pthread_mutex_trylock(&pool->lock);
+	rc = pthread_mutex_trylock(&shard->lock);
 	if (rc != 0) {
+		HFS_STATS_DMA_EXHAUST();
+		hfsStatsRecordDmaExhaust();
 		errno = EAGAIN;
 		return -1;
 	}
-	if (classPool->freeTop == 0 || pool->closing) {
-		pthread_mutex_unlock(&pool->lock);
-		errno = pool->closing ? ESHUTDOWN : EAGAIN;
+	if (classPool->freeTop == 0 || shard->closing) {
+		pthread_mutex_unlock(&shard->lock);
+		if (!shard->closing) {
+			HFS_STATS_DMA_EXHAUST();
+			hfsStatsRecordDmaExhaust();
+		}
+		errno = shard->closing ? ESHUTDOWN : EAGAIN;
 		return -1;
 	}
 	lease->pool = pool;
+	lease->shard = shard;
 	lease->classPool = classPool;
 	lease->slot = classPool->freeSlots[--classPool->freeTop];
 	lease->buffer = classPool->storage +
 		(size_t)lease->slot * classPool->bufferBytes;
-	pool->active++;
-	HFS_STATS_DMA_ACTIVE(pool->active);
-	hfsStatsRecordDmaFast(classPool->bufferBytes, false, pool->active);
-	pthread_mutex_unlock(&pool->lock);
+	shard->active++;
+	HFS_STATS_DMA_ACTIVE(shard->active);
+	hfsStatsRecordDmaFast(classPool->bufferBytes, false, shard->active);
+	pthread_mutex_unlock(&shard->lock);
 	return 0;
 }
 
 /* Return one DMA buffer to the pool and wake the next waiting request. */
 static void hfsIoRelease(HfsIoLease *lease) {
-	struct hfs_io_pool *pool;
-
 	if (lease == NULL || lease->pool == NULL) {
 		return;
 	}
-	pool = lease->pool;
-	pthread_mutex_lock(&pool->lock);
+	if (lease->shard == NULL) {
+		memset(lease, 0, sizeof(*lease));
+		return;
+	}
+	pthread_mutex_lock(&lease->shard->lock);
 	if (lease->classPool != NULL &&
 	    lease->classPool->freeTop < lease->classPool->count) {
 		lease->classPool->freeSlots[lease->classPool->freeTop++] = lease->slot;
 	}
-	if (pool->active > 0) {
-		pool->active--;
+	if (lease->shard->active > 0) {
+		lease->shard->active--;
 	}
 	HFS_STATS_DMA_RELEASE();
-	pthread_cond_broadcast(&pool->available);
-	pthread_mutex_unlock(&pool->lock);
+	pthread_cond_broadcast(&lease->shard->available);
+	pthread_mutex_unlock(&lease->shard->lock);
 	memset(lease, 0, sizeof(*lease));
+}
+
+/* Select the pool shard for a logical unit in one file. */
+static uint32_t hfsIoReactorForUnit(const HfsFile *file, uint64_t unitOffset) {
+	if (file == NULL || file->fs == NULL) {
+		return 0;
+	}
+	return hfsRuntimeDataReactorFor(file->fs, file->blobId, unitOffset);
+}
+
+/* Acquire a DMA lease from the reactor that will execute the request. */
+static int hfsIoAcquireAt(HfsFile *file, HfsIoLease *lease,
+				  size_t requestedBytes, uint64_t unitOffset) {
+	return hfsIoAcquire(file->fs, lease, requestedBytes,
+			    hfsIoReactorForUnit(file, unitOffset));
+}
+
+/* Acquire a DMA lease without waiting for an async request. */
+static int hfsIoTryAcquireAt(HfsFile *file, HfsIoLease *lease,
+				     size_t requestedBytes, uint64_t unitOffset) {
+	return hfsIoTryAcquire(file->fs, lease, requestedBytes,
+			       hfsIoReactorForUnit(file, unitOffset));
 }
 
 /* Start one SPDK blob operation on the dedicated owner thread. */
@@ -858,7 +988,8 @@ static int hfsIoAsyncStartBatch(HfsIoAsyncParent *parent) {
 				units = maxUnits;
 			}
 			bytes = (size_t)(units * parent->file->fs->unitSize);
-			if (hfsIoTryAcquire(parent->file->fs, &parent->leases[i], bytes) != 0) {
+			if (hfsIoTryAcquireAt(parent->file, &parent->leases[i], bytes,
+					parent->offset / parent->file->fs->unitSize + relativeUnit) != 0) {
 				savedErrno = errno != 0 ? errno : EAGAIN;
 				hfsIoReleasePipeline(parent->leases, i);
 				pthread_mutex_lock(&parent->lock);
@@ -1112,14 +1243,127 @@ int hfsIoWriteAtAsync(HfsFile *file, const uint8_t *buffer, size_t count,
 	return 0;
 }
 
-/* Initialize the bounded DMA pool and its synchronization primitives. */
+/* Initialize one reactor-local DMA pool shard. */
+static int hfsIoPoolShardInit(HfsIoPoolShard *shard,
+				      const size_t bufferBytes[HFS_IO_POOL_CLASS_COUNT],
+				      const uint32_t counts[HFS_IO_POOL_CLASS_COUNT]) {
+	uint32_t i;
+
+	if (pthread_mutex_init(&shard->lock, NULL) != 0) {
+		errno = ENOMEM;
+		return -1;
+	}
+	if (pthread_cond_init(&shard->available, NULL) != 0) {
+		pthread_mutex_destroy(&shard->lock);
+		errno = ENOMEM;
+		return -1;
+	}
+	for (i = 0; i < HFS_IO_POOL_CLASS_COUNT; i++) {
+		HfsIoPoolClass *classPool = &shard->classes[i];
+		uint32_t j;
+		size_t storageBytes;
+
+		if (bufferBytes[i] == 0 || counts[i] == 0 ||
+		    counts[i] > SIZE_MAX / bufferBytes[i]) {
+			errno = EOVERFLOW;
+			goto fail;
+		}
+		storageBytes = bufferBytes[i] * counts[i];
+		classPool->storage = spdk_malloc(storageBytes, 0x1000, NULL,
+					SPDK_ENV_LCORE_ID_ANY, SPDK_MALLOC_DMA);
+		if (classPool->storage == NULL) {
+			errno = ENOMEM;
+			goto fail;
+		}
+		classPool->bufferBytes = bufferBytes[i];
+		classPool->count = counts[i];
+		classPool->freeTop = counts[i];
+		for (j = 0; j < counts[i]; j++) {
+			classPool->freeSlots[j] = j;
+		}
+	}
+	return 0;
+
+fail:
+	while (i > 0) {
+		i--;
+		spdk_free(shard->classes[i].storage);
+		shard->classes[i].storage = NULL;
+	}
+	pthread_cond_destroy(&shard->available);
+	pthread_mutex_destroy(&shard->lock);
+	return -1;
+}
+
+/* Drain one reactor-local pool and release its DMA storage. */
+static void hfsIoPoolShardFini(HfsIoPoolShard *shard) {
+	uint32_t i;
+
+	pthread_mutex_lock(&shard->lock);
+	shard->closing = true;
+	pthread_cond_broadcast(&shard->available);
+	while (shard->active != 0) {
+		pthread_cond_wait(&shard->available, &shard->lock);
+	}
+	pthread_mutex_unlock(&shard->lock);
+	for (i = 0; i < HFS_IO_POOL_CLASS_COUNT; i++) {
+		spdk_free(shard->classes[i].storage);
+		shard->classes[i].storage = NULL;
+	}
+	pthread_cond_destroy(&shard->available);
+	pthread_mutex_destroy(&shard->lock);
+}
+
+/* Align configured class sizes and enforce the optional per-reactor cap. */
+static int hfsIoPoolLayout(Hfs *fs, size_t bufferBytes[HFS_IO_POOL_CLASS_COUNT],
+				   uint32_t counts[HFS_IO_POOL_CLASS_COUNT]) {
+	size_t limit = hfsIoPoolBytesEnv();
+	size_t total = 0;
+	uint32_t i;
+
+	for (i = 0; i < HFS_IO_POOL_CLASS_COUNT; i++) {
+		bufferBytes[i] = g_hfsIoPoolTargetBytes[i];
+		if (bufferBytes[i] < (size_t)fs->unitSize) {
+			bufferBytes[i] = (size_t)fs->unitSize;
+		}
+		if (bufferBytes[i] > SIZE_MAX - ((size_t)fs->unitSize - 1U)) {
+			errno = EOVERFLOW;
+			return -1;
+		}
+		bufferBytes[i] += (size_t)fs->unitSize - 1U;
+		bufferBytes[i] -= bufferBytes[i] % (size_t)fs->unitSize;
+		if (bufferBytes[i] == 0 || counts[i] > SIZE_MAX / bufferBytes[i]) {
+			errno = EOVERFLOW;
+			return -1;
+		}
+		total += bufferBytes[i] * counts[i];
+	}
+	if (limit == 0 || total <= limit) {
+		return 0;
+	}
+	for (i = HFS_IO_POOL_CLASS_COUNT; i > 0 && total > limit; i--) {
+		uint32_t classIndex = i - 1U;
+
+		while (counts[classIndex] > 1U && total > limit) {
+			counts[classIndex]--;
+			total -= bufferBytes[classIndex];
+		}
+	}
+	if (total > limit) {
+		errno = E2BIG;
+		return -1;
+	}
+	return 0;
+}
+
+/* Initialize per-reactor DMA pools and data synchronization state. */
 int hfsIoInit(Hfs *fs) {
 	HfsIoPool *pool;
-	size_t bufferBytes;
-	size_t storageBytes;
+	size_t bufferBytes[HFS_IO_POOL_CLASS_COUNT];
+	uint32_t counts[HFS_IO_POOL_CLASS_COUNT];
 	int rc;
 	uint32_t rangeLocksReady = 0;
-	uint32_t classesReady = 0;
+	uint32_t shardsReady = 0;
 	bool runtimeReady = false;
 
 	if (fs == NULL || fs->unitSize == 0 ||
@@ -1127,20 +1371,24 @@ int hfsIoInit(Hfs *fs) {
 		errno = EINVAL;
 		return -1;
 	}
+	if (hfsIoPoolCountsEnv(counts) != 0 ||
+	    hfsIoPoolLayout(fs, bufferBytes, counts) != 0) {
+		return -1;
+	}
 	pool = calloc(1, sizeof(*pool));
 	if (pool == NULL) {
 		errno = ENOMEM;
 		return -1;
 	}
-	rc = pthread_mutex_init(&pool->lock, NULL);
-	if (rc != 0) {
-		errno = rc;
-		goto fail_pool;
+	pool->shardCount = fs->dataReactorCount == 0 ? 1 : fs->dataReactorCount;
+	if (pool->shardCount > HFS_IO_MAX_POOL_REACTORS) {
+		pool->shardCount = HFS_IO_MAX_POOL_REACTORS;
 	}
-	rc = pthread_cond_init(&pool->available, NULL);
-	if (rc != 0) {
-		errno = rc;
-		goto fail_pool_mutex;
+	for (shardsReady = 0; shardsReady < pool->shardCount; shardsReady++) {
+		if (hfsIoPoolShardInit(&pool->shards[shardsReady], bufferBytes,
+					counts) != 0) {
+			goto fail_pool_shards;
+		}
 	}
 	for (rangeLocksReady = 0; rangeLocksReady < HFS_RANGE_LOCK_COUNT;
 	     rangeLocksReady++) {
@@ -1154,89 +1402,42 @@ int hfsIoInit(Hfs *fs) {
 		goto fail_range_locks;
 	}
 	runtimeReady = true;
-
-	for (uint32_t i = 0; i < HFS_IO_POOL_CLASS_COUNT; i++) {
-		HfsIoPoolClass *classPool = &pool->classes[i];
-		uint32_t j;
-
-		bufferBytes = g_hfsIoPoolTargetBytes[i];
-		if (bufferBytes < (size_t)fs->unitSize) {
-			bufferBytes = (size_t)fs->unitSize;
-		}
-		if (bufferBytes > SIZE_MAX - ((size_t)fs->unitSize - 1U)) {
-			errno = EOVERFLOW;
-			goto fail_classes;
-		}
-		bufferBytes += (size_t)fs->unitSize - 1U;
-		bufferBytes -= bufferBytes % (size_t)fs->unitSize;
-		if (bufferBytes == 0 ||
-		    g_hfsIoPoolTargetCounts[i] > SIZE_MAX / bufferBytes) {
-			errno = EOVERFLOW;
-			goto fail_classes;
-		}
-		storageBytes = bufferBytes * g_hfsIoPoolTargetCounts[i];
-		classPool->storage = spdk_malloc(storageBytes, 0x1000, NULL,
-						SPDK_ENV_LCORE_ID_ANY, SPDK_MALLOC_DMA);
-		if (classPool->storage == NULL) {
-			errno = ENOMEM;
-			goto fail_classes;
-		}
-		classPool->bufferBytes = bufferBytes;
-		classPool->count = g_hfsIoPoolTargetCounts[i];
-		classPool->freeTop = classPool->count;
-		for (j = 0; j < classPool->count; j++) {
-			classPool->freeSlots[j] = j;
-		}
-		classesReady++;
-	}
 	fs->ioPool = pool;
 	return 0;
 
-fail_classes:
-	while (classesReady > 0) {
-		classesReady--;
-		spdk_free(pool->classes[classesReady].storage);
-	}
+fail_range_locks:
 	if (runtimeReady) {
 		hfsInodeRuntimeFini(fs);
 	}
-fail_range_locks:
 	while (rangeLocksReady > 0) {
 		rangeLocksReady--;
 		pthread_rwlock_destroy(&fs->rangeLocks[rangeLocksReady]);
 	}
-	pthread_cond_destroy(&pool->available);
-fail_pool_mutex:
-	pthread_mutex_destroy(&pool->lock);
-fail_pool:
+fail_pool_shards:
+	while (shardsReady > 0) {
+		shardsReady--;
+		hfsIoPoolShardFini(&pool->shards[shardsReady]);
+	}
 	free(pool);
 	return -1;
 }
 
-/* Drain active leases and release the DMA pool during filesystem teardown. */
+/* Drain all reactor-local pools and release filesystem I/O state. */
 void hfsIoFini(Hfs *fs) {
 	HfsIoPool *pool;
+	uint32_t i;
 
 	if (fs == NULL || fs->ioPool == NULL) {
 		return;
 	}
 	pool = fs->ioPool;
-	pthread_mutex_lock(&pool->lock);
-	pool->closing = true;
-	pthread_cond_broadcast(&pool->available);
-	while (pool->active != 0) {
-		pthread_cond_wait(&pool->available, &pool->lock);
+	for (i = 0; i < pool->shardCount; i++) {
+		hfsIoPoolShardFini(&pool->shards[i]);
 	}
-	pthread_mutex_unlock(&pool->lock);
-	for (uint32_t i = 0; i < HFS_IO_POOL_CLASS_COUNT; i++) {
-		spdk_free(pool->classes[i].storage);
-	}
-	pthread_cond_destroy(&pool->available);
-	pthread_mutex_destroy(&pool->lock);
 	free(pool);
 	fs->ioPool = NULL;
 	hfsInodeRuntimeFini(fs);
-	for (uint32_t i = 0; i < HFS_RANGE_LOCK_COUNT; i++) {
+	for (i = 0; i < HFS_RANGE_LOCK_COUNT; i++) {
 		pthread_rwlock_destroy(&fs->rangeLocks[i]);
 	}
 }
@@ -1260,7 +1461,8 @@ static int hfsIoModifyPartial(HfsFile *file, uint64_t unitOffset,
 	HfsIoLease lease;
 	int rc;
 
-	if (hfsIoAcquire(file->fs, &lease, (size_t)file->fs->unitSize) != 0) {
+	if (hfsIoAcquireAt(file, &lease, (size_t)file->fs->unitSize,
+			   unitOffset) != 0) {
 		return -1;
 	}
 	rc = hfsIoReadUnit(file, &lease, unitOffset);
@@ -1287,8 +1489,8 @@ static int hfsIoWriteZeroUnits(HfsFile *file, uint64_t offset, uint64_t units) {
 		uint64_t chunkUnits = units > maxUnits ? maxUnits : units;
 		int rc;
 
-		if (hfsIoAcquire(file->fs, &lease,
-				(size_t)(chunkUnits * file->fs->unitSize)) != 0) {
+		if (hfsIoAcquireAt(file, &lease,
+				(size_t)(chunkUnits * file->fs->unitSize), offset) != 0) {
 			return -1;
 		}
 		memset(lease.buffer, 0, (size_t)(chunkUnits * file->fs->unitSize));
@@ -1341,7 +1543,8 @@ static ssize_t hfsIoReadAtLocked(HfsFile *file, uint8_t *buffer,
 		if (take > remaining) {
 			take = remaining;
 		}
-		if (hfsIoAcquire(file->fs, &lease, (size_t)file->fs->unitSize) != 0) {
+		if (hfsIoAcquireAt(file, &lease, (size_t)file->fs->unitSize,
+				   unitOffset) != 0) {
 			return -1;
 		}
 		if (hfsIoReadUnit(file, &lease, unitOffset) != 0) {
@@ -1373,8 +1576,9 @@ static ssize_t hfsIoReadAtLocked(HfsFile *file, uint8_t *buffer,
 			if (chunkUnits > maxUnits) {
 				chunkUnits = maxUnits;
 			}
-			if (hfsIoAcquire(file->fs, &leases[requestCount],
-					(size_t)(chunkUnits * unitSize)) != 0) {
+			if (hfsIoAcquireAt(file, &leases[requestCount],
+					(size_t)(chunkUnits * unitSize),
+					cursor / unitSize + pendingUnits) != 0) {
 				hfsIoWaitPipeline(requests, requestCount);
 				hfsIoReleasePipeline(leases, requestCount);
 				return -1;
@@ -1419,7 +1623,8 @@ static ssize_t hfsIoReadAtLocked(HfsFile *file, uint8_t *buffer,
 	if (remaining != 0) {
 		HfsIoLease lease;
 
-		if (hfsIoAcquire(file->fs, &lease, (size_t)unitSize) != 0) {
+		if (hfsIoAcquireAt(file, &lease, (size_t)unitSize,
+				   cursor / unitSize) != 0) {
 			return -1;
 		}
 		if (hfsIoReadUnit(file, &lease, cursor / unitSize) != 0) {
@@ -1496,8 +1701,9 @@ static ssize_t hfsIoWriteAtLocked(HfsFile *file, const uint8_t *buffer,
 			if (chunkUnits > maxUnits) {
 				chunkUnits = maxUnits;
 			}
-			if (hfsIoAcquire(file->fs, &leases[requestCount],
-					(size_t)(chunkUnits * unitSize)) != 0) {
+			if (hfsIoAcquireAt(file, &leases[requestCount],
+					(size_t)(chunkUnits * unitSize),
+					cursor / unitSize + pendingUnits) != 0) {
 				hfsIoWaitPipeline(requests, requestCount);
 				hfsIoReleasePipeline(leases, requestCount);
 				return -1;
@@ -1660,7 +1866,8 @@ static int hfsIoZeroPartial(HfsFile *file, uint64_t unitOffset,
 	HfsIoLease lease;
 	int rc;
 
-	if (hfsIoAcquire(file->fs, &lease, (size_t)file->fs->unitSize) != 0) {
+	if (hfsIoAcquireAt(file, &lease, (size_t)file->fs->unitSize,
+			   unitOffset) != 0) {
 		return -1;
 	}
 	rc = hfsIoReadUnit(file, &lease, unitOffset);

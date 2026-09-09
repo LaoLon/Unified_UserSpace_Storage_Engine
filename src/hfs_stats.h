@@ -16,6 +16,7 @@ extern _Atomic uint_fast64_t hfsStatsDmaAcquires;
 extern _Atomic uint_fast64_t hfsStatsDmaWaits;
 extern _Atomic uint_fast64_t hfsStatsDmaReleases;
 extern _Atomic uint_fast64_t hfsStatsDmaActivePeak;
+extern _Atomic uint_fast64_t hfsStatsDmaExhausts;
 extern _Atomic uint_fast64_t hfsStatsSpdkSubmits;
 extern _Atomic uint_fast64_t hfsStatsSpdkCompletions;
 extern _Atomic uint_fast64_t hfsStatsSpdkRejects;
@@ -113,6 +114,10 @@ void hfsStatsRecordMetadataSync(void);
 
 /* Record a DMA size class, wait event and active high-water mark. */
 void hfsStatsRecordDma(size_t bytes, bool waited, uint64_t active);
+/* Record time spent waiting for a reactor-local DMA lease. */
+void hfsStatsRecordDmaWaitNs(uint64_t waitNs);
+/* Record a bounded pool exhaustion observed by an async request. */
+void hfsStatsRecordDmaExhaust(void);
 
 static inline void hfsStatsRecordIoFast(bool write, size_t bytes, bool aligned) {
 	if (hfsStatsEnabledFast()) {
@@ -238,6 +243,7 @@ static inline void hfsStatsPeak(_Atomic uint_fast64_t *counter,
 #define HFS_STATS_FD_WRITE_LOCK() hfsStatsAdd(&hfsStatsFdWriteLocks)
 #define HFS_STATS_META_READ_LOCK() hfsStatsAdd(&hfsStatsMetaReadLocks)
 #define HFS_STATS_META_WRITE_LOCK() hfsStatsAdd(&hfsStatsMetaWriteLocks)
+#define HFS_STATS_DMA_EXHAUST() hfsStatsAdd(&hfsStatsDmaExhausts)
 #define HFS_STATS_DMA_ACQUIRE() hfsStatsAdd(&hfsStatsDmaAcquires)
 #define HFS_STATS_DMA_WAIT() hfsStatsAdd(&hfsStatsDmaWaits)
 #define HFS_STATS_DMA_RELEASE() hfsStatsAdd(&hfsStatsDmaReleases)

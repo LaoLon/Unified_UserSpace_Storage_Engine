@@ -33,6 +33,9 @@ _Atomic uint_fast64_t hfsStatsDmaAcquires;
 _Atomic uint_fast64_t hfsStatsDmaWaits;
 _Atomic uint_fast64_t hfsStatsDmaReleases;
 _Atomic uint_fast64_t hfsStatsDmaActivePeak;
+_Atomic uint_fast64_t hfsStatsDmaExhausts;
+static _Atomic uint_fast64_t g_hfsStatsDataReactorSubmit[HFS_STATS_MAX_DATA_REACTORS];
+static _Atomic uint_fast64_t g_hfsStatsDataReactorComplete[HFS_STATS_MAX_DATA_REACTORS];
 _Atomic uint_fast64_t hfsStatsSpdkSubmits;
 _Atomic uint_fast64_t hfsStatsSpdkCompletions;
 _Atomic uint_fast64_t hfsStatsSpdkRejects;
@@ -91,6 +94,8 @@ typedef struct HfsStatsShard {
 	uint64_t dmaSizeClass[HFS_STATS_DMA_SIZE_CLASSES];
 	uint64_t dmaPoolClass[HFS_STATS_DMA_POOL_CLASSES];
 	uint64_t dmaWaits;
+	uint64_t dmaWaitNs;
+	uint64_t dmaExhausts;
 	uint64_t dmaActivePeak;
 } HfsStatsShard;
 
@@ -183,6 +188,13 @@ static void hfsStatsReset(void) {
 	atomic_store_explicit(&hfsStatsDmaWaits, 0, memory_order_relaxed);
 	atomic_store_explicit(&hfsStatsDmaReleases, 0, memory_order_relaxed);
 	atomic_store_explicit(&hfsStatsDmaActivePeak, 0, memory_order_relaxed);
+	atomic_store_explicit(&hfsStatsDmaExhausts, 0, memory_order_relaxed);
+	for (unsigned int i = 0; i < HFS_STATS_MAX_DATA_REACTORS; i++) {
+		atomic_store_explicit(&g_hfsStatsDataReactorSubmit[i], 0,
+			memory_order_relaxed);
+		atomic_store_explicit(&g_hfsStatsDataReactorComplete[i], 0,
+			memory_order_relaxed);
+	}
 	atomic_store_explicit(&hfsStatsSpdkSubmits, 0, memory_order_relaxed);
 	atomic_store_explicit(&hfsStatsSpdkCompletions, 0, memory_order_relaxed);
 	atomic_store_explicit(&hfsStatsSpdkRejects, 0, memory_order_relaxed);
@@ -414,6 +426,8 @@ void hfsStatsRecordDataReactorSubmit(uint32_t reactorId) {
 	if (shard != NULL) {
 		shard->dataReactorSubmit[reactorId]++;
 	}
+	atomic_fetch_add_explicit(&g_hfsStatsDataReactorSubmit[reactorId], 1,
+		memory_order_relaxed);
 }
 
 /* Record one direct child completion on a bounded data reactor. */
@@ -427,6 +441,8 @@ void hfsStatsRecordDataReactorComplete(uint32_t reactorId) {
 	if (shard != NULL) {
 		shard->dataReactorComplete[reactorId]++;
 	}
+	atomic_fetch_add_explicit(&g_hfsStatsDataReactorComplete[reactorId], 1,
+		memory_order_relaxed);
 }
 
 /* Record the child fan-out observed by one aligned parent request. */
@@ -513,6 +529,24 @@ void hfsStatsRecordDma(size_t bytes, bool waited, uint64_t active) {
 	}
 }
 
+/* Record the elapsed wait for one reactor-local DMA lease. */
+void hfsStatsRecordDmaWaitNs(uint64_t waitNs) {
+	HfsStatsShard *shard = hfsStatsShardGet();
+
+	if (shard != NULL) {
+		shard->dmaWaitNs += waitNs;
+	}
+}
+
+/* Record one failed non-blocking lease acquisition in the thread shard. */
+void hfsStatsRecordDmaExhaust(void) {
+	HfsStatsShard *shard = hfsStatsShardGet();
+
+	if (shard != NULL) {
+		shard->dmaExhausts++;
+	}
+}
+
 /* Add one shard into the process aggregate used by the final report. */
 static void hfsStatsAggregateShard(HfsStatsShard *total,
 					const HfsStatsShard *shard) {
@@ -585,6 +619,8 @@ static void hfsStatsAggregateShard(HfsStatsShard *total,
 		total->dmaSizeClass[i] += shard->dmaSizeClass[i];
 	}
 	total->dmaWaits += shard->dmaWaits;
+	total->dmaWaitNs += shard->dmaWaitNs;
+	total->dmaExhausts += shard->dmaExhausts;
 	if (shard->dmaActivePeak > total->dmaActivePeak) {
 		total->dmaActivePeak = shard->dmaActivePeak;
 	}
@@ -648,6 +684,8 @@ static void hfsStatsWriteSnapshot(void) {
 		atomic_load_explicit(&hfsStatsDmaReleases, memory_order_relaxed));
 	HFS_STATS_APPEND("dma_active_peak=%"PRIuFAST64"\n",
 		atomic_load_explicit(&hfsStatsDmaActivePeak, memory_order_relaxed));
+	HFS_STATS_APPEND("dma_exhaust=%"PRIuFAST64"\n",
+		atomic_load_explicit(&hfsStatsDmaExhausts, memory_order_relaxed));
 	HFS_STATS_APPEND("spdk_submit=%"PRIuFAST64"\n",
 		atomic_load_explicit(&hfsStatsSpdkSubmits, memory_order_relaxed));
 	HFS_STATS_APPEND("spdk_complete=%"PRIuFAST64"\n",
@@ -695,9 +733,11 @@ static void hfsStatsWriteSnapshot(void) {
 		total.ioPipelinePeak);
 	for (i = 0; i < HFS_STATS_MAX_DATA_REACTORS; i++) {
 		HFS_STATS_APPEND("data_reactor_%u_submit=%"PRIu64"\n", i,
-			total.dataReactorSubmit[i]);
+			atomic_load_explicit(&g_hfsStatsDataReactorSubmit[i],
+			memory_order_relaxed));
 		HFS_STATS_APPEND("data_reactor_%u_complete=%"PRIu64"\n", i,
-			total.dataReactorComplete[i]);
+			atomic_load_explicit(&g_hfsStatsDataReactorComplete[i],
+			memory_order_relaxed));
 	}
 	HFS_STATS_APPEND("io_read_ops=%"PRIu64"\n", total.ioReadOps);
 	HFS_STATS_APPEND("io_write_ops=%"PRIu64"\n", total.ioWriteOps);
@@ -733,6 +773,8 @@ static void hfsStatsWriteSnapshot(void) {
 		total.metadataSyncCount);
 	HFS_STATS_APPEND("flush_count=%"PRIu64"\n", total.flushCount);
 	HFS_STATS_APPEND("dma_wait_shard=%"PRIu64"\n", total.dmaWaits);
+	HFS_STATS_APPEND("dma_wait_ns=%"PRIu64"\n", total.dmaWaitNs);
+	HFS_STATS_APPEND("dma_exhaust_shard=%"PRIu64"\n", total.dmaExhausts);
 	HFS_STATS_APPEND("dma_active_peak_shard=%"PRIu64"\n",
 		total.dmaActivePeak);
 	for (i = 0; i < HFS_STATS_DMA_SIZE_CLASSES; i++) {

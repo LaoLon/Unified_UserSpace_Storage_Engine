@@ -1059,4 +1059,21 @@ Bug 等级：**致命 > 严重 > 一般**。
 - **验证**：VM 上 `make -B app lib`、CMake Release、单 blob stripe 并行读写/punch 测试，以及
   2/4/8 reactor 异步多文件回归全部通过，submit/complete 无差异。
 
+### 66. data reactor 统计快照出现伪 submit/complete 不平衡（已修复，一般级）
+
+- **状态**：已修复；data reactor submit/complete 使用独立原子计数，分片统计仍保留用于聚合诊断
+- **时间**：2026-09-09（shard-50 per-reactor DMA pool 回归）
+- **等级**：一般（不影响 I/O 数据和实际 completion，但会误报资源泄漏并阻断自动化验收）
+- **现象**：高并发专项退出时偶发看到单个 reactor 的 `submit` 与 `complete` 相差 1～2，随后
+  `active/submit/complete` 总计有时也短暂不一致；同一 workload 重新运行又可能闭合。
+- **排查过程**：逐项确认 SPDK completion、DMA lease acquire/release 和 runtime active 计数均已闭合；
+  发现统计使用 thread-local shard，submit 在 data reactor 线程写入，而进程退出快照可能在另一个
+  线程读取，快照时机与 shard 合并存在竞态。该差异只出现在观测值，数据校验和实际请求状态不受影响。
+- **根因**：用非原子 thread-local 计数作为跨线程、跨 shard 的即时快照，缺少退出阶段的同步边界。
+- **修复**：增加按 reactor 的 `_Atomic uint_fast64_t` submit/complete 计数；记录路径同步更新原子值，
+  snapshot 直接读取原子数组，同时保留原 shard 字段供周期聚合和诊断使用。
+- **验证**：VM 上强制 Make/CMake、stripe accounting、DMA pool backpressure、request-local fast I/O
+  和 reactor=2/8 多 reactor 回归通过；最新 4-reactor stripe 测试 `266/266`，DMA lease
+  `128/128`，重复退出快照未再出现伪不平衡。
+
 ## 通用经验总结
