@@ -17,6 +17,10 @@ extern _Atomic uint_fast64_t hfsStatsDmaWaits;
 extern _Atomic uint_fast64_t hfsStatsDmaReleases;
 extern _Atomic uint_fast64_t hfsStatsDmaActivePeak;
 extern _Atomic uint_fast64_t hfsStatsDmaExhausts;
+extern _Atomic uint_fast64_t hfsStatsDmaFastAcquires;
+extern _Atomic uint_fast64_t hfsStatsDurabilityLeaders;
+extern _Atomic uint_fast64_t hfsStatsDurabilityWaiters;
+extern _Atomic uint_fast64_t hfsStatsFdatasyncFast;
 extern _Atomic uint_fast64_t hfsStatsSpdkSubmits;
 extern _Atomic uint_fast64_t hfsStatsSpdkCompletions;
 extern _Atomic uint_fast64_t hfsStatsSpdkRejects;
@@ -143,6 +147,11 @@ void hfsStatsRecordDma(size_t bytes, bool waited, uint64_t active);
 void hfsStatsRecordDmaWaitNs(uint64_t waitNs);
 /* Record a bounded pool exhaustion observed by an async request. */
 void hfsStatsRecordDmaExhaust(void);
+/* Record lock-free DMA and durability coordinator decisions. */
+void hfsStatsRecordDmaFastAcquire(void);
+void hfsStatsRecordDurabilityLeader(void);
+void hfsStatsRecordDurabilityWaiter(void);
+void hfsStatsRecordFdatasyncFast(void);
 
 static inline void hfsStatsRecordIoFast(bool write, size_t bytes, bool aligned) {
 	if (hfsStatsEnabledFast()) {
@@ -257,6 +266,26 @@ static inline void hfsStatsRecordDmaFast(size_t bytes, bool waited,
 								 uint64_t active) {
 	if (hfsStatsEnabledFast()) {
 		hfsStatsRecordDma(bytes, waited, active);
+	}
+}
+static inline void hfsStatsRecordDmaFastAcquireFast(void) {
+	if (hfsStatsEnabledFast()) {
+		hfsStatsRecordDmaFastAcquire();
+	}
+}
+static inline void hfsStatsRecordDurabilityLeaderFast(void) {
+	if (hfsStatsEnabledFast()) {
+		hfsStatsRecordDurabilityLeader();
+	}
+}
+static inline void hfsStatsRecordDurabilityWaiterFast(void) {
+	if (hfsStatsEnabledFast()) {
+		hfsStatsRecordDurabilityWaiter();
+	}
+}
+static inline void hfsStatsRecordFdatasyncFastPath(void) {
+	if (hfsStatsEnabledFast()) {
+		hfsStatsRecordFdatasyncFast();
 	}
 }
 

@@ -1095,10 +1095,10 @@ int fsync(int fd) {
 	return real_fsync(fd);
 }
 
-/* Intercepted fdatasync(2): same flush path as fsync. */
+/* Intercepted fdatasync(2): use the data-only durability fast path. */
 int fdatasync(int fd) {
 	if (hfs_is_hfs_fd(fd)) {
-		return hfs_lib_fsync(fd);
+		return hfs_lib_fdatasync(fd);
 	}
 	return real_fdatasync(fd);
 }

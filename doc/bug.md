@@ -1236,4 +1236,25 @@ Bug 等级：**致命 > 严重 > 一般**。
   64 KiB、16 rounds 连续 3 轮全部通过（errors=0、copy_ops=0、async submit/complete
   均为 32/64/128/256/512/1024）；reactors=4 主矩阵继续通过。
 
+### 74. DMA pool slow acquire 与 teardown 的 API 生命周期竞态（已修复，一般级）
+
+- **状态**：已修复；pool closing bit 在 API 使用计数中原子发布，慢等待者整个 acquire
+  生命周期持有 API 引用
+- **时间**：2026-09-10（shard-61 POSIX 兼容路径实现复核）
+- **等级**：一般（主要影响关闭/卸载窗口，正常 I/O 不触发）
+- **现象**：原 pool fast path 只在 CAS 前短暂增加 `apiUsers`；当 class 无空闲 slot 时，
+  该引用在进入 condition wait 前已释放。teardown 可能观察到 `apiUsers==0` 并释放
+  `HfsIoPoolShard`，随后慢路径重新取得已销毁的 mutex/condition，存在 UAF 风险。
+- **排查过程**：对 free-mask/CAS 与 `hfsIoAcquireSlow()` 的时序进行交叉检查，构造
+  “fast path 返回 exhausted → fini 设置 closing → waiter lock”序列；发现独立的
+  `closing` bool 无法阻止关闭检查后的新 API 进入。
+- **根因**：pool 生命周期闸门与单次 slot 获取绑定，而不是覆盖整个可能阻塞的 acquire；
+  `closing` 和 `apiUsers` 分离造成 check-then-free 窗口。
+- **修复**：`apiUsers` 最高位作为 `HFS_IO_POOL_API_CLOSING`，teardown 先原子置位，
+  新 API 通过 CAS gate 拒绝进入；`hfsIoAcquire()`/`hfsIoTryAcquire()` 从进入到快/慢
+  路径结束都保留引用，fini 等待 active lease 和 API users 清零后才释放 DMA/mutex。
+- **验证**：VM 上 `make -B app lib`、CMake Release、DMA backpressure、32 线程 runtime
+  stress、inode/range concurrency、fdatasync coordinator 和所有 crash/error injection
+  回归通过，acquire/release 计数闭合且无关闭超时。
+
 ## 通用经验总结

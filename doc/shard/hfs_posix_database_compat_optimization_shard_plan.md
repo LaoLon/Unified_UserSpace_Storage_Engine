@@ -1,11 +1,11 @@
 # HFS 数据库 POSIX 兼容路径优化 Shard 开发说明书
 
-> **状态**：待开发
+> **状态**：实现完成，VM 回归完成（MariaDB bootstrap 为既有环境阻塞）
 > **Shard**：shard-61
 > **目标对象**：MySQL/MariaDB、RocksDB 以及不能修改 I/O API 的普通 POSIX 应用
 > **唯一技术路线**：POSIX Compatibility Engine（无锁 DMA pool 快速获取 + reactor 批量提交
 > + 延迟元数据发布 + fdatasync/fsync group commit）
-> **当前基线**：`main@d4d85c0`，VM 内 SPDK 使用锁定 commit
+> **当前基线**：`main@afa0976`，VM 内 SPDK 使用锁定 commit
 > `f0b63ed866f0e4d3c56e73bd4a98d0042956147a`
 
 ## 1. 方案决策
@@ -146,6 +146,10 @@ write/pwrite 完成
 - 保留 `HFS_IO_POOL_CLASS_COUNTS`、`HFS_IO_POOL_BYTES` 配置和 pool wait 回退。
 - 新增 pool contention smoke，覆盖 1/4/16/32/64 个 POSIX 线程、4/16/64 KiB。
 
+**实现状态：完成。** `src/hfs_io.c` 使用 32-bit `freeMask` 做 CAS 获取/atomic OR 释放，
+并通过带 closing bit 的 API gate 覆盖快路径、慢路径和 pool teardown；耗尽时仍回退到
+condition wait。
+
 ### 5.2 shard-61.2：POSIX request hot-path 收口
 
 - 审计 aligned/unaligned/vector/large request 的 copy、lease、range 和 completion 生命周期。
@@ -156,6 +160,9 @@ write/pwrite 完成
 - 对 preallocated steady-state workload 验证 resize fast-hit，不得把必要的首次分配当成
   可删除请求。
 
+**实现状态：完成并复用现有 request-local dispatcher。** 本轮未引入新的 callback/condvar
+包装或额外 copy；原有 aligned、RMW、vector、futex completion 路径保持不变。
+
 ### 5.3 shard-61.3：durability coordinator 和 fdatasync fast path
 
 - 新增 `src/hfs_durability_coordinator.[ch]`，实现 epoch、leader、waiter 和失败传播。
@@ -164,6 +171,12 @@ write/pwrite 完成
 - 增加并发 fsync、fdatasync、跨文件 dirty inode、metadata failure、flush failure、
   crash-step 1/2/3 和后续 retry 测试。
 
+**实现状态：完成。** coordinator 作为 `src/hfs_lib.c` 的 mount 进程内 epoch 状态实现，
+`hfs_lib_fsync()`/`hfs_lib_fdatasync()` 共享 leader/waiter 合并；`src/hfs_meta.[ch]` 提供
+dirty-set 查询，`src/hfs_preload.c` 已将 `fdatasync(2)` 路由到 data-only 分支，统计字段
+位于 `src/hfs_stats.[ch]`。已有 metadata transaction/crash 测试与新增
+`scripts/db/fdatasync_smoke.sh` 覆盖失败传播、恢复顺序和重试边界。
+
 ### 5.4 shard-61.4：数据库回归和 NVMe 性能收口
 
 - MySQL/MariaDB：redo log、`O_DIRECT` 16 KiB data page、频繁 fsync、事务提交、并发 client。
@@ -171,6 +184,42 @@ write/pwrite 完成
 - FIO：普通 POSIX `psync`，4/8/16/32/64 KiB，numjobs 1/4/16/32；单独记录 pool
   fast/slow、range wait/hold、metadata epoch wait 和 barrier 次数。
 - NVMe 对照必须使用同一 `Nvme0n1`；Malloc/Aio 只作为 correctness/回归后端。
+
+**实现状态：RocksDB 完成；MariaDB 受环境阻塞。** RocksDB 已完成 WAL、direct I/O、
+flush/compact、SIGKILL recovery 和 `ldb checkconsistency`。MariaDB 脚本在 bootstrap 退出
+阶段卡住；同一 VM 用改动前远端基线 `a414d49` 构建的 HFS 得到相同超时和信号线程警告，
+因此该现象不能归因于 shard-61 代码。待 VM/MariaDB 信号线程环境修复后可直接重跑既有
+`scripts/db/mysql_smoke.sh`。
+
+## 5.5 本次实现与验证记录
+
+### 代码变更
+
+- `src/hfs_io.c`：无锁 DMA slot bitmap、API teardown gate、慢路径竞争回退。
+- `src/hfs_lib.c`/`src/hfs_lib.h`：同 inode durability epoch coordinator 与 fdatasync
+  data-only fast path；leader 持有 open-file 引用，避免 fd ABA。
+- `src/hfs_meta.c`/`src/hfs_meta.h`：公开 dirty inode 查询。
+- `src/hfs_preload.c`：fdatasync 路由切换。
+- `src/hfs_stats.c`/`src/hfs_stats.h`：fast acquire、durability leader/waiter、fdatasync
+  fast 计数。
+- `scripts/db/fdatasync_smoke.sh`：fdatasync 快路径与并发合并回归。
+
+### VM 验证结果
+
+| 验证项 | 结果 |
+| --- | --- |
+| `make -B app lib` | 通过 |
+| CMake Release（`hfs`、`spdk-hfs`） | 通过 |
+| DMA pool backpressure/accounting | 通过，128 acquire/128 release |
+| fdatasync coordinator | 通过，`fdatasync_fast=8`、leader/waiter 可观测 |
+| metadata group commit | 通过，`batch_max=6`、`metadata_sync_count=1` |
+| inode/range、runtime 32 线程压力 | 通过 |
+| POSIX data contract、request-local fast I/O | 通过 |
+| RocksDB 20,000 条、WAL/direct I/O、SIGKILL、ldb check | 通过 |
+| MariaDB bootstrap | 改动前后均在信号线程退出阶段超时，环境阻塞 |
+
+本轮新增统计文件、日志和临时 Aio 镜像均保留在 VM 的 `/var/tmp` 下；SPDK 源码仍只由 VM
+内 Git checkout 维护，没有从 Windows 工作区覆盖。
 
 ## 6. 验收标准
 

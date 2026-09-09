@@ -110,6 +110,16 @@ static int g_backendLockFd = -1;
 /* Last-reference descriptions retained until close and orphan deletion succeed. */
 static HfsOpenFile *g_deferredCloseFiles;
 
+/* Coalesce overlapping durability calls for one inode into a single epoch. */
+static pthread_mutex_t g_durabilityLock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_durabilityDone = PTHREAD_COND_INITIALIZER;
+static bool g_durabilityRunning;
+static bool g_durabilityStrong;
+static uint64_t g_durabilityInodeId;
+static uint64_t g_durabilityGeneration;
+static int g_durabilityResult;
+static int g_durabilityErrno;
+
 /* Return the configured backend name for lock naming and diagnostics. */
 static const char *hfs_backend_name(void) {
 	const char *name = getenv("HFS_BDEV_NAME");
@@ -2735,20 +2745,15 @@ int hfs_lib_fcntl(int fd, int cmd, long arg) {
 }
 
 /*
- * Flush an HFS fd with ordered data and metadata durability barriers.
+ * Flush one HFS fd, optionally stopping after its data barrier.
  * The second sync flushes the metadata transaction committed after data.
  */
-int hfs_lib_fsync(int fd) {
-	HfsOpenFile *openFile = hfsFdAcquire(fd);
+static int hfs_lib_fsync_open_file(HfsOpenFile *openFile, bool dataOnly) {
 	struct hfs_inode *inode;
 	HfsInodeRuntime *runtime = NULL;
 	bool ioLocked = false;
 	int savedErrno;
 
-	if (openFile == NULL) {
-		errno = EBADF;
-		return -1;
-	}
 	pthread_mutex_lock(&openFile->ioLock);
 	if (openFile->file != NULL) {
 		runtime = openFile->runtime;
@@ -2777,6 +2782,28 @@ int hfs_lib_fsync(int fd) {
 		hfsDurabilityTraceRecord(openFile->inodeId, "data-barrier", 0);
 	}
 	hfsFsyncCrashPoint(1);
+	if (dataOnly && openFile->file != NULL && runtime != NULL) {
+		bool needsMetadata;
+
+		/* Size/extent changes are queued in the inode dirty set; timestamps alone
+		 * are intentionally allowed to remain pending for fdatasync. */
+		hfsMetaReadLock();
+		inode = g_fs == NULL ? NULL : hfsMetaFindById(g_fs, openFile->inodeId);
+		needsMetadata = g_fs == NULL || inode == NULL ||
+			hfsMetaInodeDirty(g_fs, openFile->inodeId) ||
+			hfsInodeRuntimeGetLogicalSize(runtime) != inode->size;
+		pthread_rwlock_unlock(&g_metaLock);
+		if (!needsMetadata) {
+			hfsStatsRecordFdatasyncFastPath();
+			hfsDurabilityTraceRecord(openFile->inodeId, "data-only-skip", 0);
+			if (ioLocked) {
+				pthread_rwlock_unlock(&runtime->syncLock);
+			}
+			pthread_mutex_unlock(&openFile->ioLock);
+			hfs_release_open_file(openFile);
+			return 0;
+		}
+	}
 	hfsMetaWriteLock();
 	if (g_fs == NULL) {
 		pthread_rwlock_unlock(&g_metaLock);
@@ -2846,6 +2873,85 @@ int hfs_lib_fsync(int fd) {
 	pthread_mutex_unlock(&openFile->ioLock);
 	hfs_release_open_file(openFile);
 	return 0;
+}
+
+/* Join overlapping flushes for one open-file description into one epoch. */
+static int hfs_lib_durability_call(int fd, bool dataOnly) {
+	HfsOpenFile *probe;
+	uint64_t inodeId;
+	bool strong = !dataOnly;
+
+	probe = hfsFdAcquire(fd);
+	if (probe == NULL) {
+		errno = EBADF;
+		return -1;
+	}
+	inodeId = probe->inodeId;
+
+	for (;;) {
+		uint64_t generation;
+		int rc;
+		int savedErrno;
+
+		pthread_mutex_lock(&g_durabilityLock);
+		if (!g_durabilityRunning) {
+			g_durabilityRunning = true;
+			g_durabilityStrong = strong;
+			g_durabilityInodeId = inodeId;
+			generation = g_durabilityGeneration;
+			hfsStatsRecordDurabilityLeaderFast();
+			pthread_mutex_unlock(&g_durabilityLock);
+
+			rc = hfs_lib_fsync_open_file(probe, dataOnly);
+			probe = NULL;
+			savedErrno = rc == 0 ? 0 : errno;
+			pthread_mutex_lock(&g_durabilityLock);
+			g_durabilityResult = rc;
+			g_durabilityErrno = savedErrno;
+			g_durabilityRunning = false;
+			g_durabilityGeneration = generation + 1U;
+			pthread_cond_broadcast(&g_durabilityDone);
+			pthread_mutex_unlock(&g_durabilityLock);
+			if (rc != 0) {
+				errno = savedErrno;
+			}
+			return rc;
+		}
+
+		if (g_durabilityInodeId == inodeId &&
+		    (!strong || g_durabilityStrong)) {
+			hfsStatsRecordDurabilityWaiterFast();
+			generation = g_durabilityGeneration;
+			while (g_durabilityRunning &&
+			       g_durabilityGeneration == generation) {
+				pthread_cond_wait(&g_durabilityDone, &g_durabilityLock);
+			}
+			rc = g_durabilityResult;
+			savedErrno = g_durabilityErrno;
+			pthread_mutex_unlock(&g_durabilityLock);
+			hfs_release_open_file(probe);
+			if (rc != 0) {
+				errno = savedErrno;
+			}
+			return rc;
+		}
+
+		/* A different inode, or a stronger request, waits then starts its own epoch. */
+		while (g_durabilityRunning) {
+			pthread_cond_wait(&g_durabilityDone, &g_durabilityLock);
+		}
+		pthread_mutex_unlock(&g_durabilityLock);
+	}
+}
+
+/* Flush data and metadata, coalescing concurrent callers on the same inode. */
+int hfs_lib_fsync(int fd) {
+	return hfs_lib_durability_call(fd, false);
+}
+
+/* Flush data and only size/extent metadata when a checkpoint is required. */
+int hfs_lib_fdatasync(int fd) {
+	return hfs_lib_durability_call(fd, true);
 }
 
 /* Preallocate or punch a range while preserving Linux fallocate semantics. */

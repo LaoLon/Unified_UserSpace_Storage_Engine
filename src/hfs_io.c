@@ -23,6 +23,7 @@
 /* Keep the hot path bounded while avoiding a 1 MiB lease for tiny requests. */
 #define HFS_IO_POOL_CLASS_COUNT	4U
 #define HFS_IO_POOL_CLASS_MAX_COUNT	32U
+#define HFS_IO_POOL_API_CLOSING	(UINT32_C(1) << 31)
 #define HFS_IO_MAX_POOL_REACTORS	8U
 #define HFS_IO_POOL_4K_BYTES	(4U << 10)
 #define HFS_IO_POOL_16K_BYTES	(16U << 10)
@@ -85,8 +86,8 @@ struct HfsIoPoolClass {
 	uint8_t *storage;
 	size_t bufferBytes;
 	uint32_t count;
-	uint32_t freeTop;
-	uint32_t freeSlots[HFS_IO_POOL_CLASS_MAX_COUNT];
+	/* Each set bit represents one available DMA slot. */
+	_Atomic uint32_t freeMask;
 };
 
 /* One reactor-local DMA pool with its own wait queue and free lists. */
@@ -94,8 +95,10 @@ typedef struct HfsIoPoolShard {
 	pthread_mutex_t lock;
 	pthread_cond_t available;
 	HfsIoPoolClass classes[HFS_IO_POOL_CLASS_COUNT];
-	uint32_t active;
-	bool closing;
+	_Atomic uint32_t active;
+	_Atomic uint32_t apiUsers;
+	_Atomic uint32_t waiters;
+	_Atomic bool closing;
 } HfsIoPoolShard;
 
 /* Bounded DMA storage partitioned by the selected data reactor. */
@@ -618,64 +621,176 @@ static uint32_t hfsIoPipelineDepth(void) {
 	return g_hfsIoPipelineConfigured;
 }
 
-/* Acquire a reactor-local DMA buffer, waiting until its class has capacity. */
+/* Enter the pool API gate while preventing entry after teardown starts. */
+static bool hfsIoPoolApiEnter(HfsIoPoolShard *shard) {
+	uint32_t mask;
+
+	mask = atomic_load_explicit(&shard->apiUsers, memory_order_acquire);
+	for (;;) {
+		if ((mask & HFS_IO_POOL_API_CLOSING) != 0U) {
+			return false;
+		}
+		if (atomic_compare_exchange_weak_explicit(&shard->apiUsers, &mask,
+								mask + 1U, memory_order_acq_rel,
+								memory_order_acquire)) {
+			return true;
+		}
+	}
+}
+
+/* Leave the pool API gate and wake teardown once the final caller exits. */
+static void hfsIoPoolApiExit(HfsIoPoolShard *shard) {
+	uint32_t previous;
+
+	previous = atomic_fetch_sub_explicit(&shard->apiUsers, 1U,
+						memory_order_release);
+	if ((previous & HFS_IO_POOL_API_CLOSING) != 0U &&
+	    (previous & ~HFS_IO_POOL_API_CLOSING) == 1U) {
+		pthread_cond_broadcast(&shard->available);
+	}
+}
+
+/* Claim one free slot without taking the pool mutex. */
+static int hfsIoPoolFastTake(HfsIoPoolShard *shard, HfsIoPoolClass *classPool,
+				     uint32_t *slot) {
+	uint32_t mask;
+	uint32_t bit = 0;
+
+	if (atomic_load_explicit(&shard->closing, memory_order_acquire)) {
+		return -1;
+	}
+	for (;;) {
+		mask = atomic_load_explicit(&classPool->freeMask, memory_order_acquire);
+		if (mask == 0) {
+			return 1;
+		}
+		bit = mask & (0U - mask);
+		if (atomic_compare_exchange_weak_explicit(&classPool->freeMask, &mask,
+								mask & ~bit,
+									memory_order_acq_rel,
+									memory_order_acquire)) {
+			*slot = (uint32_t)__builtin_ctz(bit);
+			atomic_fetch_add_explicit(&shard->active, 1, memory_order_relaxed);
+			return 0;
+		}
+	}
+}
+
+/* Populate a lease after the slot has been removed from the free bitmap. */
+static void hfsIoLeaseFill(HfsIoPool *pool, HfsIoPoolShard *shard,
+				   HfsIoPoolClass *classPool, HfsIoLease *lease,
+				   uint32_t slot) {
+	lease->pool = pool;
+	lease->shard = shard;
+	lease->classPool = classPool;
+	lease->poolClass = (uint8_t)(classPool - shard->classes);
+	lease->slot = slot;
+	lease->buffer = classPool->storage + (size_t)slot * classPool->bufferBytes;
+}
+
+/* Acquire a buffer through the condvar slow path after the bitmap is empty. */
+static int hfsIoAcquireSlow(HfsIoPool *pool, HfsIoPoolShard *shard,
+				    HfsIoPoolClass *classPool, HfsIoLease *lease,
+				    size_t requestedBytes, uint32_t reactorId,
+				    uint64_t waitStartNs) {
+	uint32_t mask;
+	uint32_t bit = 0;
+	bool waited = true;
+	(void)requestedBytes;
+
+	atomic_fetch_add_explicit(&shard->waiters, 1, memory_order_relaxed);
+	pthread_mutex_lock(&shard->lock);
+	for (;;) {
+		if (atomic_load_explicit(&shard->closing, memory_order_acquire)) {
+			break;
+		}
+		mask = atomic_load_explicit(&classPool->freeMask, memory_order_acquire);
+		if (mask == 0) {
+			pthread_cond_wait(&shard->available, &shard->lock);
+			continue;
+		}
+		bit = mask & (0U - mask);
+		if (atomic_compare_exchange_weak_explicit(&classPool->freeMask, &mask,
+								mask & ~bit,
+									memory_order_acq_rel,
+									memory_order_acquire)) {
+			break;
+		}
+	}
+	atomic_fetch_sub_explicit(&shard->waiters, 1, memory_order_relaxed);
+	if (atomic_load_explicit(&shard->closing, memory_order_acquire)) {
+		pthread_mutex_unlock(&shard->lock);
+		errno = ESHUTDOWN;
+		return -1;
+	}
+	atomic_fetch_add_explicit(&shard->active, 1, memory_order_relaxed);
+	hfsIoLeaseFill(pool, shard, classPool, lease, (uint32_t)__builtin_ctz(bit));
+	pthread_mutex_unlock(&shard->lock);
+
+	HFS_STATS_DMA_ACTIVE(atomic_load_explicit(&shard->active, memory_order_relaxed));
+	hfsStatsRecordDmaFast(classPool->bufferBytes, waited,
+			      atomic_load_explicit(&shard->active, memory_order_relaxed));
+	hfsStatsRecordDmaWaitNs(hfsStatsNowNs() - waitStartNs);
+	hfsTraceEmit(HFS_TRACE_LEASE_WAIT_END, g_hfsIoTraceOperation,
+			     HFS_TRACE_BUFFER_DMA_LEASE, 0, g_hfsIoTraceParentId,
+			     0, 0, classPool->bufferBytes, 0,
+			     atomic_load_explicit(&shard->active, memory_order_relaxed),
+			     reactorId, 0, lease->poolClass,
+			     hfsStatsNowNs() - waitStartNs, 0);
+	return 0;
+}
+
+/* Acquire a reactor-local DMA buffer, waiting only when its class is empty. */
 static int hfsIoAcquire(Hfs *fs, HfsIoLease *lease, size_t requestedBytes,
 				uint32_t reactorId) {
 	HfsIoPool *pool = fs->ioPool;
 	HfsIoPoolShard *shard = hfsIoPoolShardFor(fs, reactorId);
 	HfsIoPoolClass *classPool = hfsIoSelectClass(shard, requestedBytes);
-	bool waited = false;
-	uint64_t waitStartNs = 0;
+	uint32_t slot;
+	int fastRc;
+	uint64_t waitStartNs;
 
 	if (classPool == NULL) {
 		errno = E2BIG;
 		return -1;
 	}
-	HFS_STATS_DMA_ACQUIRE();
-	memset(lease, 0, sizeof(*lease));
-	pthread_mutex_lock(&shard->lock);
-	if (classPool->freeTop == 0 && !shard->closing) {
-		waited = true;
-		waitStartNs = hfsStatsNowNs();
-		HFS_STATS_DMA_WAIT();
-		hfsTraceEmit(HFS_TRACE_LEASE_WAIT_BEGIN, g_hfsIoTraceOperation,
-			     HFS_TRACE_BUFFER_DMA_LEASE, 0, g_hfsIoTraceParentId,
-			     0, 0, requestedBytes, 0, shard->active,
-			     reactorId, 0,
-			     (uint32_t)(classPool - shard->classes), 0, 0);
-	}
-	while (classPool->freeTop == 0 && !shard->closing) {
-		pthread_cond_wait(&shard->available, &shard->lock);
-	}
-	if (shard->closing) {
-		pthread_mutex_unlock(&shard->lock);
+	if (!hfsIoPoolApiEnter(shard)) {
 		errno = ESHUTDOWN;
 		return -1;
 	}
-	lease->pool = pool;
-	lease->shard = shard;
-	lease->classPool = classPool;
-	lease->poolClass = (uint8_t)(classPool - shard->classes);
-	lease->slot = classPool->freeSlots[--classPool->freeTop];
-	lease->buffer = classPool->storage +
-		(size_t)lease->slot * classPool->bufferBytes;
-	shard->active++;
-	HFS_STATS_DMA_ACTIVE(shard->active);
-	hfsStatsRecordDmaFast(classPool->bufferBytes, waited, shard->active);
-	if (waited) {
-		hfsStatsRecordDmaWaitNs(hfsStatsNowNs() - waitStartNs);
-		hfsTraceEmit(HFS_TRACE_LEASE_WAIT_END, g_hfsIoTraceOperation,
-			     HFS_TRACE_BUFFER_DMA_LEASE, 0, g_hfsIoTraceParentId,
-			     0, 0, classPool->bufferBytes, 0, shard->active,
-			     reactorId, 0, lease->poolClass,
-			     hfsStatsNowNs() - waitStartNs, 0);
+	HFS_STATS_DMA_ACQUIRE();
+	memset(lease, 0, sizeof(*lease));
+	fastRc = hfsIoPoolFastTake(shard, classPool, &slot);
+	if (fastRc == -1) {
+		hfsIoPoolApiExit(shard);
+		errno = ESHUTDOWN;
+		return -1;
 	}
-	hfsTraceEmit(HFS_TRACE_LEASE_ACQUIRE, g_hfsIoTraceOperation,
-		     HFS_TRACE_BUFFER_DMA_LEASE, 0, g_hfsIoTraceParentId,
-		     0, 0, classPool->bufferBytes, 0, shard->active,
-		     reactorId, 0, lease->poolClass, 0, 0);
-	pthread_mutex_unlock(&shard->lock);
-	return 0;
+	if (fastRc == 0) {
+		hfsIoLeaseFill(pool, shard, classPool, lease, slot);
+		hfsStatsRecordDmaFastAcquireFast();
+		HFS_STATS_DMA_ACTIVE(atomic_load_explicit(&shard->active, memory_order_relaxed));
+		hfsStatsRecordDmaFast(classPool->bufferBytes, false,
+				      atomic_load_explicit(&shard->active, memory_order_relaxed));
+		hfsTraceEmit(HFS_TRACE_LEASE_ACQUIRE, g_hfsIoTraceOperation,
+			     HFS_TRACE_BUFFER_DMA_LEASE, 0, g_hfsIoTraceParentId,
+			     0, 0, classPool->bufferBytes, 0,
+			     atomic_load_explicit(&shard->active, memory_order_relaxed),
+			     reactorId, 0, lease->poolClass, 0, 0);
+		hfsIoPoolApiExit(shard);
+		return 0;
+	}
+	waitStartNs = hfsStatsNowNs();
+	HFS_STATS_DMA_WAIT();
+	hfsTraceEmit(HFS_TRACE_LEASE_WAIT_BEGIN, g_hfsIoTraceOperation,
+			     HFS_TRACE_BUFFER_DMA_LEASE, 0, g_hfsIoTraceParentId,
+			     0, 0, requestedBytes, 0,
+			     atomic_load_explicit(&shard->active, memory_order_relaxed),
+			     reactorId, 0, (uint32_t)(classPool - shard->classes), 0, 0);
+	fastRc = hfsIoAcquireSlow(pool, shard, classPool, lease, requestedBytes,
+					 reactorId, waitStartNs);
+	hfsIoPoolApiExit(shard);
+	return fastRc;
 }
 
 /* Acquire a reactor-local DMA buffer without waiting for an async submit. */
@@ -684,72 +799,72 @@ static int hfsIoTryAcquire(Hfs *fs, HfsIoLease *lease, size_t requestedBytes,
 	HfsIoPool *pool = fs->ioPool;
 	HfsIoPoolShard *shard = hfsIoPoolShardFor(fs, reactorId);
 	HfsIoPoolClass *classPool = hfsIoSelectClass(shard, requestedBytes);
-	int rc;
+	uint32_t slot;
+	int fastRc;
 
 	if (classPool == NULL) {
 		errno = E2BIG;
 		return -1;
 	}
+	if (!hfsIoPoolApiEnter(shard)) {
+		errno = ESHUTDOWN;
+		return -1;
+	}
 	HFS_STATS_DMA_ACQUIRE();
 	memset(lease, 0, sizeof(*lease));
-	rc = pthread_mutex_trylock(&shard->lock);
-	if (rc != 0) {
-		HFS_STATS_DMA_EXHAUST();
-		hfsStatsRecordDmaExhaust();
-		errno = EAGAIN;
-		return -1;
-	}
-	if (classPool->freeTop == 0 || shard->closing) {
-		pthread_mutex_unlock(&shard->lock);
-		if (!shard->closing) {
+	fastRc = hfsIoPoolFastTake(shard, classPool, &slot);
+	if (fastRc != 0) {
+		hfsIoPoolApiExit(shard);
+		if (fastRc > 0) {
 			HFS_STATS_DMA_EXHAUST();
 			hfsStatsRecordDmaExhaust();
+			errno = EAGAIN;
+		} else {
+			errno = ESHUTDOWN;
 		}
-		errno = shard->closing ? ESHUTDOWN : EAGAIN;
 		return -1;
 	}
-	lease->pool = pool;
-	lease->shard = shard;
-	lease->classPool = classPool;
-	lease->poolClass = (uint8_t)(classPool - shard->classes);
-	lease->slot = classPool->freeSlots[--classPool->freeTop];
-	lease->buffer = classPool->storage +
-		(size_t)lease->slot * classPool->bufferBytes;
-	shard->active++;
-	HFS_STATS_DMA_ACTIVE(shard->active);
-	hfsStatsRecordDmaFast(classPool->bufferBytes, false, shard->active);
-	hfsTraceEmit(HFS_TRACE_LEASE_ACQUIRE, g_hfsIoTraceOperation,
-		     HFS_TRACE_BUFFER_DMA_LEASE, 0, g_hfsIoTraceParentId,
-		     0, 0, classPool->bufferBytes, 0, shard->active,
-		     reactorId, 0, lease->poolClass, 0, 0);
-	pthread_mutex_unlock(&shard->lock);
+	hfsIoLeaseFill(pool, shard, classPool, lease, slot);
+	hfsStatsRecordDmaFastAcquireFast();
+	HFS_STATS_DMA_ACTIVE(atomic_load_explicit(&shard->active, memory_order_relaxed));
+	hfsStatsRecordDmaFast(classPool->bufferBytes, false,
+			      atomic_load_explicit(&shard->active, memory_order_relaxed));
+	hfsIoPoolApiExit(shard);
 	return 0;
 }
 
-/* Return one DMA buffer to the pool and wake the next waiting request. */
+/* Return one DMA buffer atomically and wake waiters only when needed. */
 static void hfsIoRelease(HfsIoLease *lease) {
+	HfsIoPoolShard *shard;
+	HfsIoPoolClass *classPool;
+	uint32_t previousActive;
+
 	if (lease == NULL || lease->pool == NULL) {
 		return;
 	}
-	if (lease->shard == NULL) {
+	if (lease->shard == NULL || lease->classPool == NULL) {
 		memset(lease, 0, sizeof(*lease));
 		return;
 	}
-	pthread_mutex_lock(&lease->shard->lock);
-	if (lease->classPool != NULL &&
-	    lease->classPool->freeTop < lease->classPool->count) {
-		lease->classPool->freeSlots[lease->classPool->freeTop++] = lease->slot;
-	}
-	if (lease->shard->active > 0) {
-		lease->shard->active--;
-	}
+	shard = lease->shard;
+	classPool = lease->classPool;
+	atomic_fetch_or_explicit(&classPool->freeMask, 1U << lease->slot,
+					memory_order_release);
+	previousActive = atomic_fetch_sub_explicit(&shard->active, 1,
+							 memory_order_relaxed);
 	HFS_STATS_DMA_RELEASE();
 	hfsTraceEmit(HFS_TRACE_LEASE_RELEASE, g_hfsIoTraceOperation,
-		     HFS_TRACE_BUFFER_DMA_LEASE, 0, g_hfsIoTraceParentId,
-		     0, 0, lease->classPool->bufferBytes, 0, lease->shard->active,
-		     0, 0, lease->poolClass, 0, 0);
-	pthread_cond_broadcast(&lease->shard->available);
-	pthread_mutex_unlock(&lease->shard->lock);
+			     HFS_TRACE_BUFFER_DMA_LEASE, 0, g_hfsIoTraceParentId,
+			     0, 0, classPool->bufferBytes, 0, previousActive - 1U,
+			     0, 0, lease->poolClass, 0, 0);
+	if (atomic_load_explicit(&shard->closing, memory_order_acquire)) {
+		/* The fini path owns the mutex while waiting; signal without relocking. */
+		pthread_cond_broadcast(&shard->available);
+	} else if (atomic_load_explicit(&shard->waiters, memory_order_relaxed) != 0) {
+		pthread_mutex_lock(&shard->lock);
+		pthread_cond_broadcast(&shard->available);
+		pthread_mutex_unlock(&shard->lock);
+	}
 	memset(lease, 0, sizeof(*lease));
 }
 
@@ -2080,9 +2195,12 @@ static int hfsIoPoolShardInit(HfsIoPoolShard *shard,
 		errno = ENOMEM;
 		return -1;
 	}
+	atomic_init(&shard->active, 0);
+	atomic_init(&shard->apiUsers, 0);
+	atomic_init(&shard->waiters, 0);
+	atomic_init(&shard->closing, false);
 	for (i = 0; i < HFS_IO_POOL_CLASS_COUNT; i++) {
 		HfsIoPoolClass *classPool = &shard->classes[i];
-		uint32_t j;
 		size_t storageBytes;
 
 		if (bufferBytes[i] == 0 || counts[i] == 0 ||
@@ -2099,10 +2217,8 @@ static int hfsIoPoolShardInit(HfsIoPoolShard *shard,
 		}
 		classPool->bufferBytes = bufferBytes[i];
 		classPool->count = counts[i];
-		classPool->freeTop = counts[i];
-		for (j = 0; j < counts[i]; j++) {
-			classPool->freeSlots[j] = j;
-		}
+		atomic_init(&classPool->freeMask,
+				counts[i] == 32U ? UINT32_MAX : ((1U << counts[i]) - 1U));
 	}
 	return 0;
 
@@ -2121,10 +2237,15 @@ fail:
 static void hfsIoPoolShardFini(HfsIoPoolShard *shard) {
 	uint32_t i;
 
+	/* Close the API gate before waiting so no new acquire can touch the shard. */
+	atomic_fetch_or_explicit(&shard->apiUsers, HFS_IO_POOL_API_CLOSING,
+					memory_order_acq_rel);
+	atomic_store_explicit(&shard->closing, true, memory_order_release);
 	pthread_mutex_lock(&shard->lock);
-	shard->closing = true;
 	pthread_cond_broadcast(&shard->available);
-	while (shard->active != 0) {
+	while (atomic_load_explicit(&shard->active, memory_order_acquire) != 0 ||
+	       (atomic_load_explicit(&shard->apiUsers, memory_order_acquire) &
+		~HFS_IO_POOL_API_CLOSING) != 0U) {
 		pthread_cond_wait(&shard->available, &shard->lock);
 	}
 	pthread_mutex_unlock(&shard->lock);

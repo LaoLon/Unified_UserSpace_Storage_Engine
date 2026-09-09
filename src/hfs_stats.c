@@ -34,6 +34,10 @@ _Atomic uint_fast64_t hfsStatsDmaWaits;
 _Atomic uint_fast64_t hfsStatsDmaReleases;
 _Atomic uint_fast64_t hfsStatsDmaActivePeak;
 _Atomic uint_fast64_t hfsStatsDmaExhausts;
+_Atomic uint_fast64_t hfsStatsDmaFastAcquires;
+_Atomic uint_fast64_t hfsStatsDurabilityLeaders;
+_Atomic uint_fast64_t hfsStatsDurabilityWaiters;
+_Atomic uint_fast64_t hfsStatsFdatasyncFast;
 static _Atomic uint_fast64_t g_hfsStatsDataReactorSubmit[HFS_STATS_MAX_DATA_REACTORS];
 static _Atomic uint_fast64_t g_hfsStatsDataReactorComplete[HFS_STATS_MAX_DATA_REACTORS];
 _Atomic uint_fast64_t hfsStatsSpdkSubmits;
@@ -197,6 +201,10 @@ static void hfsStatsReset(void) {
 	atomic_store_explicit(&hfsStatsDmaReleases, 0, memory_order_relaxed);
 	atomic_store_explicit(&hfsStatsDmaActivePeak, 0, memory_order_relaxed);
 	atomic_store_explicit(&hfsStatsDmaExhausts, 0, memory_order_relaxed);
+	atomic_store_explicit(&hfsStatsDmaFastAcquires, 0, memory_order_relaxed);
+	atomic_store_explicit(&hfsStatsDurabilityLeaders, 0, memory_order_relaxed);
+	atomic_store_explicit(&hfsStatsDurabilityWaiters, 0, memory_order_relaxed);
+	atomic_store_explicit(&hfsStatsFdatasyncFast, 0, memory_order_relaxed);
 	for (unsigned int i = 0; i < HFS_STATS_MAX_DATA_REACTORS; i++) {
 		atomic_store_explicit(&g_hfsStatsDataReactorSubmit[i], 0,
 			memory_order_relaxed);
@@ -647,6 +655,26 @@ void hfsStatsRecordDmaExhaust(void) {
 	}
 }
 
+/* Record one successful lock-free DMA slot claim. */
+void hfsStatsRecordDmaFastAcquire(void) {
+	atomic_fetch_add_explicit(&hfsStatsDmaFastAcquires, 1, memory_order_relaxed);
+}
+
+/* Record one durability epoch leader. */
+void hfsStatsRecordDurabilityLeader(void) {
+	atomic_fetch_add_explicit(&hfsStatsDurabilityLeaders, 1, memory_order_relaxed);
+}
+
+/* Record one caller that joined an in-flight durability epoch. */
+void hfsStatsRecordDurabilityWaiter(void) {
+	atomic_fetch_add_explicit(&hfsStatsDurabilityWaiters, 1, memory_order_relaxed);
+}
+
+/* Record a fdatasync that completed after only the data barrier. */
+void hfsStatsRecordFdatasyncFast(void) {
+	atomic_fetch_add_explicit(&hfsStatsFdatasyncFast, 1, memory_order_relaxed);
+}
+
 /* Add one shard into the process aggregate used by the final report. */
 static void hfsStatsAggregateShard(HfsStatsShard *total,
 					const HfsStatsShard *shard) {
@@ -792,6 +820,14 @@ static void hfsStatsWriteSnapshot(void) {
 		atomic_load_explicit(&hfsStatsDmaActivePeak, memory_order_relaxed));
 	HFS_STATS_APPEND("dma_exhaust=%"PRIuFAST64"\n",
 		atomic_load_explicit(&hfsStatsDmaExhausts, memory_order_relaxed));
+	HFS_STATS_APPEND("dma_fast_acquire=%"PRIuFAST64"\n",
+		atomic_load_explicit(&hfsStatsDmaFastAcquires, memory_order_relaxed));
+	HFS_STATS_APPEND("durability_leader=%"PRIuFAST64"\n",
+		atomic_load_explicit(&hfsStatsDurabilityLeaders, memory_order_relaxed));
+	HFS_STATS_APPEND("durability_waiter=%"PRIuFAST64"\n",
+		atomic_load_explicit(&hfsStatsDurabilityWaiters, memory_order_relaxed));
+	HFS_STATS_APPEND("fdatasync_fast=%"PRIuFAST64"\n",
+		atomic_load_explicit(&hfsStatsFdatasyncFast, memory_order_relaxed));
 	HFS_STATS_APPEND("spdk_submit=%"PRIuFAST64"\n",
 		atomic_load_explicit(&hfsStatsSpdkSubmits, memory_order_relaxed));
 	HFS_STATS_APPEND("spdk_complete=%"PRIuFAST64"\n",

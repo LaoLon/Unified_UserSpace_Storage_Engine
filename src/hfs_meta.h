@@ -158,6 +158,9 @@ int hfsMetaCommitDirty(Hfs *fs);
 /* Mark a successfully written inode for the next metadata checkpoint. */
 void hfsMetaMarkInodeDirty(Hfs *fs, uint64_t inodeId);
 
+/* Check whether an inode is queued in the current metadata epoch. */
+bool hfsMetaInodeDirty(const Hfs *fs, uint64_t inodeId);
+
 /* Return the last metadata generation known durable on the mounted blob. */
 uint64_t hfsMetaDurableEpoch(const Hfs *fs);
 

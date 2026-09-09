@@ -880,6 +880,11 @@ static bool hfsMetaDirtyContains(const Hfs *fs, uint64_t inodeId) {
 	return false;
 }
 
+/* Expose dirty-set membership needed by fdatasync's data-only decision. */
+bool hfsMetaInodeDirty(const Hfs *fs, uint64_t inodeId) {
+	return hfsMetaDirtyContains(fs, inodeId);
+}
+
 /* Clear the in-memory dirty set after a stable metadata epoch is durable. */
 static void hfsMetaDirtyClear(Hfs *fs) {
 	if (fs == NULL) {
