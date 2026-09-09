@@ -68,11 +68,15 @@ HFS_RECREATE=1 bash "$ROOT/scripts/db/prepare_hfs_db_bdev.sh" "$IMAGE" 1G
 } > "$OUT/environment.txt"
 
 echo "== shard-59 Aio FIO/native comparison =="
-HFS_FIO_CONFIG="$EFFECTIVE_CONFIG" HFS_FIO_BDEV_NAME=Aio0 \
-	HFS_FIO_SIZE="$FIO_SIZE" HFS_FIO_RUNTIME_SECONDS="$FIO_RUNTIME" \
-	HFS_FIO_RUN_SPDK_REFERENCE=0 \
-	bash "$ROOT/scripts/performance/fio_stage2_compare.sh" \
-	"$LIB" "$OUT/fio-aio" "$OUT/fio-native" /bin/true "$EFFECTIVE_CONFIG"
+for round in $(seq 1 "$ROUNDS"); do
+	echo "== FIO round $round/$ROUNDS =="
+	HFS_FIO_CONFIG="$EFFECTIVE_CONFIG" HFS_FIO_BDEV_NAME=Aio0 \
+		HFS_FIO_SIZE="$FIO_SIZE" HFS_FIO_RUNTIME_SECONDS="$FIO_RUNTIME" \
+		HFS_FIO_RUN_SPDK_REFERENCE=0 \
+		bash "$ROOT/scripts/performance/fio_stage2_compare.sh" \
+		"$LIB" "$OUT/fio-aio/round-$round" "$OUT/fio-native/round-$round" \
+		/bin/true "$EFFECTIVE_CONFIG"
+done
 
 echo "== shard-59 RocksDB matrix =="
 HFS_STAGE48_ROUNDS="$ROUNDS" HFS_STAGE48_DURATION_SECONDS="$DURATION" \
@@ -81,21 +85,28 @@ HFS_STAGE48_ROUNDS="$ROUNDS" HFS_STAGE48_DURATION_SECONDS="$DURATION" \
 	"$LIB" /hfs "$EFFECTIVE_CONFIG" "$IMAGE" "$OUT/rocksdb"
 
 echo "== shard-59 MariaDB/MySQL matrix =="
-HFS_MYSQLSLAP_QUERIES="$MYSQL_QUERIES" \
-HFS_MYSQLSLAP_ITERATIONS="$MYSQL_ITERATIONS" \
-HFS_MYSQL_BDEV_TYPE=persistent-aio \
-HFS_MYSQL_BOOTSTRAP_SIGNAL_TIMEOUT=1 \
-bash "$ROOT/scripts/performance/mysql_stage2_benchmark.sh" \
-	"$LIB" "$EFFECTIVE_CONFIG" "$IMAGE" "$OUT/mysql"
+for round in $(seq 1 "$ROUNDS"); do
+	echo "== MySQL round $round/$ROUNDS =="
+	HFS_MYSQLSLAP_QUERIES="$MYSQL_QUERIES" \
+	HFS_MYSQLSLAP_ITERATIONS="$MYSQL_ITERATIONS" \
+	HFS_MYSQL_BDEV_TYPE=persistent-aio \
+	HFS_MYSQL_BOOTSTRAP_SIGNAL_TIMEOUT=1 \
+	bash "$ROOT/scripts/performance/mysql_stage2_benchmark.sh" \
+		"$LIB" "$EFFECTIVE_CONFIG" "$IMAGE" "$OUT/mysql/round-$round"
+done
 
 NVME_REASON=""
 if [[ -f "$NVME_CONFIG" && -f "$SPDK_PLUGIN" && -n "$(compgen -G '/dev/nvme*' || true)" ]]; then
 	echo "== shard-59 direct NVMe FIO comparison =="
-	HFS_FIO_CONFIG="$NVME_CONFIG" HFS_FIO_BDEV_NAME=Nvme0n1 \
-		HFS_FIO_SIZE="$FIO_SIZE" HFS_FIO_RUNTIME_SECONDS="$FIO_RUNTIME" \
-		HFS_FIO_RUN_SPDK_REFERENCE=1 \
-		bash "$ROOT/scripts/performance/fio_stage2_compare.sh" \
-		"$LIB" "$OUT/fio-nvme" "$OUT/fio-native-nvme" "$SPDK_PLUGIN" "$NVME_CONFIG"
+	for round in $(seq 1 "$ROUNDS"); do
+		echo "== direct NVMe FIO round $round/$ROUNDS =="
+		HFS_FIO_CONFIG="$NVME_CONFIG" HFS_FIO_BDEV_NAME=Nvme0n1 \
+			HFS_FIO_SIZE="$FIO_SIZE" HFS_FIO_RUNTIME_SECONDS="$FIO_RUNTIME" \
+			HFS_FIO_RUN_SPDK_REFERENCE=1 \
+			bash "$ROOT/scripts/performance/fio_stage2_compare.sh" \
+			"$LIB" "$OUT/fio-nvme/round-$round" \
+			"$OUT/fio-native-nvme/round-$round" "$SPDK_PLUGIN" "$NVME_CONFIG"
+	done
 	NVME_STATUS="PASS"
 else
 	NVME_STATUS="SKIP"
@@ -110,9 +121,9 @@ cat > "$OUT/closeout.md" <<EOF
 
 - commit: $(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)
 - SPDK commit: $(git -C "$ROOT/spdk" rev-parse HEAD 2>/dev/null || echo unknown)
-- Aio matrix: PASS ($OUT/fio-aio/summary.tsv)
+- Aio matrix: PASS ($OUT/fio-aio/round-1..$ROUNDS/summary.tsv)
 - RocksDB matrix: PASS ($OUT/rocksdb/summary.tsv)
-- MariaDB/MySQL matrix: PASS ($OUT/mysql/results.tsv)
+- MariaDB/MySQL matrix: PASS ($OUT/mysql/round-1..$ROUNDS/results.tsv)
 - direct NVMe matrix: $NVME_STATUS
 - NVMe note: ${NVME_REASON:-direct NVMe FIO completed}
 

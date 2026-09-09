@@ -3,12 +3,12 @@
 > 记录时间：2026-09-09
 > 目标：验证 shard-54～58 的 bounce-copy、请求放大和 completion 生命周期改动，并完成
 > FIO、RocksDB、MariaDB/MySQL 的统一回归。
-> HFS source commit：`3443c09`（本地 `main`）。
+> HFS source commit：`3443c09`；本报告脚本/文档收口 commit：`0ef4a0d`。
 > SPDK：VM 内 Git 工作树，锁定 `f0b63ed866f0e4d3c56e73bd4a98d0042956147a`。
 
 ## 测试口径
 
-本次快速验收使用 VM 上持久化 Aio 镜像，避免把不同后端混为一谈：
+本次验收使用 VM 上持久化 Aio 镜像，避免把不同后端混为一谈：
 
 | 项目 | 配置 |
 |---|---|
@@ -18,12 +18,12 @@
 | RocksDB | stage48 `fillseq`、`readwhilewriting`，1/4 threads，5 s |
 | MariaDB | native ext4 与 HFS persistent-Aio，read/write，1/4/16 并发 |
 | 统计 | stats-off 主口径；错误数必须为 0 |
-| 本轮规模 | shard59 quick：1 轮、RocksDB 5000 条、MySQL 100 queries |
+| 本轮规模 | shard59 3-round short：3 轮、RocksDB 5000 条、MySQL 100 queries |
 
 执行入口：
 
 ```bash
-HFS_SHARD59_ROUNDS=1 \
+HFS_SHARD59_ROUNDS=3 \
 HFS_SHARD59_DURATION_SECONDS=5 \
 HFS_SHARD59_FIO_RUNTIME_SECONDS=3 \
 HFS_SHARD59_FIO_SIZE=32m \
@@ -32,7 +32,7 @@ HFS_SHARD59_MYSQL_QUERIES=100 \
 HFS_SHARD59_MYSQL_ITERATIONS=1 \
 bash scripts/db/shard59_performance_matrix.sh \
   build/lib/libhfs.so config/hfs_db_aio.json \
-  /var/tmp/hfs-shard59-quick.img /var/tmp/hfs-shard59-quick
+  /var/tmp/hfs-shard59-3r.img /var/tmp/hfs-shard59-3r
 ```
 
 ## FIO：HFS 与 native ext4
@@ -50,6 +50,17 @@ bash scripts/db/shard59_performance_matrix.sh \
 HFS 在本 Aio/ext4 口径下没有错误，64K 的吞吐高于 native；这不是 raw SPDK/NVMe 结论，
 只用于确认 persistent-Aio 文件系统路径没有新的请求丢失或异常放大。
 
+三轮短样本的总 IOPS 中位数如下（每轮的完整 JSON/TSV 位于 VM 的
+`/var/tmp/hfs-shard59-3r/fio-aio/round-*`）：
+
+| bs | HFS median IOPS | native median IOPS | HFS/native |
+|---:|---:|---:|---:|
+| 4K | 14,658.78 | 13,704.10 | 1.07x |
+| 8K | 15,139.62 | 14,084.64 | 1.07x |
+| 16K | 14,074.31 | 13,551.82 | 1.04x |
+| 32K | 14,065.64 | 12,860.05 | 1.09x |
+| 64K | 12,411.86 | 11,480.00 | 1.08x |
+
 ## RocksDB：持久化 Aio
 
 | case | ops/sec | p50 (µs) | p99 (µs) | errors |
@@ -58,9 +69,10 @@ HFS 在本 Aio/ext4 口径下没有错误，64K 的吞吐高于 native；这不�
 | readwhilewriting-1t | 1,057,228 | 131.87 | 361.65 | 0 |
 | readwhilewriting-4t | 3,861,609 | 194.01 | 523.89 | 0 |
 
-stage48 矩阵返回 `DATABASE BENCHMARK OK` 和 `STAGE48 MATRIX OK`。这轮是短样本，不能
-替代 shard-35 的 60 秒正式吞吐数据；其作用是确认 shard-58 之后的 vector/RMW/resize
-路径没有破坏 WAL、flush/compact 和读写并发。
+stage48 矩阵返回 `DATABASE BENCHMARK OK` 和 `STAGE48 MATRIX OK`。三轮中位数为
+fillseq 7,404 ops/s、readwhilewriting-1t 1,077,791 ops/s、readwhilewriting-4t
+3,681,855 ops/s。它不能替代 shard-35 的 60 秒正式吞吐数据，作用是确认 shard-58
+之后的 vector/RMW/resize 路径没有破坏 WAL、flush/compact 和读写并发。
 
 ## MariaDB/MySQL：persistent-Aio 对照
 
@@ -75,6 +87,17 @@ stage48 矩阵返回 `DATABASE BENCHMARK OK` 和 `STAGE48 MATRIX OK`。这轮是
 
 初始化与 workload 均返回 `MYSQL STAGE2 OK`。写 QPS 差距仍主要反映 HFS 的 POSIX
 元数据、同步和持久化提交成本，不能用 FIO 的 Aio 对照直接推导数据库性能。
+
+三轮中位数的关键对照：
+
+| workload | concurrency | native QPS | HFS QPS | HFS/native |
+|---|---:|---:|---:|---:|
+| read | 1 | 1,075.27 | 1,041.67 | 0.97x |
+| write | 1 | 5,882.35 | 833.33 | 0.14x |
+| read | 4 | 3,846.15 | 3,448.28 | 0.90x |
+| write | 4 | 14,285.71 | 1,923.08 | 0.13x |
+| read | 16 | 5,882.35 | 4,761.90 | 0.81x |
+| write | 16 | 25,000.00 | 6,666.67 | 0.27x |
 
 ## completion 生命周期修复验证
 

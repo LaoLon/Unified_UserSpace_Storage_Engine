@@ -446,10 +446,11 @@ min、max、p50/p99/p99.9，不能只保留最好一轮。
   触发 SIGSEGV（Bug 68）。
 - 修复 MariaDB bootstrap 强制回收后 backend flock 延迟释放造成的启动竞争：stage2 在
   启动服务前等待锁可重新获取（`HFS_MYSQL_LOCK_WAIT_SECONDS` 可调）。
-- VM 快速验收（1 轮、FIO 3 s、RocksDB 5 s、MySQL 100 queries）全绿：FIO errors=0，
-  RocksDB errors=0，MySQL stage2 `MYSQL STAGE2 OK`；Aio FIO HFS/native 总 IOPS 为
-  14.7k/14.3k（4K）和 12.5k/10.7k（64K），RocksDB 4-thread readwhilewriting 为
-  3.86M ops/s，MySQL HFS/native 16-thread write 为 6.67k/20.0k QPS。
+- VM 三轮短样本（FIO 3 s、RocksDB 5 s、MySQL 100 queries）全绿：FIO errors=0，
+  RocksDB errors=0，MySQL 每轮均返回 `MYSQL STAGE2 OK`；Aio FIO HFS/native 总 IOPS
+  中位数为 14.66k/13.70k（4K）和 12.41k/11.48k（64K），RocksDB 4-thread
+  readwhilewriting 中位数为 3.68M ops/s，MySQL HFS/native 16-thread write 中位数为
+  6.67k/25.0k QPS。
 - 当前 VM 没有 `/dev/nvme*`，且 `/root/code/spdk/build/fio/spdk_bdev` 不存在，
   direct-NVMe 项输出 `SKIP direct NVMe: spdk_fio_plugin_missing; no_nvme_device`；
   真实 NVMe 仍沿用 `performance/stage2_nvme_native_baseline.md` 的已存证据，待具备

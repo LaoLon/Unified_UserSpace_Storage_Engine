@@ -268,7 +268,7 @@ MySQL/MariaDB-compatible server、RocksDB、同步 POSIX 和 async libhfs。普�
 ## shard-59 性能矩阵收口（2026-09-09）
 
 新增 `scripts/db/shard59_performance_matrix.sh`，统一输出持久化 Aio 下的 HFS/native
-FIO、RocksDB 和 MariaDB/MySQL 结果。快速验收使用 1 轮、FIO 3 s、RocksDB 5 s、MySQL
+FIO、RocksDB 和 MariaDB/MySQL 结果。三轮短样本使用 FIO 3 s、RocksDB 5 s、MySQL
 100 queries，所有 workload errors=0；详细表格见
 [`performance/hfs_shard59_performance_matrix.md`](../../performance/hfs_shard59_performance_matrix.md)。
 
