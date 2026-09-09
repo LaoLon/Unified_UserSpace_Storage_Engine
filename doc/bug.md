@@ -1213,4 +1213,27 @@ Bug 等级：**致命 > 严重 > 一般**。
   `runtime_queue_depth_peak=26`、`io_backend_outstanding_peak=31`；stats-off 同口径 HFS
   64 KiB 为 30,233 IOPS，raw SPDK 为 35,287 IOPS，errors=0。
 
+### 73. direct-DMA 完成先唤醒 waiter 导致退出阶段 blob close 竞态（已修复，严重级）
+
+- **状态**：已修复；direct completion 在发布用户完成前先释放 `HfsOpenFile`，确保
+  `hfsAsyncFini()` 的 in-flight 计数覆盖全部内部清理
+- **时间**：2026-09-09（direct-DMA 异步并发矩阵）
+- **等级**：严重（单 reactor、depth>=2 时可使 Python/FIO 进程在退出阶段随机 SIGSEGV）
+- **现象**：`HFS_DATA_REACTORS=1` 的 direct-DMA 矩阵偶发在 depth=2 完成数据操作后段错误，
+  内核 fault 位于 `spdk_blob_close()`；同一测试低轮数可能通过，导致问题具有时序相关性。
+- **排查过程**：重复执行 1/2/4/8/16/32 深度矩阵并保留 dmesg。故障地址按共享库
+  executable segment 偏移还原到 `spdk/lib/blob/blobstore.c:9291`。检查 direct async
+  完成链发现 `hfsAsyncCompleteDirect()` 会先广播 `done` 并递减 `directInFlight`，
+  随后 `hfs_lib_async_direct_done/finish()` 才释放 `HfsOpenFile`；进程退出可在后者仍
+  访问 blob 时进入 `hfs_lib_fini()`/`spdk_bs_unload()`。
+- **根因**：异步 API 对外宣称完成时，内部 open-file/blob 引用尚未退休；`hfsAsyncFini()`
+  因提前递减的 in-flight 计数无法等待该尾部清理，卸载 blobstore 与 `spdk_blob_close()`
+  并发，形成 use-after-free/非法 blob 访问。
+- **修复**：在正常 direct 完成、metadata commit 完成以及 ENOMEM 错误分支中，先调用
+  `hfs_release_open_file()`，再调用 `hfsAsyncCompleteDirect()`，最后释放 direct context；
+  如此 waiter、`directInFlight` 和 blob 生命周期都以内部清理完成为边界。
+- **验证**：VM 强制 `make -B lib` 后，`HFS_DATA_REACTORS=1`、depth=1/2/4/8/16/32、
+  64 KiB、16 rounds 连续 3 轮全部通过（errors=0、copy_ops=0、async submit/complete
+  均为 32/64/128/256/512/1024）；reactors=4 主矩阵继续通过。
+
 ## 通用经验总结

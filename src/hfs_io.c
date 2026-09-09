@@ -1175,6 +1175,8 @@ static void hfsIoDirectAsyncDone(HfsIoRequest *request) {
 		result = -1;
 	} else {
 		result = (ssize_t)(request->units * direct->file->fs->unitSize);
+		/* Account small registered requests that bypass the window parent. */
+		hfsStatsRecordIoDirectFast((uint64_t)result);
 	}
 	hfsIoRangeUnlock(direct->file, &direct->guard);
 	hfsIoSyncReadUnlock(direct->runtime);

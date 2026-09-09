@@ -996,8 +996,9 @@ static void hfs_lib_async_direct_finish(void *arg) {
 	HfsLibAsyncDirectCommit *commit = arg;
 	HfsLibAsyncDirectContext *direct = commit->direct;
 
-	hfsAsyncCompleteDirect(direct->request, commit->result, commit->error);
+	/* Retire the open description before exposing completion to teardown. */
 	(void)hfs_release_open_file(direct->openFile);
+	hfsAsyncCompleteDirect(direct->request, commit->result, commit->error);
 	free(direct);
 	free(commit);
 }
@@ -1055,15 +1056,17 @@ static void hfs_lib_async_direct_done(void *context, ssize_t result, int error) 
 			hfsPublishWriteEnd(direct->openFile,
 				direct->writeOffset + (uint64_t)result);
 		}
-		hfsAsyncCompleteDirect(direct->request, result, error);
+		/* Retire the open description before exposing completion to teardown. */
 		(void)hfs_release_open_file(direct->openFile);
+		hfsAsyncCompleteDirect(direct->request, result, error);
 		free(direct);
 		return;
 	}
 	commit = calloc(1, sizeof(*commit));
 	if (commit == NULL) {
-		hfsAsyncCompleteDirect(direct->request, -1, ENOMEM);
+		/* Retire the open description before exposing completion to teardown. */
 		(void)hfs_release_open_file(direct->openFile);
+		hfsAsyncCompleteDirect(direct->request, -1, ENOMEM);
 		free(direct);
 		return;
 	}
