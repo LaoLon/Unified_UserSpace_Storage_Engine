@@ -6,8 +6,10 @@
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/uio.h>
 
+#include <spdk/bdev.h>
 #include <spdk/blob.h>
 #include <spdk/env.h>
 
@@ -30,6 +32,32 @@
 #define HFS_IO_MAX_VECTOR	32U
 #define HFS_IO_DEFAULT_PIPELINE	8U
 #define HFS_IO_ASYNC_MAGIC	UINT64_C(0x4846534153594e43)
+
+static pthread_once_t g_hfsIoUnmapCapabilityOnce = PTHREAD_ONCE_INIT;
+static bool g_hfsIoUnmapZeroSafe;
+
+/* Parse the explicit operator declaration for an unmap-to-zero backend. */
+static void hfsIoInitUnmapCapability(void) {
+	const char *value = getenv("HFS_UNMAP_ZERO_SAFE");
+
+	g_hfsIoUnmapZeroSafe = value != NULL &&
+		(!strcmp(value, "1") || !strcasecmp(value, "true") ||
+		 !strcasecmp(value, "yes") || !strcasecmp(value, "on"));
+}
+
+/* Require both an explicit declaration and an SPDK UNMAP capability bit. */
+static bool hfsIoUnmapGuaranteesZero(const HfsFile *file) {
+	struct spdk_bdev *base;
+
+	pthread_once(&g_hfsIoUnmapCapabilityOnce, hfsIoInitUnmapCapability);
+	if (!g_hfsIoUnmapZeroSafe || file == NULL || file->fs == NULL ||
+	    file->fs->bsDev == NULL || file->fs->bsDev->get_base_bdev == NULL) {
+		return false;
+	}
+	base = file->fs->bsDev->get_base_bdev(file->fs->bsDev);
+	return base != NULL &&
+		spdk_bdev_io_type_supported(base, SPDK_BDEV_IO_TYPE_UNMAP);
+}
 
 /* One size-class DMA buffer leased by one request at a time. */
 typedef struct HfsIoPoolClass HfsIoPoolClass;
@@ -2748,8 +2776,15 @@ static int hfsIoUnmapUnits(HfsFile *file, uint64_t offset, uint64_t units) {
 		if (savedErrno != EOPNOTSUPP && savedErrno != ENOTSUP) {
 			return -1;
 		}
+		/* An unsupported UNMAP must retain the observable zero guarantee. */
+		hfsStatsRecordPunchFast(false, true);
+	} else if (hfsIoUnmapGuaranteesZero(file)) {
+		/* The bdev capability and operator declaration make UNMAP sufficient. */
+		hfsStatsRecordPunchFast(true, false);
+		return 0;
 	}
 	if (hfsIoSubmit(file, NULL, offset, units, HFS_IO_WRITE_ZEROES) == 0) {
+		hfsStatsRecordPunchFast(false, false);
 		return 0;
 	}
 	/*
@@ -2757,6 +2792,7 @@ static int hfsIoUnmapUnits(HfsFile *file, uint64_t offset, uint64_t units) {
 	 * accelerated zeroes path fails, retry through the DMA write path and only
 	 * report success after the observable hole contents are actually zero.
 	 */
+	hfsStatsRecordPunchFast(false, true);
 	return hfsIoWriteZeroUnits(file, offset, units);
 }
 

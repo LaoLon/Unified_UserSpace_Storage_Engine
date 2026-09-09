@@ -474,6 +474,7 @@ int hfsResizeTo(HfsFile *file, uint64_t bytes) {
 	if (runtime != NULL &&
 	    atomic_load_explicit(&runtime->allocatedClusters,
 				 memory_order_acquire) >= needClusters) {
+		hfsStatsRecordResizeFast(true);
 		return 0;
 	}
 	if (runtime != NULL) {
@@ -482,6 +483,7 @@ int hfsResizeTo(HfsFile *file, uint64_t bytes) {
 		pthread_mutex_lock(&file->fs->compatibilityResizeLock);
 	}
 	rc = hfsResizeClusters(file, needClusters, true);
+	hfsStatsRecordResizeFast(false);
 	if (rc == 0 && runtime != NULL) {
 		atomic_store_explicit(&runtime->allocatedClusters, needClusters,
 				      memory_order_release);

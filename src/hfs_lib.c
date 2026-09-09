@@ -450,6 +450,132 @@ static int hfsIovTotal(const struct iovec *iov, int iovcnt, size_t *totalOut) {
 	return 0;
 }
 
+/* Copy one logical iovec range into a bounded DMA staging buffer. */
+static void hfsIovCopyIn(const struct iovec *iov, int iovcnt,
+			 size_t logicalOffset, uint8_t *destination, size_t bytes) {
+	int i;
+	size_t skipped = logicalOffset;
+	size_t copied = 0;
+
+	for (i = 0; i < iovcnt && copied < bytes; i++) {
+		size_t available = iov[i].iov_len;
+		size_t take;
+
+		if (skipped >= available) {
+			skipped -= available;
+			continue;
+		}
+		available -= skipped;
+		take = bytes - copied < available ? bytes - copied : available;
+		memcpy(destination + copied,
+		       (const uint8_t *)iov[i].iov_base + skipped, take);
+		copied += take;
+		skipped = 0;
+	}
+}
+
+/* Copy one logical range from a bounded DMA staging buffer to iovec segments. */
+static void hfsIovCopyOut(const uint8_t *source, const struct iovec *iov,
+			  int iovcnt, size_t logicalOffset, size_t bytes) {
+	int i;
+	size_t skipped = logicalOffset;
+	size_t copied = 0;
+
+	for (i = 0; i < iovcnt && copied < bytes; i++) {
+		size_t available = iov[i].iov_len;
+		size_t take;
+
+		if (skipped >= available) {
+			skipped -= available;
+			continue;
+		}
+		available -= skipped;
+		take = bytes - copied < available ? bytes - copied : available;
+		memcpy((uint8_t *)iov[i].iov_base + skipped,
+		       source + copied, take);
+		copied += take;
+		skipped = 0;
+	}
+}
+
+/* Coalesce mixed vector segments into bounded requests to avoid per-segment RMW. */
+static ssize_t hfsReadvBounceAt(HfsOpenFile *openFile,
+				const struct iovec *iov, int iovcnt,
+				size_t total, uint64_t offset, uint64_t fileSize) {
+	const size_t chunkBytes = 1U << 20;
+	uint8_t *staging;
+	size_t available;
+	size_t done = 0;
+
+	if (offset >= fileSize) {
+		return 0;
+	}
+	available = total;
+	if ((uint64_t)available > fileSize - offset) {
+		available = (size_t)(fileSize - offset);
+	}
+	staging = hfsIoDmaAlloc(chunkBytes, 0);
+	if (staging == NULL) {
+		return -1;
+	}
+	while (done < available) {
+		size_t requestBytes = available - done;
+		ssize_t n;
+
+		if (requestBytes > chunkBytes) {
+			requestBytes = chunkBytes;
+		}
+		n = hfsReadAt(openFile->file, staging, requestBytes,
+			       offset + done);
+		if (n < 0) {
+			hfsIoDmaFree(staging);
+			return done != 0 ? (ssize_t)done : -1;
+		}
+		hfsIovCopyOut(staging, iov, iovcnt, done, (size_t)n);
+		done += (size_t)n;
+		if ((size_t)n != requestBytes) {
+			break;
+		}
+	}
+	hfsIoDmaFree(staging);
+	return (ssize_t)done;
+}
+
+/* Coalesce mixed vector segments into bounded writes with one edge decision. */
+static ssize_t hfsWritevBounceAt(HfsOpenFile *openFile,
+				 const struct iovec *iov, int iovcnt,
+				 size_t total, uint64_t offset) {
+	const size_t chunkBytes = 1U << 20;
+	uint8_t *staging;
+	size_t done = 0;
+
+	staging = hfsIoDmaAlloc(chunkBytes, 0);
+	if (staging == NULL) {
+		return -1;
+	}
+	while (done < total) {
+		size_t requestBytes = total - done;
+		ssize_t n;
+
+		if (requestBytes > chunkBytes) {
+			requestBytes = chunkBytes;
+		}
+		hfsIovCopyIn(iov, iovcnt, done, staging, requestBytes);
+		n = hfsWriteAt(openFile->file, staging, requestBytes,
+				 offset + done);
+		if (n < 0) {
+			hfsIoDmaFree(staging);
+			return done != 0 ? (ssize_t)done : -1;
+		}
+		done += (size_t)n;
+		if ((size_t)n != requestBytes) {
+			break;
+		}
+	}
+	hfsIoDmaFree(staging);
+	return (ssize_t)done;
+}
+
 /* Snapshot one inode size while keeping metadata lock scope short. */
 static int hfsSnapshotFileSize(HfsOpenFile *openFile, uint64_t *sizeOut) {
 	struct hfs_inode *in;
@@ -478,8 +604,6 @@ static int hfsSnapshotFileSize(HfsOpenFile *openFile, uint64_t *sizeOut) {
 static ssize_t hfsReadvAt(HfsOpenFile *openFile, const struct iovec *iov,
 			  int iovcnt, size_t total, uint64_t offset,
 			  uint64_t fileSize) {
-	size_t done = 0;
-	int i;
 	ssize_t direct;
 
 	/* Use SPDK native vector I/O when every segment is DMA-addressable. */
@@ -491,37 +615,13 @@ static ssize_t hfsReadvAt(HfsOpenFile *openFile, const struct iovec *iov,
 		}
 	}
 
-	for (i = 0; i < iovcnt && done < total; i++) {
-		size_t want = iov[i].iov_len;
-		ssize_t n;
-
-		if (want == 0) {
-			continue;
-		}
-		if (offset >= fileSize) {
-			break;
-		}
-		if ((uint64_t)want > fileSize - offset) {
-			want = (size_t)(fileSize - offset);
-		}
-		n = hfsReadAt(openFile->file, iov[i].iov_base, want, offset);
-		if (n < 0) {
-			return done != 0 ? (ssize_t)done : -1;
-		}
-		done += (size_t)n;
-		offset += (uint64_t)n;
-		if ((size_t)n != want) {
-			break;
-		}
-	}
-	return (ssize_t)done;
+	return hfsReadvBounceAt(openFile, iov, iovcnt, total, offset,
+					fileSize);
 }
 
 /* Write iovec segments directly from caller buffers through request-local DMA. */
 static ssize_t hfsWritevAt(HfsOpenFile *openFile, const struct iovec *iov,
 			   int iovcnt, size_t total, uint64_t offset) {
-	size_t done = 0;
-	int i;
 	ssize_t direct;
 
 	/* Use SPDK native vector I/O before falling back to per-segment copies. */
@@ -532,24 +632,7 @@ static ssize_t hfsWritevAt(HfsOpenFile *openFile, const struct iovec *iov,
 		}
 	}
 
-	for (i = 0; i < iovcnt && done < total; i++) {
-		size_t want = iov[i].iov_len;
-		ssize_t n;
-
-		if (want == 0) {
-			continue;
-		}
-		n = hfsWriteAt(openFile->file, iov[i].iov_base, want, offset);
-		if (n < 0) {
-			return done != 0 ? (ssize_t)done : -1;
-		}
-		done += (size_t)n;
-		offset += (uint64_t)n;
-		if ((size_t)n != want) {
-			break;
-		}
-	}
-	return (ssize_t)done;
+	return hfsWritevBounceAt(openFile, iov, iovcnt, total, offset);
 }
 
 /* Publish a non-extending write through runtime state without global locking. */

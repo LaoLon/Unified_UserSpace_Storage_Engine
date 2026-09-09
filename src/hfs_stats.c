@@ -82,6 +82,12 @@ typedef struct HfsStatsShard {
 	uint64_t ioDirectOps;
 	uint64_t ioVectorBytes;
 	uint64_t ioVectorOps;
+	uint64_t resizeChecks;
+	uint64_t resizeFastHits;
+	uint64_t resizeRequests;
+	uint64_t punchRequests;
+	uint64_t punchUnmapOnly;
+	uint64_t punchZeroFallbacks;
 	uint64_t ioSizeHist[HFS_STATS_IO_SIZE_BUCKETS];
 	uint64_t metadataLogBytes;
 	uint64_t metadataImageBytes;
@@ -357,6 +363,35 @@ void hfsStatsRecordRmw(uint64_t bytes) {
 	}
 }
 
+/* Record whether a resize was absorbed by the runtime allocation cache. */
+void hfsStatsRecordResize(bool fastHit) {
+	HfsStatsShard *shard = hfsStatsShardGet();
+
+	if (shard != NULL) {
+		shard->resizeChecks++;
+		if (fastHit) {
+			shard->resizeFastHits++;
+		} else {
+			shard->resizeRequests++;
+		}
+	}
+}
+
+/* Record the selected aligned punch implementation and fallback activity. */
+void hfsStatsRecordPunch(bool unmapOnly, bool zeroFallback) {
+	HfsStatsShard *shard = hfsStatsShardGet();
+
+	if (shard != NULL) {
+		shard->punchRequests++;
+		if (unmapOnly) {
+			shard->punchUnmapOnly++;
+		}
+		if (zeroFallback) {
+			shard->punchZeroFallbacks++;
+		}
+	}
+}
+
 /* Record queue depth at the point a request is handed to SPDK. */
 void hfsStatsRecordRuntimeSubmit(uint64_t queueDepth) {
 	HfsStatsShard *shard = hfsStatsShardGet();
@@ -602,6 +637,12 @@ static void hfsStatsAggregateShard(HfsStatsShard *total,
 	total->ioDirectOps += shard->ioDirectOps;
 	total->ioVectorBytes += shard->ioVectorBytes;
 	total->ioVectorOps += shard->ioVectorOps;
+	total->resizeChecks += shard->resizeChecks;
+	total->resizeFastHits += shard->resizeFastHits;
+	total->resizeRequests += shard->resizeRequests;
+	total->punchRequests += shard->punchRequests;
+	total->punchUnmapOnly += shard->punchUnmapOnly;
+	total->punchZeroFallbacks += shard->punchZeroFallbacks;
 	for (i = 0; i < HFS_STATS_IO_SIZE_BUCKETS; i++) {
 		total->ioSizeHist[i] += shard->ioSizeHist[i];
 	}
@@ -753,6 +794,13 @@ static void hfsStatsWriteSnapshot(void) {
 	HFS_STATS_APPEND("io_direct_ops=%"PRIu64"\n", total.ioDirectOps);
 	HFS_STATS_APPEND("io_vector_bytes=%"PRIu64"\n", total.ioVectorBytes);
 	HFS_STATS_APPEND("io_vector_ops=%"PRIu64"\n", total.ioVectorOps);
+	HFS_STATS_APPEND("resize_checks=%"PRIu64"\n", total.resizeChecks);
+	HFS_STATS_APPEND("resize_fast_hits=%"PRIu64"\n", total.resizeFastHits);
+	HFS_STATS_APPEND("resize_requests=%"PRIu64"\n", total.resizeRequests);
+	HFS_STATS_APPEND("punch_requests=%"PRIu64"\n", total.punchRequests);
+	HFS_STATS_APPEND("punch_unmap_only=%"PRIu64"\n", total.punchUnmapOnly);
+	HFS_STATS_APPEND("punch_zero_fallbacks=%"PRIu64"\n",
+		total.punchZeroFallbacks);
 	for (i = 0; i < HFS_STATS_IO_SIZE_BUCKETS; i++) {
 		HFS_STATS_APPEND("io_size_hist_%u=%"PRIu64"\n", i,
 			total.ioSizeHist[i]);

@@ -88,6 +88,10 @@ void hfsStatsRecordIoVector(uint64_t bytes);
 void hfsStatsRecordCopy(uint64_t bytes);
 /* Record one read-modify-write unit and its byte cost. */
 void hfsStatsRecordRmw(uint64_t bytes);
+/* Record a resize fast-path check and whether it avoided a blob request. */
+void hfsStatsRecordResize(bool fastHit);
+/* Record an aligned punch request and its zero-preservation fallback. */
+void hfsStatsRecordPunch(bool unmapOnly, bool zeroFallback);
 
 /* Record runtime queue depth and dispatch timing from a request wrapper. */
 void hfsStatsRecordRuntimeSubmit(uint64_t queueDepth);
@@ -142,6 +146,16 @@ static inline void hfsStatsRecordIoVectorFast(uint64_t bytes) {
 static inline void hfsStatsRecordRmwFast(uint64_t bytes) {
 	if (hfsStatsEnabledFast()) {
 		hfsStatsRecordRmw(bytes);
+	}
+}
+static inline void hfsStatsRecordResizeFast(bool fastHit) {
+	if (hfsStatsEnabledFast()) {
+		hfsStatsRecordResize(fastHit);
+	}
+}
+static inline void hfsStatsRecordPunchFast(bool unmapOnly, bool zeroFallback) {
+	if (hfsStatsEnabledFast()) {
+		hfsStatsRecordPunch(unmapOnly, zeroFallback);
 	}
 }
 static inline void hfsStatsRecordRuntimeSubmitFast(uint64_t queueDepth) {

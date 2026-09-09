@@ -1,6 +1,6 @@
 # HFS 用户 Buffer Bounce Copy 优化 Shard 计划
 
-> **状态**：shard-54/55 已实现，shard-56 copy/lease lifetime 开发中
+> **状态**：shard-54 ～ shard-58 已实现，shard-59 性能收口中
 > **计划范围**：shard-54 ～ shard-59
 > **输入评审**：[`review/hfs_user_buffer_bounce_copy_optimization.md`](../../review/hfs_user_buffer_bounce_copy_optimization.md)
 > **当前基线**：`main@4054111`，VM 内 SPDK 使用锁定 commit `f0b63ed866f0e4d3c56e73bd4a98d0042956147a`
@@ -381,6 +381,27 @@ chunk、wait 一个 completion”升级为 bounded outstanding window。
 - vector 的 logical/child 比例下降，数据校验和错误注入通过。
 - preallocated workload 的 resize request 从 steady-state 热路径消失。
 - punch 后读零、fsync、SIGKILL recovery 和旧 metadata 格式兼容不回退。
+
+### 8.4 当前实现记录（shard-58）
+
+- 混合 `readv/writev` 不再按 segment 循环调用同步 `hfsReadAt()/hfsWriteAt()`；当原生
+  SPDK vector 因普通 heap segment 无法使用时，逻辑 iovec 被聚合到固定 1 MiB DMA
+  staging buffer，按有界 chunk 提交，因而同一 unit 的相邻 edge 更新只产生一次 RMW。
+  全 DMA、unit 对齐的 vector 仍保留原生 SPDK `readv/writev` 零 copy 路径。
+- staging buffer 只在 mixed/partial fallback 中存在，使用后立即释放；不改变调用者
+  iovec 的顺序、短读/短写和 EOF 语义。新增 smoke 覆盖 heap + DMA mixed vector，验证
+  单边非对齐写的 `io_rmw_ops=1` 且数据完整。
+- `hfsResizeTo()` 增加 `resize_checks`、`resize_fast_hits`、`resize_requests` 统计，
+  可区分 runtime allocation cache 命中与真正进入 blob resize 的路径。重复 fallocate
+  在测试中命中 fast check，不再把 steady-state resize 误计为设备请求。
+- aligned punch 默认仍保留 `UNMAP -> WRITE_ZEROES -> DMA zero` 的可靠零保证；新增
+  `HFS_UNMAP_ZERO_SAFE=1` 显式运维开关，并要求底层 bdev 报告 `SPDK_BDEV_IO_TYPE_UNMAP`
+  后才允许 unmap-only。能力未知时不会跳过 zero fallback，新增
+  `punch_requests/punch_unmap_only/punch_zero_fallbacks` 统计。
+- VM 验证：`make -B app lib`、CMake Release、shard-58 request reduction smoke、
+  request-local fast I/O、I/O error injection（含 punch zero fallback）通过；SPDK
+  submit/complete 为 `74/74`，errors=0。Aio bdev 未宣称 unmap-to-zero 能力，因此
+  `punch_unmap_only=0`，默认可靠路径保持不变。
 
 ## 9. shard-59：真实 NVMe 与数据库性能收口
 
