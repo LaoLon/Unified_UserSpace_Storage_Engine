@@ -1257,4 +1257,26 @@ Bug 等级：**致命 > 严重 > 一般**。
   stress、inode/range concurrency、fdatasync coordinator 和所有 crash/error injection
   回归通过，acquire/release 计数闭合且无关闭超时。
 
+### 75. VM 重启后 NVMe 恢复为内核驱动导致 HFS 无法挂载（已处理，环境级）
+
+- **状态**：已处理；测试前通过 SPDK `scripts/setup.sh config` 重新绑定设备，并保留
+  1 GiB hugepage 预留
+- **时间**：2026-09-10（VM 重启后的 NVMe FIO 映射复核）
+- **等级**：一般（环境初始化问题，不改变 HFS 数据语义）
+- **现象**：HFS 使用 `config/hfs_nvme.json` 启动时返回 `ENODEV`，FIO 报
+  `/hfs: No such device`；此时 PCI NVMe 控制器仍可在 `lspci` 中看到，但由内核
+  `nvme` 驱动占用，且重启后 hugepages 计数为零。
+- **排查过程**：确认没有 fio、SPDK 或 HFS 测试进程；`lspci -Dnnk -s 0000:0b:00.0`
+  显示 `Kernel driver in use: nvme`，`HugePages_Total=0`。设置
+  `vm.nr_hugepages=1024` 后仍无法 attach，说明根因不是内存而是 PCI 驱动绑定。
+- **根因**：VM 重启不会持久化本项目测试所需的 SPDK 用户态设备绑定；NVMe 被内核
+  `nvme` 驱动重新接管，SPDK 无法通过 `traddr=0000:0b:00.0` 探测控制器。
+- **处理**：在 VM 内执行
+  `PCI_ALLOWED=0000:0b:00.0 DEV_TYPE=NVME SKIP_HUGE=yes ./scripts/setup.sh config`，
+  并在测试前设置 `sysctl -w vm.nr_hugepages=1024`；确认设备显示为
+  `uio_pci_generic` 后再启动 HFS。不得把 Windows 侧 `spdk/` 目录同步到 VM。
+- **验证**：HFS 与 raw SPDK 均使用 `Nvme0n1` 完成 qd1/qd32 FIO，所有 errors=0；
+  原生本地对照文件位于 `/mnt/hfs-data`，结果保存在
+  `/mnt/hfs-data/performance-stage3-nvme-fio-shard61/{qd1,qd32}`。
+
 ## 通用经验总结
