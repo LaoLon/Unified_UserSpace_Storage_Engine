@@ -193,9 +193,6 @@ typedef struct HfsIoDirectAsync {
 	HfsIoRequest request;
 } HfsIoDirectAsync;
 
-/* Use a per-inode gate when a range would otherwise lock most global buckets. */
-#define HFS_IO_RANGE_GATE_THRESHOLD (HFS_RANGE_LOCK_COUNT / 4U)
-
 /* Parent state for one worker-free aligned request and its bounded child batches. */
 typedef struct HfsIoAsyncParent {
 	HfsFile *file;
@@ -226,23 +223,29 @@ typedef struct HfsIoAsyncParent {
 	pthread_mutex_t lock;
 } HfsIoAsyncParent;
 
-/* Hash a blob/unit pair so unrelated files normally use independent locks. */
+/* Map logical units to a stable per-inode stripe. */
 static uint32_t hfsIoRangeBucket(const HfsFile *file, uint64_t unitIndex) {
-	uint64_t hash = (uint64_t)file->blobId ^ (unitIndex * UINT64_C(0x9e3779b97f4a7c15));
-
-	hash ^= hash >> 30;
-	hash *= UINT64_C(0xbf58476d1ce4e5b9);
-	hash ^= hash >> 27;
-	return (uint32_t)hash & (HFS_RANGE_LOCK_COUNT - 1U);
+	(void)file;
+	return (uint32_t)((unitIndex / HFS_INODE_RANGE_STRIPE_UNITS) &
+		(HFS_INODE_RANGE_STRIPE_COUNT - 1U));
 }
 
-/* Lock all hashed buckets covering a byte range in a deadlock-free order. */
+/* Return the per-inode stripe selected by one range guard. */
+static HfsRangeLock *hfsIoRangePrimitive(const HfsIoRangeGuard *guard,
+						 HfsFile *file, uint16_t bucket) {
+	if (guard != NULL && guard->runtime != NULL) {
+		return &guard->runtime->rangeStripes[bucket];
+	}
+	return &file->fs->rangeLocks[bucket];
+}
+
+/* Lock all per-inode stripes covering a byte range in a deadlock-free order. */
 static int hfsIoRangeLock(HfsFile *file, uint64_t offset, uint64_t length,
 			  bool write, HfsIoRangeGuard *guard) {
 	uint64_t firstUnit;
 	uint64_t lastUnit;
 	uint64_t unit;
-	uint64_t seen[HFS_RANGE_LOCK_COUNT / 64U] = {0};
+	uint64_t seen[HFS_INODE_RANGE_STRIPE_COUNT / 64U] = {0};
 	uint32_t bucket;
 	uint32_t seenCount = 0;
 	HfsInodeRuntime *runtime;
@@ -267,48 +270,26 @@ static int hfsIoRangeLock(HfsFile *file, uint64_t offset, uint64_t length,
 			seen[bucket / 64U] |= UINT64_C(1) << (bucket % 64U);
 			seenCount++;
 		}
-		if (unit == UINT64_MAX || seenCount == HFS_RANGE_LOCK_COUNT) {
+		if (unit == UINT64_MAX || seenCount == HFS_INODE_RANGE_STRIPE_COUNT) {
 			break;
 		}
 	}
 	guard->write = write;
-	guard->gateStatsTimed = false;
-	if (seenCount >= HFS_IO_RANGE_GATE_THRESHOLD) {
-		/* A large range is exclusive per inode, but does not block other files. */
-		guard->gateWrite = true;
-		guard->gateStatsTimed = hfsStatsTimingFastEnabled();
-		if (guard->gateStatsTimed) {
-			hfsStatsLockBeforeFast(HFS_STATS_LOCK_RANGE_GATE);
-		}
-		hfsRangeLockWriteLock(&runtime->rangeGate);
-		if (guard->gateStatsTimed) {
-			hfsStatsLockAfterFast(HFS_STATS_LOCK_RANGE_GATE);
-			guard->gateHoldStartNs = hfsStatsNowNs();
-			hfsStatsLockCancelFast(HFS_STATS_LOCK_RANGE_GATE);
-		}
-		return 0;
-	}
 	guard->gateWrite = false;
-	guard->gateStatsTimed = hfsStatsTimingFastEnabled();
-	if (guard->gateStatsTimed) {
-		hfsStatsLockBeforeFast(HFS_STATS_LOCK_RANGE_GATE);
-	}
-	hfsRangeLockReadLock(&runtime->rangeGate);
-	if (guard->gateStatsTimed) {
-		hfsStatsLockAfterFast(HFS_STATS_LOCK_RANGE_GATE);
-		guard->gateHoldStartNs = hfsStatsNowNs();
-		hfsStatsLockCancelFast(HFS_STATS_LOCK_RANGE_GATE);
-	}
-	for (bucket = 0; bucket < HFS_RANGE_LOCK_COUNT; bucket++) {
+	guard->gateStatsTimed = false;
+	guard->gateHoldStartNs = 0;
+	for (bucket = 0; bucket < HFS_INODE_RANGE_STRIPE_COUNT; bucket++) {
 		if ((seen[bucket / 64U] & (UINT64_C(1) << (bucket % 64U))) == 0) {
 			continue;
 		}
 		guard->buckets[guard->count++] = (uint16_t)bucket;
 		hfsStatsLockBeforeFast(HFS_STATS_LOCK_IO);
 		if (write) {
-			hfsRangeLockWriteLock(&file->fs->rangeLocks[bucket]);
+			hfsRangeLockWriteLock(hfsIoRangePrimitive(guard, file,
+								 (uint16_t)bucket));
 		} else {
-			hfsRangeLockReadLock(&file->fs->rangeLocks[bucket]);
+			hfsRangeLockReadLock(hfsIoRangePrimitive(guard, file,
+								 (uint16_t)bucket));
 		}
 		hfsStatsLockAfterFast(HFS_STATS_LOCK_IO);
 	}
@@ -324,7 +305,7 @@ static int hfsIoRangeTryLock(HfsFile *file, uint64_t offset, uint64_t length,
 	uint64_t firstUnit;
 	uint64_t lastUnit;
 	uint64_t unit;
-	uint64_t seen[HFS_RANGE_LOCK_COUNT / 64U] = {0};
+	uint64_t seen[HFS_INODE_RANGE_STRIPE_COUNT / 64U] = {0};
 	uint32_t bucket;
 	uint32_t seenCount = 0;
 	int rc;
@@ -351,58 +332,24 @@ static int hfsIoRangeTryLock(HfsFile *file, uint64_t offset, uint64_t length,
 			seen[bucket / 64U] |= UINT64_C(1) << (bucket % 64U);
 			seenCount++;
 		}
-		if (unit == UINT64_MAX || seenCount == HFS_RANGE_LOCK_COUNT) {
+		if (unit == UINT64_MAX || seenCount == HFS_INODE_RANGE_STRIPE_COUNT) {
 			break;
 		}
 	}
 	guard->write = write;
-	guard->gateStatsTimed = hfsStatsTimingFastEnabled();
-	if (seenCount >= HFS_IO_RANGE_GATE_THRESHOLD) {
-		guard->gateWrite = true;
-		if (guard->gateStatsTimed) {
-			hfsStatsLockBeforeFast(HFS_STATS_LOCK_RANGE_GATE);
-		}
-		rc = hfsRangeLockTryWriteLock(&runtime->rangeGate);
-		if (rc != 0) {
-			if (guard->gateStatsTimed) {
-				hfsStatsLockCancelFast(HFS_STATS_LOCK_RANGE_GATE);
-				guard->gateStatsTimed = false;
-			}
-			errno = EAGAIN;
-			return -1;
-		}
-		if (guard->gateStatsTimed) {
-			hfsStatsLockAfterFast(HFS_STATS_LOCK_RANGE_GATE);
-			guard->gateHoldStartNs = hfsStatsNowNs();
-			hfsStatsLockCancelFast(HFS_STATS_LOCK_RANGE_GATE);
-		}
-		return 0;
-	}
-	if (guard->gateStatsTimed) {
-		hfsStatsLockBeforeFast(HFS_STATS_LOCK_RANGE_GATE);
-	}
-	rc = hfsRangeLockTryReadLock(&runtime->rangeGate);
-	if (rc != 0) {
-		if (guard->gateStatsTimed) {
-			hfsStatsLockCancelFast(HFS_STATS_LOCK_RANGE_GATE);
-			guard->gateStatsTimed = false;
-		}
-		errno = EAGAIN;
-		return -1;
-	}
-	if (guard->gateStatsTimed) {
-		hfsStatsLockAfterFast(HFS_STATS_LOCK_RANGE_GATE);
-		guard->gateHoldStartNs = hfsStatsNowNs();
-		hfsStatsLockCancelFast(HFS_STATS_LOCK_RANGE_GATE);
-	}
 	guard->gateWrite = false;
-	for (bucket = 0; bucket < HFS_RANGE_LOCK_COUNT; bucket++) {
+	guard->gateStatsTimed = false;
+	guard->gateHoldStartNs = 0;
+	for (bucket = 0; bucket < HFS_INODE_RANGE_STRIPE_COUNT; bucket++) {
 		if ((seen[bucket / 64U] & (UINT64_C(1) << (bucket % 64U))) == 0) {
 			continue;
 		}
 		hfsStatsLockBeforeFast(HFS_STATS_LOCK_IO);
-		rc = write ? hfsRangeLockTryWriteLock(&file->fs->rangeLocks[bucket])
-			    : hfsRangeLockTryReadLock(&file->fs->rangeLocks[bucket]);
+		rc = write
+			? hfsRangeLockTryWriteLock(hfsIoRangePrimitive(guard, file,
+								   (uint16_t)bucket))
+			: hfsRangeLockTryReadLock(hfsIoRangePrimitive(guard, file,
+								   (uint16_t)bucket));
 		if (rc != 0) {
 			hfsStatsLockCancelFast(HFS_STATS_LOCK_IO);
 			hfsIoRangeUnlock(file, guard);
@@ -424,20 +371,10 @@ static void hfsIoRangeUnlock(HfsFile *file, HfsIoRangeGuard *guard) {
 	}
 	for (i = guard->count; i > 0; i--) {
 		hfsStatsLockReleaseFast(HFS_STATS_LOCK_IO);
-		hfsRangeLockUnlock(&file->fs->rangeLocks[guard->buckets[i - 1]], guard->write);
+		hfsRangeLockUnlock(hfsIoRangePrimitive(guard, file,
+						 guard->buckets[i - 1]), guard->write);
 	}
-	if (guard->runtime != NULL) {
-		/* Close the gate timing frame before releasing the gate itself. */
-		if (guard->gateStatsTimed) {
-			uint64_t now = hfsStatsNowNs();
-
-			if (now >= guard->gateHoldStartNs) {
-				hfsStatsLockRecordHoldFast(HFS_STATS_LOCK_RANGE_GATE,
-					now - guard->gateHoldStartNs);
-			}
-		}
-		hfsRangeLockUnlock(&guard->runtime->rangeGate, guard->gateWrite);
-	}
+	/* The per-inode stripe locks are released in reverse order. */
 	guard->count = 0;
 	guard->gateWrite = false;
 	guard->gateStatsTimed = false;
@@ -822,6 +759,8 @@ static void hfsIoStart(void *arg) {
 		hfsIoDone(request, -EIO);
 		return;
 	}
+	/* Count one real SPDK data callback window, separate from queue dispatch depth. */
+	hfsStatsRecordIoSubmitFast();
 	if (request->vector) {
 		if (request->operation == HFS_IO_READ) {
 			spdk_blob_io_readv(file->blob, channel, request->iov,
@@ -875,6 +814,7 @@ static void hfsIoDone(void *arg, int bserrno) {
 	void (*asyncDone)(HfsIoRequest *request);
 
 	/* Publish reactor accounting before waking waiters or shutdown snapshots. */
+	hfsStatsRecordIoCompleteFast();
 	if (request->dataPath) {
 		hfsStatsRecordDataReactorCompleteFast(request->dataReactor);
 	}
@@ -961,6 +901,7 @@ static int hfsIoStartRequest(HfsIoRequest *request) {
 					     &request->batchItem);
 	}
 	if (rc != 0) {
+		hfsStatsRecordIoCompleteFast();
 		hfsIoBufferRelease(request->registeredBuffer);
 		request->registeredBuffer = NULL;
 	}

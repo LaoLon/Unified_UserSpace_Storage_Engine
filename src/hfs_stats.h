@@ -20,6 +20,8 @@ extern _Atomic uint_fast64_t hfsStatsDmaExhausts;
 extern _Atomic uint_fast64_t hfsStatsSpdkSubmits;
 extern _Atomic uint_fast64_t hfsStatsSpdkCompletions;
 extern _Atomic uint_fast64_t hfsStatsSpdkRejects;
+extern _Atomic uint_fast64_t hfsStatsIoOutstanding;
+extern _Atomic uint_fast64_t hfsStatsIoOutstandingPeak;
 extern _Atomic uint_fast64_t hfsStatsErrors;
 extern bool hfsStatsFastEnabledState;
 extern bool hfsStatsTimingState;
@@ -122,6 +124,9 @@ void hfsStatsRecordIoPipeline(uint64_t depth);
 /* Record one direct child submit/completion on a selected data reactor. */
 void hfsStatsRecordDataReactorSubmit(uint32_t reactorId);
 void hfsStatsRecordDataReactorComplete(uint32_t reactorId);
+/* Record actual data I/O callbacks submitted to and completed by SPDK. */
+void hfsStatsRecordIoSubmit(void);
+void hfsStatsRecordIoComplete(void);
 
 /* Record metadata image/page/log writes and transaction batch size. */
 void hfsStatsRecordMetadataWrite(uint64_t bytes, uint64_t imageBytes,
@@ -214,6 +219,16 @@ static inline void hfsStatsRecordDataReactorSubmitFast(uint32_t reactorId) {
 static inline void hfsStatsRecordDataReactorCompleteFast(uint32_t reactorId) {
 	if (hfsStatsEnabledFast()) {
 		hfsStatsRecordDataReactorComplete(reactorId);
+	}
+}
+static inline void hfsStatsRecordIoSubmitFast(void) {
+	if (hfsStatsEnabledFast()) {
+		hfsStatsRecordIoSubmit();
+	}
+}
+static inline void hfsStatsRecordIoCompleteFast(void) {
+	if (hfsStatsEnabledFast()) {
+		hfsStatsRecordIoComplete();
 	}
 }
 static inline void hfsStatsRecordMetadataWriteFast(uint64_t bytes,

@@ -61,8 +61,12 @@ void hfsInodeRuntimeFini(Hfs *fs) {
 
 		while (runtime != NULL) {
 			HfsInodeRuntime *next = runtime->next;
+			uint32_t stripe;
 
 			hfsRangeLockDestroy(&runtime->rangeGate);
+			for (stripe = 0; stripe < HFS_INODE_RANGE_STRIPE_COUNT; stripe++) {
+				hfsRangeLockDestroy(&runtime->rangeStripes[stripe]);
+			}
 			pthread_rwlock_destroy(&runtime->syncLock);
 			pthread_mutex_destroy(&runtime->appendLock);
 			pthread_mutex_destroy(&runtime->resizeLock);
@@ -135,6 +139,27 @@ HfsInodeRuntime *hfsInodeRuntimeGet(Hfs *fs, uint64_t inodeId) {
 		pthread_mutex_unlock(&fs->inodeRuntimeLock);
 		errno = rc;
 		return NULL;
+	}
+	{
+		uint32_t stripe;
+
+		for (stripe = 0; stripe < HFS_INODE_RANGE_STRIPE_COUNT; stripe++) {
+			rc = hfsRangeLockInit(&runtime->rangeStripes[stripe]);
+			if (rc != 0) {
+				while (stripe > 0) {
+					stripe--;
+					hfsRangeLockDestroy(&runtime->rangeStripes[stripe]);
+				}
+				hfsRangeLockDestroy(&runtime->rangeGate);
+				pthread_rwlock_destroy(&runtime->syncLock);
+				pthread_mutex_destroy(&runtime->appendLock);
+				pthread_mutex_destroy(&runtime->resizeLock);
+				free(runtime);
+				errno = rc;
+				pthread_mutex_unlock(&fs->inodeRuntimeLock);
+				return NULL;
+			}
+		}
 	}
 	runtime->next = fs->inodeRuntimeBuckets[bucket];
 	fs->inodeRuntimeBuckets[bucket] = runtime;

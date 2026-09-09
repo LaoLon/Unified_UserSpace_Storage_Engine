@@ -2,6 +2,9 @@
 
 #include "hfs_range_lock.h"
 
+/* Keep read bursts short once an exclusive range request is waiting. */
+#define HFS_RANGE_LOCK_READER_BURST 8U
+
 /* Initialize the mutex/condition pair backing one ownerless range lock. */
 int hfsRangeLockInit(HfsRangeLock *lock)
 {
@@ -21,6 +24,7 @@ int hfsRangeLockInit(HfsRangeLock *lock)
 	}
 	lock->readers = 0;
 	lock->waitingWriters = 0;
+	lock->readersAfterWriter = 0;
 	lock->writer = false;
 	return 0;
 }
@@ -35,12 +39,19 @@ void hfsRangeLockDestroy(HfsRangeLock *lock)
 	pthread_mutex_destroy(&lock->mutex);
 }
 
-/* Acquire a shared range while writers have priority to avoid starvation. */
+/* Acquire a shared range with a bounded reader burst for writer fairness. */
 void hfsRangeLockReadLock(HfsRangeLock *lock)
 {
 	pthread_mutex_lock(&lock->mutex);
-	while (lock->writer || lock->waitingWriters != 0) {
+	while (lock->writer ||
+	       (lock->waitingWriters != 0 &&
+		lock->readersAfterWriter >= HFS_RANGE_LOCK_READER_BURST)) {
 		pthread_cond_wait(&lock->condition, &lock->mutex);
+	}
+	if (lock->waitingWriters != 0) {
+		lock->readersAfterWriter++;
+	} else {
+		lock->readersAfterWriter = 0;
 	}
 	lock->readers++;
 	pthread_mutex_unlock(&lock->mutex);
@@ -56,6 +67,7 @@ void hfsRangeLockWriteLock(HfsRangeLock *lock)
 	}
 	lock->waitingWriters--;
 	lock->writer = true;
+	lock->readersAfterWriter = 0;
 	pthread_mutex_unlock(&lock->mutex);
 }
 
@@ -65,9 +77,16 @@ int hfsRangeLockTryReadLock(HfsRangeLock *lock)
 	int rc = 0;
 
 	pthread_mutex_lock(&lock->mutex);
-	if (lock->writer || lock->waitingWriters != 0) {
+	if (lock->writer ||
+	    (lock->waitingWriters != 0 &&
+	     lock->readersAfterWriter >= HFS_RANGE_LOCK_READER_BURST)) {
 		rc = EBUSY;
 	} else {
+		if (lock->waitingWriters != 0) {
+			lock->readersAfterWriter++;
+		} else {
+			lock->readersAfterWriter = 0;
+		}
 		lock->readers++;
 	}
 	pthread_mutex_unlock(&lock->mutex);
@@ -95,8 +114,12 @@ void hfsRangeLockUnlock(HfsRangeLock *lock, bool write)
 	pthread_mutex_lock(&lock->mutex);
 	if (write) {
 		lock->writer = false;
+		lock->readersAfterWriter = 0;
 	} else if (lock->readers != 0) {
 		lock->readers--;
+		if (lock->readers == 0 && lock->waitingWriters == 0) {
+			lock->readersAfterWriter = 0;
+		}
 	}
 	pthread_cond_broadcast(&lock->condition);
 	pthread_mutex_unlock(&lock->mutex);

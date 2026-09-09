@@ -7,6 +7,10 @@
 
 #include "hfs.h"
 
+/* Per-inode range stripes remove cross-file collisions from the data path. */
+#define HFS_INODE_RANGE_STRIPE_COUNT 64U
+#define HFS_INODE_RANGE_STRIPE_UNITS 64U
+
 /* Runtime-only state for one persistent inode; never serialized on disk. */
 typedef struct hfs_inode_runtime {
 	uint64_t inodeId;
@@ -20,7 +24,9 @@ typedef struct hfs_inode_runtime {
 	pthread_mutex_t resizeLock;
 	pthread_mutex_t appendLock;
 	pthread_rwlock_t syncLock;
-	/* Serialize large range operations without taking every global bucket. */
+	/* Serialize overlapping ranges without taking the global hash buckets. */
+	HfsRangeLock rangeStripes[HFS_INODE_RANGE_STRIPE_COUNT];
+	/* Retained as a compatibility barrier for legacy callers. */
 	HfsRangeLock rangeGate;
 	struct hfs_inode_runtime *next;
 } HfsInodeRuntime;

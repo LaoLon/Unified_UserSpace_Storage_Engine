@@ -1188,4 +1188,29 @@ Bug 等级：**致命 > 严重 > 一般**。
   `registered_children=4,copies=0`，统计 `io_direct_ops=2,io_direct_bytes=1048576`；
   registered DMA 生命周期测试也通过。
 
+### 72. 单 inode rangeGate 导致大块 I/O 全局排队且掩盖真实 backend 并发（已修复，严重级）
+
+- **状态**：已修复；数据路径改为 per-inode range stripes，并补充真实 SPDK backend outstanding
+  统计
+- **时间**：2026-09-09（rangeGate 修复与 NVMe FIO 复测）
+- **等级**：严重（64 KiB 高并发吞吐和尾延迟显著恶化）
+- **现象**：前一轮 64 KiB、`numjobs=32` FIO 中，`rangeGate` contention 为 53,900/59,588，
+  平均等待约 7.80 ms，stats-on 吞吐约 3.7 kIOPS；`runtime_inflight_peak=1` 又被误解为
+  HFS 没有异步并发。
+- **排查过程**：确认大范围路径把同一 inode 的请求升级为 `runtime->rangeGate`，而小范围路径
+  还要访问全局 hash bucket；不同文件也可能因为 hash 冲突相互等待。进一步检查
+  `hfsRuntimeSubmitDataBatch()` 发现 per-reactor linked submission queue 已存在，
+  `runtime_queue_depth_peak` 可到 26，但旧统计只显示 dispatcher callback 深度，不显示
+  SPDK data callback 的真实 outstanding。
+- **根因**：单个 inode gate 的粒度过粗，且 writer-priority 在高并发读写下放大排队；统计字段
+  混淆 dispatcher depth 与 backend outstanding，掩盖了“队列已经异步提交”的事实。
+- **修复**：每个 inode 增加 64 个 range stripe，每 stripe 覆盖 64 logical units；按升序获取、
+  逆序释放并保留 bounded reader burst=8，数据热路径不再使用 `rangeGate`。新增
+  `io_backend_outstanding`/`io_backend_outstanding_peak`，在 `spdk_blob_io_*` 提交和完成处
+  统计真实后端窗口；同步 POSIX 继续等待 completion，异步调用使用既有 `hfs_lib_async_*`。
+- **验证**：VM 上 Make/CMake、fast I/O、I/O concurrency（770/770）、4-reactor scaling（192/192）
+  和 registered-DMA/direct smoke 全部通过。修复后 stats-on `range_gate_wait/hold=0`、
+  `runtime_queue_depth_peak=26`、`io_backend_outstanding_peak=31`；stats-off 同口径 HFS
+  64 KiB 为 30,233 IOPS，raw SPDK 为 35,287 IOPS，errors=0。
+
 ## 通用经验总结

@@ -39,6 +39,8 @@ static _Atomic uint_fast64_t g_hfsStatsDataReactorComplete[HFS_STATS_MAX_DATA_RE
 _Atomic uint_fast64_t hfsStatsSpdkSubmits;
 _Atomic uint_fast64_t hfsStatsSpdkCompletions;
 _Atomic uint_fast64_t hfsStatsSpdkRejects;
+_Atomic uint_fast64_t hfsStatsIoOutstanding;
+_Atomic uint_fast64_t hfsStatsIoOutstandingPeak;
 _Atomic uint_fast64_t hfsStatsErrors;
 bool hfsStatsFastEnabledState;
 bool hfsStatsTimingState;
@@ -204,6 +206,8 @@ static void hfsStatsReset(void) {
 	atomic_store_explicit(&hfsStatsSpdkSubmits, 0, memory_order_relaxed);
 	atomic_store_explicit(&hfsStatsSpdkCompletions, 0, memory_order_relaxed);
 	atomic_store_explicit(&hfsStatsSpdkRejects, 0, memory_order_relaxed);
+	atomic_store_explicit(&hfsStatsIoOutstanding, 0, memory_order_relaxed);
+	atomic_store_explicit(&hfsStatsIoOutstandingPeak, 0, memory_order_relaxed);
 	atomic_store_explicit(&hfsStatsErrors, 0, memory_order_relaxed);
 	pthread_mutex_lock(&g_hfsStatsShardLock);
 	for (shard = g_hfsStatsShards; shard != NULL; shard = shard->next) {
@@ -512,6 +516,35 @@ void hfsStatsRecordDataReactorComplete(uint32_t reactorId) {
 		memory_order_relaxed);
 }
 
+/* Record the actual SPDK data callback outstanding depth, not dispatcher depth. */
+void hfsStatsRecordIoSubmit(void) {
+	uint64_t current;
+	uint64_t peak;
+
+	current = atomic_fetch_add_explicit(&hfsStatsIoOutstanding, 1,
+		memory_order_relaxed) + 1U;
+	peak = atomic_load_explicit(&hfsStatsIoOutstandingPeak,
+		memory_order_relaxed);
+	while (current > peak &&
+	       !atomic_compare_exchange_weak_explicit(&hfsStatsIoOutstandingPeak,
+			&peak, current, memory_order_relaxed, memory_order_relaxed)) {
+		/* Retry with the peak value refreshed by the failed compare-exchange. */
+	}
+}
+
+/* Retire one SPDK data callback from the outstanding-depth counter. */
+void hfsStatsRecordIoComplete(void) {
+	uint64_t current;
+
+	current = atomic_load_explicit(&hfsStatsIoOutstanding, memory_order_relaxed);
+	while (current != 0 &&
+	       !atomic_compare_exchange_weak_explicit(&hfsStatsIoOutstanding,
+			&current, current - 1U, memory_order_relaxed,
+			memory_order_relaxed)) {
+		/* Retry with the current value refreshed by the failed compare-exchange. */
+	}
+}
+
 /* Record the child fan-out observed by one aligned parent request. */
 void hfsStatsRecordIoPipeline(uint64_t depth) {
 	HfsStatsShard *shard = hfsStatsShardGet();
@@ -765,6 +798,10 @@ static void hfsStatsWriteSnapshot(void) {
 		atomic_load_explicit(&hfsStatsSpdkCompletions, memory_order_relaxed));
 	HFS_STATS_APPEND("spdk_reject=%"PRIuFAST64"\n",
 		atomic_load_explicit(&hfsStatsSpdkRejects, memory_order_relaxed));
+	HFS_STATS_APPEND("io_backend_outstanding=%"PRIuFAST64"\n",
+		atomic_load_explicit(&hfsStatsIoOutstanding, memory_order_relaxed));
+	HFS_STATS_APPEND("io_backend_outstanding_peak=%"PRIuFAST64"\n",
+		atomic_load_explicit(&hfsStatsIoOutstandingPeak, memory_order_relaxed));
 	HFS_STATS_APPEND("errors=%"PRIuFAST64"\n",
 		atomic_load_explicit(&hfsStatsErrors, memory_order_relaxed));
 	HFS_STATS_APPEND("stats_shards=%"PRIu64"\n", shardCount);

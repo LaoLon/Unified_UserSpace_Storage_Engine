@@ -61,3 +61,11 @@ DMA 等待只在 8K、16K 出现，且没有 `dma_exhaust`。因此直接把 poo
 ## 原始结果
 
 VM 原始目录：`/var/tmp/hfs-fio-nvme-stats-20260909/`。每个块大小包含 HFS/raw SPDK JSON、stderr 和 HFS stats 快照。
+
+## 后续修复结果
+
+本报告的原始 64K 样本是在 `rangeGate` 分片修复前采集的；修复后的同口径结果和提交
+队列分析见 [`hfs_range_stripe_submission_queue_fix_20260909.md`](hfs_range_stripe_submission_queue_fix_20260909.md)。
+修复后 `lock_range_gate_*` 已归零，新增的 `io_backend_outstanding_peak=31` 表明：
+同步 POSIX 调用仍等待各自 completion，但后端已通过 batch submission queue 保持真实
+并发 outstanding。

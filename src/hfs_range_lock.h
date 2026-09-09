@@ -11,6 +11,8 @@ typedef struct HfsRangeLock {
 	pthread_cond_t condition;
 	uint32_t readers;
 	uint32_t waitingWriters;
+	/* Bound the number of readers admitted after a writer queues. */
+	uint32_t readersAfterWriter;
 	bool writer;
 } HfsRangeLock;
 
