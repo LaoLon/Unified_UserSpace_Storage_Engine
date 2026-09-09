@@ -10,7 +10,7 @@ Bug 等级：**致命 > 严重 > 一般**。
 
 ### 已修复
 
-1–5、8–10、10b、11–43、45–47、51–52、57、60–62、67–70。包括已由后续 shard 修复的历史记录；条目中的原始“遗留”描述保留用于复盘，当前状态以本汇总和条目状态字段为准。
+1–5、8–10、10b、11–43、45–47、51–52、57、60–62、67–71。包括已由后续 shard 修复的历史记录；条目中的原始“遗留”描述保留用于复盘，当前状态以本汇总和条目状态字段为准。
 
 ### 未修复
 
@@ -1160,5 +1160,25 @@ Bug 等级：**致命 > 严重 > 一般**。
 - **验证**：VM 上 `bash -n` 通过；NVMe 4K/8K/16K/32K/64K 两轮 FIO 均完成，HFS/raw
   errors=0，结果保存在 `/var/tmp/hfs-fio-nvme-current-20260909-r1`（单线程）和
   `r2`（HFS numjobs=32）。
+
+### 71. 大范围 I/O 的 rangeGate 未进入统计计时（待修复，一般级）
+
+- **状态**：待修复；不影响数据正确性，但会让 64 KiB FIO 归因错误地显示为“无锁等待”
+- **时间**：2026-09-09（NVMe FIO stats attribution）
+- **等级**：一般（可观测性缺口）
+- **现象**：带 `HFS_STATS_TIMING=1` 的 `numjobs=32` NVMe FIO 中，64 KiB 样本的
+  `lock_io_wait_ns=179`、`lock_io_contention=0`，但 HFS p99 达到 41.7 ms，吞吐只有
+  raw SPDK 的 9.8%；4/8/16/32 KiB 样本则出现数百秒累计 `lock_io_wait_ns` 和大量竞争。
+- **排查过程**：核对 `src/hfs_io.c` 的 `hfsIoRangeLock()`：小范围请求在每个 bucket
+  外围调用 `hfsStatsLockBefore/After/ReleaseFast(HFS_STATS_LOCK_IO)`；达到
+  `HFS_IO_RANGE_GATE_THRESHOLD` 的大范围请求直接对 `runtime->rangeGate` 调用
+  `hfsRangeLockWriteLock()`，没有对应的 stats timing。64 KiB 请求因此绕过了当前统计，
+  并不能证明它没有等待锁。
+- **根因**：range bucket 和 per-inode rangeGate 复用了同一个逻辑 guard，但统计埋点只覆盖
+  bucket 分支，未覆盖 gate 的阻塞/持有生命周期。
+- **处理**：当前先在归因报告中标记该缺口，不把 64 KiB 的零 `lock_io_wait_ns` 当作结论；
+  后续应增加独立 `range_gate_wait/hold` 计数和 tracepoint，并用同一 workload 复测。
+- **当前证据**：统计快照保存在 VM `/var/tmp/hfs-fio-nvme-stats-20260909/`；所有样本
+  `io_direct_ops=0`、`spdk_submit=spdk_complete`、`errors=0`。
 
 ## 通用经验总结
