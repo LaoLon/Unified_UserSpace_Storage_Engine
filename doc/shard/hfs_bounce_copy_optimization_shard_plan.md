@@ -3,7 +3,7 @@
 > **状态**：shard-54 ～ shard-59 已实现并完成当前 VM 可执行项；direct-NVMe 受设备/插件缺失跳过
 > **计划范围**：shard-54 ～ shard-59
 > **输入评审**：[`review/hfs_user_buffer_bounce_copy_optimization.md`](../../review/hfs_user_buffer_bounce_copy_optimization.md)
-> **当前基线**：`main@b490bad`，VM 内 SPDK 使用锁定 commit `f0b63ed866f0e4d3c56e73bd4a98d0042956147a`
+> **当前基线**：`main@4f2d6a1`，VM 内 SPDK 使用锁定 commit `f0b63ed866f0e4d3c56e73bd4a98d0042956147a`
 
 ## 1. 背景与问题定义
 

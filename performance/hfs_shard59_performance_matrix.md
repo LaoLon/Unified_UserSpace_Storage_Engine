@@ -3,7 +3,7 @@
 > 记录时间：2026-09-09
 > 目标：验证 shard-54～58 的 bounce-copy、请求放大和 completion 生命周期改动，并完成
 > FIO、RocksDB、MariaDB/MySQL 的统一回归。
-> HFS source commit：`3443c09`；本报告脚本/文档收口 commit：`0ef4a0d`。
+> HFS source commit：`3443c09`；本报告脚本/文档收口 commit：`4f2d6a1`。
 > SPDK：VM 内 Git 工作树，锁定 `f0b63ed866f0e4d3c56e73bd4a98d0042956147a`。
 
 ## 测试口径
