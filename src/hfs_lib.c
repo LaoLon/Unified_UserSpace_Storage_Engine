@@ -796,6 +796,24 @@ Hfs *hfs_lib_get_fs(void) {
 	return g_fs;
 }
 
+/* Register a caller-owned DMA range for async direct-I/O lifetime tracking. */
+int hfsRegisterBuffer(void *buffer, size_t length) {
+	if (g_fs == NULL) {
+		errno = ENODEV;
+		return -1;
+	}
+	return hfsIoRegisterBuffer(buffer, length);
+}
+
+/* Unregister a DMA range after all requests have released their references. */
+int hfsUnregisterBuffer(void *buffer) {
+	if (g_fs == NULL) {
+		errno = ENODEV;
+		return -1;
+	}
+	return hfsIoUnregisterBuffer(buffer);
+}
+
 /* Runs before main(): proves the library was loaded by LD_PRELOAD. */
 __attribute__((constructor))
 static void hfs_preload_ctor(void) {

@@ -3,6 +3,7 @@
 #include <limits.h>
 #include <pthread.h>
 #include <stdint.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/uio.h>
@@ -40,6 +41,14 @@ typedef struct HfsIoLease {
 	uint32_t slot;
 	uint8_t *buffer;
 } HfsIoLease;
+
+/* Registered DMA memory range with an outstanding-request reference count. */
+typedef struct HfsIoBufferRegistration {
+	void *base;
+	size_t length;
+	atomic_uint active;
+	struct HfsIoBufferRegistration *next;
+} HfsIoBufferRegistration;
 
 /* Storage and free-list state for one DMA size class. */
 struct HfsIoPoolClass {
@@ -101,7 +110,15 @@ typedef struct HfsIoRequest {
 	void (*asyncDone)(struct HfsIoRequest *request);
 	void *asyncContext;
 	uint32_t asyncIndex;
+	HfsIoBufferRegistration *registeredBuffer;
 } HfsIoRequest;
+
+static pthread_mutex_t g_hfsIoBufferLock = PTHREAD_MUTEX_INITIALIZER;
+static HfsIoBufferRegistration *g_hfsIoBuffers;
+
+static HfsIoBufferRegistration *hfsIoBufferAcquire(const void *buffer,
+						 size_t bytes);
+static void hfsIoBufferRelease(HfsIoBufferRegistration *entry);
 
 /* Set of hashed range buckets held by one request in ascending order. */
 typedef struct HfsIoRangeGuard {
@@ -110,6 +127,16 @@ typedef struct HfsIoRangeGuard {
 	bool write;
 	HfsInodeRuntime *runtime;
 } HfsIoRangeGuard;
+
+/* Worker-free direct request state retained until the SPDK callback arrives. */
+typedef struct HfsIoDirectAsync {
+	HfsFile *file;
+	HfsIoAsyncCallback callback;
+	void *context;
+	HfsInodeRuntime *runtime;
+	HfsIoRangeGuard guard;
+	HfsIoRequest request;
+} HfsIoDirectAsync;
 
 /* Use a per-inode gate when a range would otherwise lock most global buckets. */
 #define HFS_IO_RANGE_GATE_THRESHOLD (HFS_RANGE_LOCK_COUNT / 4U)
@@ -330,6 +357,7 @@ static void hfsIoSyncReadUnlock(HfsInodeRuntime *runtime) {
 
 /* Capture an SPDK completion code before waking the synchronous caller. */
 static void hfsIoDone(void *arg, int bserrno);
+static void hfsIoDirectAsyncDone(HfsIoRequest *request);
 
 /* Map a data transfer opcode to the shared request result vocabulary. */
 static HfsRequestOperation hfsIoRequestOperation(HfsIoOperation operation) {
@@ -664,6 +692,8 @@ static void hfsIoDone(void *arg, int bserrno) {
 	if (request->dataPath) {
 		hfsStatsRecordDataReactorCompleteFast(request->dataReactor);
 	}
+	hfsIoBufferRelease(request->registeredBuffer);
+	request->registeredBuffer = NULL;
 	hfsRequestComplete(&request->result, bserrno, request->units);
 	if (request->asyncMagic == HFS_IO_ASYNC_MAGIC && request->asyncDone != NULL) {
 		request->asyncDone(request);
@@ -672,8 +702,19 @@ static void hfsIoDone(void *arg, int bserrno) {
 
 /* Submit one child request without waiting for its owner-thread completion. */
 static int hfsIoStartRequest(HfsIoRequest *request) {
+	size_t requestBytes;
 	int rc;
 
+	if (request == NULL || request->file == NULL || request->file->fs == NULL) {
+		errno = EINVAL;
+		return -1;
+	}
+	if (!request->vector && request->buffer != NULL &&
+		request->units <= SIZE_MAX / (size_t)request->file->fs->unitSize) {
+		requestBytes = (size_t)request->units * request->file->fs->unitSize;
+		request->registeredBuffer = hfsIoBufferAcquire(request->buffer,
+								 requestBytes);
+	}
 	hfsRequestInit(&request->result, hfsIoRequestOperation(request->operation));
 	if (request->dataPath && request->dataReactor != 0) {
 		rc = hfsRequestSubmitDataBatch(&request->result, hfsIoStart,
@@ -683,6 +724,10 @@ static int hfsIoStartRequest(HfsIoRequest *request) {
 		rc = hfsRequestSubmitBatch(&request->result, hfsIoStart, request,
 					     &request->batchItem);
 	}
+	if (rc != 0) {
+		hfsIoBufferRelease(request->registeredBuffer);
+		request->registeredBuffer = NULL;
+	}
 	if (rc == 0 && request->dataPath) {
 		hfsStatsRecordDataReactorSubmitFast(request->dataReactor);
 	}
@@ -691,6 +736,149 @@ static int hfsIoStartRequest(HfsIoRequest *request) {
 
 /* Forward declaration used by direct and vector synchronous submissions. */
 static int hfsIoWaitRequest(HfsIoRequest *request);
+
+/* Return true when a byte range is fully contained in a registered range. */
+static HfsIoBufferRegistration *hfsIoFindBufferLocked(const void *buffer,
+						      size_t bytes) {
+	uintptr_t start;
+	uintptr_t end;
+	HfsIoBufferRegistration *entry;
+
+	if (buffer == NULL || bytes == 0) {
+		return NULL;
+	}
+	start = (uintptr_t)buffer;
+	if (start > UINTPTR_MAX - bytes) {
+		return NULL;
+	}
+	end = start + bytes;
+	for (entry = g_hfsIoBuffers; entry != NULL; entry = entry->next) {
+		uintptr_t entryStart = (uintptr_t)entry->base;
+		uintptr_t entryEnd = entryStart + entry->length;
+
+		if (start >= entryStart && end <= entryEnd) {
+			return entry;
+		}
+	}
+	return NULL;
+}
+
+/* Acquire an outstanding reference for a registered contiguous buffer. */
+static HfsIoBufferRegistration *hfsIoBufferAcquire(const void *buffer,
+						 size_t bytes) {
+	HfsIoBufferRegistration *entry;
+
+	pthread_mutex_lock(&g_hfsIoBufferLock);
+	entry = hfsIoFindBufferLocked(buffer, bytes);
+	if (entry != NULL) {
+		atomic_fetch_add_explicit(&entry->active, 1, memory_order_relaxed);
+	}
+	pthread_mutex_unlock(&g_hfsIoBufferLock);
+	return entry;
+}
+
+/* Release an outstanding reference before waking the public waiter. */
+static void hfsIoBufferRelease(HfsIoBufferRegistration *entry) {
+	if (entry == NULL) {
+		return;
+	}
+	pthread_mutex_lock(&g_hfsIoBufferLock);
+	if (atomic_load_explicit(&entry->active, memory_order_relaxed) > 0) {
+		atomic_fetch_sub_explicit(&entry->active, 1, memory_order_relaxed);
+	}
+	pthread_mutex_unlock(&g_hfsIoBufferLock);
+}
+
+/* Register a DMA-capable memory range for async direct I/O lifetime tracking. */
+int hfsIoRegisterBuffer(void *buffer, size_t length) {
+	HfsIoBufferRegistration *entry;
+	HfsIoBufferRegistration *current;
+	uint64_t span = length;
+	uintptr_t start;
+	uintptr_t end;
+
+	if (buffer == NULL || length == 0 ||
+		spdk_vtophys(buffer, &span) == SPDK_VTOPHYS_ERROR || span < length) {
+		errno = EINVAL;
+		return -1;
+	}
+	start = (uintptr_t)buffer;
+	if (start > UINTPTR_MAX - length) {
+		errno = EOVERFLOW;
+		return -1;
+	}
+	end = start + length;
+	entry = calloc(1, sizeof(*entry));
+	if (entry == NULL) {
+		errno = ENOMEM;
+		return -1;
+	}
+	entry->base = buffer;
+	entry->length = length;
+	atomic_init(&entry->active, 0);
+	pthread_mutex_lock(&g_hfsIoBufferLock);
+	for (current = g_hfsIoBuffers; current != NULL; current = current->next) {
+		uintptr_t currentStart = (uintptr_t)current->base;
+		uintptr_t currentEnd = currentStart + current->length;
+
+		if (start < currentEnd && currentStart < end) {
+			pthread_mutex_unlock(&g_hfsIoBufferLock);
+			free(entry);
+			errno = EEXIST;
+			return -1;
+		}
+	}
+	entry->next = g_hfsIoBuffers;
+	g_hfsIoBuffers = entry;
+	pthread_mutex_unlock(&g_hfsIoBufferLock);
+	return 0;
+}
+
+/* Unregister a DMA range after all direct requests have released it. */
+int hfsIoUnregisterBuffer(void *buffer) {
+	HfsIoBufferRegistration **link;
+	HfsIoBufferRegistration *entry;
+
+	if (buffer == NULL) {
+		errno = EINVAL;
+		return -1;
+	}
+	pthread_mutex_lock(&g_hfsIoBufferLock);
+	for (link = &g_hfsIoBuffers; *link != NULL; link = &(*link)->next) {
+		if ((*link)->base != buffer) {
+			continue;
+		}
+		entry = *link;
+		if (atomic_load_explicit(&entry->active, memory_order_relaxed) != 0) {
+			pthread_mutex_unlock(&g_hfsIoBufferLock);
+			errno = EBUSY;
+			return -1;
+		}
+		*link = entry->next;
+		pthread_mutex_unlock(&g_hfsIoBufferLock);
+		free(entry);
+		return 0;
+	}
+	pthread_mutex_unlock(&g_hfsIoBufferLock);
+	errno = ENOENT;
+	return -1;
+}
+
+/* Drop registrations during final unmount after runtime requests have drained. */
+static void hfsIoClearBufferRegistry(void) {
+	HfsIoBufferRegistration *entry;
+	HfsIoBufferRegistration *next;
+
+	pthread_mutex_lock(&g_hfsIoBufferLock);
+	entry = g_hfsIoBuffers;
+	g_hfsIoBuffers = NULL;
+	pthread_mutex_unlock(&g_hfsIoBufferLock);
+	while (entry != NULL) {
+		next = entry->next;
+		free(entry);
+		entry = next;
+	}
+}
 
 /* Check that SPDK can address one caller buffer without a bounce copy. */
 static bool hfsIoBufferDmaCapable(const void *buffer, size_t bytes) {
@@ -745,6 +933,130 @@ static int hfsIoSubmitDirect(HfsFile *file, void *buffer, uint64_t offset,
 		return -1;
 	}
 	hfsStatsRecordIoDirectFast(units * file->fs->unitSize);
+	return 0;
+}
+
+/* Finish one direct async request and release its synchronization domain. */
+static void hfsIoDirectAsyncDone(HfsIoRequest *request) {
+	HfsIoDirectAsync *direct = request->asyncContext;
+	int error = request->result.completionRc;
+	ssize_t result;
+
+	if (error != 0) {
+		error = error < 0 ? -error : error;
+		result = -1;
+	} else {
+		result = (ssize_t)(request->units * direct->file->fs->unitSize);
+	}
+	hfsIoRangeUnlock(direct->file, &direct->guard);
+	hfsIoSyncReadUnlock(direct->runtime);
+	direct->callback(direct->context, result, error);
+	free(direct);
+}
+
+/* Submit a registered/DMA-capable contiguous range without a bounce buffer. */
+static int hfsIoSubmitDirectAsync(HfsFile *file, void *buffer, size_t count,
+					   uint64_t offset,
+					   HfsIoAsyncCallback callback,
+					   void *context) {
+	HfsIoDirectAsync *direct;
+	uint64_t units = count / file->fs->unitSize;
+	int rc;
+
+	direct = calloc(1, sizeof(*direct));
+	if (direct == NULL) {
+		errno = ENOMEM;
+		return -1;
+	}
+	direct->file = file;
+	direct->callback = callback;
+	direct->context = context;
+	direct->runtime = hfsIoSyncReadTryLock(file);
+	if (direct->runtime == NULL ||
+		hfsIoRangeTryLock(file, offset, count, false, &direct->guard) != 0) {
+		if (direct->runtime != NULL) {
+			hfsIoSyncReadUnlock(direct->runtime);
+		}
+		free(direct);
+		errno = EAGAIN;
+		return -1;
+	}
+	memset(&direct->request, 0, sizeof(direct->request));
+	direct->request.file = file;
+	direct->request.buffer = buffer;
+	direct->request.offset = offset / file->fs->unitSize;
+	direct->request.units = units;
+	direct->request.operation = HFS_IO_READ;
+	direct->request.dataReactor = hfsRuntimeDataReactorFor(file->fs,
+								file->blobId,
+								direct->request.offset);
+	direct->request.channel = hfsRuntimeDataChannel(file->fs,
+								direct->request.dataReactor);
+	direct->request.dataPath = true;
+	direct->request.asyncMagic = HFS_IO_ASYNC_MAGIC;
+	direct->request.asyncDone = hfsIoDirectAsyncDone;
+	direct->request.asyncContext = direct;
+	rc = direct->request.channel == NULL ? -1 :
+		hfsIoStartRequest(&direct->request);
+	if (rc != 0) {
+		hfsIoRangeUnlock(file, &direct->guard);
+		hfsIoSyncReadUnlock(direct->runtime);
+		free(direct);
+		return -1;
+	}
+	return 0;
+}
+
+/* Submit one registered/DMA-capable write without a bounce buffer. */
+static int hfsIoSubmitDirectWriteAsync(HfsFile *file, const void *buffer,
+						size_t count, uint64_t offset,
+						HfsIoAsyncCallback callback,
+						void *context) {
+	HfsIoDirectAsync *direct;
+	uint64_t units = count / file->fs->unitSize;
+	int rc;
+
+	direct = calloc(1, sizeof(*direct));
+	if (direct == NULL) {
+		errno = ENOMEM;
+		return -1;
+	}
+	direct->file = file;
+	direct->callback = callback;
+	direct->context = context;
+	direct->runtime = hfsIoSyncReadTryLock(file);
+	if (direct->runtime == NULL ||
+		hfsIoRangeTryLock(file, offset, count, true, &direct->guard) != 0) {
+		if (direct->runtime != NULL) {
+			hfsIoSyncReadUnlock(direct->runtime);
+		}
+		free(direct);
+		errno = EAGAIN;
+		return -1;
+	}
+	memset(&direct->request, 0, sizeof(direct->request));
+	direct->request.file = file;
+	direct->request.buffer = (void *)buffer;
+	direct->request.offset = offset / file->fs->unitSize;
+	direct->request.units = units;
+	direct->request.operation = HFS_IO_WRITE;
+	direct->request.dataReactor = hfsRuntimeDataReactorFor(file->fs,
+								file->blobId,
+								direct->request.offset);
+	direct->request.channel = hfsRuntimeDataChannel(file->fs,
+								direct->request.dataReactor);
+	direct->request.dataPath = true;
+	direct->request.asyncMagic = HFS_IO_ASYNC_MAGIC;
+	direct->request.asyncDone = hfsIoDirectAsyncDone;
+	direct->request.asyncContext = direct;
+	rc = direct->request.channel == NULL ? -1 :
+		hfsIoStartRequest(&direct->request);
+	if (rc != 0) {
+		hfsIoRangeUnlock(file, &direct->guard);
+		hfsIoSyncReadUnlock(direct->runtime);
+		free(direct);
+		return -1;
+	}
 	return 0;
 }
 
@@ -1111,6 +1423,11 @@ int hfsIoReadAtAsync(HfsFile *file, uint8_t *buffer, size_t count,
 		errno = EINVAL;
 		return -1;
 	}
+	if (hfsIoBufferDmaCapable(buffer, count) &&
+		count / file->fs->unitSize <= hfsIoMaxUnits(file->fs)) {
+		return hfsIoSubmitDirectAsync(file, buffer, count, offset,
+						      callback, context);
+	}
 	parent = calloc(1, sizeof(*parent));
 	if (parent == NULL) {
 		errno = ENOMEM;
@@ -1177,6 +1494,11 @@ int hfsIoWriteAtAsync(HfsFile *file, const uint8_t *buffer, size_t count,
 	    count % (size_t)file->fs->unitSize != 0) {
 		errno = EINVAL;
 		return -1;
+	}
+	if (hfsIoBufferDmaCapable(buffer, count) &&
+		count / file->fs->unitSize <= hfsIoMaxUnits(file->fs)) {
+		return hfsIoSubmitDirectWriteAsync(file, buffer, count, offset,
+							callback, context);
 	}
 	if (file->fs->clusterSize == 0) {
 		errno = EAGAIN;
@@ -1441,6 +1763,7 @@ void hfsIoFini(Hfs *fs) {
 	for (i = 0; i < HFS_RANGE_LOCK_COUNT; i++) {
 		pthread_rwlock_destroy(&fs->rangeLocks[i]);
 	}
+	hfsIoClearBufferRegistry();
 }
 
 /* Read one complete I/O unit into a leased DMA buffer. */

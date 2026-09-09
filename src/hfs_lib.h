@@ -37,6 +37,11 @@ void hfs_lib_fini(void);
 /* Return the mounted filesystem instance, or NULL before init. */
 Hfs *hfs_lib_get_fs(void);
 
+/* Register DMA-capable memory for experimental asynchronous direct I/O. */
+int hfsRegisterBuffer(void *buffer, size_t length);
+/* Unregister DMA memory; returns EBUSY while requests still reference it. */
+int hfsUnregisterBuffer(void *buffer);
+
 /* Open a file/dir under the HFS mount prefix. */
 int hfs_lib_open(const char *path, int flags, mode_t mode);
 /* Open relative to an HFS directory fd (openat semantics). */

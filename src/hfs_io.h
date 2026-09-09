@@ -12,6 +12,10 @@ typedef void (*HfsIoAsyncCallback)(void *context, ssize_t result, int error);
 int hfsIoInit(Hfs *fs);
 /* Stop new pool waiters and release all DMA buffers after I/O has drained. */
 void hfsIoFini(Hfs *fs);
+/* Register a DMA-capable contiguous range for async direct-I/O lifetime tracking. */
+int hfsIoRegisterBuffer(void *buffer, size_t length);
+/* Unregister a range after all outstanding direct requests have completed. */
+int hfsIoUnregisterBuffer(void *buffer);
 
 /* Read a byte range through request-local DMA buffers. */
 ssize_t hfsIoReadAt(HfsFile *file, uint8_t *buffer, size_t count,

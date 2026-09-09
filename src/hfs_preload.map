@@ -30,5 +30,6 @@ HFS_0.1 {
     global: hfs_lib_async_pread; hfs_lib_async_pwrite;
             hfs_lib_async_preadv; hfs_lib_async_pwritev;
             hfs_lib_async_fsync; hfsAsyncCancel; hfsAsyncWait;
-            hfsAsyncResult; hfsAsyncRelease;
+            hfsAsyncResult; hfsAsyncRelease; hfsRegisterBuffer;
+            hfsUnregisterBuffer;
 };

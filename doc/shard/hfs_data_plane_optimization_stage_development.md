@@ -1,6 +1,6 @@
 # HFS 数据面性能优化阶段计划（shard-49～53）
 
-> 状态：shard-49～51 已完成，shard-52～53 待实施；基于 `main@78650bf` 制定（2026-09-09）
+> 状态：shard-49～52 已完成，shard-53 待实施；基于 `main@78650bf` 制定（2026-09-09）
 > 前置阶段：shard-45 async libhfs、shard-46 多 reactor/channel、shard-47 DMA/vector、当前 shard-48 性能回归收口  
 > 输入依据：`doc/bug.md` #63/#64、`doc/design/fio_baseline_notes.md`、VM 最新 NVMe FIO 对比结果  
 > 适用范围：单 HFS 进程、持久化 AIO/NVMe bdev；不扩大多进程、mmap、native libaio/io_uring 支持边界
@@ -297,6 +297,22 @@ int hfsUnregisterBuffer(void *buffer);
 - direct path 的 `copy_bytes` 接近零；普通 buffer 的兼容测试仍通过。
 - 注册/注销、close、fork、cancel、shutdown 和错误注入无 use-after-free。
 - 不宣称 `mmap`、native libaio/io_uring 或任意第三方 buffer 自动零拷贝已支持。
+
+### 7.5 shard-52 实施结果（2026-09-09）
+
+- 新增实验性 `hfsRegisterBuffer(void *, size_t)` / `hfsUnregisterBuffer(void *)`，导出到
+  `HFS_0.1`；注册时要求整个范围通过 `spdk_vtophys`，重叠范围返回 `EEXIST`，未注册或无效
+  heap buffer 安全返回 `EINVAL`。
+- 每个 direct request 在提交前取得 registered range 引用，在 `hfsIoDone` 唤醒调用方前释放；
+  unregister 遇到 outstanding request 返回 `EBUSY`，完成后才允许注销，避免用户 buffer 提前复用。
+- async aligned DMA buffer 现在绕过 request-local bounce pool，走 worker-free direct request；
+  普通 heap buffer 仍走原有兼容 pipeline。direct path 仍受 unit alignment、单 request 最大
+  DMA chunk 和 range reservation 约束，vector/mmap/native io_uring 支持边界不变。
+- 新增 `scripts/db/registered_dma_test.sh`：使用 SPDK DMA memory 验证注册、重复注册、异步写、
+  生命周期注销和数据回读；VM 输出 `REGISTERED DMA IO OK direct=1 duplicate=EEXIST lifetime=closed`，
+  与 Make/CMake、fast I/O、stripe、pool、concurrency、reactor=2/8 回归一起通过。
+- 普通用户 buffer 的零拷贝比例未被虚假扩大；只有显式注册且通过物理地址验证的 buffer 才计入
+  direct path，最终 FIO/数据库收益和 NVMe 口径由 shard-53 收口。
 
 ## 8. shard-53：性能收口与数据库回归
 
