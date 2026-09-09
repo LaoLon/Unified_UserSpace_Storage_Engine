@@ -10,7 +10,7 @@ Bug 等级：**致命 > 严重 > 一般**。
 
 ### 已修复
 
-1–5、8–10、10b、11–43、45–47、51–52、57、60–62、67。包括已由后续 shard 修复的历史记录；条目中的原始“遗留”描述保留用于复盘，当前状态以本汇总和条目状态字段为准。
+1–5、8–10、10b、11–43、45–47、51–52、57、60–62、67–69。包括已由后续 shard 修复的历史记录；条目中的原始“遗留”描述保留用于复盘，当前状态以本汇总和条目状态字段为准。
 
 ### 未修复
 
@@ -1101,5 +1101,43 @@ Bug 等级：**致命 > 严重 > 一般**。
   两个 direct children、`copy_ops=0`）、registered DMA 生命周期、request-local trace、DMA
   pool backpressure、POSIX contract 全部通过；write→read async 回归不再阻塞，SPDK
   submit/complete 保持闭合。
+
+### 68. completion 先唤醒 waiter 后继续访问栈 request 导致段错误（已修复，严重级）
+
+- **状态**：已修复；completion trace 在唤醒同步 waiter 前完成，异步 callback 元数据提前快照
+- **时间**：2026-09-09（shard-59 性能矩阵回归）
+- **等级**：严重（会使 FIO/数据库进程随机 SIGSEGV，且通常只在退出或 JSON 输出路径暴露）
+- **现象**：Aio FIO 使用 `--output-format=json` 时偶发 `libhfs.so` 段错误；普通文本输出和
+  短样本可能通过。内核日志显示 fault 位于 `hfsIoDone`，地址落在
+  `request->file->fs->unitSize` 的解引用。
+- **排查过程**：将 fault 地址按 VM 当前 ELF text load 偏移还原到
+  `src/hfs_io.c:822`；反汇编确认 `hfsIoDone()` 先执行 `hfsRequestComplete()`，该函数
+  会唤醒同步 waiter，随后 completion 线程又继续读 `request->file`、`request->units` 和
+  trace 字段。FIO JSON 的收尾时序更容易让 waiter 释放栈上 request，复现由低概率变为稳定。
+- **根因**：同步 request 的生命周期只保证到 `hfsRequestComplete()` 被调用前；唤醒 waiter
+  后，completion 回调仍把 request 当作有效对象使用，形成 use-after-return/use-after-free。
+- **修复**：在唤醒前快照 trace 所需的 request/file 字段、完成 units 和异步 callback 指针；
+  先导出 completion trace，再调用 `hfsRequestComplete()`，之后只使用已快照的 callback，
+  不再访问 waiter 可能已经回收的 request 内容。
+- **验证**：修复后 Aio FIO `psync` 文本/JSON 输出重复样本、shard-58 request reduction、
+  I/O error injection 和后续 shard-59 矩阵回归均无段错误；SPDK submit/complete 保持闭合。
+
+### 69. MariaDB bootstrap 强制回收后立即重启触发 backend lock 竞争（已修复，一般级）
+
+- **状态**：已修复；性能测试入口等待共享 backend flock 可再次获取后才启动服务
+- **时间**：2026-09-09（shard-59 性能矩阵）
+- **等级**：一般（只影响性能测试脚本的启动稳定性，不改变 HFS 数据语义）
+- **现象**：MariaDB bootstrap 在已提交系统表后出现 signal-handler 超时，测试器按既定
+  边界回收进程组；紧接着启动 HFS server 时，路径操作返回 `ENODEV`。
+- **排查过程**：检查 HFS 日志发现新进程的 `hfs_acquire_backend_lock()` 返回 `EBUSY`；
+  `lslocks`/精确 PID 检查确认旧 bootstrap 子进程的 `HFS_LOCK_PATH` flock 释放存在短暂
+  延迟。等待锁重新可获取后，新的 HFS 进程即可完成 mount 并正常启动。
+- **根因**：测试脚本只等待 bootstrap leader 的 `wait`，没有等待所有 MariaDB 子进程的
+  文件锁句柄释放，导致下一进程在 mount 前被拒绝。
+- **修复**：`mysql_stage2_benchmark.sh` 在 bootstrap 边界后以
+  `HFS_MYSQL_LOCK_WAIT_SECONDS`（默认 15 秒）轮询 `flock -n`，锁释放后再启动 HFS
+  server；shard-59 同时规范化 wrapper 的换行并显式启用 signal 边界。
+- **验证**：干净 VM 上 shard-59 FIO、RocksDB、MariaDB/MySQL 矩阵全绿，输出
+  `MYSQL STAGE2 OK`、`SHARD59 PERFORMANCE MATRIX OK`。
 
 ## 通用经验总结

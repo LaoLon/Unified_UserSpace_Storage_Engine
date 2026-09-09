@@ -798,6 +798,18 @@ static void hfsIoStart(void *arg) {
 static void hfsIoDone(void *arg, int bserrno) {
 	HfsIoRequest *request = arg;
 	uint64_t durationNs = 0;
+	uint64_t traceRequestId;
+	uint64_t traceParentId;
+	uint64_t traceInodeId;
+	uint64_t traceOffset;
+	uint64_t traceBytes;
+	uint32_t traceUnits;
+	uint32_t traceReactor;
+	HfsTraceOperation traceOperation;
+	HfsTraceBufferKind traceBufferKind;
+	HfsFile *traceFile;
+	uint64_t completedUnits;
+	void (*asyncDone)(HfsIoRequest *request);
 
 	/* Publish reactor accounting before waking waiters or shutdown snapshots. */
 	if (request->dataPath) {
@@ -805,7 +817,21 @@ static void hfsIoDone(void *arg, int bserrno) {
 	}
 	hfsIoBufferRelease(request->registeredBuffer);
 	request->registeredBuffer = NULL;
-	hfsRequestComplete(&request->result, bserrno, request->units);
+	/* Snapshot all request fields before waking a waiter that may unwind a stack request. */
+	traceRequestId = request->result.requestId;
+	traceParentId = request->traceParentId;
+	traceFile = request->file;
+	traceInodeId = traceFile != NULL ? traceFile->inodeId : 0;
+	traceOffset = request->offset;
+	traceBytes = request->units *
+		(traceFile != NULL && traceFile->fs != NULL ? traceFile->fs->unitSize : 0);
+	traceUnits = (uint32_t)request->units;
+	traceReactor = request->dataReactor;
+	traceOperation = hfsIoTraceOperation(request->operation);
+	traceBufferKind = request->traceBufferKind;
+	completedUnits = request->units;
+	asyncDone = request->asyncMagic == HFS_IO_ASYNC_MAGIC ?
+		request->asyncDone : NULL;
 	if (request->traceSubmitNs != 0) {
 		uint64_t nowNs = hfsTraceNowNs();
 		if (nowNs >= request->traceSubmitNs) {
@@ -813,17 +839,14 @@ static void hfsIoDone(void *arg, int bserrno) {
 		}
 	}
 	hfsTraceEmit(HFS_TRACE_SPDK_COMPLETE,
-		     hfsIoTraceOperation(request->operation),
-		     request->traceBufferKind,
-		     request->result.requestId, request->traceParentId,
-		     request->file != NULL ? request->file->inodeId : 0,
-		     request->offset,
-		     request->units *
-		     (request->file != NULL ? request->file->fs->unitSize : 0),
-		     (uint32_t)request->units, 0, request->dataReactor, 0,
+		     traceOperation, traceBufferKind, traceRequestId, traceParentId,
+		     traceInodeId, traceOffset, traceBytes, traceUnits, 0,
+		     traceReactor, 0,
 		     0, durationNs, bserrno);
-	if (request->asyncMagic == HFS_IO_ASYNC_MAGIC && request->asyncDone != NULL) {
-		request->asyncDone(request);
+	/* Publish completion only after tracing stops touching the caller-owned request. */
+	hfsRequestComplete(&request->result, bserrno, completedUnits);
+	if (asyncDone != NULL) {
+		asyncDone(request);
 	}
 }
 

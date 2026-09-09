@@ -76,3 +76,12 @@ DMA-addressable. Applications that need a stable direct buffer may use the exper
 completion, and unregister rejects outstanding I/O. Vector read/write uses the same probe and
 attempts one native `spdk_blob_io_*v`; ordinary heap buffers continue through the bounded bounce
 path. No mmap, native libaio, or native io_uring support is implied.
+
+## Completion lifetime invariant (shard-59)
+
+`hfsIoDone()` snapshots trace fields, file metadata, completed units, and the optional async
+callback before calling `hfsRequestComplete()`. The latter wakes a synchronous waiter, so no code
+after the wake-up may dereference the caller-owned synchronous request. The async callback is
+invoked only from the previously snapshotted pointer and remains valid for heap-owned async
+requests. This ordering prevents a waiter unwind from turning the completion path into a
+use-after-return while keeping submit/complete counters and trace events closed.

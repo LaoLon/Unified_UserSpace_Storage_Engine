@@ -264,3 +264,14 @@ FIO raw 文件；该限制是环境边界，不是 HFS 性能结果，后续 fre
 阶段结论：shard-49～53 的代码和回归已经收口；HFS 支持单进程持久化 AIO/NVMe 上的
 MySQL/MariaDB-compatible server、RocksDB、同步 POSIX 和 async libhfs。普通 POSIX buffer
 仍可能走 bounce copy，多个 HFS 进程共享挂载、mmap、native libaio/io_uring 继续不在支持范围。
+
+## shard-59 性能矩阵收口（2026-09-09）
+
+新增 `scripts/db/shard59_performance_matrix.sh`，统一输出持久化 Aio 下的 HFS/native
+FIO、RocksDB 和 MariaDB/MySQL 结果。快速验收使用 1 轮、FIO 3 s、RocksDB 5 s、MySQL
+100 queries，所有 workload errors=0；详细表格见
+[`performance/hfs_shard59_performance_matrix.md`](../../performance/hfs_shard59_performance_matrix.md)。
+
+本轮同时修复了 FIO JSON 收尾时 `hfsIoDone()` completion waiter 唤醒后的 request UAF，
+以及 MariaDB bootstrap 强制回收后的 backend flock 启动竞争。当前 VM 没有 NVMe 设备和
+SPDK FIO plugin，direct-NVMe 项按脚本输出 SKIP；不得把 Aio/Malloc 结果用作 NVMe 替代。

@@ -1,9 +1,9 @@
 # HFS 用户 Buffer Bounce Copy 优化 Shard 计划
 
-> **状态**：shard-54 ～ shard-58 已实现，shard-59 性能收口中
+> **状态**：shard-54 ～ shard-59 已实现并完成当前 VM 可执行项；direct-NVMe 受设备/插件缺失跳过
 > **计划范围**：shard-54 ～ shard-59
 > **输入评审**：[`review/hfs_user_buffer_bounce_copy_optimization.md`](../../review/hfs_user_buffer_bounce_copy_optimization.md)
-> **当前基线**：`main@4054111`，VM 内 SPDK 使用锁定 commit `f0b63ed866f0e4d3c56e73bd4a98d0042956147a`
+> **当前基线**：`main@b490bad`，VM 内 SPDK 使用锁定 commit `f0b63ed866f0e4d3c56e73bd4a98d0042956147a`
 
 ## 1. 背景与问题定义
 
@@ -432,6 +432,28 @@ min、max、p50/p99/p99.9，不能只保留最好一轮。
   SIGKILL recovery 全部通过，errors=0。
 - 更新 `doc/bug.md`、`doc/design/fio_baseline_notes.md`、`doc/design/hfs_async_model.md`、
   本计划各 shard 状态和最终产品边界。
+
+### 9.3 当前实现记录（shard-59）
+
+- 新增 `scripts/db/shard59_performance_matrix.sh`，统一准备持久化 Aio 镜像并执行 FIO、
+  RocksDB、MariaDB/MySQL 三组矩阵；输出环境、原始结果、错误计数和 `closeout.md`，
+  direct-NVMe 前置条件不满足时明确输出 SKIP，不用 Aio/Malloc 结果冒充 NVMe。
+- FIO 使用现有 stage2 解析器覆盖 4K/8K/16K/32K/64K；RocksDB 复用 stage48 的
+  `fillseq/readwhilewriting`；MySQL 复用 stage2 的 native-ext4 与 persistent-Aio
+  对照，并设置 bootstrap signal 边界。
+- 修复 `hfsIoDone()` completion 唤醒 waiter 后继续访问栈 request 的生命周期缺陷：trace
+  字段、file 快照、completed units 和 async callback 均在唤醒前保存；FIO JSON 收尾不再
+  触发 SIGSEGV（Bug 68）。
+- 修复 MariaDB bootstrap 强制回收后 backend flock 延迟释放造成的启动竞争：stage2 在
+  启动服务前等待锁可重新获取（`HFS_MYSQL_LOCK_WAIT_SECONDS` 可调）。
+- VM 快速验收（1 轮、FIO 3 s、RocksDB 5 s、MySQL 100 queries）全绿：FIO errors=0，
+  RocksDB errors=0，MySQL stage2 `MYSQL STAGE2 OK`；Aio FIO HFS/native 总 IOPS 为
+  14.7k/14.3k（4K）和 12.5k/10.7k（64K），RocksDB 4-thread readwhilewriting 为
+  3.86M ops/s，MySQL HFS/native 16-thread write 为 6.67k/20.0k QPS。
+- 当前 VM 没有 `/dev/nvme*`，且 `/root/code/spdk/build/fio/spdk_bdev` 不存在，
+  direct-NVMe 项输出 `SKIP direct NVMe: spdk_fio_plugin_missing; no_nvme_device`；
+  真实 NVMe 仍沿用 `performance/stage2_nvme_native_baseline.md` 的已存证据，待具备
+  设备授权和 plugin 后按本脚本原始矩阵补跑。
 
 ## 10. 统一观测字段与报告格式
 

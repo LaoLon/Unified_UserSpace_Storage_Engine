@@ -140,6 +140,7 @@ printf "layer\tworkload\tconcurrency\tavg_seconds\tqps\n" > "$OUT/results.tsv"
 	echo "backend=$HFS_BDEV_TYPE"
 	echo "bdev_name=$HFS_BDEV_NAME"
 	echo "bootstrap_signal_timeout=$BOOTSTRAP_SIGNAL_TIMEOUT"
+	echo "lock_wait_seconds=${HFS_MYSQL_LOCK_WAIT_SECONDS:-15}"
 	echo "spdk_pci_bdf=$SPDK_PCI_BDF"
 	echo "image=$IMAGE"
 	echo "queries=$COUNT"
@@ -205,6 +206,21 @@ set -e
 if [[ "$bootstrap_rc" -ne 0 ]]; then
 	tail -120 "$OUT/hfs-install.log" >&2
 	exit "$bootstrap_rc"
+fi
+
+# Wait until every bootstrap child releases the shared backend lock.
+lock_wait_seconds="${HFS_MYSQL_LOCK_WAIT_SECONDS:-15}"
+lock_available=0
+for _ in $(seq 1 "$lock_wait_seconds"); do
+	if flock -n "$OUT/hfs.lock" -c true 2>/dev/null; then
+		lock_available=1
+		break
+	fi
+	sleep 1
+done
+if [[ "$lock_available" != "1" ]]; then
+	echo "ERROR: HFS backend lock remained busy after bootstrap" >&2
+	exit 1
 fi
 start_hfs
 seed_db "$HFS_SOCK"
