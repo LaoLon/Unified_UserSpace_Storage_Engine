@@ -1302,4 +1302,22 @@ Bug 等级：**致命 > 严重 > 一般**。
   DMA backpressure、runtime stress、POSIX contract、metadata transaction 和 IO trace
   全部通过；`spdk_submit=spdk_complete`，errors=0，trace 1621 records/27 phases。
 
+### 77. Ticket 初始化失败路径读取未初始化状态并遗漏 waiter 清理（已修复）
+
+- **状态**：已修复（shard-63）
+- **时间**：2026-09-10
+- **等级**：一般（资源分配/关闭异常窗口；正常路径不触发）
+- **现象**：POSIX read/write 在 ticket mutex/condition 初始化失败，或 ticket admission 被
+  stopping 状态拒绝时，错误分支可能读取未初始化的 `ticket.admitted`；初始化成功但 admission
+  失败时还可能跳过 `pthread_mutex_destroy`/`pthread_cond_destroy`。
+- **排查过程**：复核 `hfsIoReadAt()`/`hfsIoWriteAt()` 的短路条件发现，`HfsPosixIoTicket`
+  原先是栈变量，`hfsPosixTicketInit()` 返回错误后仍检查 `ticket.admitted`；同一条件也没有
+  记录“wait state 已初始化但尚未 admitted”的阶段。
+- **根因**：把 init、admit、wait 三个有不同清理责任的阶段压缩为一个布尔表达式，未区分
+  mutex/condition 的所有权。
+- **修复**：ticket 置零初始化并新增 `ticketInitialized` 标记；只在 init 成功后调用 admit，
+  所有 init 成功的失败分支都执行 complete（如已 admitted）和 destroy。
+- **验证**：VM 上重新 `make -B app lib`、CMake Release、POSIX range-ticket smoke、全量
+  Shard-62 回归、MariaDB/RocksDB recovery 和 NVMe FIO，均通过且 errors=0。
+
 ## 通用经验总结

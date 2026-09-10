@@ -325,6 +325,32 @@ peak 均达到 32，`io_copy_ops=0`，但它是分阶段 read/write companion wo
 该 async/DMA 路径随后按 POSIX-only 架构决策退役；本节数据保留作历史对照，当前 FIO
 和数据库性能回归只使用 HFS 完整 POSIX 路径。
 
+## shard-63 POSIX range-ticket scheduler：NVMe FIO 与数据库验证（2026-09-10）
+
+Shard-63 在完整 POSIX 路径加入 inode-local ticket admission，aligned read/write 不再把
+`hfsIoRangeLock()` 持有到 SPDK completion；默认深度 64，`HFS_POSIX_TICKET=0` 保留旧路径。
+专项测试、Make/CMake、POSIX/fd/metadata/runtime/trace 回归，以及 MariaDB/MySQL 和 RocksDB
+持久化恢复均通过，`spdk_submit=spdk_complete`、errors=0。
+
+固定 NVMe `Nvme0n1`、HFS `numjobs=32`、raw SPDK `iodepth=32`、`randrw=50/50`、O_DIRECT、
+64 MiB、5 秒矩阵（`HFS_DATA_REACTORS=4`）结果如下：
+
+| bs | HFS IOPS | raw SPDK IOPS | HFS/raw | HFS read p99 / write p99 (µs) |
+|---:|---:|---:|---:|---:|
+| 4K | 83,959 | 123,325 | 68.1% | 889 / 897 |
+| 8K | 80,604 | 111,129 | 72.5% | 987 / 1,004 |
+| 16K | 75,120 | 94,309 | 79.7% | 954 / 979 |
+| 32K | 59,571 | 73,771 | 80.8% | 1,122 / 1,155 |
+| 64K | 44,311 | 52,712 | 84.1% | 1,516 / 1,565 |
+
+8K stats-off 10 秒重复三次稳定为 `88,403/88,577/88,629 IOPS`，p99 约 `0.83–0.85 ms`，
+通过 Shard-63 的 `>=82K` 目标。stats-on 归因样本为 `ticket_admit=442820`、
+`ticket_complete=442820`、`ticket_pending_peak=32`、`ticket_dependency_waits=1183`、
+`io_backend_outstanding_peak=32`、`lock_io_hold_ns≈248 ms`、SPDK submit/complete
+`443010/443010`；这证明 range lock 长 hold 已从稳态 I/O 中移除。普通 POSIX buffer 仍有
+一份必要 bounce copy，HFS/raw 差距的下一主因转为 copy、fd/metadata 同步和每请求 completion，
+不应再通过无限扩大 queue depth 或 reactor 数掩盖。
+
 ## shard-62 POSIX reactor queue engine：NVMe FIO 验证（2026-09-10）
 
 本轮用于验证 Shard-62 的默认 POSIX reactor queue 是否已经在真实 SPDK NVMe bdev 上形成

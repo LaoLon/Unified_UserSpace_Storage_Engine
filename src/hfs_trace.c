@@ -146,6 +146,10 @@ static const char *hfsTracePhaseName(HfsTracePhase phase)
     case HFS_TRACE_THREAD_WAIT_BEGIN: return "thread_wait_begin";
     case HFS_TRACE_THREAD_WAIT_END: return "thread_wait_end";
     case HFS_TRACE_THREAD_WAKE: return "thread_wake";
+    case HFS_TRACE_TICKET_ADMIT: return "ticket_admit";
+    case HFS_TRACE_TICKET_DEP_WAIT: return "ticket_dependency_wait";
+    case HFS_TRACE_TICKET_READY: return "ticket_ready";
+    case HFS_TRACE_TICKET_WAKE: return "ticket_wake";
     default: return "unknown";
     }
 }

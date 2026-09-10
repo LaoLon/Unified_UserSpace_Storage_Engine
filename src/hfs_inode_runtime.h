@@ -7,6 +7,9 @@
 
 #include "hfs.h"
 
+struct hfs_posix_io_ticket;
+typedef struct hfs_posix_io_ticket HfsPosixIoTicket;
+
 /* Per-inode range stripes remove cross-file collisions from the data path. */
 #define HFS_INODE_RANGE_STRIPE_COUNT 64U
 #define HFS_INODE_RANGE_STRIPE_UNITS 64U
@@ -28,6 +31,15 @@ typedef struct hfs_inode_runtime {
 	HfsRangeLock rangeStripes[HFS_INODE_RANGE_STRIPE_COUNT];
 	/* Retained as a compatibility barrier for legacy callers. */
 	HfsRangeLock rangeGate;
+	/* Short admission lock for the POSIX range-ticket scheduler. */
+	pthread_mutex_t ticketLock;
+	pthread_cond_t ticketAvailable;
+	HfsPosixIoTicket *ticketHead;
+	uint64_t nextTicketId;
+	uint64_t nextTicketSeq;
+	uint32_t ticketCount;
+	uint32_t ticketLimit;
+	bool ticketStopping;
 	struct hfs_inode_runtime *next;
 } HfsInodeRuntime;
 

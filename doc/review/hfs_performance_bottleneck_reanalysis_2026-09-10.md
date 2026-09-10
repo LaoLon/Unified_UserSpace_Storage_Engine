@@ -306,3 +306,38 @@ spdk_submit/complete  = 365,705/365,705
 
 因此 Shard-62 的提交队列实现已完成，82K IOPS 性能门槛仍属于后续 range-ticket 与
 copy-elision shard，不能把当前 72K 样本误写成已达标。
+
+## 12. Shard-63 ticket 验证后的归因更新
+
+Shard-63 已将普通 POSIX read/write 接入 inode-local ticket admission：短临界区只建立
+overlap 依赖，aligned steady-state 不再让 `rangeStripes` 覆盖 SPDK completion；非对齐请求
+仍由一个 ticket 包住现有 RMW，控制操作继续走已有 exclusive sync barrier。
+
+专项测试闭合了 `ticket_admit/ready/complete`、依赖等待和 SPDK submit/complete；MariaDB、
+RocksDB、POSIX contract、fd lifecycle、metadata recovery、trace 和 runtime stress 均通过。
+NVMe 5 秒矩阵（HFS_DATA_REACTORS=4）为 HFS/raw：4K `83,959/123,325`、8K
+`80,604/111,129`、16K `75,120/94,309`、32K `59,571/73,771`、64K `44,311/52,712`
+IOPS；8K stats-off 10 秒重复为 `88,403/88,577/88,629`，p99 读写约 `0.83–0.85 ms`。
+
+stats-on 8K 归因样本显示：
+
+```text
+ticket_admit/complete       = 442820/442820
+ticket_pending_peak         = 32
+ticket_dependency_waits     = 1183
+ticket_dependency_wait_ns   = 262568670
+lock_io_wait_count          = 64
+lock_io_hold_count          = 8
+lock_io_hold_ns             = 247538246
+io_backend_outstanding_peak = 32
+spdk_submit/complete        = 443010/443010
+io_copy_ops                 = 442820
+io_copy_bytes               = 3.38 GiB
+```
+
+这组数据确认原先 `lock_io_wait_ns/lock_io_hold_ns` 的 30.95/126.82 秒级热点已经消失，
+并发窗口和后端 completion 已闭合；性能剩余差距不是 queue credit 或 backend outstanding
+不足。当前第一主因转为普通 POSIX buffer 的一次 bounce copy、fd/metadata 轻量同步、
+每请求 ticket/condition/futex 生命周期和 data-reactor 消息往返。下一阶段应围绕“copy
+批量化 + caller 提交批量化”做测量型优化，不能把 registered-DMA 专用接口强行套到普通
+数据库 buffer，也不应继续无上限增大 reactor/queue。

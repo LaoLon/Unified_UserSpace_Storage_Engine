@@ -42,7 +42,11 @@ typedef enum HfsTracePhase {
     HFS_TRACE_COMPLETION_WAKE,
     HFS_TRACE_THREAD_WAIT_BEGIN,
     HFS_TRACE_THREAD_WAIT_END,
-    HFS_TRACE_THREAD_WAKE
+    HFS_TRACE_THREAD_WAKE,
+    HFS_TRACE_TICKET_ADMIT,
+    HFS_TRACE_TICKET_DEP_WAIT,
+    HFS_TRACE_TICKET_READY,
+    HFS_TRACE_TICKET_WAKE
 } HfsTracePhase;
 
 /* Buffer kinds distinguish caller buffers from internal bounce buffers. */

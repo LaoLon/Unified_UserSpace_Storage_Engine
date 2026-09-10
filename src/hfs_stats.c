@@ -51,6 +51,14 @@ _Atomic uint_fast64_t hfsStatsQueueCreditWaitNs[HFS_STATS_MAX_DATA_REACTORS];
 _Atomic uint_fast64_t hfsStatsQueueDepthPeak[HFS_STATS_MAX_DATA_REACTORS];
 _Atomic uint_fast64_t hfsStatsQueueDrainBatches[HFS_STATS_MAX_DATA_REACTORS];
 _Atomic uint_fast64_t hfsStatsQueueDrainItems[HFS_STATS_MAX_DATA_REACTORS];
+_Atomic uint_fast64_t hfsStatsTicketAdmits;
+_Atomic uint_fast64_t hfsStatsTicketReadies;
+_Atomic uint_fast64_t hfsStatsTicketCompletes;
+_Atomic uint_fast64_t hfsStatsTicketDependencyWaits;
+_Atomic uint_fast64_t hfsStatsTicketDependencyWaitNs;
+_Atomic uint_fast64_t hfsStatsTicketPromotes;
+_Atomic uint_fast64_t hfsStatsTicketPendingPeak;
+_Atomic uint_fast64_t hfsStatsTicketWakes;
 bool hfsStatsFastEnabledState;
 bool hfsStatsTimingState;
 
@@ -230,6 +238,16 @@ static void hfsStatsReset(void) {
 		atomic_store_explicit(&hfsStatsQueueDrainItems[i], 0,
 			memory_order_relaxed);
 	}
+	atomic_store_explicit(&hfsStatsTicketAdmits, 0, memory_order_relaxed);
+	atomic_store_explicit(&hfsStatsTicketReadies, 0, memory_order_relaxed);
+	atomic_store_explicit(&hfsStatsTicketCompletes, 0, memory_order_relaxed);
+	atomic_store_explicit(&hfsStatsTicketDependencyWaits, 0,
+		memory_order_relaxed);
+	atomic_store_explicit(&hfsStatsTicketDependencyWaitNs, 0,
+		memory_order_relaxed);
+	atomic_store_explicit(&hfsStatsTicketPromotes, 0, memory_order_relaxed);
+	atomic_store_explicit(&hfsStatsTicketPendingPeak, 0, memory_order_relaxed);
+	atomic_store_explicit(&hfsStatsTicketWakes, 0, memory_order_relaxed);
 	pthread_mutex_lock(&g_hfsStatsShardLock);
 	for (shard = g_hfsStatsShards; shard != NULL; shard = shard->next) {
 		struct HfsStatsShard *next = shard->next;
@@ -546,6 +564,68 @@ void hfsStatsRecordQueueDrain(uint32_t reactorId, uint64_t batchSize) {
 		memory_order_relaxed);
 }
 
+/* Record one ticket admission and its active high-water mark. */
+void hfsStatsRecordTicketAdmit(uint32_t pendingDependencies,
+				       uint32_t activeTickets) {
+	uint_fast64_t current;
+
+	(void)pendingDependencies;
+	if (!hfsStatsIsEnabled()) {
+		return;
+	}
+	atomic_fetch_add_explicit(&hfsStatsTicketAdmits, 1, memory_order_relaxed);
+	current = atomic_load_explicit(&hfsStatsTicketPendingPeak,
+		memory_order_relaxed);
+	while (current < activeTickets &&
+	       !atomic_compare_exchange_weak_explicit(&hfsStatsTicketPendingPeak,
+			&current, activeTickets, memory_order_relaxed,
+			memory_order_relaxed)) {
+		/* Retry with the refreshed peak. */
+	}
+}
+
+/* Record one ticket that became executable. */
+void hfsStatsRecordTicketReady(void) {
+	if (hfsStatsIsEnabled()) {
+		atomic_fetch_add_explicit(&hfsStatsTicketReadies, 1,
+			memory_order_relaxed);
+	}
+}
+
+/* Record one ticket removed from the active inode scheduler. */
+void hfsStatsRecordTicketComplete(void) {
+	if (hfsStatsIsEnabled()) {
+		atomic_fetch_add_explicit(&hfsStatsTicketCompletes, 1,
+			memory_order_relaxed);
+	}
+}
+
+/* Record one dependency wait and its elapsed duration. */
+void hfsStatsRecordTicketDependencyWait(uint64_t waitNs) {
+	if (hfsStatsIsEnabled()) {
+		atomic_fetch_add_explicit(&hfsStatsTicketDependencyWaits, 1,
+			memory_order_relaxed);
+		atomic_fetch_add_explicit(&hfsStatsTicketDependencyWaitNs, waitNs,
+			memory_order_relaxed);
+	}
+}
+
+/* Record a completion that promoted one or more dependent tickets. */
+void hfsStatsRecordTicketPromote(uint32_t count) {
+	if (hfsStatsIsEnabled()) {
+		atomic_fetch_add_explicit(&hfsStatsTicketPromotes, count,
+			memory_order_relaxed);
+	}
+}
+
+/* Record one logical POSIX waiter wake. */
+void hfsStatsRecordTicketWake(void) {
+	if (hfsStatsIsEnabled()) {
+		atomic_fetch_add_explicit(&hfsStatsTicketWakes, 1,
+			memory_order_relaxed);
+	}
+}
+
 /* Record the actual SPDK data callback outstanding depth, not dispatcher depth. */
 void hfsStatsRecordIoSubmit(void) {
 	uint64_t current;
@@ -856,6 +936,25 @@ static void hfsStatsWriteSnapshot(void) {
 		atomic_load_explicit(&hfsStatsIoOutstandingPeak, memory_order_relaxed));
 	HFS_STATS_APPEND("errors=%"PRIuFAST64"\n",
 		atomic_load_explicit(&hfsStatsErrors, memory_order_relaxed));
+	HFS_STATS_APPEND("ticket_admit=%"PRIuFAST64"\n",
+		atomic_load_explicit(&hfsStatsTicketAdmits, memory_order_relaxed));
+	HFS_STATS_APPEND("ticket_ready=%"PRIuFAST64"\n",
+		atomic_load_explicit(&hfsStatsTicketReadies, memory_order_relaxed));
+	HFS_STATS_APPEND("ticket_complete=%"PRIuFAST64"\n",
+		atomic_load_explicit(&hfsStatsTicketCompletes, memory_order_relaxed));
+	HFS_STATS_APPEND("ticket_dependency_waits=%"PRIuFAST64"\n",
+		atomic_load_explicit(&hfsStatsTicketDependencyWaits,
+		memory_order_relaxed));
+	HFS_STATS_APPEND("ticket_dependency_wait_ns=%"PRIuFAST64"\n",
+		atomic_load_explicit(&hfsStatsTicketDependencyWaitNs,
+		memory_order_relaxed));
+	HFS_STATS_APPEND("ticket_promotes=%"PRIuFAST64"\n",
+		atomic_load_explicit(&hfsStatsTicketPromotes, memory_order_relaxed));
+	HFS_STATS_APPEND("ticket_pending_peak=%"PRIuFAST64"\n",
+		atomic_load_explicit(&hfsStatsTicketPendingPeak,
+		memory_order_relaxed));
+	HFS_STATS_APPEND("ticket_wakes=%"PRIuFAST64"\n",
+		atomic_load_explicit(&hfsStatsTicketWakes, memory_order_relaxed));
 	HFS_STATS_APPEND("stats_shards=%"PRIu64"\n", shardCount);
 	for (i = 0; i < HFS_STATS_LOCK_CLASS_COUNT; i++) {
 		HFS_STATS_APPEND("lock_%s_wait_count=%"PRIu64"\n", lockNames[i],

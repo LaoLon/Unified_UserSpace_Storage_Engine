@@ -32,6 +32,14 @@ extern _Atomic uint_fast64_t hfsStatsQueueCreditWaitNs[8];
 extern _Atomic uint_fast64_t hfsStatsQueueDepthPeak[8];
 extern _Atomic uint_fast64_t hfsStatsQueueDrainBatches[8];
 extern _Atomic uint_fast64_t hfsStatsQueueDrainItems[8];
+extern _Atomic uint_fast64_t hfsStatsTicketAdmits;
+extern _Atomic uint_fast64_t hfsStatsTicketReadies;
+extern _Atomic uint_fast64_t hfsStatsTicketCompletes;
+extern _Atomic uint_fast64_t hfsStatsTicketDependencyWaits;
+extern _Atomic uint_fast64_t hfsStatsTicketDependencyWaitNs;
+extern _Atomic uint_fast64_t hfsStatsTicketPromotes;
+extern _Atomic uint_fast64_t hfsStatsTicketPendingPeak;
+extern _Atomic uint_fast64_t hfsStatsTicketWakes;
 extern bool hfsStatsFastEnabledState;
 extern bool hfsStatsTimingState;
 
@@ -133,6 +141,14 @@ void hfsStatsRecordDataReactorComplete(uint32_t reactorId);
 void hfsStatsRecordQueueCreditWait(uint32_t reactorId, uint64_t waitNs);
 void hfsStatsRecordQueueDepth(uint32_t reactorId, uint64_t depth);
 void hfsStatsRecordQueueDrain(uint32_t reactorId, uint64_t batchSize);
+/* Record internal POSIX range-ticket admission and dependency progress. */
+void hfsStatsRecordTicketAdmit(uint32_t pendingDependencies,
+				       uint32_t activeTickets);
+void hfsStatsRecordTicketReady(void);
+void hfsStatsRecordTicketComplete(void);
+void hfsStatsRecordTicketDependencyWait(uint64_t waitNs);
+void hfsStatsRecordTicketPromote(uint32_t count);
+void hfsStatsRecordTicketWake(void);
 /* Record actual data I/O callbacks submitted to and completed by SPDK. */
 void hfsStatsRecordIoSubmit(void);
 void hfsStatsRecordIoComplete(void);

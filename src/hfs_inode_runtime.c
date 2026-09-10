@@ -63,6 +63,13 @@ void hfsInodeRuntimeFini(Hfs *fs) {
 			HfsInodeRuntime *next = runtime->next;
 			uint32_t stripe;
 
+			pthread_mutex_lock(&runtime->ticketLock);
+			runtime->ticketStopping = true;
+			pthread_cond_broadcast(&runtime->ticketAvailable);
+			pthread_mutex_unlock(&runtime->ticketLock);
+			/* The runtime is destroyed only after HFS has stopped accepting I/O. */
+			pthread_cond_destroy(&runtime->ticketAvailable);
+			pthread_mutex_destroy(&runtime->ticketLock);
 			hfsRangeLockDestroy(&runtime->rangeGate);
 			for (stripe = 0; stripe < HFS_INODE_RANGE_STRIPE_COUNT; stripe++) {
 				hfsRangeLockDestroy(&runtime->rangeStripes[stripe]);
@@ -130,8 +137,33 @@ HfsInodeRuntime *hfsInodeRuntimeGet(Hfs *fs, uint64_t inodeId) {
 		errno = rc;
 		return NULL;
 	}
+	rc = pthread_mutex_init(&runtime->ticketLock, NULL);
+	if (rc != 0) {
+		pthread_rwlock_destroy(&runtime->syncLock);
+		pthread_mutex_destroy(&runtime->appendLock);
+		pthread_mutex_destroy(&runtime->resizeLock);
+		free(runtime);
+		pthread_mutex_unlock(&fs->inodeRuntimeLock);
+		errno = rc;
+		return NULL;
+	}
+	rc = pthread_cond_init(&runtime->ticketAvailable, NULL);
+	if (rc != 0) {
+		pthread_mutex_destroy(&runtime->ticketLock);
+		pthread_rwlock_destroy(&runtime->syncLock);
+		pthread_mutex_destroy(&runtime->appendLock);
+		pthread_mutex_destroy(&runtime->resizeLock);
+		free(runtime);
+		pthread_mutex_unlock(&fs->inodeRuntimeLock);
+		errno = rc;
+		return NULL;
+	}
+	runtime->ticketLimit = 64U;
+	runtime->ticketStopping = false;
 	rc = hfsRangeLockInit(&runtime->rangeGate);
 	if (rc != 0) {
+		pthread_cond_destroy(&runtime->ticketAvailable);
+		pthread_mutex_destroy(&runtime->ticketLock);
 		pthread_rwlock_destroy(&runtime->syncLock);
 		pthread_mutex_destroy(&runtime->appendLock);
 		pthread_mutex_destroy(&runtime->resizeLock);
@@ -148,9 +180,11 @@ HfsInodeRuntime *hfsInodeRuntimeGet(Hfs *fs, uint64_t inodeId) {
 			if (rc != 0) {
 				while (stripe > 0) {
 					stripe--;
-					hfsRangeLockDestroy(&runtime->rangeStripes[stripe]);
+				hfsRangeLockDestroy(&runtime->rangeStripes[stripe]);
 				}
 				hfsRangeLockDestroy(&runtime->rangeGate);
+				pthread_cond_destroy(&runtime->ticketAvailable);
+				pthread_mutex_destroy(&runtime->ticketLock);
 				pthread_rwlock_destroy(&runtime->syncLock);
 				pthread_mutex_destroy(&runtime->appendLock);
 				pthread_mutex_destroy(&runtime->resizeLock);
