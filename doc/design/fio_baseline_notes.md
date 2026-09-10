@@ -376,3 +376,24 @@ Malloc/Aio 基线相比，这次 HFS 已经不再是“单请求同步路径”�
 
 同轮 ext4 `/dev/sdb1` 总 IOPS 为 7,638～9,161，显著低于 NVMe；它只用于确认测试目录
 落盘位置，不能用来推导 HFS 相对原生 SPDK 的文件系统开销。
+
+## shard-64 durability coordinator：NVMe FIO 与数据库验证（2026-09-10）
+
+Shard-64 在完整 POSIX 路径加入 mount 级 durability coordinator。FIO 仍使用同一块
+VMware NVMe、HFS `numjobs=32`、原生 SPDK `iodepth=32`、`randrw=50/50`、O_DIRECT、
+64 MiB、5 秒；所有档位 `errors=0`：
+
+| bs | HFS IOPS | raw SPDK IOPS | HFS/raw | HFS read p99 / write p99 (µs) |
+|---:|---:|---:|---:|---:|
+| 4K | 94,975 | 122,747 | 77.4% | 782 / 791 |
+| 8K | 87,576 | 111,847 | 78.3% | 848 / 856 |
+| 16K | 75,055 | 94,439 | 79.5% | 946 / 954 |
+| 32K | 59,832 | 74,062 | 80.8% | 1,122 / 1,139 |
+| 64K | 43,892 | 52,908 | 83.0% | 1,532 / 1,614 |
+
+相较 shard-63 同口径样本，FIO 没有出现错误或 SPDK submit/complete 不一致；该改动主要
+针对数据库同步持久化，不会把纯 randrw 的每请求 POSIX completion 变成原生 SPDK
+路径。MariaDB/MySQL 与 RocksDB 持久化 smoke、SIGKILL recovery、并发客户端、WAL、
+flush/compact 和 `ldb checkconsistency` 均通过。RocksDB 10 秒 Aio benchmark 中
+`spdk_submit == spdk_complete`、`errors=0`；顺序单线程阶段的 group batch 最大值为 1，
+应使用并发事务/WAL workload 评估真正的 group commit 合并收益。

@@ -10,7 +10,7 @@ Bug 等级：**致命 > 严重 > 一般**。
 
 ### 已修复
 
-1–5、8–10、10b、11–43、45–47、51–52、57、60–62、67–72、76。包括已由后续 shard 修复的历史记录；条目中的原始“遗留”描述保留用于复盘，当前状态以本汇总和条目状态字段为准。
+1–5、8–10、10b、11–43、45–47、51–52、57、60–62、67–72、76、78。包括已由后续 shard 修复的历史记录；条目中的原始“遗留”描述保留用于复盘，当前状态以本汇总和条目状态字段为准。
 
 ### 未修复
 
@@ -1319,5 +1319,48 @@ Bug 等级：**致命 > 严重 > 一般**。
   所有 init 成功的失败分支都执行 complete（如已 admitted）和 destroy。
 - **验证**：VM 上重新 `make -B app lib`、CMake Release、POSIX range-ticket smoke、全量
   Shard-62 回归、MariaDB/RocksDB recovery 和 NVMe FIO，均通过且 errors=0。
+
+### 78. Group-commit 对同一 inode 重复获取 syncLock（已修复）
+
+- **状态**：已修复（shard-64）
+- **时间**：2026-09-10
+- **等级**：严重（同一文件多线程 fsync 返回 EAGAIN/EBUSY）
+- **现象**：开启 `HFS_DURABILITY_GROUP_COMMIT=1` 后，多个线程对同一文件并发
+  `fsync`，首个请求成功，其他请求返回 `BlockingIOError(EAGAIN)`；runtime stress
+  在 16/32 线程下出现批量 worker failure。关闭 group commit 时同一测试通过。
+- **排查过程**：最小 4 线程用例确认 open/read/write 全部成功，只有 fsync 失败；
+  日志显示请求在同一个 coordinator batch 中进入 `hfs_lib_process_durability_batch`。
+  逐项检查批处理锁集合后发现不同 `HfsOpenFile` 共享同一个 inode runtime。
+- **根因**：批处理初版仅按 `HfsOpenFile *` 去重，dup/独立 open 的描述共享同一
+  `runtime->syncLock`，worker 在同一线程第二次 `pthread_rwlock_wrlock`，导致批次
+  被错误中止；失败分支还可能留下当前描述的 ioLock。
+- **修复**：锁集合改为按 `HfsInodeRuntime *` 去重；每个 open-file description
+  仍保持独立 `ioLock`，同一 runtime 只同步一次 blob；锁获取失败立即释放当前
+  ioLock，已获取锁按逆序释放。补充 4 线程同 inode fsync 用例。
+- **验证**：开启 group commit 后最小并发用例、16 线程 10 秒 runtime stress、
+  persistent/fd/POSIX contract、durability barrier、metadata group commit 和
+  crash-recovery 全部通过。
+
+### 79. durability worker 未屏蔽宿主终止信号导致 MariaDB bootstrap 停滞（已修复）
+
+- **状态**：已修复（shard-64）
+- **时间**：2026-09-10
+- **等级**：严重（数据库初始化退出阶段可永久等待）
+- **现象**：开启 `HFS_DURABILITY_GROUP_COMMIT=1` 时，MariaDB
+  `mariadb-install-db` 在 bootstrap 完成后停留在 `unireg_abort()`，日志出现
+  `Signal handler thread did not exit in a timely manner`；关闭 group commit 的同一
+  NVMe/Aio 测试正常完成。
+- **排查过程**：对 bootstrap 进程做 gdb 全线程回溯，主线程在等待 MariaDB signal
+  thread，HFS durability worker 仍可见为独立 pthread；对照 group-disabled 运行确认
+  不是元数据格式、bdev flush 或恢复逻辑错误。新建 worker 时会继承调用线程的信号屏蔽
+  状态，而 MariaDB 的终止信号由专用 signal thread 管理。
+- **根因**：durability worker 没有像 HFS owner/log 线程一样屏蔽 `SIGHUP`、`SIGQUIT`、
+  `SIGALRM`、`SIGTERM` 和 `SIGTSTP`，宿主进程的信号管理与 HFS 后台线程的继承状态不一致，
+  使 MariaDB bootstrap 的终止阶段出现信号处理线程无法收敛。
+- **修复**：新增 `hfsDurabilityBlockManagedSignals()`，worker 启动后立即屏蔽同一组宿主
+  管理信号，使信号只留给宿主 signal thread；不改变 coordinator 请求队列、锁或持久化
+  顺序。
+- **验证**：group commit 开启时 MariaDB 持久化初始化、正常重启、SIGKILL 恢复和
+  mysqlslap 并发均通过；关闭 group commit 的 legacy 路径亦通过。
 
 ## 通用经验总结

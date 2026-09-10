@@ -37,6 +37,9 @@ _Atomic uint_fast64_t hfsStatsDmaExhausts;
 _Atomic uint_fast64_t hfsStatsDmaFastAcquires;
 _Atomic uint_fast64_t hfsStatsDurabilityLeaders;
 _Atomic uint_fast64_t hfsStatsDurabilityWaiters;
+_Atomic uint_fast64_t hfsStatsDurabilityBatches;
+_Atomic uint_fast64_t hfsStatsDurabilityBatchRequests;
+_Atomic uint_fast64_t hfsStatsDurabilityBatchMax;
 _Atomic uint_fast64_t hfsStatsFdatasyncFast;
 static _Atomic uint_fast64_t g_hfsStatsDataReactorSubmit[HFS_STATS_MAX_DATA_REACTORS];
 static _Atomic uint_fast64_t g_hfsStatsDataReactorComplete[HFS_STATS_MAX_DATA_REACTORS];
@@ -213,6 +216,10 @@ static void hfsStatsReset(void) {
 	atomic_store_explicit(&hfsStatsDmaFastAcquires, 0, memory_order_relaxed);
 	atomic_store_explicit(&hfsStatsDurabilityLeaders, 0, memory_order_relaxed);
 	atomic_store_explicit(&hfsStatsDurabilityWaiters, 0, memory_order_relaxed);
+	atomic_store_explicit(&hfsStatsDurabilityBatches, 0, memory_order_relaxed);
+	atomic_store_explicit(&hfsStatsDurabilityBatchRequests, 0,
+		memory_order_relaxed);
+	atomic_store_explicit(&hfsStatsDurabilityBatchMax, 0, memory_order_relaxed);
 	atomic_store_explicit(&hfsStatsFdatasyncFast, 0, memory_order_relaxed);
 	for (unsigned int i = 0; i < HFS_STATS_MAX_DATA_REACTORS; i++) {
 		atomic_store_explicit(&g_hfsStatsDataReactorSubmit[i], 0,
@@ -772,6 +779,23 @@ void hfsStatsRecordDurabilityWaiter(void) {
 	atomic_fetch_add_explicit(&hfsStatsDurabilityWaiters, 1, memory_order_relaxed);
 }
 
+/* Record one coordinator batch and its coalesced request count. */
+void hfsStatsRecordDurabilityBatch(uint64_t requestCount) {
+	uint_fast64_t current;
+
+	atomic_fetch_add_explicit(&hfsStatsDurabilityBatches, 1,
+		memory_order_relaxed);
+	atomic_fetch_add_explicit(&hfsStatsDurabilityBatchRequests, requestCount,
+		memory_order_relaxed);
+	current = atomic_load_explicit(&hfsStatsDurabilityBatchMax,
+		memory_order_relaxed);
+	while (current < requestCount && !atomic_compare_exchange_weak_explicit(
+		&hfsStatsDurabilityBatchMax, &current, requestCount,
+		memory_order_relaxed, memory_order_relaxed)) {
+		/* Retry until another producer publishes an equal or larger batch. */
+	}
+}
+
 /* Record a fdatasync that completed after only the data barrier. */
 void hfsStatsRecordFdatasyncFast(void) {
 	atomic_fetch_add_explicit(&hfsStatsFdatasyncFast, 1, memory_order_relaxed);
@@ -922,6 +946,13 @@ static void hfsStatsWriteSnapshot(void) {
 		atomic_load_explicit(&hfsStatsDurabilityLeaders, memory_order_relaxed));
 	HFS_STATS_APPEND("durability_waiter=%"PRIuFAST64"\n",
 		atomic_load_explicit(&hfsStatsDurabilityWaiters, memory_order_relaxed));
+	HFS_STATS_APPEND("durability_group_batches=%"PRIuFAST64"\n",
+		atomic_load_explicit(&hfsStatsDurabilityBatches, memory_order_relaxed));
+	HFS_STATS_APPEND("durability_group_requests=%"PRIuFAST64"\n",
+		atomic_load_explicit(&hfsStatsDurabilityBatchRequests,
+		memory_order_relaxed));
+	HFS_STATS_APPEND("durability_group_batch_max=%"PRIuFAST64"\n",
+		atomic_load_explicit(&hfsStatsDurabilityBatchMax, memory_order_relaxed));
 	HFS_STATS_APPEND("fdatasync_fast=%"PRIuFAST64"\n",
 		atomic_load_explicit(&hfsStatsFdatasyncFast, memory_order_relaxed));
 	HFS_STATS_APPEND("spdk_submit=%"PRIuFAST64"\n",

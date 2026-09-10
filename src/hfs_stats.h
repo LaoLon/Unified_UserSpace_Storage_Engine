@@ -20,6 +20,9 @@ extern _Atomic uint_fast64_t hfsStatsDmaExhausts;
 extern _Atomic uint_fast64_t hfsStatsDmaFastAcquires;
 extern _Atomic uint_fast64_t hfsStatsDurabilityLeaders;
 extern _Atomic uint_fast64_t hfsStatsDurabilityWaiters;
+extern _Atomic uint_fast64_t hfsStatsDurabilityBatches;
+extern _Atomic uint_fast64_t hfsStatsDurabilityBatchRequests;
+extern _Atomic uint_fast64_t hfsStatsDurabilityBatchMax;
 extern _Atomic uint_fast64_t hfsStatsFdatasyncFast;
 extern _Atomic uint_fast64_t hfsStatsSpdkSubmits;
 extern _Atomic uint_fast64_t hfsStatsSpdkCompletions;
@@ -172,6 +175,7 @@ void hfsStatsRecordDmaExhaust(void);
 void hfsStatsRecordDmaFastAcquire(void);
 void hfsStatsRecordDurabilityLeader(void);
 void hfsStatsRecordDurabilityWaiter(void);
+void hfsStatsRecordDurabilityBatch(uint64_t requestCount);
 void hfsStatsRecordFdatasyncFast(void);
 
 static inline void hfsStatsRecordIoFast(bool write, size_t bytes, bool aligned) {
@@ -305,6 +309,11 @@ static inline void hfsStatsRecordDurabilityLeaderFast(void) {
 static inline void hfsStatsRecordDurabilityWaiterFast(void) {
 	if (hfsStatsEnabledFast()) {
 		hfsStatsRecordDurabilityWaiter();
+	}
+}
+static inline void hfsStatsRecordDurabilityBatchFast(uint64_t requestCount) {
+	if (hfsStatsEnabledFast()) {
+		hfsStatsRecordDurabilityBatch(requestCount);
 	}
 }
 static inline void hfsStatsRecordFdatasyncFastPath(void) {

@@ -205,6 +205,16 @@ static uint64_t g_durabilityGeneration;
 static int g_durabilityResult;
 static int g_durabilityErrno;
 
+static int hfs_lib_process_durability_batch(
+	Hfs *fs, HfsDurabilityRequest **requests, size_t requestCount);
+
+/* Group commit is enabled by default and can be disabled for A/B comparison. */
+static bool hfs_durability_group_commit_enabled(void) {
+	const char *value = getenv("HFS_DURABILITY_GROUP_COMMIT");
+
+	return value == NULL || strcmp(value, "0") != 0;
+}
+
 /* Trace one durability condition-variable wait without changing its semantics. */
 static int hfsDurabilityCondWait(void) {
 	HfsTraceWaitToken traceWait = {0};
@@ -961,6 +971,21 @@ int hfs_lib_init(void) {
 		pthread_rwlock_unlock(&g_metaLock);
 		return -1;
 	}
+	if (hfs_durability_group_commit_enabled() &&
+		hfsDurabilityCoordinatorInit(g_fs,
+			hfs_lib_process_durability_batch) != 0) {
+		HFS_LOG_ERROR("durability coordinator init failed");
+		hfsMetaFini(g_fs);
+		hfsIoFini(g_fs);
+		hfsUmount(g_fs);
+		free(g_fs);
+		g_fs = NULL;
+		hfsRuntimeStop();
+		hfs_release_backend_lock();
+		hfs_log_fini();
+		pthread_rwlock_unlock(&g_metaLock);
+		return -1;
+	}
 	hfsFdReset();
 	HFS_LOG_INFO("libhfs initialized");
 
@@ -1002,6 +1027,10 @@ void hfs_lib_fini(void) {
 	/* Inherited pthread/SPDK state cannot be safely finalized after fork. */
 	if (hfs_lib_is_fork_child()) {
 		return;
+	}
+	/* Stop new group commits before taking the final metadata lock. */
+	if (g_fs != NULL) {
+		hfsDurabilityCoordinatorStop(g_fs);
 	}
 	hfsMetaWriteLock();
 	if (g_fs == NULL) {
@@ -2638,8 +2667,152 @@ static int hfs_lib_fsync_open_file(HfsOpenFile *openFile, bool dataOnly) {
 	return 0;
 }
 
+/* Process one bounded group-commit epoch while preserving POSIX barriers. */
+static int hfs_lib_process_durability_batch(
+	Hfs *fs, HfsDurabilityRequest **requests, size_t requestCount) {
+	HfsOpenFile **lockedFiles;
+	HfsInodeRuntime **lockedRuntimes;
+	size_t lockedCount = 0;
+	size_t i;
+	int savedErrno = 0;
+	int rc = 0;
+	bool metadataNeeded = false;
+
+	if (fs == NULL || requests == NULL || requestCount == 0) {
+		return -EINVAL;
+	}
+	hfsStatsRecordDurabilityBatchFast(requestCount);
+	lockedFiles = calloc(requestCount, sizeof(*lockedFiles));
+	lockedRuntimes = calloc(requestCount, sizeof(*lockedRuntimes));
+	if (lockedFiles == NULL || lockedRuntimes == NULL) {
+		free(lockedFiles);
+		free(lockedRuntimes);
+		return -ENOMEM;
+	}
+
+	/* Hold every description's I/O lock through the shared post-commit barrier. */
+	for (i = 0; i < requestCount; i++) {
+		HfsOpenFile *openFile = requests[i]->openFile;
+		bool duplicate = false;
+		size_t j;
+
+		for (j = 0; j < lockedCount; j++) {
+			if (lockedFiles[j] == openFile) {
+				duplicate = true;
+				break;
+			}
+		}
+		if (duplicate) {
+			continue;
+		}
+		pthread_mutex_lock(&openFile->ioLock);
+		lockedFiles[lockedCount] = openFile;
+		lockedRuntimes[lockedCount] = NULL;
+		if (openFile->runtime != NULL) {
+			for (j = 0; j < lockedCount; j++) {
+				if (lockedRuntimes[j] == openFile->runtime) {
+					break;
+				}
+			}
+			if (j == lockedCount) {
+				if (hfsLibSyncWriteLock(openFile->runtime) != 0) {
+					savedErrno = errno != 0 ? errno : EBUSY;
+					rc = -1;
+					pthread_mutex_unlock(&openFile->ioLock);
+					break;
+				}
+				lockedRuntimes[lockedCount] = openFile->runtime;
+			}
+		}
+		lockedCount++;
+	}
+
+	/* Synchronize each blob's metadata without issuing one flush per caller. */
+	if (rc == 0) {
+		for (i = 0; i < lockedCount; i++) {
+			if (lockedRuntimes[i] != NULL && lockedFiles[i]->file != NULL &&
+				hfsSyncData(lockedFiles[i]->file) != 0) {
+				savedErrno = errno != 0 ? errno : EIO;
+				rc = -1;
+				break;
+			}
+		}
+		for (i = 0; i < requestCount; i++) {
+			hfsDurabilityTraceRecord(requests[i]->openFile->inodeId,
+				"data-barrier", rc == 0 ? 0 : -savedErrno);
+		}
+	}
+	if (rc == 0) {
+		hfsFsyncCrashPoint(1);
+		hfsMetaWriteLock();
+		if (g_fs == NULL || g_fs != fs) {
+			savedErrno = ENODEV;
+			rc = -1;
+		} else {
+			/* Fold lock-free write publication into this shared metadata epoch. */
+			hfsInodeRuntimeDrainPendingLocked(fs);
+			for (i = 0; i < requestCount; i++) {
+				if (!requests[i]->dataOnly) {
+					metadataNeeded = true;
+					break;
+				}
+			}
+			/* A data-only call still commits size/extent changes; timestamps may be
+			 * included as a safe stronger ordering when another inode is dirty. */
+			if (fs->metaDirty) {
+				metadataNeeded = true;
+			}
+			if (metadataNeeded && hfsMetaCommitDirty(fs) != 0) {
+				savedErrno = errno != 0 ? errno : EIO;
+				rc = -1;
+			}
+		}
+		for (i = 0; i < requestCount; i++) {
+			hfsDurabilityTraceRecord(requests[i]->openFile->inodeId,
+				metadataNeeded ? "metadata-commit" : "metadata-skip",
+				rc == 0 ? 0 : -savedErrno);
+		}
+		pthread_rwlock_unlock(&g_metaLock);
+	}
+	if (rc == 0) {
+		hfsFsyncCrashPoint(2);
+		if (hfsDeviceFlush(fs) != 0) {
+			savedErrno = errno != 0 ? errno : EIO;
+			rc = -1;
+		}
+		for (i = 0; i < requestCount; i++) {
+			hfsDurabilityTraceRecord(requests[i]->openFile->inodeId,
+				"post-metadata-barrier", rc == 0 ? 0 : -savedErrno);
+		}
+	}
+	if (rc == 0) {
+		hfsFsyncCrashPoint(3);
+	}
+
+	for (i = lockedCount; i > 0; i--) {
+		size_t index = i - 1U;
+
+		if (lockedRuntimes[index] != NULL) {
+			pthread_rwlock_unlock(&lockedRuntimes[index]->syncLock);
+		}
+		pthread_mutex_unlock(&lockedFiles[index]->ioLock);
+	}
+	for (i = 0; i < requestCount; i++) {
+		if (rc == 0) {
+			requests[i]->result = 0;
+			requests[i]->error = 0;
+		} else {
+			requests[i]->result = -1;
+			requests[i]->error = savedErrno != 0 ? savedErrno : EIO;
+		}
+	}
+	free(lockedFiles);
+	free(lockedRuntimes);
+	return 0;
+}
+
 /* Join overlapping flushes for one open-file description into one epoch. */
-static int hfs_lib_durability_call(int fd, bool dataOnly) {
+static int hfs_lib_durability_call_legacy(int fd, bool dataOnly) {
 	HfsOpenFile *probe;
 	uint64_t inodeId;
 	bool strong = !dataOnly;
@@ -2708,6 +2881,30 @@ static int hfs_lib_durability_call(int fd, bool dataOnly) {
 		}
 		pthread_mutex_unlock(&g_durabilityLock);
 	}
+}
+
+/* Submit one POSIX durability request to the mount-level group-commit worker. */
+static int hfs_lib_durability_call(int fd, bool dataOnly) {
+	HfsOpenFile *openFile;
+	HfsDurabilityRequest request;
+	int rc;
+
+	if (g_fs == NULL || g_fs->durability == NULL) {
+		return hfs_lib_durability_call_legacy(fd, dataOnly);
+	}
+	openFile = hfsFdAcquire(fd);
+	if (openFile == NULL) {
+		errno = EBADF;
+		return -1;
+	}
+	if (hfsDurabilityRequestInit(&request, openFile, dataOnly) != 0) {
+		hfs_release_open_file(openFile);
+		return -1;
+	}
+	rc = hfsDurabilityRequestSubmit(g_fs, &request);
+	hfsDurabilityRequestFini(&request);
+	hfs_release_open_file(openFile);
+	return rc;
 }
 
 /* Flush data and metadata, coalescing concurrent callers on the same inode. */

@@ -16,6 +16,7 @@ struct hfs_io_pool;
 struct hfs_inode_runtime;
 struct hfs_meta_index;
 struct spdk_bdev_desc;
+struct HfsDurabilityCoordinator;
 
 /* Number of hashed range-lock buckets shared by all mounted inodes. */
 #define HFS_RANGE_LOCK_COUNT 256U
@@ -111,6 +112,7 @@ typedef struct Hfs {
 	uint64_t *metaDirtyInodeIds;		/* data inodes waiting for a checkpoint */
 	uint32_t metaDirtyInodeCount;		/* number of entries in metaDirtyInodeIds */
 	struct spdk_blob *metaBlob;		/* resident metadata blob handle */
+	struct HfsDurabilityCoordinator *durability;	/* mount-level fsync coordinator */
 
 	/* Request-local range synchronization and DMA buffer pool. */
 	HfsRangeLock rangeLocks[HFS_RANGE_LOCK_COUNT];
@@ -188,6 +190,10 @@ int hfsClose(HfsFile *file);
 int hfsDeleteBlobById(HfsFile *file);
 /* Flush file metadata and the backing bdev for fsync semantics. */
 int hfsSync(HfsFile *file);
+/* Flush one file's blob metadata without issuing a device barrier. */
+int hfsSyncData(HfsFile *file);
+/* Issue one device barrier shared by a durability batch. */
+int hfsDeviceFlush(Hfs *fs);
 /* Flush the final fsync barrier after an inode metadata transaction. */
 int hfsSyncPostCommit(HfsFile *file);
 

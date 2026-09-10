@@ -17,6 +17,7 @@
 /* Request state used by blob lifecycle and fsync operation chains. */
 typedef struct HfsFileRequest {
 	HfsFile *file;
+	Hfs *fs;
 	HfsRequestResult result;
 	struct spdk_bs_dev_cb_args flushArgs;
 	HfsRequestOperation flushOperation;
@@ -112,6 +113,7 @@ static void hfsSpdkBdevFlushCb(struct spdk_bdev_io *bdevIo, bool success, void *
 /* Submit a direct bdev flush, with a blobstore-device fallback for custom devices. */
 static void hfsSubmitFsyncFlush(HfsFileRequest *request) {
 	HfsFile *file = request->file;
+	Hfs *fs = file != NULL ? file->fs : request->fs;
 	int rc;
 
 	/* Count both real and injected barriers so failure ratios remain visible. */
@@ -127,23 +129,23 @@ static void hfsSubmitFsyncFlush(HfsFileRequest *request) {
 		hfsRequestComplete(&request->result, -EIO, 0);
 		return;
 	}
-	if (file->fs->bdevDesc != NULL && file->fs->bdevChannel != NULL) {
-		rc = spdk_bdev_flush(file->fs->bdevDesc, file->fs->bdevChannel, 0, 0,
+	if (fs->bdevDesc != NULL && fs->bdevChannel != NULL) {
+		rc = spdk_bdev_flush(fs->bdevDesc, fs->bdevChannel, 0, 0,
 				      hfsSpdkBdevFlushCb, request);
 		if (rc != 0) {
 			hfsRequestComplete(&request->result, rc, 0);
 		}
 		return;
 	}
-	if (file->fs->bsDev == NULL || file->fs->bsDev->flush == NULL) {
+	if (fs->bsDev == NULL || fs->bsDev->flush == NULL) {
 		hfsRequestComplete(&request->result, -EOPNOTSUPP, 0);
 		return;
 	}
 	memset(&request->flushArgs, 0, sizeof(request->flushArgs));
 	request->flushArgs.cb_fn = hfsSpdkFsyncFlushCb;
-	request->flushArgs.channel = file->fs->channel;
+	request->flushArgs.channel = fs->channel;
 	request->flushArgs.cb_arg = request;
-	file->fs->bsDev->flush(file->fs->bsDev, file->fs->channel,
+	fs->bsDev->flush(fs->bsDev, fs->channel,
 				      &request->flushArgs);
 }
 
@@ -167,11 +169,34 @@ static void hfsDoSync(void *arg) {
 		hfsSpdkFsyncBlobCb(request, -EIO);
 		return;
 	}
-	if (file->blob == NULL) {
+	if (file == NULL || file->blob == NULL) {
 		hfsSubmitFsyncFlush(request);
 		return;
 	}
 	spdk_blob_sync_md(file->blob, hfsSpdkFsyncBlobCb, request);
+}
+
+/* Complete a blob-only metadata sync without starting the flush chain. */
+static void hfsSpdkSyncDataCb(void *arg, int bserrno) {
+	HfsFileRequest *request = arg;
+
+	hfsRequestComplete(&request->result, bserrno, 0);
+}
+
+/* SPDK-thread task: synchronize blob metadata without a device barrier. */
+static void hfsDoSyncData(void *arg) {
+	HfsFileRequest *request = arg;
+	HfsFile *file = request->file;
+
+	if (hfsRequestCompletionInjected(request->result.operation)) {
+		hfsRequestComplete(&request->result, -EIO, 0);
+		return;
+	}
+	if (file == NULL || file->blob == NULL) {
+		hfsRequestComplete(&request->result, 0, 0);
+		return;
+	}
+	spdk_blob_sync_md(file->blob, hfsSpdkSyncDataCb, request);
 }
 
 /* Preserve the first open failure while the cleanup chain releases its blob. */
@@ -384,6 +409,36 @@ static int hfsSyncWithFlushOperation(HfsFile *file,
 /* Flush one open file and its backing bdev for the first fsync barrier. */
 int hfsSync(HfsFile *file) {
 	return hfsSyncWithFlushOperation(file, HFS_REQUEST_BDEV_FLUSH);
+}
+
+/* Synchronize one blob while leaving the shared device barrier to the batch. */
+int hfsSyncData(HfsFile *file) {
+	HfsFileRequest request;
+
+	if (file == NULL || file->fs == NULL) {
+		errno = EINVAL;
+		return -1;
+	}
+	memset(&request, 0, sizeof(request));
+	request.file = file;
+	hfsRequestInit(&request.result, HFS_REQUEST_BLOB_SYNC);
+	request.result.completion.traceInodeId = file->inodeId;
+	return hfsRequestWait(&request.result, hfsDoSyncData, &request);
+}
+
+/* Issue one durable device barrier without requiring a file handle. */
+int hfsDeviceFlush(Hfs *fs) {
+	HfsFileRequest request;
+
+	if (fs == NULL) {
+		errno = EINVAL;
+		return -1;
+	}
+	memset(&request, 0, sizeof(request));
+	request.fs = fs;
+	request.flushOperation = HFS_REQUEST_BDEV_FLUSH;
+	hfsRequestInit(&request.result, HFS_REQUEST_BDEV_FLUSH);
+	return hfsRequestWait(&request.result, hfsDoSync, &request);
 }
 
 /* Flush the device boundary that follows a completed metadata transaction. */
