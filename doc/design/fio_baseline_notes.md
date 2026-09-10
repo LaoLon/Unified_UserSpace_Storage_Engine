@@ -306,3 +306,18 @@ IOPS，所有错误为 0。完整表格见
 该结果说明当前同步 POSIX 路径的固定开销低于“异步对象 + callback + condition wait”包装；
 后续性能主路径应是调用方显式 DMA buffer + 真正的多请求 async submit，普通 POSIX 桥接保持
 默认关闭。
+
+## 2026-09-10 HFS 普通路径与 registered-DMA async 路径 NVMe 对照
+
+本轮重新绑定 VM 内真实 NVMe `0000:0b:00.0`（SPDK bdev `Nvme0n1`），补测普通完整
+POSIX 路径并运行 HFS registered-DMA/direct-async 矩阵。普通 FIO 使用
+`LD_PRELOAD + psync + O_DIRECT`、`randrw` 50/50、64 MiB、5 秒，HFS 采用
+`numjobs=1/32`，raw SPDK 采用 `iodepth=1/32`；完整数字见
+[`performance/hfs_posix_vs_async_nvme_20260910.md`](../../performance/hfs_posix_vs_async_nvme_20260910.md)。
+
+普通 POSIX 路径 HFS/raw SPDK 总 IOPS 比例为：QD1 的 71.6%～75.3%，QD32 的
+55.6%～82.1%（4～64 KiB）。所有样本 `errors=0`。高性能矩阵使用
+`hfsDmaAlloc`/`hfsRegisterBuffer` 和 `hfs_lib_async_*`，depth=32 时 backend/queue
+peak 均达到 32，`io_copy_ops=0`，但它是分阶段 read/write companion workload，不能
+作为与 FIO `randrw` 完全同负载的吞吐数字。当前 FIO 没有 HFS async engine；若需要严格
+的“FIO 普通 vs FIO 高性能”对照，仍需新增 `hfs_async` ioengine。
