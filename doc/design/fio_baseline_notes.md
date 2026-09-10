@@ -270,7 +270,7 @@ MySQL/MariaDB-compatible server、RocksDB、同步 POSIX 和 async libhfs。普�
 新增 `scripts/db/shard59_performance_matrix.sh`，统一输出持久化 Aio 下的 HFS/native
 FIO、RocksDB 和 MariaDB/MySQL 结果。三轮短样本使用 FIO 3 s、RocksDB 5 s、MySQL
 100 queries，所有 workload errors=0；详细表格见
-[`performance/hfs_shard59_performance_matrix.md`](../../performance/hfs_shard59_performance_matrix.md)。
+[`hfs_shard59_performance_matrix.md`](../performance/hfs_shard59_performance_matrix.md)。
 
 本轮同时修复了 FIO JSON 收尾时 `hfsIoDone()` completion waiter 唤醒后的 request UAF，
 以及 MariaDB bootstrap 强制回收后的 backend flock 启动竞争。当前 VM 没有 NVMe 设备和
@@ -282,7 +282,7 @@ SPDK FIO plugin，direct-NVMe 项按脚本输出 SKIP；不得把 Aio/Malloc 结
 3.42，`randrw` 50/50，256 MiB，10 秒，块大小 4/8/16/32/64 KiB。为对齐有效并发度，
 HFS 分别运行 `numjobs=1/32`，原生 SPDK 分别运行 `iodepth=1/32`；所有样本 `errors=0`。
 完整读写 IOPS、带宽和 p50/p99 表格见
-[`performance/hfs_vs_native_spdk_fio_nvme_full_20260909.md`](../../performance/hfs_vs_native_spdk_fio_nvme_full_20260909.md)。
+[`hfs_vs_native_spdk_fio_nvme_full_20260909.md`](../performance/hfs_vs_native_spdk_fio_nvme_full_20260909.md)。
 
 | 并发口径 | HFS/raw 总 IOPS 比例 | 主要观察 |
 |---|---:|---|
@@ -301,7 +301,7 @@ pool，再调用 direct async，完成后读路径复制回调用方。它不是
 使用 `hfsDmaAlloc` 的 registered-DMA API。NVMe `numjobs=32`、5 秒、4/8/16/32/64 KiB
 测试中，桥接开关相对原有同步 bounce 路径分别为 `-15.0%/-14.5%/-15.2%/-29.7%/-22.8%`
 IOPS，所有错误为 0。完整表格见
-[`performance/hfs_posix_dma_bridge_ab_20260909.md`](../../performance/hfs_posix_dma_bridge_ab_20260909.md)。
+[`hfs_posix_dma_bridge_ab_20260909.md`](../performance/hfs_posix_dma_bridge_ab_20260909.md)。
 
 该结果说明当前同步 POSIX 路径的固定开销低于“异步对象 + callback + condition wait”包装；
 后续性能主路径应是调用方显式 DMA buffer + 真正的多请求 async submit，普通 POSIX 桥接保持
@@ -313,7 +313,7 @@ IOPS，所有错误为 0。完整表格见
 POSIX 路径并运行 HFS registered-DMA/direct-async 矩阵。普通 FIO 使用
 `LD_PRELOAD + psync + O_DIRECT`、`randrw` 50/50、64 MiB、5 秒，HFS 采用
 `numjobs=1/32`，raw SPDK 采用 `iodepth=1/32`；完整数字见
-[`performance/hfs_posix_vs_async_nvme_20260910.md`](../../performance/hfs_posix_vs_async_nvme_20260910.md)。
+[`hfs_posix_vs_async_nvme_20260910.md`](../performance/hfs_posix_vs_async_nvme_20260910.md)。
 
 普通 POSIX 路径 HFS/raw SPDK 总 IOPS 比例为：QD1 的 71.6%～75.3%，QD32 的
 55.6%～82.1%（4～64 KiB）。所有样本 `errors=0`。高性能矩阵使用

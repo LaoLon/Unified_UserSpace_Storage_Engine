@@ -45,7 +45,7 @@ native 应用
 | SPDK commit | `f0b63ed866f0e4d3c56e73bd4a98d0042956147a` | 不适用 |
 | VM | Ubuntu，Linux 6.8.0-139-generic，8 vCPU | 同左 |
 
-> **口径说明**：`performance/stage2_baseline.md` 是旧的持久化 Aio 镜像测试，镜像位于 `/dev/sdb1`。旧报告与本报告的 direct-NVMe 结果不能直接等价比较。
+> **口径说明**：`doc/performance/stage2_baseline.md` 是旧的持久化 Aio 镜像测试，镜像位于 `/dev/sdb1`。旧报告与本报告的 direct-NVMe 结果不能直接等价比较。
 
 ## 2. 测试方法
 

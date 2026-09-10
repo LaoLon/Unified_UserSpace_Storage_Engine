@@ -2,7 +2,7 @@
 
 > **状态**：shard-54 ～ shard-59 已实现并完成当前 VM 可执行项；direct-NVMe 受设备/插件缺失跳过
 > **计划范围**：shard-54 ～ shard-59
-> **输入评审**：[`review/hfs_user_buffer_bounce_copy_optimization.md`](../../review/hfs_user_buffer_bounce_copy_optimization.md)
+> **输入评审**：[`review/hfs_user_buffer_bounce_copy_optimization.md`](../review/hfs_user_buffer_bounce_copy_optimization.md)
 > **当前基线**：`main@4f2d6a1`，VM 内 SPDK 使用锁定 commit `f0b63ed866f0e4d3c56e73bd4a98d0042956147a`
 
 ## 1. 背景与问题定义
@@ -453,7 +453,7 @@ min、max、p50/p99/p99.9，不能只保留最好一轮。
   6.67k/25.0k QPS。
 - 当前 VM 没有 `/dev/nvme*`，且 `/root/code/spdk/build/fio/spdk_bdev` 不存在，
   direct-NVMe 项输出 `SKIP direct NVMe: spdk_fio_plugin_missing; no_nvme_device`；
-  真实 NVMe 仍沿用 `performance/stage2_nvme_native_baseline.md` 的已存证据，待具备
+  真实 NVMe 仍沿用 `doc/performance/stage2_nvme_native_baseline.md` 的已存证据，待具备
   设备授权和 plugin 后按本脚本原始矩阵补跑。
 
 ## 10. 统一观测字段与报告格式

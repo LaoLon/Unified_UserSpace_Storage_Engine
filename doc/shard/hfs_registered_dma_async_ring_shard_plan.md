@@ -194,7 +194,7 @@ callback 不执行 `malloc/free`、文件元数据操作、同步等待或下一
 - 新增 async ring benchmark，覆盖 4/8/16/32/64 KiB、QD 1/4/8/16/32、read/write/randrw。
 - 使用同一 `Nvme0n1` 对比原生 SPDK；Aio/Malloc 只用于 correctness 和回归，不冒充 NVMe。
 - 记录 `copy_ops=0`、有效 outstanding、submit/complete、range wait/hold、p50/p99/p99.9。
-- 更新 `doc/design/fio_baseline_notes.md` 和 `performance/` 报告，明确 async ring 与
+- 更新 `doc/design/fio_baseline_notes.md` 和 `doc/performance/` 报告，明确 async ring 与
   普通 POSIX/FIO preload 不是同一 API 口径。
 
 ## 7. 正确性和性能验收
@@ -244,5 +244,5 @@ shard-60 只有在以下条件全部满足后才能标记完成：
 2. VM 上 Make/CMake、ring smoke、既有全量 smoke 和错误注入全部通过。
 3. NVMe 矩阵证明 `copy_ops=0`、QD32 outstanding 稳定、submit/complete 闭合，并达到
    性能门槛或给出可复现的剩余锁/队列证据。
-4. `performance/`、`doc/design/fio_baseline_notes.md`、本计划和产品支持边界已更新。
+4. `doc/performance/`、`doc/design/fio_baseline_notes.md`、本计划和产品支持边界已更新。
 5. 独立提交后在 `main` 上复核 Git 状态、VM 构建和原始测试结果。

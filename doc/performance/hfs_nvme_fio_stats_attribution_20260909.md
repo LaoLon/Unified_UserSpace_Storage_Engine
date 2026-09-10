@@ -46,7 +46,7 @@ DMA 等待只在 8K、16K 出现，且没有 `dma_exhaust`。因此直接把 poo
 
 64K 样本的 `lock_io_wait_ns` 近似为零并不代表没有锁等待。大范围请求会直接走 per-inode `rangeGate`，
 旧统计只包围 bucket lock，没有包围 gate lock。该缺口已在本轮补齐；修复后的同口径 64K 样本见
-`performance/hfs_range_gate_registered_direct_20260909.md`，记录到 `range_gate` 累计 wait/hold。
+`doc/performance/hfs_range_gate_registered_direct_20260909.md`，记录到 `range_gate` 累计 wait/hold。
 
 ### 6. 请求放大不是主因
 
