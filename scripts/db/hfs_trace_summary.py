@@ -19,11 +19,25 @@ def main() -> int:
     parents = set()
     children = set()
     copyBytes = Counter()
+    lockClasses = Counter()
+    wakeReasons = Counter()
+    metadataOps = Counter()
     durations = defaultdict(list)
+    dropped = 0
     with open(sys.argv[1], newline="", encoding="utf-8") as stream:
-        rows = (line for line in stream
-                if line.strip() and not line.startswith("#"))
-        for row in csv.DictReader(rows, delimiter="\t"):
+        lines = []
+        for line in stream:
+            if line.startswith("#"):
+                marker = "dropped="
+                if marker in line:
+                    try:
+                        dropped += int(line.split(marker, 1)[1].split()[0])
+                    except ValueError:
+                        pass
+                continue
+            if line.strip():
+                lines.append(line)
+        for row in csv.DictReader(lines, delimiter="\t"):
             phase = row["phase"]
             phases[phase] += 1
             operations[row["operation"]] += 1
@@ -36,6 +50,12 @@ def main() -> int:
                 children.add(request)
             if phase in ("copy_in_end", "copy_out_end"):
                 copyBytes[phase] += int(row["bytes"])
+            if row.get("lock_class", "none") != "none":
+                lockClasses[row["lock_class"]] += 1
+            if row.get("wake_reason", "none") != "none":
+                wakeReasons[row["wake_reason"]] += 1
+            if row.get("metadata_op", "none") != "none":
+                metadataOps[row["metadata_op"]] += 1
             duration = int(row["duration_ns"])
             if duration:
                 durations[phase].append(duration)
@@ -49,11 +69,18 @@ def main() -> int:
     print(f"spdk_submit_complete={submit}/{complete}")
     print(f"copy_in_bytes={copyBytes['copy_in_end']}")
     print(f"copy_out_bytes={copyBytes['copy_out_end']}")
+    print(f"trace_dropped={dropped}")
     print(f"parent_ids={len(parents)} child_ids={len(children)}")
     print("phase_counts=" + ",".join(f"{key}:{value}"
                                     for key, value in sorted(phases.items())))
     print("buffer_counts=" + ",".join(f"{key}:{value}"
                                      for key, value in sorted(buffers.items())))
+    print("lock_class_counts=" + ",".join(
+        f"{key}:{value}" for key, value in sorted(lockClasses.items())))
+    print("wake_reason_counts=" + ",".join(
+        f"{key}:{value}" for key, value in sorted(wakeReasons.items())))
+    print("metadata_op_counts=" + ",".join(
+        f"{key}:{value}" for key, value in sorted(metadataOps.items())))
     for phase, values in sorted(durations.items()):
         print(f"{phase}_p50_ns={int(statistics.median(values))}")
     return 0

@@ -29,23 +29,104 @@
 
 /* Protects the mounted inode table and metadata snapshots. */
 static pthread_rwlock_t g_metaLock = PTHREAD_RWLOCK_INITIALIZER;
+#define HFS_TRACE_META_LOCK_DEPTH 16U
+#define HFS_TRACE_SYNC_LOCK_DEPTH 16U
+/* Keep metadata and sync-lock hold tokens on the owning business thread. */
+static _Thread_local HfsTraceLockToken g_metaTraceTokens[HFS_TRACE_META_LOCK_DEPTH];
+static _Thread_local uint32_t g_metaTraceDepth;
+static _Thread_local HfsTraceLockToken g_syncTraceTokens[HFS_TRACE_SYNC_LOCK_DEPTH];
+static _Thread_local uint32_t g_syncTraceDepth;
 /* Protects final descriptions whose SPDK close or orphan delete must retry. */
 static pthread_mutex_t g_deferredCloseLock = PTHREAD_MUTEX_INITIALIZER;
 
+/* Reserve one metadata lock token and publish its wait-begin event. */
+static HfsTraceLockToken *hfsMetaTracePush(void) {
+	HfsTraceLockToken *token;
+
+	if (!hfsTraceEnabledFast() ||
+	    g_metaTraceDepth >= HFS_TRACE_META_LOCK_DEPTH) {
+		return NULL;
+	}
+	token = &g_metaTraceTokens[g_metaTraceDepth++];
+	hfsTraceLockWaitBegin(token, HFS_TRACE_LOCK_METADATA, 0,
+			HFS_TRACE_OPERATION_METADATA, 0, 0, 0, 0, 0);
+	token->lockKey = (uintptr_t)&g_metaLock;
+	return token;
+}
+
+/* Release the most recent metadata lock token after its protected section. */
+static void hfsMetaTracePop(void) {
+	HfsTraceLockToken *token;
+
+	if (g_metaTraceDepth == 0) {
+		return;
+	}
+	token = &g_metaTraceTokens[g_metaTraceDepth - 1U];
+	hfsTraceLockReleased(token, 0);
+	g_metaTraceDepth--;
+}
+
+/* Reserve one inode sync-lock token and publish its wait-begin event. */
+static HfsTraceLockToken *hfsSyncTracePush(HfsInodeRuntime *runtime) {
+	HfsTraceLockToken *token;
+
+	if (runtime == NULL || !hfsTraceEnabledFast() ||
+	    g_syncTraceDepth >= HFS_TRACE_SYNC_LOCK_DEPTH) {
+		return NULL;
+	}
+	token = &g_syncTraceTokens[g_syncTraceDepth++];
+	hfsTraceLockWaitBegin(token, HFS_TRACE_LOCK_SYNC, 0,
+			HFS_TRACE_OPERATION_LOCK, 0, runtime->inodeId, 0, 0, 0);
+	token->lockKey = (uintptr_t)&runtime->syncLock;
+	return token;
+}
+
+/* Release the most recent inode sync-lock token after its protected section. */
+static void hfsSyncTracePop(pthread_rwlock_t *lock) {
+	HfsTraceLockToken *token;
+
+	if (g_syncTraceDepth == 0) {
+		return;
+	}
+	token = &g_syncTraceTokens[g_syncTraceDepth - 1U];
+	if (token->lockKey != (uintptr_t)lock) {
+		return;
+	}
+	hfsTraceLockReleased(token, 0);
+	g_syncTraceDepth--;
+}
+
+/* Acquire an inode sync write lock with explicit wait timing. */
+static int hfsLibSyncWriteLock(HfsInodeRuntime *runtime) {
+	HfsTraceLockToken *token = hfsSyncTracePush(runtime);
+	int rc = pthread_rwlock_wrlock(&runtime->syncLock);
+
+	hfsTraceLockAcquired(token, rc);
+	return rc;
+}
+
 /* Count metadata read-lock acquisitions without extending lock ownership. */
 static void hfsMetaReadLock(void) {
+	HfsTraceLockToken *token = hfsMetaTracePush();
+	int rc;
+
 	HFS_STATS_META_READ_LOCK();
 	hfsStatsLockBeforeFast(HFS_STATS_LOCK_META);
-	pthread_rwlock_rdlock(&g_metaLock);
+	rc = pthread_rwlock_rdlock(&g_metaLock);
 	hfsStatsLockAfterFast(HFS_STATS_LOCK_META);
+	hfsTraceLockAcquired(token, rc);
 }
 
 /* Count metadata write-lock acquisitions without extending lock ownership. */
 static void hfsMetaWriteLock(void) {
+	HfsTraceLockToken *token = hfsMetaTracePush();
+	int rc;
+
 	HFS_STATS_META_WRITE_LOCK();
 	hfsStatsLockBeforeFast(HFS_STATS_LOCK_META);
-	pthread_rwlock_wrlock(&g_metaLock);
+	rc = pthread_rwlock_wrlock(&g_metaLock);
 	hfsStatsLockAfterFast(HFS_STATS_LOCK_META);
+	hfsTraceLockAcquired(token, rc);
 }
 
 /* Classify a rwlock release so metadata and data-path hold times stay separate. */
@@ -69,6 +150,11 @@ static int hfsLibRwlockUnlock(pthread_rwlock_t *lock) {
 	HfsStatsLockClass lockClass = hfsLibRwlockClass(lock);
 
 	hfsStatsLockReleaseFast(lockClass);
+	if (lock == &g_metaLock) {
+		hfsMetaTracePop();
+	} else {
+		hfsSyncTracePop(lock);
+	}
 	return pthread_rwlock_unlock(lock);
 }
 
@@ -118,6 +204,19 @@ static uint64_t g_durabilityInodeId;
 static uint64_t g_durabilityGeneration;
 static int g_durabilityResult;
 static int g_durabilityErrno;
+
+/* Trace one durability condition-variable wait without changing its semantics. */
+static int hfsDurabilityCondWait(void) {
+	HfsTraceWaitToken traceWait = {0};
+	int rc;
+
+	hfsTraceThreadWaitBegin(&traceWait, HFS_TRACE_OPERATION_METADATA,
+		HFS_TRACE_WAKE_DURABILITY, HFS_TRACE_META_OP_FLUSH, 0,
+		g_durabilityInodeId, 0, 0, 0, 0, 0, 0);
+	rc = pthread_cond_wait(&g_durabilityDone, &g_durabilityLock);
+	hfsTraceThreadWaitEnd(&traceWait, rc);
+	return rc;
+}
 
 /* Return the configured backend name for lock naming and diagnostics. */
 static const char *hfs_backend_name(void) {
@@ -649,6 +748,7 @@ static bool hfsPublishWriteEndFast(HfsOpenFile *openFile, uint64_t end) {
 	HfsInodeRuntime *runtime;
 	uint64_t logicalSize;
 	uint64_t nowNs;
+	uint64_t traceStartNs;
 
 	if (openFile == NULL) {
 		return false;
@@ -661,11 +761,19 @@ static bool hfsPublishWriteEndFast(HfsOpenFile *openFile, uint64_t end) {
 	if (end > logicalSize) {
 		return false;
 	}
+	traceStartNs = hfsTraceNowNs();
 	nowNs = hfs_now_ns();
 	/* The data path is complete; only timestamp publication is deferred. */
 	hfsInodeRuntimeRecordMetadata(runtime, nowNs, nowNs);
 	atomic_store_explicit(&openFile->mtimeNs, nowNs, memory_order_release);
 	atomic_store_explicit(&openFile->ctimeNs, nowNs, memory_order_release);
+	hfsTraceEmitDetail(HFS_TRACE_METADATA_PUBLISH,
+		HFS_TRACE_OPERATION_METADATA, HFS_TRACE_BUFFER_NONE, 0, 0,
+		openFile->inodeId, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+		HFS_TRACE_META_OP_PUBLISH,
+		traceStartNs != 0 && hfsTraceNowNs() >= traceStartNs
+			? hfsTraceNowNs() - traceStartNs : 0,
+		0);
 	return true;
 }
 
@@ -673,6 +781,8 @@ static bool hfsPublishWriteEndFast(HfsOpenFile *openFile, uint64_t end) {
 static void hfsPublishWriteEndLocked(HfsOpenFile *openFile, uint64_t end) {
 	struct hfs_inode *in;
 	uint64_t nowNs = hfs_now_ns();
+	uint64_t traceStartNs = hfsTraceNowNs();
+	bool published = false;
 
 	/* A size-changing write supersedes any older deferred timestamp. */
 	hfsInodeRuntimeDiscardPending(openFile == NULL ? NULL : openFile->runtime);
@@ -692,6 +802,7 @@ static void hfsPublishWriteEndLocked(HfsOpenFile *openFile, uint64_t end) {
 		atomic_store_explicit(&openFile->mtimeNs, in->mtimeNs,
 				      memory_order_relaxed);
 		atomic_store_explicit(&openFile->ctimeNs, nowNs, memory_order_relaxed);
+		published = true;
 	} else if (in == NULL && hfsFdGetOrphanInfo(openFile, NULL, NULL, NULL)) {
 		uint64_t size = atomic_load_explicit(&openFile->size,
 					     memory_order_relaxed);
@@ -706,7 +817,15 @@ static void hfsPublishWriteEndLocked(HfsOpenFile *openFile, uint64_t end) {
 		atomic_store_explicit(&openFile->mtimeNs, nowNs,
 				      memory_order_relaxed);
 		atomic_store_explicit(&openFile->ctimeNs, nowNs, memory_order_relaxed);
+		published = true;
 	}
+	hfsTraceEmitDetail(HFS_TRACE_METADATA_PUBLISH,
+		HFS_TRACE_OPERATION_METADATA, HFS_TRACE_BUFFER_NONE, 0, 0,
+		openFile->inodeId, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+		HFS_TRACE_META_OP_PUBLISH,
+		traceStartNs != 0 && hfsTraceNowNs() >= traceStartNs
+			? hfsTraceNowNs() - traceStartNs : 0,
+		published ? 0 : -ENOENT);
 }
 
 /* Publish a successful write end for both linked and unlinked open files. */
@@ -1862,7 +1981,7 @@ int hfs_lib_ftruncate(int fd, off_t length) {
 		errno = EIO;
 		return -1;
 	}
-	pthread_rwlock_wrlock(&runtime->syncLock);
+	hfsLibSyncWriteLock(runtime);
 	hfsMetaReadLock();
 	in = g_fs == NULL ? NULL : hfsMetaFindById(g_fs, openFile->inodeId);
 	if (g_fs == NULL) {
@@ -2407,7 +2526,7 @@ static int hfs_lib_fsync_open_file(HfsOpenFile *openFile, bool dataOnly) {
 			errno = EIO;
 			return -1;
 		}
-		pthread_rwlock_wrlock(&runtime->syncLock);
+		hfsLibSyncWriteLock(runtime);
 		ioLocked = true;
 	}
 	if (openFile->file != NULL && hfsSync(openFile->file) != 0) {
@@ -2554,6 +2673,9 @@ static int hfs_lib_durability_call(int fd, bool dataOnly) {
 			g_durabilityErrno = savedErrno;
 			g_durabilityRunning = false;
 			g_durabilityGeneration = generation + 1U;
+			hfsTraceThreadWake(HFS_TRACE_OPERATION_METADATA,
+			HFS_TRACE_WAKE_DURABILITY, HFS_TRACE_META_OP_FLUSH, 0,
+			g_durabilityInodeId, 0, 0, 0, 0, 0, 0, 0);
 			pthread_cond_broadcast(&g_durabilityDone);
 			pthread_mutex_unlock(&g_durabilityLock);
 			if (rc != 0) {
@@ -2568,7 +2690,7 @@ static int hfs_lib_durability_call(int fd, bool dataOnly) {
 			generation = g_durabilityGeneration;
 			while (g_durabilityRunning &&
 			       g_durabilityGeneration == generation) {
-				pthread_cond_wait(&g_durabilityDone, &g_durabilityLock);
+				hfsDurabilityCondWait();
 			}
 			rc = g_durabilityResult;
 			savedErrno = g_durabilityErrno;
@@ -2582,7 +2704,7 @@ static int hfs_lib_durability_call(int fd, bool dataOnly) {
 
 		/* A different inode, or a stronger request, waits then starts its own epoch. */
 		while (g_durabilityRunning) {
-			pthread_cond_wait(&g_durabilityDone, &g_durabilityLock);
+			hfsDurabilityCondWait();
 		}
 		pthread_mutex_unlock(&g_durabilityLock);
 	}
@@ -2659,7 +2781,7 @@ int hfs_lib_fallocate(int fd, int mode, off_t offset, off_t len) {
 			errno = EIO;
 			return -1;
 		}
-		pthread_rwlock_wrlock(&runtime->syncLock);
+		hfsLibSyncWriteLock(runtime);
 		if (hfsSnapshotFileSize(openFile, &fileSize) != 0) {
 			pthread_rwlock_unlock(&runtime->syncLock);
 			pthread_mutex_unlock(&openFile->ioLock);
@@ -2698,7 +2820,7 @@ int hfs_lib_fallocate(int fd, int mode, off_t offset, off_t len) {
 		errno = EIO;
 		return -1;
 	}
-	pthread_rwlock_wrlock(&runtime->syncLock);
+	hfsLibSyncWriteLock(runtime);
 	if (hfsResizeTo(openFile->file, end) != 0) {
 		pthread_rwlock_unlock(&runtime->syncLock);
 		pthread_mutex_unlock(&openFile->ioLock);

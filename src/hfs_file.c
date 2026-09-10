@@ -12,6 +12,7 @@
 #include "hfs_io.h"
 #include "hfs_log.h"
 #include "hfs_stats.h"
+#include "hfs_trace.h"
 
 /* Request state used by blob lifecycle and fsync operation chains. */
 typedef struct HfsFileRequest {
@@ -19,6 +20,7 @@ typedef struct HfsFileRequest {
 	HfsRequestResult result;
 	struct spdk_bs_dev_cb_args flushArgs;
 	HfsRequestOperation flushOperation;
+	uint64_t traceFlushStartNs;
 	int primaryRc;
 	bool createdBlob;
 } HfsFileRequest;
@@ -114,6 +116,13 @@ static void hfsSubmitFsyncFlush(HfsFileRequest *request) {
 
 	/* Count both real and injected barriers so failure ratios remain visible. */
 	hfsStatsRecordFlushFast();
+	request->traceFlushStartNs = hfsTraceNowNs();
+	request->result.completion.traceStageStartNs = request->traceFlushStartNs;
+	hfsTraceEmitDetail(HFS_TRACE_FLUSH_BEGIN,
+		HFS_TRACE_OPERATION_FLUSH, HFS_TRACE_BUFFER_NONE,
+		request->result.requestId, request->result.completion.traceParentId,
+		request->result.completion.traceInodeId, 0, 0, 0, 0, 0, 0, 0,
+		0, 0, 0, HFS_TRACE_META_OP_FLUSH, 0, 0);
 	if (hfsRequestCompletionInjected(request->flushOperation)) {
 		hfsRequestComplete(&request->result, -EIO, 0);
 		return;
@@ -367,6 +376,8 @@ static int hfsSyncWithFlushOperation(HfsFile *file,
 	request.file = file;
 	request.flushOperation = flushOperation;
 	hfsRequestInit(&request.result, HFS_REQUEST_BLOB_SYNC);
+	/* Attach the file identity so flush and completion wake events correlate. */
+	request.result.completion.traceInodeId = file->inodeId;
 	return hfsRequestWait(&request.result, hfsDoSync, &request);
 }
 

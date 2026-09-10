@@ -25,6 +25,20 @@ struct spdk_bdev_desc;
 /* Completion state shared by one asynchronous SPDK request. */
 typedef struct HfsCompletion {
 	atomic_int state;
+	/* Optional trace identity copied into wait and wake events. */
+	uint64_t traceRequestId;
+	uint64_t traceParentId;
+	uint64_t traceInodeId;
+	uint64_t traceOffset;
+	uint64_t traceBytes;
+	uint8_t traceOperation;
+	uint8_t traceBufferKind;
+	uint16_t traceReserved;
+	uint32_t traceMetadataOperation;
+	uint64_t traceStageStartNs;
+	/* Runtime queue credit retained until the backend callback retires. */
+	_Atomic bool runtimeCreditHeld;
+	uint32_t runtimeReactorId;
 } HfsCompletion;
 
 /* Operations recorded by one request-private SPDK result object. */

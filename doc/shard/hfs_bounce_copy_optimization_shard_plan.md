@@ -193,6 +193,22 @@ spdk_latency / completion_wakeup_latency
 - VM 验证：make -B app lib、CMake Release、io_trace_smoke.sh 通过；trace-on 样例
   记录 421 条事件、13 类 phase，SPDK submit/complete 与现有数据校验均通过。
 
+#### Trace 扩展（当前工作区）
+
+- TSV 保留原有列并增加 `lock_class`、`lock_id`、`wake_reason`、`metadata_op`，旧解析器仍可
+  读取基础阶段；`hfs_trace_summary.py` 额外汇总锁类别、唤醒原因、metadata 子操作和丢弃数。
+- 锁点覆盖 inode `syncLock`、range stripe 以及全局 metadata rwlock，统一记录
+  `lock_wait_begin`、`lock_acquired`、`lock_release`，分别得到等待时间和持有时间。
+- metadata 点覆盖请求级 begin/end、事务提交、publish、设备 flush begin/end；completion
+  wait/wake 记录 request/parent/inode 关联，避免把 metadata 延迟误归因到 SPDK completion。
+- 条件变量点覆盖 runtime 状态、durability barrier 和 DMA pool available 队列，记录
+  `thread_wait_begin/end/wake` 及 `runtime`、`durability`、`dma_lease` 三类唤醒原因；trace
+  默认关闭，未启用时只走原有快速路径。
+- VM 回归：`make -B app lib`、CMake Release 和 `io_trace_smoke.sh` 均通过；最新样例
+  记录 1,580 条事件、27 类 phase，`trace_dropped=0`，`spdk_submit=spdk_complete=38`，
+  并观察到 `lock_class={metadata,range_stripe,sync}` 与
+  `wake_reason={completion,runtime,durability,dma_lease}`。
+
 ## 5. shard-55：Buffer ownership 与 Registry Fast Path
 
 ### 5.1 目标

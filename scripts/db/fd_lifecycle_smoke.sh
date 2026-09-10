@@ -29,6 +29,7 @@ import os
 import threading
 
 root = "/hfs/fd-lifecycle"
+print("FD LIFECYCLE: mkdir", flush=True)
 try:
     os.rmdir(root)
 except OSError:
@@ -36,6 +37,7 @@ except OSError:
 os.mkdir(root)
 
 # dup shares the same open-file description and therefore the file offset.
+print("FD LIFECYCLE: dup", flush=True)
 path = root + "/shared"
 fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
 assert os.write(fd, b"abcdef") == 6
@@ -48,6 +50,7 @@ assert second == b"cd", ("shared offset read", second)
 os.close(dup_fd)
 
 # F_DUPFD_CLOEXEC and dup2 must share the same offset and status flags.
+print("FD LIFECYCLE: dup variants", flush=True)
 assert fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE == os.O_RDWR
 fcntl_dup = fcntl.fcntl(fd, getattr(fcntl, "F_DUPFD_CLOEXEC", fcntl.F_DUPFD), 0)
 assert os.read(fcntl_dup, 2) == b"ef"
@@ -59,6 +62,7 @@ os.close(dup2_fd)
 os.close(fd)
 
 # Closing a slot must permit immediate reuse without stale HFS routing.
+print("FD LIFECYCLE: slot reuse", flush=True)
 fd = os.open(path, os.O_RDONLY)
 old_number = fd
 os.close(fd)
@@ -68,6 +72,7 @@ assert os.write(fd, b"reuse") == 5
 os.close(fd)
 
 # An unlinked file stays available through its old open description.
+print("FD LIFECYCLE: unlink-open", flush=True)
 orphan_path = root + "/orphan"
 fd = os.open(orphan_path, os.O_CREAT | os.O_RDWR, 0o600)
 assert os.write(fd, b"orphan-data") == 11
@@ -84,6 +89,7 @@ assert os.pread(fd, 11, 0) == b"orphan-data"
 os.close(fd)
 
 # Renaming over an open destination keeps the old description alive.
+print("FD LIFECYCLE: rename-open", flush=True)
 rename_dst = root + "/rename-dst"
 rename_src = root + "/rename-src"
 old_fd = os.open(rename_dst, os.O_CREAT | os.O_RDWR, 0o600)
@@ -101,6 +107,7 @@ os.close(reopened_fd)
 os.close(old_fd)
 
 # Renaming a path onto itself is a no-op and must retain its blob.
+print("FD LIFECYCLE: same-path rename", flush=True)
 same_path = root + "/same"
 same_fd = os.open(same_path, os.O_CREAT | os.O_RDWR, 0o600)
 assert os.write(same_fd, b"same-data") == 9
@@ -110,6 +117,7 @@ os.close(same_fd)
 os.unlink(same_path)
 
 # Independent descriptions can perform concurrent positioned I/O safely.
+print("FD LIFECYCLE: positioned IO", flush=True)
 parallel_path = root + "/parallel"
 fd = os.open(parallel_path, os.O_CREAT | os.O_RDWR, 0o600)
 assert os.pwrite(fd, b"\0" * (8 * 4096), 0) == 8 * 4096
@@ -138,6 +146,7 @@ for thread in threads:
 assert not errors, errors
 
 # Churn one path from many threads to exercise bucket lookup and fd reuse.
+print("FD LIFECYCLE: churn setup", flush=True)
 churn_path = root + "/lookup-churn"
 seed_fd = os.open(churn_path, os.O_CREAT | os.O_RDWR, 0o600)
 try:
@@ -161,8 +170,10 @@ churn_threads = [threading.Thread(target=churn_worker, args=(i,))
                  for i in range(64)]
 for thread in churn_threads:
     thread.start()
+print("FD LIFECYCLE: churn workers started", flush=True)
 for thread in churn_threads:
     thread.join()
+print("FD LIFECYCLE: churn workers joined", flush=True)
 assert not churn_errors, churn_errors
 
 print("FD LIFECYCLE OK")

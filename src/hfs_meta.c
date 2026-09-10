@@ -14,6 +14,7 @@
 #include "hfs_meta.h"
 #include "hfs_meta_index.h"
 #include "hfs_stats.h"
+#include "hfs_trace.h"
 
 /* Versioned metadata header used to keep inode IDs stable across compaction. */
 #define HFS_META_MAGIC		0x32465348U
@@ -461,8 +462,33 @@ static void hfsMetaDoClose(void *arg) {
 /* Run one metadata I/O stage and preserve the exact SPDK completion status. */
 static int hfsMetaWait(HfsMetaIoRequest *request, HfsRequestOperation operation,
 			       spdk_msg_fn startFn) {
+	uint64_t traceStartNs;
+	uint64_t traceBytes;
+	int rc;
+
 	hfsRequestInit(&request->result, operation);
-	return hfsRequestWait(&request->result, startFn, request);
+	traceBytes = request->units *
+		(request->fs != NULL ? request->fs->unitSize : 0);
+	request->result.completion.traceOffset = request->offset;
+	request->result.completion.traceBytes = traceBytes;
+	traceStartNs = hfsTraceNowNs();
+	hfsTraceEmitDetail(HFS_TRACE_METADATA_BEGIN,
+		(HfsTraceOperation)request->result.completion.traceOperation,
+		HFS_TRACE_BUFFER_NONE, request->result.requestId, 0,
+		0, request->offset, traceBytes, (uint32_t)request->units,
+		0, 0, 0, 0, 0, 0, 0,
+		request->result.completion.traceMetadataOperation, 0, 0);
+	rc = hfsRequestWait(&request->result, startFn, request);
+	hfsTraceEmitDetail(HFS_TRACE_METADATA_END,
+		(HfsTraceOperation)request->result.completion.traceOperation,
+		HFS_TRACE_BUFFER_NONE, request->result.requestId, 0,
+		0, request->offset, traceBytes, (uint32_t)request->units,
+		0, 0, 0, 0, 0, 0, 0,
+		request->result.completion.traceMetadataOperation,
+		traceStartNs != 0 && hfsTraceNowNs() >= traceStartNs
+			? hfsTraceNowNs() - traceStartNs : 0,
+		rc == 0 ? 0 : -1);
+	return rc;
 }
 
 /* Reuse the mount-lifetime metadata handle, with a temporary fallback for setup. */
@@ -1003,7 +1029,7 @@ static void hfsMetaBuildIntent(Hfs *fs, uint64_t baseGeneration,
  * already returned success, so a failure before the intent becomes durable
  * must retain its dirty in-memory inode for a later fsync retry.
  */
-static int hfsMetaCommit(Hfs *fs, const uint32_t *indices,
+static int hfsMetaCommitInternal(Hfs *fs, const uint32_t *indices,
 				 uint32_t indexCount, bool retainRuntimeMutation) {
 	HfsMetaHeaderDisk oldHeader;
 	HfsMetaHeaderDisk newHeader;
@@ -1140,6 +1166,28 @@ out:
 		}
 		errno = savedErrno;
 	}
+	return rc;
+}
+
+/* Trace one complete metadata transaction, including all intent/data phases. */
+static int hfsMetaCommit(Hfs *fs, const uint32_t *indices,
+				 uint32_t indexCount, bool retainRuntimeMutation) {
+	uint64_t traceStartNs = hfsTraceNowNs();
+	int rc;
+
+	hfsTraceEmitDetail(HFS_TRACE_METADATA_BEGIN,
+		HFS_TRACE_OPERATION_METADATA, HFS_TRACE_BUFFER_NONE, 0, 0, 0,
+		0, 0, indexCount, 0, 0, 0, 0, 0, 0, 0,
+		HFS_TRACE_META_OP_TRANSACTION, 0, 0);
+	rc = hfsMetaCommitInternal(fs, indices, indexCount,
+					retainRuntimeMutation);
+	hfsTraceEmitDetail(HFS_TRACE_METADATA_END,
+		HFS_TRACE_OPERATION_METADATA, HFS_TRACE_BUFFER_NONE, 0, 0, 0,
+		0, 0, indexCount, 0, 0, 0, 0, 0, 0, 0,
+		HFS_TRACE_META_OP_TRANSACTION,
+		traceStartNs != 0 && hfsTraceNowNs() >= traceStartNs
+			? hfsTraceNowNs() - traceStartNs : 0,
+		rc == 0 ? 0 : -1);
 	return rc;
 }
 

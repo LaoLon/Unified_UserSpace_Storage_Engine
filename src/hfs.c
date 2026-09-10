@@ -13,6 +13,7 @@
 
 #include "hfs_internal.h"
 #include "hfs_log.h"
+#include "hfs_trace.h"
 
 /* Monotonic identifiers let diagnostics correlate one submit and completion. */
 static _Atomic uint64_t g_hfsRequestId;
@@ -65,6 +66,44 @@ static const char *hfsRequestOperationName(HfsRequestOperation operation) {
 	}
 }
 
+/* Map an internal request operation to the stable trace operation vocabulary. */
+static HfsTraceOperation hfsRequestTraceOperation(HfsRequestOperation operation) {
+	switch (operation) {
+	case HFS_REQUEST_BLOB_READ:
+	case HFS_REQUEST_METADATA_READ:
+		return HFS_TRACE_OPERATION_READ;
+	case HFS_REQUEST_BLOB_WRITE:
+	case HFS_REQUEST_METADATA_WRITE:
+		return HFS_TRACE_OPERATION_WRITE;
+	case HFS_REQUEST_BDEV_FLUSH:
+	case HFS_REQUEST_BDEV_FLUSH_POST_COMMIT:
+	case HFS_REQUEST_BLOB_SYNC:
+		return HFS_TRACE_OPERATION_FLUSH;
+	case HFS_REQUEST_METADATA_OPEN:
+	case HFS_REQUEST_METADATA_FORMAT:
+	case HFS_REQUEST_METADATA_GET_SUPER:
+		return HFS_TRACE_OPERATION_METADATA;
+	default:
+		return HFS_TRACE_OPERATION_NONE;
+	}
+}
+
+/* Map a request operation to the metadata detail field used by trace readers. */
+static HfsTraceMetadataOperation hfsRequestTraceMetadata(HfsRequestOperation operation) {
+	switch (operation) {
+	case HFS_REQUEST_METADATA_OPEN: return HFS_TRACE_META_OP_OPEN;
+	case HFS_REQUEST_METADATA_READ: return HFS_TRACE_META_OP_READ;
+	case HFS_REQUEST_METADATA_WRITE: return HFS_TRACE_META_OP_WRITE;
+	case HFS_REQUEST_BLOB_SYNC: return HFS_TRACE_META_OP_SYNC;
+	case HFS_REQUEST_BLOB_RESIZE: return HFS_TRACE_META_OP_RESIZE;
+	case HFS_REQUEST_BLOB_CLOSE: return HFS_TRACE_META_OP_CLOSE;
+	case HFS_REQUEST_BDEV_FLUSH:
+	case HFS_REQUEST_BDEV_FLUSH_POST_COMMIT:
+		return HFS_TRACE_META_OP_FLUSH;
+	default: return HFS_TRACE_META_OP_NONE;
+	}
+}
+
 /* Enable deterministic pre-submit failures only when an explicit test env is set. */
 static bool hfsRequestSubmitInjected(HfsRequestOperation operation) {
 	const char *requested = getenv("HFS_TEST_FAIL_SUBMIT");
@@ -99,6 +138,11 @@ void hfsRequestInit(HfsRequestResult *result, HfsRequestOperation operation) {
 						memory_order_relaxed) + 1;
 	result->completionRc = -EIO;
 	result->bserrno = -EIO;
+	result->completion.traceRequestId = result->requestId;
+	result->completion.traceOperation =
+		(uint8_t)hfsRequestTraceOperation(operation);
+	result->completion.traceMetadataOperation =
+		(uint32_t)hfsRequestTraceMetadata(operation);
 }
 
 /* Store the SPDK completion result before waking the waiting caller. */
@@ -107,6 +151,20 @@ void hfsRequestComplete(HfsRequestResult *result, int bserrno,
 	result->bserrno = bserrno;
 	result->completionRc = bserrno;
 	result->completedUnits = completedUnits;
+	if (result->completion.traceStageStartNs != 0) {
+		uint64_t nowNs = hfsTraceNowNs();
+		uint64_t durationNs = nowNs >= result->completion.traceStageStartNs
+			? nowNs - result->completion.traceStageStartNs : 0;
+
+		/* Close the device-flush interval before publishing the completion wake. */
+		hfsTraceEmitDetail(HFS_TRACE_FLUSH_END,
+			HFS_TRACE_OPERATION_FLUSH, HFS_TRACE_BUFFER_NONE,
+			result->completion.traceRequestId,
+			result->completion.traceParentId,
+			result->completion.traceInodeId, 0, 0, 0, 0, 0, 0, 0,
+			0, 0, 0, HFS_TRACE_META_OP_FLUSH, durationNs, bserrno);
+		result->completion.traceStageStartNs = 0;
+	}
 	hfsRuntimeCompletionComplete(&result->completion);
 }
 
@@ -181,6 +239,12 @@ int hfsRequestSubmitDataBatch(HfsRequestResult *result, spdk_msg_fn startFn,
 		result->submitRc = -EIO;
 		return hfsRequestSetError(result->submitRc);
 	}
+	if (batchItem == NULL) {
+		result->submitRc = -EINVAL;
+		return hfsRequestSetError(result->submitRc);
+	}
+	/* Keep the bounded reactor credit until this request's backend callback. */
+	batchItem->completion = &result->completion;
 	rc = hfsRuntimeSubmitDataBatch(reactorId, batchItem, startFn, ctx);
 	result->submitRc = rc;
 	if (rc != 0) {

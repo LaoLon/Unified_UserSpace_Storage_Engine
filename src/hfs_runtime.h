@@ -23,6 +23,7 @@ typedef struct HfsRuntimeBatchItem {
 	void *ctx;
 	uint64_t enqueueNs;
 	uint64_t traceParentId;
+	HfsCompletion *completion;
 	struct HfsRuntimeBatchItem *next;
 } HfsRuntimeBatchItem;
 /* Queue one request and coalesce concurrent submissions into one owner message. */

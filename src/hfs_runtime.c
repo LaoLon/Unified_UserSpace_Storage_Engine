@@ -7,6 +7,7 @@
 #include <sched.h>
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/syscall.h>
 #include <linux/futex.h>
 #include <time.h>
@@ -27,6 +28,9 @@
 #define HFS_COMPLETION_DONE 1
 #define HFS_COMPLETION_TIMED_OUT 2
 #define HFS_RUNTIME_MAX_DATA_REACTORS 8U
+#define HFS_RUNTIME_DEFAULT_QUEUE_DEPTH 32U
+#define HFS_RUNTIME_MIN_QUEUE_DEPTH 4U
+#define HFS_RUNTIME_MAX_QUEUE_DEPTH 256U
 #define HFS_RUNTIME_DEFAULT_STRIPE_KIB 1024UL
 #define HFS_RUNTIME_MIN_STRIPE_KIB 64UL
 #define HFS_RUNTIME_MAX_STRIPE_KIB 16384UL
@@ -38,9 +42,14 @@ typedef struct HfsRuntimeDataReactor {
 	pthread_mutex_t lock;
 	pthread_cond_t stateChanged;
 	pthread_mutex_t batchLock;
+	pthread_cond_t queueAvailable;
 	HfsRuntimeBatchItem *batchHead;
 	HfsRuntimeBatchItem *batchTail;
 	bool batchScheduled;
+	bool queueClosed;
+	uint32_t queueDepth;
+	uint32_t inflight;
+	uint32_t maxDepth;
 	unsigned int index;
 	int cpu;
 	bool threadCreated;
@@ -61,6 +70,10 @@ struct hfs_runtime_state {
 	bool threadCreated;
 	bool ready;
 	bool batchEnabled;
+	bool posixQueueEnabled;
+	uint32_t queueDepthLimit;
+	/* Serialize multi-producer SPDK ring admission to avoid tail reservation stalls. */
+	pthread_mutex_t messageSubmitLock;
 	_Atomic bool accepting;
 	bool stopSubmitted;
 	_Atomic bool subsystemsReady;
@@ -78,12 +91,24 @@ static struct hfs_runtime_state g_runtime = {
 	.lock = PTHREAD_MUTEX_INITIALIZER,
 	.stateChanged = PTHREAD_COND_INITIALIZER,
 	.batchLock = PTHREAD_MUTEX_INITIALIZER,
+	.messageSubmitLock = PTHREAD_MUTEX_INITIALIZER,
 };
 static _Atomic bool g_ownerViolationLogged;
 
 /* Owner identity is immutable for a runtime generation and needs no mutex lookup. */
 static _Thread_local bool g_hfsRuntimeOwnerThread;
 static _Thread_local bool g_hfsRuntimeDataThread;
+
+/* Serialize producers before entering SPDK's lockless message ring. */
+static void hfsRuntimeSendMessage(struct spdk_thread *thread,
+					spdk_msg_fn fn, void *ctx) {
+	if (thread == NULL || fn == NULL) {
+		return;
+	}
+	pthread_mutex_lock(&g_runtime.messageSubmitLock);
+	spdk_thread_send_msg(thread, fn, ctx);
+	pthread_mutex_unlock(&g_runtime.messageSubmitLock);
+}
 
 /* Instrument the runtime state mutex while keeping the fast path lock-free in stats-off mode. */
 static int hfsRuntimeMutexLock(pthread_mutex_t *lock) {
@@ -243,49 +268,110 @@ static void hfsRuntimeDispatchBatch(void *arg) {
 	}
 }
 
-/* Drain one data-reactor batch after one notification instead of one message per I/O. */
+/* Return one bounded credit to a reactor and wake blocked producers. */
+static void hfsRuntimeDataCreditReleaseReactor(HfsRuntimeDataReactor *reactor) {
+	if (reactor == NULL) {
+		return;
+	}
+	pthread_mutex_lock(&reactor->batchLock);
+	if (reactor->inflight != 0) {
+		reactor->inflight--;
+	}
+	pthread_cond_broadcast(&reactor->queueAvailable);
+	pthread_mutex_unlock(&reactor->batchLock);
+}
+
+/* Release one reactor credit after the backend callback has retired. */
+static void hfsRuntimeDataCreditRelease(HfsCompletion *completion) {
+	HfsRuntimeDataReactor *reactor;
+	uint32_t reactorId;
+
+	if (completion == NULL ||
+	    !atomic_exchange_explicit(&completion->runtimeCreditHeld, false,
+					   memory_order_acq_rel)) {
+		return;
+	}
+	reactorId = completion->runtimeReactorId;
+	if (reactorId == 0 || g_runtime.dataReactors == NULL ||
+	    reactorId >= g_runtime.dataReactorCount) {
+		return;
+	}
+	reactor = &g_runtime.dataReactors[reactorId - 1U];
+	hfsRuntimeDataCreditReleaseReactor(reactor);
+}
+
+/* Drain one data-reactor batch while retaining a bounded backend credit. */
 static void hfsRuntimeDispatchDataBatch(void *arg) {
 	HfsRuntimeDataReactor *reactor = arg;
 	HfsRuntimeBatchItem *item;
 	HfsRuntimeBatchItem *next;
 	bool timing = hfsStatsTimingFastEnabled();
 
-	pthread_mutex_lock(&reactor->batchLock);
-	item = reactor->batchHead;
-	reactor->batchHead = NULL;
-	reactor->batchTail = NULL;
-	reactor->batchScheduled = false;
-	pthread_mutex_unlock(&reactor->batchLock);
-	while (item != NULL) {
-		next = item->next;
-		if (hfsTraceEnabledFast()) {
-			uint64_t nowNs = hfsTraceNowNs();
-			uint64_t waitNs = item->enqueueNs != 0 && nowNs >= item->enqueueNs ?
-					  nowNs - item->enqueueNs : 0;
-			hfsTraceEmit(HFS_TRACE_RUNTIME_DEQUEUE,
-				     HFS_TRACE_OPERATION_NONE,
-				     HFS_TRACE_BUFFER_NONE,
-				     0, item->traceParentId, 0, 0, 0, 0,
-				     (uint32_t)atomic_load_explicit(&g_runtime.queued,
-								    memory_order_relaxed),
-				     reactor->index, 0, 0, waitNs, 0);
+	/* Keep the notification armed while draining newly appended items. */
+	for (;;) {
+		uint64_t batchSize = 0;
+
+		pthread_mutex_lock(&reactor->batchLock);
+		item = reactor->batchHead;
+		reactor->batchHead = NULL;
+		reactor->batchTail = NULL;
+		if (item == NULL) {
+			reactor->batchScheduled = false;
+			pthread_mutex_unlock(&reactor->batchLock);
+			break;
 		}
-		if (timing) {
-			uint64_t depth = atomic_fetch_sub_explicit(&g_runtime.queued, 1,
-					memory_order_relaxed) - 1U;
-			uint64_t queueWaitNs = hfsStatsNowNs() - item->enqueueNs;
-			uint64_t ownerStartNs = hfsStatsNowNs();
-			atomic_fetch_add_explicit(&g_runtime.inflight, 1,
-					memory_order_relaxed);
-			item->fn(item->ctx);
-			depth = atomic_fetch_sub_explicit(&g_runtime.inflight, 1,
-					memory_order_relaxed);
-			hfsStatsRecordRuntimeDispatchFast(queueWaitNs,
-					hfsStatsNowNs() - ownerStartNs, depth);
-		} else {
-			item->fn(item->ctx);
+		pthread_mutex_unlock(&reactor->batchLock);
+		for (HfsRuntimeBatchItem *cursor = item; cursor != NULL;
+		     cursor = cursor->next) {
+			batchSize++;
 		}
-		item = next;
+		hfsStatsRecordQueueDrainFast(reactor->index, batchSize);
+		while (item != NULL) {
+			uint64_t queueWaitNs = 0;
+			uint64_t ownerStartNs = 0;
+			uint64_t depth = 0;
+			uint64_t nowNs;
+			uint32_t currentQueueDepth;
+
+			next = item->next;
+			pthread_mutex_lock(&reactor->batchLock);
+			if (reactor->queueDepth != 0) {
+				reactor->queueDepth--;
+			}
+			reactor->inflight++;
+			currentQueueDepth = reactor->queueDepth;
+			pthread_mutex_unlock(&reactor->batchLock);
+			if (hfsTraceEnabledFast()) {
+				nowNs = hfsTraceNowNs();
+				queueWaitNs = item->enqueueNs != 0 && nowNs >= item->enqueueNs ?
+					nowNs - item->enqueueNs : 0;
+				hfsTraceEmit(HFS_TRACE_RUNTIME_DEQUEUE,
+					     HFS_TRACE_OPERATION_NONE,
+					     HFS_TRACE_BUFFER_NONE,
+					     0, item->traceParentId, 0, 0, 0, 0,
+					     currentQueueDepth, reactor->index, 0, 0,
+					     queueWaitNs, 0);
+			}
+			if (timing) {
+				depth = atomic_fetch_sub_explicit(&g_runtime.queued, 1,
+						memory_order_relaxed) - 1U;
+				atomic_fetch_add_explicit(&g_runtime.inflight, 1,
+						memory_order_relaxed);
+				ownerStartNs = hfsStatsNowNs();
+			}
+			item->fn(item->ctx);
+			if (timing) {
+				uint64_t ownerNs = hfsStatsNowNs() - ownerStartNs;
+				depth = atomic_fetch_sub_explicit(&g_runtime.inflight, 1,
+						memory_order_relaxed);
+				hfsStatsRecordRuntimeDispatchFast(queueWaitNs, ownerNs, depth);
+			}
+			/* Non-I/O users do not attach a completion and release immediately. */
+			if (item->completion == NULL) {
+				hfsRuntimeDataCreditReleaseReactor(reactor);
+			}
+			item = next;
+		}
 	}
 }
 
@@ -296,6 +382,10 @@ static void hfsRuntimePublishReady(int rc) {
 	g_runtime.ready = true;
 	atomic_store_explicit(&g_runtime.accepting, rc == 0,
 		memory_order_release);
+	hfsTraceThreadWake(HFS_TRACE_OPERATION_THREAD, HFS_TRACE_WAKE_RUNTIME,
+		HFS_TRACE_META_OP_NONE, 0, 0, 0, 0, 0,
+		(uint32_t)atomic_load_explicit(&g_runtime.queued, memory_order_relaxed),
+		0, 0, rc);
 	pthread_cond_broadcast(&g_runtime.stateChanged);
 	HFS_RUNTIME_STATE_UNLOCK(&g_runtime.lock);
 }
@@ -391,25 +481,67 @@ static void *hfsRuntimeOwnerMain(void *arg) {
 	atomic_store_explicit(&g_runtime.spdkThread, NULL, memory_order_release);
 	atomic_store_explicit(&g_runtime.accepting, false, memory_order_release);
 	atomic_store_explicit(&g_runtime.ownerPid, 0, memory_order_release);
+	hfsTraceThreadWake(HFS_TRACE_OPERATION_THREAD, HFS_TRACE_WAKE_RUNTIME,
+		HFS_TRACE_META_OP_NONE, 0, 0, 0, 0, 0,
+		(uint32_t)atomic_load_explicit(&g_runtime.queued, memory_order_relaxed),
+		0, 0, 0);
 	pthread_cond_broadcast(&g_runtime.stateChanged);
 	HFS_RUNTIME_STATE_UNLOCK(&g_runtime.lock);
 	g_hfsRuntimeOwnerThread = false;
 	return NULL;
 }
 
-/* Parse a bounded reactor count while retaining a single-reactor default. */
+/* Parse a bounded total reactor count; reactor zero remains the metadata owner. */
 static uint32_t hfsRuntimeDataReactorCountEnv(void) {
 	const char *value = getenv("HFS_DATA_REACTORS");
 	char *end = NULL;
 	unsigned long parsed;
+	long cpuCount;
+	uint32_t dataCount;
 
 	if (value == NULL || value[0] == '\0') {
-		return 1;
+		cpuCount = sysconf(_SC_NPROCESSORS_ONLN);
+		dataCount = cpuCount > 1 ? (uint32_t)cpuCount / 2U : 1U;
+		if (dataCount == 0) {
+			dataCount = 1;
+		}
+		if (dataCount > HFS_RUNTIME_MAX_DATA_REACTORS - 1U) {
+			dataCount = HFS_RUNTIME_MAX_DATA_REACTORS - 1U;
+		}
+		return dataCount + 1U;
 	}
 	parsed = strtoul(value, &end, 10);
 	if (end == value || *end != '\0' || parsed == 0 ||
 	    parsed > HFS_RUNTIME_MAX_DATA_REACTORS) {
 		return 1;
+	}
+	return (uint32_t)parsed;
+}
+
+/* Parse a boolean environment switch with a safe enabled default. */
+static bool hfsRuntimeBoolEnv(const char *name, bool defaultValue) {
+	const char *value = getenv(name);
+
+	if (value == NULL || value[0] == '\0') {
+		return defaultValue;
+	}
+	return strcmp(value, "0") != 0 && strcasecmp(value, "false") != 0 &&
+		strcasecmp(value, "off") != 0 && strcasecmp(value, "no") != 0;
+}
+
+/* Parse a bounded per-reactor queue depth for POSIX backpressure. */
+static uint32_t hfsRuntimeQueueDepthEnv(void) {
+	const char *value = getenv("HFS_POSIX_QUEUE_DEPTH");
+	char *end = NULL;
+	unsigned long parsed;
+
+	if (value == NULL || value[0] == '\0') {
+		return HFS_RUNTIME_DEFAULT_QUEUE_DEPTH;
+	}
+	parsed = strtoul(value, &end, 10);
+	if (end == value || *end != '\0' || parsed < HFS_RUNTIME_MIN_QUEUE_DEPTH ||
+	    parsed > HFS_RUNTIME_MAX_QUEUE_DEPTH) {
+		return HFS_RUNTIME_DEFAULT_QUEUE_DEPTH;
 	}
 	return (uint32_t)parsed;
 }
@@ -476,6 +608,8 @@ static void hfsRuntimeDataPublishReady(HfsRuntimeDataReactor *reactor,
 	pthread_mutex_lock(&reactor->lock);
 	reactor->initRc = rc;
 	reactor->ready = true;
+	hfsTraceThreadWake(HFS_TRACE_OPERATION_THREAD, HFS_TRACE_WAKE_RUNTIME,
+		HFS_TRACE_META_OP_NONE, 0, 0, 0, 0, 0, 0, reactor->index, 0, rc);
 	pthread_cond_broadcast(&reactor->stateChanged);
 	pthread_mutex_unlock(&reactor->lock);
 }
@@ -568,6 +702,9 @@ static int hfsRuntimeStartDataReactors(void) {
 		pthread_mutex_init(&reactor->lock, NULL);
 		pthread_cond_init(&reactor->stateChanged, NULL);
 		pthread_mutex_init(&reactor->batchLock, NULL);
+		pthread_cond_init(&reactor->queueAvailable, NULL);
+		reactor->maxDepth = g_runtime.queueDepthLimit;
+		reactor->queueClosed = false;
 		initialized = i;
 		rc = pthread_create(&reactor->owner, NULL, hfsRuntimeDataMain,
 				    reactor);
@@ -577,7 +714,15 @@ static int hfsRuntimeStartDataReactors(void) {
 		created = i;
 		pthread_mutex_lock(&reactor->lock);
 		while (!reactor->ready) {
-			pthread_cond_wait(&reactor->stateChanged, &reactor->lock);
+			HfsTraceWaitToken traceWait = {0};
+			hfsTraceThreadWaitBegin(&traceWait, HFS_TRACE_OPERATION_THREAD,
+				HFS_TRACE_WAKE_RUNTIME, HFS_TRACE_META_OP_NONE, 0, 0, 0, 0,
+				0, 0, reactor->index, 0);
+			{
+				int waitRc = pthread_cond_wait(&reactor->stateChanged,
+					&reactor->lock);
+				hfsTraceThreadWaitEnd(&traceWait, waitRc);
+			}
 		}
 		rc = reactor->initRc;
 		pthread_mutex_unlock(&reactor->lock);
@@ -593,8 +738,8 @@ static int hfsRuntimeStartDataReactors(void) {
 				&reactor->spdkThread, memory_order_acquire);
 
 			if (thread != NULL) {
-				spdk_thread_send_msg(thread, hfsRuntimeDataStopMessage,
-						    reactor);
+				hfsRuntimeSendMessage(thread, hfsRuntimeDataStopMessage,
+						 reactor);
 			}
 		}
 		for (uint32_t j = 1; j <= created; j++) {
@@ -606,6 +751,7 @@ static int hfsRuntimeStartDataReactors(void) {
 			HfsRuntimeDataReactor *reactor =
 				&g_runtime.dataReactors[j - 1U];
 			pthread_cond_destroy(&reactor->stateChanged);
+			pthread_cond_destroy(&reactor->queueAvailable);
 			pthread_mutex_destroy(&reactor->batchLock);
 			pthread_mutex_destroy(&reactor->lock);
 		}
@@ -631,7 +777,7 @@ static void hfsRuntimeStopDataReactors(void) {
 			&reactor->spdkThread, memory_order_acquire);
 
 		if (thread != NULL) {
-			spdk_thread_send_msg(thread, hfsRuntimeDataStopMessage, reactor);
+			hfsRuntimeSendMessage(thread, hfsRuntimeDataStopMessage, reactor);
 		}
 	}
 	for (i = 1; i < g_runtime.dataReactorCount; i++) {
@@ -639,6 +785,7 @@ static void hfsRuntimeStopDataReactors(void) {
 
 		pthread_join(reactor->owner, NULL);
 		pthread_cond_destroy(&reactor->stateChanged);
+		pthread_cond_destroy(&reactor->queueAvailable);
 		pthread_mutex_destroy(&reactor->batchLock);
 		pthread_mutex_destroy(&reactor->lock);
 	}
@@ -663,7 +810,10 @@ int hfsRuntimeStart(void) {
 		return -ESHUTDOWN;
 	}
 	batchEnv = getenv("HFS_RUNTIME_BATCH");
-	g_runtime.batchEnabled = batchEnv == NULL || strcmp(batchEnv, "0") != 0;
+	g_runtime.posixQueueEnabled = hfsRuntimeBoolEnv("HFS_POSIX_QUEUE", true);
+	g_runtime.queueDepthLimit = hfsRuntimeQueueDepthEnv();
+	g_runtime.batchEnabled = (batchEnv == NULL || strcmp(batchEnv, "0") != 0) &&
+		g_runtime.posixQueueEnabled;
 	g_runtime.dataStripeBytes = hfsRuntimeDataStripeBytesEnv();
 
 	rc = pthread_create(&g_runtime.owner, NULL, hfsRuntimeOwnerMain, NULL);
@@ -672,7 +822,15 @@ int hfsRuntimeStart(void) {
 		return -rc;
 	}
 	while (!g_runtime.ready) {
-		pthread_cond_wait(&g_runtime.stateChanged, &g_runtime.lock);
+		HfsTraceWaitToken traceWait = {0};
+		hfsTraceThreadWaitBegin(&traceWait, HFS_TRACE_OPERATION_THREAD,
+			HFS_TRACE_WAKE_RUNTIME, HFS_TRACE_META_OP_NONE, 0, 0, 0, 0,
+			0, 0, 0, 0);
+		{
+			int waitRc = pthread_cond_wait(&g_runtime.stateChanged,
+				&g_runtime.lock);
+			hfsTraceThreadWaitEnd(&traceWait, waitRc);
+		}
 	}
 	rc = g_runtime.initRc;
 	HFS_RUNTIME_STATE_UNLOCK(&g_runtime.lock);
@@ -734,11 +892,10 @@ int hfsRuntimeSubmit(spdk_msg_fn fn, void *ctx) {
 			queueDepth = atomic_fetch_add_explicit(&g_runtime.queued, 1,
 				memory_order_relaxed) + 1U;
 			hfsStatsRecordRuntimeSubmitFast(queueDepth);
-			spdk_thread_send_msg(thread,
-				hfsRuntimeDispatchMessage, message);
+			hfsRuntimeSendMessage(thread, hfsRuntimeDispatchMessage, message);
 			message = NULL;
 		} else {
-			spdk_thread_send_msg(thread, fn, ctx);
+				hfsRuntimeSendMessage(thread, fn, ctx);
 		}
 	}
 
@@ -808,10 +965,10 @@ int hfsRuntimeSubmitData(uint32_t reactorId, spdk_msg_fn fn, void *ctx) {
 		queueDepth = atomic_fetch_add_explicit(&g_runtime.queued, 1,
 						memory_order_relaxed) + 1U;
 		hfsStatsRecordRuntimeSubmitFast(queueDepth);
-		spdk_thread_send_msg(thread, hfsRuntimeDispatchMessage, message);
+		hfsRuntimeSendMessage(thread, hfsRuntimeDispatchMessage, message);
 		message = NULL;
 	} else {
-		spdk_thread_send_msg(thread, fn, ctx);
+		hfsRuntimeSendMessage(thread, fn, ctx);
 	}
 
 data_submit_done:
@@ -831,6 +988,10 @@ int hfsRuntimeSubmitDataBatch(uint32_t reactorId, HfsRuntimeBatchItem *item,
 	struct spdk_thread *thread;
 	bool notify = false;
 	bool timing;
+	bool creditWaited = false;
+	bool directFallback = false;
+	uint64_t creditWaitStartNs = 0;
+	uint64_t queueDepth = 0;
 	int rc = 0;
 
 	if (reactorId == 0) {
@@ -841,7 +1002,7 @@ int hfsRuntimeSubmitDataBatch(uint32_t reactorId, HfsRuntimeBatchItem *item,
 		HFS_STATS_SPDK_REJECT();
 		return -EINVAL;
 	}
-	if (!g_runtime.batchEnabled) {
+	if (!g_runtime.batchEnabled || !g_runtime.posixQueueEnabled) {
 		return hfsRuntimeSubmitData(reactorId, fn, ctx);
 	}
 	if (hfsRuntimeIsForkChild()) {
@@ -860,22 +1021,63 @@ int hfsRuntimeSubmitDataBatch(uint32_t reactorId, HfsRuntimeBatchItem *item,
 		goto data_batch_done;
 	}
 	timing = hfsStatsTimingFastEnabled();
+	pthread_mutex_lock(&reactor->batchLock);
+	while (!reactor->queueClosed &&
+	       atomic_load_explicit(&g_runtime.accepting, memory_order_acquire) &&
+	       reactor->queueDepth + reactor->inflight >= reactor->maxDepth) {
+		HfsTraceWaitToken traceWait = {0};
+
+		if (hfsRuntimeIsOwnerThread()) {
+			rc = -EAGAIN;
+			break;
+		}
+		/*
+		 * POSIX range locks are held by the caller until this request completes.
+		 * Blocking here can invert that lock order: a full queue waits for an
+		 * earlier request while retaining a range lock needed by that request.
+		 * Fall back to the legacy single-message submission instead of waiting.
+		 */
+		if (timing && !creditWaited) {
+			creditWaited = true;
+			creditWaitStartNs = hfsStatsNowNs();
+		}
+		hfsTraceThreadWaitBegin(&traceWait, HFS_TRACE_OPERATION_THREAD,
+			HFS_TRACE_WAKE_RUNTIME, HFS_TRACE_META_OP_NONE, 0, 0, 0, 0,
+			reactor->queueDepth + reactor->inflight, reactorId, 0, 0);
+		hfsTraceThreadWaitEnd(&traceWait, EAGAIN);
+		pthread_mutex_unlock(&reactor->batchLock);
+		if (creditWaited) {
+			hfsStatsRecordQueueCreditWaitFast(reactorId,
+				hfsStatsNowNs() >= creditWaitStartNs ?
+				hfsStatsNowNs() - creditWaitStartNs : 0);
+		}
+		directFallback = true;
+		rc = hfsRuntimeSubmitData(reactorId, fn, ctx);
+		goto data_batch_done;
+	}
+	if (creditWaited) {
+		hfsStatsRecordQueueCreditWaitFast(reactorId,
+			hfsStatsNowNs() >= creditWaitStartNs ?
+			hfsStatsNowNs() - creditWaitStartNs : 0);
+	}
+	if (rc != 0 || reactor->queueClosed ||
+	    !atomic_load_explicit(&g_runtime.accepting, memory_order_acquire)) {
+		if (rc == 0) {
+			rc = -ESHUTDOWN;
+		}
+		pthread_mutex_unlock(&reactor->batchLock);
+		goto data_batch_done;
+	}
 	item->fn = fn;
 	item->ctx = ctx;
 	item->enqueueNs = timing ? hfsStatsNowNs() : 0;
 	item->next = NULL;
-	if (timing) {
-		uint64_t depth = atomic_fetch_add_explicit(&g_runtime.queued, 1,
-				memory_order_relaxed) + 1U;
-		hfsStatsRecordRuntimeSubmitFast(depth);
+	queueDepth = ++reactor->queueDepth;
+	if (item->completion != NULL) {
+		item->completion->runtimeReactorId = reactorId;
+		atomic_store_explicit(&item->completion->runtimeCreditHeld, true,
+					      memory_order_release);
 	}
-	hfsTraceEmit(HFS_TRACE_RUNTIME_ENQUEUE,
-		     HFS_TRACE_OPERATION_NONE, HFS_TRACE_BUFFER_NONE, 0,
-		     item->traceParentId, 0, 0, 0, 0,
-		     (uint32_t)atomic_load_explicit(&g_runtime.queued,
-						    memory_order_relaxed),
-		     reactorId, 0, 0, 0, 0);
-	pthread_mutex_lock(&reactor->batchLock);
 	if (reactor->batchTail != NULL) {
 		reactor->batchTail->next = item;
 	} else {
@@ -887,13 +1089,23 @@ int hfsRuntimeSubmitDataBatch(uint32_t reactorId, HfsRuntimeBatchItem *item,
 		notify = true;
 	}
 	pthread_mutex_unlock(&reactor->batchLock);
+	if (timing) {
+		uint64_t depth = atomic_fetch_add_explicit(&g_runtime.queued, 1,
+				memory_order_relaxed) + 1U;
+		hfsStatsRecordRuntimeSubmitFast(depth);
+	}
+	hfsStatsRecordQueueDepthFast(reactorId, queueDepth);
+	hfsTraceEmit(HFS_TRACE_RUNTIME_ENQUEUE,
+		     HFS_TRACE_OPERATION_NONE, HFS_TRACE_BUFFER_NONE, 0,
+		     item->traceParentId, 0, 0, 0, 0,
+		     (uint32_t)queueDepth, reactorId, 0, 0, 0, 0);
 	HFS_STATS_SPDK_SUBMIT();
 	if (notify) {
-		spdk_thread_send_msg(thread, hfsRuntimeDispatchDataBatch, reactor);
+		hfsRuntimeSendMessage(thread, hfsRuntimeDispatchDataBatch, reactor);
 	}
 
 data_batch_done:
-	if (rc != 0) {
+	if (rc != 0 && !directFallback) {
 		HFS_STATS_SPDK_REJECT();
 	}
 	atomic_fetch_sub_explicit(&g_runtime.submitters, 1, memory_order_release);
@@ -972,7 +1184,7 @@ int hfsRuntimeSubmitBatch(HfsRuntimeBatchItem *item, spdk_msg_fn fn, void *ctx) 
 	pthread_mutex_unlock(&g_runtime.batchLock);
 	HFS_STATS_SPDK_SUBMIT();
 	if (notify) {
-		spdk_thread_send_msg(thread, hfsRuntimeDispatchBatch, NULL);
+		hfsRuntimeSendMessage(thread, hfsRuntimeDispatchBatch, NULL);
 	}
 
 submit_done:
@@ -1148,6 +1360,55 @@ bool hfsRuntimeIsForkChild(void) {
 	return ownerPid != 0 && ownerPid != getpid();
 }
 
+/* Close every data queue and wake producers blocked on bounded credits. */
+static void hfsRuntimeCloseDataQueues(void) {
+	uint32_t i;
+
+	if (g_runtime.dataReactors == NULL) {
+		return;
+	}
+	for (i = 1; i < g_runtime.dataReactorCount; i++) {
+		HfsRuntimeDataReactor *reactor = &g_runtime.dataReactors[i - 1U];
+
+		pthread_mutex_lock(&reactor->batchLock);
+		reactor->queueClosed = true;
+		pthread_cond_broadcast(&reactor->queueAvailable);
+		pthread_mutex_unlock(&reactor->batchLock);
+	}
+}
+
+/* Wait for queued and backend-owned tickets before destroying reactor threads. */
+static void hfsRuntimeDrainDataQueues(void) {
+	uint64_t deadline = hfsStatsNowNs() +
+		(uint64_t)HFS_RUNTIME_TIMEOUT_MS * 1000000ULL;
+	bool busy;
+	uint32_t i;
+
+	if (g_runtime.dataReactors == NULL) {
+		return;
+	}
+	do {
+		busy = false;
+		for (i = 1; i < g_runtime.dataReactorCount; i++) {
+			HfsRuntimeDataReactor *reactor =
+				&g_runtime.dataReactors[i - 1U];
+
+			pthread_mutex_lock(&reactor->batchLock);
+			if (reactor->queueDepth != 0 || reactor->inflight != 0) {
+				busy = true;
+			}
+			pthread_mutex_unlock(&reactor->batchLock);
+		}
+		if (!busy || hfsStatsNowNs() >= deadline) {
+			break;
+		}
+		sched_yield();
+	} while (true);
+	if (busy) {
+		HFS_LOG_ERROR("data reactor drain timed out; forcing runtime stop");
+	}
+}
+
 /* Stop the runtime after callers have released all HFS resources. */
 int hfsRuntimeStop(void) {
 	struct spdk_thread *thread;
@@ -1166,7 +1427,15 @@ int hfsRuntimeStop(void) {
 	if (g_runtime.stopSubmitted) {
 		/* A concurrent stopper waits for the first stopper to finish joining. */
 		while (g_runtime.threadCreated) {
-			pthread_cond_wait(&g_runtime.stateChanged, &g_runtime.lock);
+			HfsTraceWaitToken traceWait = {0};
+			hfsTraceThreadWaitBegin(&traceWait, HFS_TRACE_OPERATION_THREAD,
+				HFS_TRACE_WAKE_RUNTIME, HFS_TRACE_META_OP_NONE, 0, 0, 0, 0,
+				0, 0, 0, 0);
+			{
+				int waitRc = pthread_cond_wait(&g_runtime.stateChanged,
+					&g_runtime.lock);
+				hfsTraceThreadWaitEnd(&traceWait, waitRc);
+			}
 		}
 		HFS_RUNTIME_STATE_UNLOCK(&g_runtime.lock);
 		return 0;
@@ -1175,6 +1444,7 @@ int hfsRuntimeStop(void) {
 	if (!g_runtime.stopSubmitted) {
 		g_runtime.stopSubmitted = true;
 		atomic_store_explicit(&g_runtime.accepting, false, memory_order_release);
+		hfsRuntimeCloseDataQueues();
 		submitStop = thread != NULL;
 	}
 	HFS_RUNTIME_STATE_UNLOCK(&g_runtime.lock);
@@ -1186,6 +1456,7 @@ int hfsRuntimeStop(void) {
 			sched_yield();
 		}
 		/* Stop data reactors before the global SPDK environment is finalized. */
+		hfsRuntimeDrainDataQueues();
 		hfsRuntimeStopDataReactors();
 		/* Detailed timing mode also waits for wrapped callbacks to retire. */
 		do {
@@ -1199,7 +1470,7 @@ int hfsRuntimeStop(void) {
 			}
 			sched_yield();
 		} while (true);
-		spdk_thread_send_msg(thread, hfsRuntimeStopMessage, &g_runtime);
+		hfsRuntimeSendMessage(thread, hfsRuntimeStopMessage, &g_runtime);
 	}
 
 	pthread_join(g_runtime.owner, NULL);
@@ -1210,6 +1481,10 @@ int hfsRuntimeStop(void) {
 	atomic_store_explicit(&g_runtime.subsystemsReady, false,
 		memory_order_relaxed);
 	g_runtime.initRc = 0;
+	hfsTraceThreadWake(HFS_TRACE_OPERATION_THREAD, HFS_TRACE_WAKE_RUNTIME,
+		HFS_TRACE_META_OP_NONE, 0, 0, 0, 0, 0,
+		(uint32_t)atomic_load_explicit(&g_runtime.queued, memory_order_relaxed),
+		0, 0, 0);
 	pthread_cond_broadcast(&g_runtime.stateChanged);
 	HFS_RUNTIME_STATE_UNLOCK(&g_runtime.lock);
 	return 0;
@@ -1217,6 +1492,9 @@ int hfsRuntimeStop(void) {
 
 /* Reset one request before its SPDK message is submitted. */
 void hfsRuntimeCompletionReset(HfsCompletion *completion) {
+	atomic_store_explicit(&completion->runtimeCreditHeld, false,
+				      memory_order_relaxed);
+	completion->runtimeReactorId = 0;
 	atomic_store_explicit(&completion->state, HFS_COMPLETION_PENDING,
 				      memory_order_relaxed);
 }
@@ -1224,11 +1502,22 @@ void hfsRuntimeCompletionReset(HfsCompletion *completion) {
 /* Complete one request and wake any blocked business thread. */
 void hfsRuntimeCompletionComplete(HfsCompletion *completion) {
 	HFS_STATS_SPDK_COMPLETE();
+	hfsRuntimeDataCreditRelease(completion);
 	if (!hfsRuntimeIsOwnerThread() &&
 	    !atomic_exchange_explicit(&g_ownerViolationLogged, true, memory_order_relaxed)) {
 		HFS_LOG_ERROR("SPDK completion arrived outside owner thread");
 	}
 	atomic_store_explicit(&completion->state, HFS_COMPLETION_DONE, memory_order_release);
+	/* Record the wake immediately before futex wake so caller handoff is visible. */
+	hfsTraceEmitDetail(HFS_TRACE_COMPLETION_WAKE,
+		(HfsTraceOperation)completion->traceOperation,
+		(HfsTraceBufferKind)completion->traceBufferKind,
+		completion->traceRequestId, completion->traceParentId,
+		completion->traceInodeId, completion->traceOffset,
+		completion->traceBytes, 0,
+		(uint32_t)atomic_load_explicit(&g_runtime.queued, memory_order_relaxed),
+		0, 0, 0, 0, 0, HFS_TRACE_WAKE_COMPLETION,
+		completion->traceMetadataOperation, 0, 0);
 	hfsRuntimeFutexWake(completion);
 }
 
@@ -1236,8 +1525,20 @@ void hfsRuntimeCompletionComplete(HfsCompletion *completion) {
 bool hfsRuntimeCompletionWait(HfsCompletion *completion, uint32_t timeoutMs) {
 	struct timespec deadline;
 	struct timespec remaining;
+	uint64_t traceStartNs = hfsTraceNowNs();
 	int expected;
 	int rc;
+	bool completed = true;
+
+	hfsTraceEmitDetail(HFS_TRACE_COMPLETION_WAIT_BEGIN,
+		(HfsTraceOperation)completion->traceOperation,
+		(HfsTraceBufferKind)completion->traceBufferKind,
+		completion->traceRequestId, completion->traceParentId,
+		completion->traceInodeId, completion->traceOffset,
+		completion->traceBytes, 0,
+		(uint32_t)atomic_load_explicit(&g_runtime.queued, memory_order_relaxed),
+		0, 0, 0, 0, 0, 0,
+		completion->traceMetadataOperation, 0, 0);
 
 	clock_gettime(CLOCK_MONOTONIC, &deadline);
 	hfsRuntimeAddMs(&deadline, timeoutMs);
@@ -1251,24 +1552,38 @@ bool hfsRuntimeCompletionWait(HfsCompletion *completion, uint32_t timeoutMs) {
 					memory_order_acq_rel, memory_order_acquire)) {
 				/* Keep the caller's context alive until the owner callback retires. */
 				errno = ETIMEDOUT;
-				while (atomic_load_explicit(&completion->state,
+					while (atomic_load_explicit(&completion->state,
 						memory_order_acquire) != HFS_COMPLETION_DONE) {
-					syscall(SYS_futex, (int *)&completion->state,
-						FUTEX_WAIT_PRIVATE, HFS_COMPLETION_TIMED_OUT,
-						NULL, NULL, 0);
+						syscall(SYS_futex, (int *)&completion->state,
+							FUTEX_WAIT_PRIVATE, HFS_COMPLETION_TIMED_OUT,
+							NULL, NULL, 0);
+					}
+					completed = false;
+					break;
 				}
-				return false;
-			}
 			if (expected == HFS_COMPLETION_DONE) {
-				return true;
+				break;
 			}
 			continue;
 		}
 		rc = syscall(SYS_futex, (int *)&completion->state, FUTEX_WAIT_PRIVATE,
 			     HFS_COMPLETION_PENDING, &remaining, NULL, 0);
 		if (rc != 0 && errno != EAGAIN && errno != EINTR) {
-			return false;
+			completed = false;
+			break;
 		}
 	}
-	return true;
+	hfsTraceEmitDetail(HFS_TRACE_COMPLETION_WAIT_END,
+		(HfsTraceOperation)completion->traceOperation,
+		(HfsTraceBufferKind)completion->traceBufferKind,
+		completion->traceRequestId, completion->traceParentId,
+		completion->traceInodeId, completion->traceOffset,
+		completion->traceBytes, 0,
+		(uint32_t)atomic_load_explicit(&g_runtime.queued, memory_order_relaxed),
+		0, 0, 0, 0, 0, 0,
+		completion->traceMetadataOperation,
+		traceStartNs != 0 && hfsTraceNowNs() >= traceStartNs
+			? hfsTraceNowNs() - traceStartNs : 0,
+		completed ? 0 : -ETIMEDOUT);
+	return completed;
 }

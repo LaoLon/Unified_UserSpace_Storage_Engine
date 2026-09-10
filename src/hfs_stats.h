@@ -27,6 +27,11 @@ extern _Atomic uint_fast64_t hfsStatsSpdkRejects;
 extern _Atomic uint_fast64_t hfsStatsIoOutstanding;
 extern _Atomic uint_fast64_t hfsStatsIoOutstandingPeak;
 extern _Atomic uint_fast64_t hfsStatsErrors;
+extern _Atomic uint_fast64_t hfsStatsQueueCreditWaits[8];
+extern _Atomic uint_fast64_t hfsStatsQueueCreditWaitNs[8];
+extern _Atomic uint_fast64_t hfsStatsQueueDepthPeak[8];
+extern _Atomic uint_fast64_t hfsStatsQueueDrainBatches[8];
+extern _Atomic uint_fast64_t hfsStatsQueueDrainItems[8];
 extern bool hfsStatsFastEnabledState;
 extern bool hfsStatsTimingState;
 
@@ -124,6 +129,10 @@ void hfsStatsRecordIoPipeline(uint64_t depth);
 /* Record one direct child submit/completion on a selected data reactor. */
 void hfsStatsRecordDataReactorSubmit(uint32_t reactorId);
 void hfsStatsRecordDataReactorComplete(uint32_t reactorId);
+/* Record bounded POSIX queue admission and drain behavior per reactor. */
+void hfsStatsRecordQueueCreditWait(uint32_t reactorId, uint64_t waitNs);
+void hfsStatsRecordQueueDepth(uint32_t reactorId, uint64_t depth);
+void hfsStatsRecordQueueDrain(uint32_t reactorId, uint64_t batchSize);
 /* Record actual data I/O callbacks submitted to and completed by SPDK. */
 void hfsStatsRecordIoSubmit(void);
 void hfsStatsRecordIoComplete(void);
@@ -209,6 +218,24 @@ static inline void hfsStatsRecordDataReactorSubmitFast(uint32_t reactorId) {
 static inline void hfsStatsRecordDataReactorCompleteFast(uint32_t reactorId) {
 	if (hfsStatsEnabledFast()) {
 		hfsStatsRecordDataReactorComplete(reactorId);
+	}
+}
+static inline void hfsStatsRecordQueueCreditWaitFast(uint32_t reactorId,
+									 uint64_t waitNs) {
+	if (hfsStatsEnabledFast()) {
+		hfsStatsRecordQueueCreditWait(reactorId, waitNs);
+	}
+}
+static inline void hfsStatsRecordQueueDepthFast(uint32_t reactorId,
+								 uint64_t depth) {
+	if (hfsStatsEnabledFast()) {
+		hfsStatsRecordQueueDepth(reactorId, depth);
+	}
+}
+static inline void hfsStatsRecordQueueDrainFast(uint32_t reactorId,
+								 uint64_t batchSize) {
+	if (hfsStatsEnabledFast()) {
+		hfsStatsRecordQueueDrain(reactorId, batchSize);
 	}
 }
 static inline void hfsStatsRecordIoSubmitFast(void) {

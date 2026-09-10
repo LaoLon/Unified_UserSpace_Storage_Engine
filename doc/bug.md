@@ -10,7 +10,7 @@ Bug 等级：**致命 > 严重 > 一般**。
 
 ### 已修复
 
-1–5、8–10、10b、11–43、45–47、51–52、57、60–62、67–71。包括已由后续 shard 修复的历史记录；条目中的原始“遗留”描述保留用于复盘，当前状态以本汇总和条目状态字段为准。
+1–5、8–10、10b、11–43、45–47、51–52、57、60–62、67–72、76。包括已由后续 shard 修复的历史记录；条目中的原始“遗留”描述保留用于复盘，当前状态以本汇总和条目状态字段为准。
 
 ### 未修复
 
@@ -1278,5 +1278,28 @@ Bug 等级：**致命 > 严重 > 一般**。
 - **验证**：HFS 与 raw SPDK 均使用 `Nvme0n1` 完成 qd1/qd32 FIO，所有 errors=0；
   原生本地对照文件位于 `/mnt/hfs-data`，结果保存在
   `/mnt/hfs-data/performance-stage3-nvme-fio-shard61/{qd1,qd32}`。
+
+### 76. 多生产者直接提交 SPDK 消息导致 DPDK ring reservation stall（已修复）
+
+- **状态**：已修复（shard-62）
+- **时间**：2026-09-10
+- **等级**：严重
+- **现象**：64 线程 POSIX fd churn 在 `open/close` 阶段长时间无响应；主线程等待
+  worker join，多个 worker 卡在 `spdk_thread_send_msg`，测试在 120 秒超时。单线程、
+  8 线程及 data reactor I/O 正常。
+- **排查过程**：保留远端进程后用 gdb 查看线程栈，确认 owner 线程在
+  `spdk_thread_poll`，64 个生产者停在 DPDK `rte_wait_until_equal_32` →
+  `__rte_ring_update_tail` → `spdk_thread_send_msg`。`g_runtime.submitters=64`，
+  owner/data queue 深度为 0，排除 HFS completion 或 bounded credit 泄漏。
+- **根因**：所有 POSIX metadata/open/close 请求同时直接调用 SPDK 的多生产者 lockless
+  ring。某生产者在保留 slot 后被调度延迟，后续生产者自旋等待 tail 提交；owner 在
+  ring tail 前看不到后续消息，形成 reservation stall。
+- **修复**：新增 runtime 级 `messageSubmitLock`，所有 owner、data、batch、stop 消息
+  通过 `hfsRuntimeSendMessage()` 串行进入 SPDK ring；锁不跨 callback 持有，不改变
+  POSIX 顺序或 data reactor 的 bounded credit。queue 满时仍使用 direct-submit 溢出
+  路径，避免在 range lock 持有期间等待 queue credit。
+- **验证**：VM 上 `fd_lifecycle_smoke`（含 64×250 churn）、data reactor stripe、
+  DMA backpressure、runtime stress、POSIX contract、metadata transaction 和 IO trace
+  全部通过；`spdk_submit=spdk_complete`，errors=0，trace 1621 records/27 phases。
 
 ## 通用经验总结

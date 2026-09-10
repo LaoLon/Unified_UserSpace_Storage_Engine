@@ -324,3 +324,29 @@ peak 均达到 32，`io_copy_ops=0`，但它是分阶段 read/write companion wo
 
 该 async/DMA 路径随后按 POSIX-only 架构决策退役；本节数据保留作历史对照，当前 FIO
 和数据库性能回归只使用 HFS 完整 POSIX 路径。
+
+## shard-62 POSIX reactor queue engine：NVMe FIO 验证（2026-09-10）
+
+本轮用于验证 Shard-62 的默认 POSIX reactor queue 是否已经在真实 SPDK NVMe bdev 上形成
+可控并发。HFS 和原生 SPDK 访问同一块 VMware NVMe 控制器（PCI `0000:0b:00.0`，SPDK
+`Nvme0n1`）；ext4 对照使用 `/mnt/hfs-data` 上的 `/dev/sdb1`，不把 ext4 数字与 NVMe
+数字混作同介质结论。HFS 使用完整 POSIX `LD_PRELOAD` 路径，32 个 fio jobs；原生 SPDK
+使用官方 `spdk_bdev` engine、iodepth=32。两者均为 `randrw` 50/50、`O_DIRECT`、64 MiB、
+每个块大小 5 s，错误均为 0。
+
+| bs | HFS IOPS | SPDK IOPS | HFS/SPDK | HFS BW (MiB/s) | SPDK BW (MiB/s) | HFS read p50/p99 (µs) | HFS write p50/p99 (µs) |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 4K | 79,525 | 123,356 | 64.5% | 310.65 | 481.86 | 317/1,122 | 363/1,516 |
+| 8K | 72,004 | 112,179 | 64.2% | 562.53 | 876.40 | 354/1,221 | 403/1,663 |
+| 16K | 61,768 | 97,294 | 63.5% | 965.12 | 1,520.21 | 424/1,384 | 477/1,876 |
+| 32K | 49,537 | 74,459 | 66.5% | 1,548.03 | 2,326.85 | 528/1,696 | 594/2,310 |
+| 64K | 36,331 | 53,068 | 68.5% | 2,270.71 | 3,316.76 | 643/2,376 | 791/3,981 |
+
+原始结果位于 VM `/mnt/hfs-data/shard62-fio-nvme-20260910/summary.tsv`。与旧的单线程
+Malloc/Aio 基线相比，这次 HFS 已经不再是“单请求同步路径”的测试：32 个 POSIX jobs
+能够把请求分散到默认的 4 个 data reactor（总 reactor 数 5），队列深度和 SPDK 提交/完成
+计数在独立 queue smoke 中保持一致。HFS 仍比裸 SPDK 慢约 31%～35%，主要剩余成本属于
+完整 POSIX 路径（fd/区间锁、元数据、每请求 completion 和同步等待），而不是未形成并发。
+
+同轮 ext4 `/dev/sdb1` 总 IOPS 为 7,638～9,161，显著低于 NVMe；它只用于确认测试目录
+落盘位置，不能用来推导 HFS 相对原生 SPDK 的文件系统开销。

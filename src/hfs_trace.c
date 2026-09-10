@@ -133,6 +133,19 @@ static const char *hfsTracePhaseName(HfsTracePhase phase)
     case HFS_TRACE_CHILD_START: return "child_start";
     case HFS_TRACE_CHILD_DONE: return "child_done";
     case HFS_TRACE_PARENT_DONE: return "parent_done";
+    case HFS_TRACE_LOCK_WAIT_BEGIN: return "lock_wait_begin";
+    case HFS_TRACE_LOCK_ACQUIRED: return "lock_acquired";
+    case HFS_TRACE_LOCK_RELEASE: return "lock_release";
+    case HFS_TRACE_METADATA_BEGIN: return "metadata_begin";
+    case HFS_TRACE_METADATA_END: return "metadata_end";
+    case HFS_TRACE_FLUSH_BEGIN: return "flush_begin";
+    case HFS_TRACE_FLUSH_END: return "flush_end";
+    case HFS_TRACE_COMPLETION_WAIT_BEGIN: return "completion_wait_begin";
+    case HFS_TRACE_COMPLETION_WAIT_END: return "completion_wait_end";
+    case HFS_TRACE_COMPLETION_WAKE: return "completion_wake";
+    case HFS_TRACE_THREAD_WAIT_BEGIN: return "thread_wait_begin";
+    case HFS_TRACE_THREAD_WAIT_END: return "thread_wait_end";
+    case HFS_TRACE_THREAD_WAKE: return "thread_wake";
     default: return "unknown";
     }
 }
@@ -147,6 +160,55 @@ static const char *hfsTraceOperationName(HfsTraceOperation operation)
     case HFS_TRACE_OPERATION_WRITE_ZEROES: return "write_zeroes";
     case HFS_TRACE_OPERATION_VECTOR_READ: return "vector_read";
     case HFS_TRACE_OPERATION_VECTOR_WRITE: return "vector_write";
+    case HFS_TRACE_OPERATION_METADATA: return "metadata";
+    case HFS_TRACE_OPERATION_FLUSH: return "flush";
+    case HFS_TRACE_OPERATION_COMPLETION: return "completion";
+    case HFS_TRACE_OPERATION_LOCK: return "lock";
+    case HFS_TRACE_OPERATION_THREAD: return "thread";
+    default: return "none";
+    }
+}
+
+/* Convert a lock class to a stable text token for offline analysis. */
+static const char *hfsTraceLockName(uint32_t lockClass)
+{
+    switch ((HfsTraceLockClass)lockClass) {
+    case HFS_TRACE_LOCK_SYNC: return "sync";
+    case HFS_TRACE_LOCK_RANGE_STRIPE: return "range_stripe";
+    case HFS_TRACE_LOCK_METADATA: return "metadata";
+    case HFS_TRACE_LOCK_RUNTIME: return "runtime";
+    case HFS_TRACE_LOCK_FD: return "fd";
+    case HFS_TRACE_LOCK_APPEND: return "append";
+    case HFS_TRACE_LOCK_OTHER: return "other";
+    default: return "none";
+    }
+}
+
+/* Convert a wake reason to a stable text token for offline analysis. */
+static const char *hfsTraceWakeName(uint32_t wakeReason)
+{
+    switch ((HfsTraceWakeReason)wakeReason) {
+    case HFS_TRACE_WAKE_COMPLETION: return "completion";
+    case HFS_TRACE_WAKE_DURABILITY: return "durability";
+    case HFS_TRACE_WAKE_RUNTIME: return "runtime";
+    case HFS_TRACE_WAKE_DMA_LEASE: return "dma_lease";
+    default: return "none";
+    }
+}
+
+/* Convert a metadata operation to a stable text token for offline analysis. */
+static const char *hfsTraceMetadataName(uint32_t metadataOperation)
+{
+    switch ((HfsTraceMetadataOperation)metadataOperation) {
+    case HFS_TRACE_META_OP_OPEN: return "open";
+    case HFS_TRACE_META_OP_READ: return "read";
+    case HFS_TRACE_META_OP_WRITE: return "write";
+    case HFS_TRACE_META_OP_SYNC: return "sync";
+    case HFS_TRACE_META_OP_RESIZE: return "resize";
+    case HFS_TRACE_META_OP_CLOSE: return "close";
+    case HFS_TRACE_META_OP_TRANSACTION: return "transaction";
+    case HFS_TRACE_META_OP_FLUSH: return "flush";
+    case HFS_TRACE_META_OP_PUBLISH: return "publish";
     default: return "none";
     }
 }
@@ -173,22 +235,26 @@ uint64_t hfsTraceNextRequestId(void)
     return atomic_fetch_add_explicit(&g_traceRequestId, 1, memory_order_relaxed) + 1;
 }
 
-/* Record one fixed-size event into the calling thread's ring. */
-void hfsTraceEmit(HfsTracePhase phase,
-                  HfsTraceOperation operation,
-                  HfsTraceBufferKind bufferKind,
-                  uint64_t requestId,
-                  uint64_t parentId,
-                  uint64_t inodeId,
-                  uint64_t offset,
-                  uint64_t bytes,
-                  uint32_t units,
-                  uint32_t queueDepth,
-                  uint32_t reactorId,
-                  uint32_t rangeBucketCount,
-                  uint32_t poolClass,
-                  uint64_t durationNs,
-                  int32_t result)
+/* Record one fixed-size event with optional lock, wake and metadata details. */
+void hfsTraceEmitDetail(HfsTracePhase phase,
+                        HfsTraceOperation operation,
+                        HfsTraceBufferKind bufferKind,
+                        uint64_t requestId,
+                        uint64_t parentId,
+                        uint64_t inodeId,
+                        uint64_t offset,
+                        uint64_t bytes,
+                        uint32_t units,
+                        uint32_t queueDepth,
+                        uint32_t reactorId,
+                        uint32_t rangeBucketCount,
+                        uint32_t poolClass,
+                        uint32_t lockClass,
+                        uint32_t lockId,
+                        uint32_t wakeReason,
+                        uint32_t metadataOperation,
+                        uint64_t durationNs,
+                        int32_t result)
 {
     HfsTraceThread *thread;
     HfsTraceEvent *event;
@@ -224,11 +290,203 @@ void hfsTraceEmit(HfsTracePhase phase,
     event->reactorId = reactorId;
     event->rangeBucketCount = rangeBucketCount;
     event->poolClass = poolClass;
+    event->lockClass = lockClass;
+    event->lockId = lockId;
+    event->wakeReason = wakeReason;
+    event->metadataOperation = metadataOperation;
     event->result = result;
     event->phase = (uint8_t)phase;
     event->operation = (uint8_t)operation;
     event->bufferKind = (uint8_t)bufferKind;
     event->reserved = 0;
+}
+
+/* Preserve the compact legacy call shape for ordinary data-path events. */
+void hfsTraceEmit(HfsTracePhase phase,
+                  HfsTraceOperation operation,
+                  HfsTraceBufferKind bufferKind,
+                  uint64_t requestId,
+                  uint64_t parentId,
+                  uint64_t inodeId,
+                  uint64_t offset,
+                  uint64_t bytes,
+                  uint32_t units,
+                  uint32_t queueDepth,
+                  uint32_t reactorId,
+                  uint32_t rangeBucketCount,
+                  uint32_t poolClass,
+                  uint64_t durationNs,
+                  int32_t result)
+{
+    hfsTraceEmitDetail(phase, operation, bufferKind, requestId, parentId,
+                       inodeId, offset, bytes, units, queueDepth, reactorId,
+                       rangeBucketCount, poolClass, 0, 0, 0, 0,
+                       durationNs, result);
+}
+
+/* Start timing one lock acquisition and publish its wait-begin event. */
+void hfsTraceLockWaitBegin(HfsTraceLockToken *token,
+                           HfsTraceLockClass lockClass,
+                           uint32_t lockId,
+                           HfsTraceOperation operation,
+                           uint64_t parentId,
+                           uint64_t inodeId,
+                           uint64_t offset,
+                           uint64_t bytes,
+                           uint32_t rangeBucketCount)
+{
+    if (token == NULL) {
+        return;
+    }
+    memset(token, 0, sizeof(*token));
+    token->lockClass = (uint32_t)lockClass;
+    token->lockId = lockId;
+    token->operation = (uint8_t)operation;
+    token->parentId = parentId;
+    token->inodeId = inodeId;
+    token->offset = offset;
+    token->bytes = bytes;
+    if (!hfsTraceEnabledFast()) {
+        return;
+    }
+    token->waitStartNs = hfsTraceNowNs();
+    hfsTraceEmitDetail(HFS_TRACE_LOCK_WAIT_BEGIN, operation,
+                       HFS_TRACE_BUFFER_NONE, 0, parentId, inodeId,
+                       offset, bytes, 0, 0, 0, rangeBucketCount, 0,
+                       token->lockClass, lockId, 0, 0, 0, 0);
+}
+
+/* Finish lock acquisition timing and publish the wait duration. */
+void hfsTraceLockAcquired(HfsTraceLockToken *token, int32_t result)
+{
+    uint64_t nowNs;
+    uint64_t waitNs = 0;
+
+    if (token == NULL || !hfsTraceEnabledFast()) {
+        return;
+    }
+    nowNs = hfsTraceNowNs();
+    if (token->waitStartNs != 0 && nowNs >= token->waitStartNs) {
+        waitNs = nowNs - token->waitStartNs;
+    }
+    hfsTraceEmitDetail(HFS_TRACE_LOCK_ACQUIRED,
+                       (HfsTraceOperation)token->operation,
+                       HFS_TRACE_BUFFER_NONE, 0, token->parentId,
+                       token->inodeId, token->offset, token->bytes, 0, 0, 0,
+                       0, 0, token->lockClass, token->lockId, 0, 0,
+                       waitNs, result);
+    token->holdStartNs = nowNs;
+    token->active = result == 0;
+}
+
+/* Publish lock hold duration when the protected section is released. */
+void hfsTraceLockReleased(HfsTraceLockToken *token, int32_t result)
+{
+    uint64_t nowNs;
+    uint64_t holdNs = 0;
+
+    if (token == NULL || !hfsTraceEnabledFast() || !token->active) {
+        return;
+    }
+    nowNs = hfsTraceNowNs();
+    if (token->holdStartNs != 0 && nowNs >= token->holdStartNs) {
+        holdNs = nowNs - token->holdStartNs;
+    }
+    hfsTraceEmitDetail(HFS_TRACE_LOCK_RELEASE,
+                       (HfsTraceOperation)token->operation,
+                       HFS_TRACE_BUFFER_NONE, 0, token->parentId,
+                       token->inodeId, token->offset, token->bytes, 0, 0, 0,
+                       0, 0, token->lockClass, token->lockId, 0, 0,
+                       holdNs, result);
+    token->active = false;
+}
+
+/* Start timing one condition-variable wait and publish its wait-begin event. */
+void hfsTraceThreadWaitBegin(HfsTraceWaitToken *token,
+                             HfsTraceOperation operation,
+                             HfsTraceWakeReason wakeReason,
+                             HfsTraceMetadataOperation metadataOperation,
+                             uint64_t parentId,
+                             uint64_t inodeId,
+                             uint64_t offset,
+                             uint64_t bytes,
+                             uint32_t units,
+                             uint32_t queueDepth,
+                             uint32_t reactorId,
+                             uint32_t poolClass)
+{
+    if (token == NULL) {
+        return;
+    }
+    memset(token, 0, sizeof(*token));
+    token->parentId = parentId;
+    token->inodeId = inodeId;
+    token->offset = offset;
+    token->bytes = bytes;
+    token->units = units;
+    token->queueDepth = queueDepth;
+    token->reactorId = reactorId;
+    token->poolClass = poolClass;
+    token->wakeReason = (uint32_t)wakeReason;
+    token->metadataOperation = (uint32_t)metadataOperation;
+    token->operation = (uint8_t)operation;
+    if (!hfsTraceEnabledFast()) {
+        return;
+    }
+    token->waitStartNs = hfsTraceNowNs();
+    token->active = true;
+    hfsTraceEmitDetail(HFS_TRACE_THREAD_WAIT_BEGIN, operation,
+                       HFS_TRACE_BUFFER_NONE, 0, parentId, inodeId,
+                       offset, bytes, units, queueDepth, reactorId, 0,
+                       poolClass, 0, 0, token->wakeReason,
+                       token->metadataOperation, 0, 0);
+}
+
+/* Finish one condition-variable wait and publish its measured duration. */
+void hfsTraceThreadWaitEnd(HfsTraceWaitToken *token, int32_t result)
+{
+    uint64_t nowNs;
+    uint64_t durationNs = 0;
+
+    if (token == NULL || !token->active || !hfsTraceEnabledFast()) {
+        return;
+    }
+    nowNs = hfsTraceNowNs();
+    if (nowNs >= token->waitStartNs) {
+        durationNs = nowNs - token->waitStartNs;
+    }
+    hfsTraceEmitDetail(HFS_TRACE_THREAD_WAIT_END,
+                       (HfsTraceOperation)token->operation,
+                       HFS_TRACE_BUFFER_NONE, 0, token->parentId,
+                       token->inodeId, token->offset, token->bytes,
+                       token->units, token->queueDepth, token->reactorId,
+                       0, token->poolClass, 0, 0, token->wakeReason,
+                       token->metadataOperation, durationNs, result);
+    token->active = false;
+}
+
+/* Publish a condition-variable wake event without allocating or taking a lock. */
+void hfsTraceThreadWake(HfsTraceOperation operation,
+                        HfsTraceWakeReason wakeReason,
+                        HfsTraceMetadataOperation metadataOperation,
+                        uint64_t parentId,
+                        uint64_t inodeId,
+                        uint64_t offset,
+                        uint64_t bytes,
+                        uint32_t units,
+                        uint32_t queueDepth,
+                        uint32_t reactorId,
+                        uint32_t poolClass,
+                        int32_t result)
+{
+    if (!hfsTraceEnabledFast()) {
+        return;
+    }
+    hfsTraceEmitDetail(HFS_TRACE_THREAD_WAKE, operation,
+                       HFS_TRACE_BUFFER_NONE, 0, parentId, inodeId,
+                       offset, bytes, units, queueDepth, reactorId, 0,
+                       poolClass, 0, 0, (uint32_t)wakeReason,
+                       (uint32_t)metadataOperation, 0, result);
 }
 
 /* Write all per-thread rings as a tab-separated snapshot at shutdown. */
@@ -244,7 +502,7 @@ static void hfsTraceWriteSnapshot(void)
     if (file == NULL) {
         return;
     }
-    fprintf(file, "sequence\ttid\ttimestamp_ns\tphase\toperation\tbuffer_kind\trequest_id\tparent_id\tinode_id\toffset\tbytes\tunits\tqueue_depth\treactor\trange_buckets\tpool_class\tduration_ns\tresult\n");
+    fprintf(file, "sequence\ttid\ttimestamp_ns\tphase\toperation\tbuffer_kind\trequest_id\tparent_id\tinode_id\toffset\tbytes\tunits\tqueue_depth\treactor\trange_buckets\tpool_class\tlock_class\tlock_id\twake_reason\tmetadata_op\tduration_ns\tresult\n");
     pthread_mutex_lock(&g_traceLock);
     for (thread = g_traceThreads; thread != NULL; thread = thread->next) {
         uint64_t count = thread->writeSequence;
@@ -257,7 +515,7 @@ static void hfsTraceWriteSnapshot(void)
             if (event->sequence != sequence) {
                 continue;
             }
-            fprintf(file, "%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%s\t%s\t%s\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%u\t%u\t%u\t%u\t%u\t%" PRIu64 "\t%d\n",
+            fprintf(file, "%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%s\t%s\t%s\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%u\t%u\t%u\t%u\t%u\t%s\t%u\t%s\t%s\t%" PRIu64 "\t%d\n",
                     event->sequence, thread->threadId, event->timestampNs,
                     hfsTracePhaseName((HfsTracePhase)event->phase),
                     hfsTraceOperationName((HfsTraceOperation)event->operation),
@@ -266,6 +524,9 @@ static void hfsTraceWriteSnapshot(void)
                     event->offset, event->bytes, event->units,
                     event->queueDepth, event->reactorId,
                     event->rangeBucketCount, event->poolClass,
+                    hfsTraceLockName(event->lockClass), event->lockId,
+                    hfsTraceWakeName(event->wakeReason),
+                    hfsTraceMetadataName(event->metadataOperation),
                     event->durationNs, event->result);
         }
         fprintf(file, "# thread=%" PRIu64 " dropped=%" PRIu64 "\n",

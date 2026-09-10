@@ -46,6 +46,11 @@ _Atomic uint_fast64_t hfsStatsSpdkRejects;
 _Atomic uint_fast64_t hfsStatsIoOutstanding;
 _Atomic uint_fast64_t hfsStatsIoOutstandingPeak;
 _Atomic uint_fast64_t hfsStatsErrors;
+_Atomic uint_fast64_t hfsStatsQueueCreditWaits[HFS_STATS_MAX_DATA_REACTORS];
+_Atomic uint_fast64_t hfsStatsQueueCreditWaitNs[HFS_STATS_MAX_DATA_REACTORS];
+_Atomic uint_fast64_t hfsStatsQueueDepthPeak[HFS_STATS_MAX_DATA_REACTORS];
+_Atomic uint_fast64_t hfsStatsQueueDrainBatches[HFS_STATS_MAX_DATA_REACTORS];
+_Atomic uint_fast64_t hfsStatsQueueDrainItems[HFS_STATS_MAX_DATA_REACTORS];
 bool hfsStatsFastEnabledState;
 bool hfsStatsTimingState;
 
@@ -213,6 +218,18 @@ static void hfsStatsReset(void) {
 	atomic_store_explicit(&hfsStatsIoOutstanding, 0, memory_order_relaxed);
 	atomic_store_explicit(&hfsStatsIoOutstandingPeak, 0, memory_order_relaxed);
 	atomic_store_explicit(&hfsStatsErrors, 0, memory_order_relaxed);
+	for (unsigned int i = 0; i < HFS_STATS_MAX_DATA_REACTORS; i++) {
+		atomic_store_explicit(&hfsStatsQueueCreditWaits[i], 0,
+			memory_order_relaxed);
+		atomic_store_explicit(&hfsStatsQueueCreditWaitNs[i], 0,
+			memory_order_relaxed);
+		atomic_store_explicit(&hfsStatsQueueDepthPeak[i], 0,
+			memory_order_relaxed);
+		atomic_store_explicit(&hfsStatsQueueDrainBatches[i], 0,
+			memory_order_relaxed);
+		atomic_store_explicit(&hfsStatsQueueDrainItems[i], 0,
+			memory_order_relaxed);
+	}
 	pthread_mutex_lock(&g_hfsStatsShardLock);
 	for (shard = g_hfsStatsShards; shard != NULL; shard = shard->next) {
 		struct HfsStatsShard *next = shard->next;
@@ -487,6 +504,45 @@ void hfsStatsRecordDataReactorComplete(uint32_t reactorId) {
 		shard->dataReactorComplete[reactorId]++;
 	}
 	atomic_fetch_add_explicit(&g_hfsStatsDataReactorComplete[reactorId], 1,
+		memory_order_relaxed);
+}
+
+/* Record one bounded queue credit wait and its elapsed duration. */
+void hfsStatsRecordQueueCreditWait(uint32_t reactorId, uint64_t waitNs) {
+	if (reactorId >= HFS_STATS_MAX_DATA_REACTORS) {
+		return;
+	}
+	atomic_fetch_add_explicit(&hfsStatsQueueCreditWaits[reactorId], 1,
+		memory_order_relaxed);
+	atomic_fetch_add_explicit(&hfsStatsQueueCreditWaitNs[reactorId], waitNs,
+		memory_order_relaxed);
+}
+
+/* Record the queue high-water mark for one data reactor. */
+void hfsStatsRecordQueueDepth(uint32_t reactorId, uint64_t depth) {
+	uint_fast64_t current;
+
+	if (reactorId >= HFS_STATS_MAX_DATA_REACTORS) {
+		return;
+	}
+	current = atomic_load_explicit(&hfsStatsQueueDepthPeak[reactorId],
+		memory_order_relaxed);
+	while (current < depth &&
+	       !atomic_compare_exchange_weak_explicit(
+			&hfsStatsQueueDepthPeak[reactorId], &current, depth,
+			memory_order_relaxed, memory_order_relaxed)) {
+		/* Retry only when another producer advanced the same peak. */
+	}
+}
+
+/* Record one reactor queue drain and the number of tickets it consumed. */
+void hfsStatsRecordQueueDrain(uint32_t reactorId, uint64_t batchSize) {
+	if (reactorId >= HFS_STATS_MAX_DATA_REACTORS) {
+		return;
+	}
+	atomic_fetch_add_explicit(&hfsStatsQueueDrainBatches[reactorId], 1,
+		memory_order_relaxed);
+	atomic_fetch_add_explicit(&hfsStatsQueueDrainItems[reactorId], batchSize,
 		memory_order_relaxed);
 }
 
@@ -838,6 +894,21 @@ static void hfsStatsWriteSnapshot(void) {
 			memory_order_relaxed));
 		HFS_STATS_APPEND("data_reactor_%u_complete=%"PRIu64"\n", i,
 			atomic_load_explicit(&g_hfsStatsDataReactorComplete[i],
+			memory_order_relaxed));
+		HFS_STATS_APPEND("queue_reactor_%u_credit_waits=%"PRIuFAST64"\n", i,
+			atomic_load_explicit(&hfsStatsQueueCreditWaits[i],
+			memory_order_relaxed));
+		HFS_STATS_APPEND("queue_reactor_%u_credit_wait_ns=%"PRIuFAST64"\n", i,
+			atomic_load_explicit(&hfsStatsQueueCreditWaitNs[i],
+			memory_order_relaxed));
+		HFS_STATS_APPEND("queue_reactor_%u_depth_peak=%"PRIuFAST64"\n", i,
+			atomic_load_explicit(&hfsStatsQueueDepthPeak[i],
+			memory_order_relaxed));
+		HFS_STATS_APPEND("queue_reactor_%u_drain_batches=%"PRIuFAST64"\n", i,
+			atomic_load_explicit(&hfsStatsQueueDrainBatches[i],
+			memory_order_relaxed));
+		HFS_STATS_APPEND("queue_reactor_%u_drain_items=%"PRIuFAST64"\n", i,
+			atomic_load_explicit(&hfsStatsQueueDrainItems[i],
 			memory_order_relaxed));
 	}
 	HFS_STATS_APPEND("io_read_ops=%"PRIu64"\n", total.ioReadOps);
