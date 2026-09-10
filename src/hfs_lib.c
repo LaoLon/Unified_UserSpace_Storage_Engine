@@ -17,7 +17,6 @@
 #include "hfs.h"
 #include "hfs_durability.h"
 #include "hfs_fd.h"
-#include "hfs_async.h"
 #include "hfs_internal.h"
 #include "hfs_inode_runtime.h"
 #include "hfs_io.h"
@@ -720,19 +719,6 @@ static void hfsPublishWriteEnd(HfsOpenFile *openFile, uint64_t end) {
 	pthread_rwlock_unlock(&g_metaLock);
 }
 
-/* Try to publish a write without blocking the SPDK owner thread. */
-static bool hfsTryPublishWriteEnd(HfsOpenFile *openFile, uint64_t end) {
-	if (hfsPublishWriteEndFast(openFile, end)) {
-		return true;
-	}
-	if (pthread_rwlock_trywrlock(&g_metaLock) != 0) {
-		return false;
-	}
-	hfsPublishWriteEndLocked(openFile, end);
-	pthread_rwlock_unlock(&g_metaLock);
-	return true;
-}
-
 /* Prepare a truncate range before publishing its new logical file size. */
 static int hfsPrepareTruncateInternal(HfsFile *file, uint64_t currentSize,
 				       uint64_t targetSize, bool syncLocked) {
@@ -856,20 +842,6 @@ int hfs_lib_init(void) {
 		pthread_rwlock_unlock(&g_metaLock);
 		return -1;
 	}
-	if (hfsAsyncInit() != 0) {
-		HFS_LOG_ERROR("hfsAsyncInit failed");
-		hfsMetaFini(g_fs);
-		hfsIoFini(g_fs);
-		hfsUmount(g_fs);
-		free(g_fs);
-		g_fs = NULL;
-		hfsRuntimeStop();
-		hfs_release_backend_lock();
-		hfs_log_fini();
-		pthread_rwlock_unlock(&g_metaLock);
-		return -1;
-	}
-
 	hfsFdReset();
 	HFS_LOG_INFO("libhfs initialized");
 
@@ -889,38 +861,6 @@ int hfs_lib_init(void) {
 /* Return the mounted filesystem instance (or NULL before init). */
 Hfs *hfs_lib_get_fs(void) {
 	return g_fs;
-}
-
-/* Register a caller-owned DMA range for async direct-I/O lifetime tracking. */
-int hfsRegisterBuffer(void *buffer, size_t length) {
-	if (g_fs == NULL) {
-		errno = ENODEV;
-		return -1;
-	}
-	return hfsIoRegisterBuffer(buffer, length);
-}
-
-/* Unregister a DMA range after all requests have released their references. */
-int hfsUnregisterBuffer(void *buffer) {
-	if (g_fs == NULL) {
-		errno = ENODEV;
-		return -1;
-	}
-	return hfsIoUnregisterBuffer(buffer);
-}
-
-/* Allocate DMA memory through SPDK without overriding libc allocation. */
-void *hfsDmaAlloc(size_t size, size_t alignment) {
-	if (g_fs == NULL) {
-		errno = ENODEV;
-		return NULL;
-	}
-	return hfsIoDmaAlloc(size, alignment);
-}
-
-/* Free a buffer returned by hfsDmaAlloc after direct requests retire. */
-void hfsDmaFree(void *buffer) {
-	hfsIoDmaFree(buffer);
 }
 
 /* Runs before main(): proves the library was loaded by LD_PRELOAD. */
@@ -944,8 +884,6 @@ void hfs_lib_fini(void) {
 	if (hfs_lib_is_fork_child()) {
 		return;
 	}
-	/* Stop new async work before taking the metadata write lock for teardown. */
-	hfsAsyncFini();
 	hfsMetaWriteLock();
 	if (g_fs == NULL) {
 		hfsDurabilityTraceFini();
@@ -982,300 +920,6 @@ void hfs_lib_fini(void) {
 	hfsStatsFini();
 	hfs_log_fini();
 	pthread_rwlock_unlock(&g_metaLock);
-}
-
-/* Context retained by a worker-free positioned data request. */
-typedef struct HfsLibAsyncDirectContext {
-	HfsAsyncRequest *request;
-	HfsOpenFile *openFile;
-	uint64_t writeOffset;
-	bool write;
-} HfsLibAsyncDirectContext;
-
-/* Carry a multi-reactor write completion through metadata ordering. */
-typedef struct HfsLibAsyncDirectCommit {
-	HfsLibAsyncDirectContext *direct;
-	ssize_t result;
-	int error;
-	uint32_t dataReactor;
-	struct spdk_poller *poller;
-} HfsLibAsyncDirectCommit;
-
-/* Finish a direct request on its data reactor after metadata publication. */
-static void hfs_lib_async_direct_finish(void *arg) {
-	HfsLibAsyncDirectCommit *commit = arg;
-	HfsLibAsyncDirectContext *direct = commit->direct;
-
-	/* Retire the open description before exposing completion to teardown. */
-	(void)hfs_release_open_file(direct->openFile);
-	hfsAsyncCompleteDirect(direct->request, commit->result, commit->error);
-	free(direct);
-	free(commit);
-}
-
-/* Retry metadata publication from the owner poller without blocking it. */
-static int hfs_lib_async_direct_publish_poller(void *arg);
-
-/* Publish a direct write's inode size on the metadata reactor. */
-static void hfs_lib_async_direct_publish(void *arg) {
-	HfsLibAsyncDirectCommit *commit = arg;
-	HfsLibAsyncDirectContext *direct = commit->direct;
-
-	if (direct->write && commit->error == 0 && commit->result > 0) {
-		if (!hfsTryPublishWriteEnd(direct->openFile,
-				direct->writeOffset + (uint64_t)commit->result)) {
-			if (commit->poller == NULL) {
-				commit->poller = spdk_poller_register_named(
-					hfs_lib_async_direct_publish_poller, commit, 1000,
-					"hfs_direct_publish");
-			}
-			if (commit->poller != NULL) {
-				return;
-			}
-			commit->error = EIO;
-		}
-	}
-	if (commit->poller != NULL) {
-		spdk_poller_unregister(&commit->poller);
-	}
-	if (hfsRuntimeSubmitData(commit->dataReactor,
-			 hfs_lib_async_direct_finish, commit) != 0) {
-		commit->error = EIO;
-		hfs_lib_async_direct_finish(commit);
-	}
-}
-
-/* Run one deferred metadata publication attempt on the owner reactor. */
-static int hfs_lib_async_direct_publish_poller(void *arg) {
-	hfs_lib_async_direct_publish(arg);
-	return SPDK_POLLER_BUSY;
-}
-
-/* Complete a direct data request without taking metadata locks on a data reactor. */
-static void hfs_lib_async_direct_done(void *context, ssize_t result, int error) {
-	HfsLibAsyncDirectContext *direct = context;
-	uint32_t dataReactor;
-	HfsLibAsyncDirectCommit *commit;
-
-	dataReactor = hfsRuntimeDataReactorFor(direct->openFile->file->fs,
-					      direct->openFile->file->blobId,
-					      direct->writeOffset /
-					      direct->openFile->file->fs->unitSize);
-	if (!direct->write || dataReactor == 0) {
-		if (direct->write && error == 0 && result > 0) {
-			hfsPublishWriteEnd(direct->openFile,
-				direct->writeOffset + (uint64_t)result);
-		}
-		/* Retire the open description before exposing completion to teardown. */
-		(void)hfs_release_open_file(direct->openFile);
-		hfsAsyncCompleteDirect(direct->request, result, error);
-		free(direct);
-		return;
-	}
-	commit = calloc(1, sizeof(*commit));
-	if (commit == NULL) {
-		/* Retire the open description before exposing completion to teardown. */
-		(void)hfs_release_open_file(direct->openFile);
-		hfsAsyncCompleteDirect(direct->request, -1, ENOMEM);
-		free(direct);
-		return;
-	}
-	commit->direct = direct;
-	commit->result = result;
-	commit->error = error;
-	commit->dataReactor = dataReactor;
-	if (hfsRuntimeSubmit(hfs_lib_async_direct_publish, commit) != 0) {
-		commit->error = EIO;
-		hfs_lib_async_direct_finish(commit);
-	}
-}
-
-/* Return true when a request is large and aligned enough for direct child fan-out. */
-static bool hfs_lib_async_direct_shape(HfsOpenFile *openFile, size_t count,
-				       uint64_t offset) {
-	uint64_t unitSize;
-
-	if (openFile == NULL || openFile->file == NULL || openFile->file->fs == NULL) {
-		return false;
-	}
-	unitSize = openFile->file->fs->unitSize;
-	return unitSize != 0 && count / (size_t)unitSize >= 2U &&
-		count % (size_t)unitSize == 0 && offset % unitSize == 0;
-}
-
-/* Try the worker-free positioned read path and report whether fallback is needed. */
-static int hfs_lib_async_try_pread(int fd, void *buffer, size_t count,
-				   off_t offset, HfsAsyncCallback callback,
-				   void *context, HfsAsyncRequest **requestOut) {
-	HfsOpenFile *openFile;
-	HfsLibAsyncDirectContext *direct;
-	struct hfs_inode *in;
-	uint64_t fileSize;
-	uint64_t effectiveCount;
-	int savedErrno;
-	int rc;
-
-	if (offset < 0 || count == 0 || !hfsFdIsHfs(fd)) {
-		return 0;
-	}
-	openFile = hfs_acquire_file(fd, true);
-	if (openFile == NULL || !hfs_lib_async_direct_shape(openFile, count,
-							       (uint64_t)offset)) {
-		if (openFile != NULL) {
-			hfs_release_open_file(openFile);
-		}
-		return 0;
-	}
-	hfsMetaReadLock();
-	in = g_fs == NULL ? NULL : hfsMetaFindById(g_fs, openFile->inodeId);
-	if (g_fs == NULL) {
-		pthread_rwlock_unlock(&g_metaLock);
-		hfs_release_open_file(openFile);
-		return 0;
-	}
-	if (in != NULL) {
-		fileSize = in->size;
-	} else if (!hfsFdGetOrphanInfo(openFile, &fileSize, NULL, NULL)) {
-		pthread_rwlock_unlock(&g_metaLock);
-		hfs_release_open_file(openFile);
-		return 0;
-	}
-	if ((uint64_t)offset >= fileSize) {
-		pthread_rwlock_unlock(&g_metaLock);
-		hfs_release_open_file(openFile);
-		return 0;
-	}
-	effectiveCount = count;
-	if ((uint64_t)offset + effectiveCount > fileSize) {
-		effectiveCount = fileSize - (uint64_t)offset;
-	}
-	pthread_rwlock_unlock(&g_metaLock);
-	if (effectiveCount == 0 || effectiveCount % openFile->file->fs->unitSize != 0 ||
-	    effectiveCount > SIZE_MAX) {
-		hfs_release_open_file(openFile);
-		return 0;
-	}
-	direct = calloc(1, sizeof(*direct));
-	if (direct == NULL) {
-		hfs_release_open_file(openFile);
-		errno = ENOMEM;
-		return -1;
-	}
-	direct->openFile = openFile;
-	if (hfsAsyncCreateDirect(callback, context, &direct->request) != 0) {
-		hfs_release_open_file(openFile);
-		free(direct);
-		return -1;
-	}
-	*requestOut = direct->request;
-	rc = hfsIoReadAtAsync(openFile->file, buffer, (size_t)effectiveCount,
-				      (uint64_t)offset, hfs_lib_async_direct_done, direct);
-	if (rc == 0) {
-		hfsAsyncRecordDirectSubmit(direct->request);
-		return 1;
-	}
-	*requestOut = NULL;
-	savedErrno = errno;
-	hfsAsyncDiscardDirect(direct->request);
-	hfs_release_open_file(openFile);
-	free(direct);
-	errno = savedErrno;
-	return savedErrno == EAGAIN ? 0 : -1;
-}
-
-/* Try the worker-free positioned write path and report whether fallback is needed. */
-static int hfs_lib_async_try_pwrite(int fd, const void *buffer, size_t count,
-				    off_t offset, HfsAsyncCallback callback,
-				    void *context, HfsAsyncRequest **requestOut) {
-	HfsOpenFile *openFile;
-	HfsLibAsyncDirectContext *direct;
-	int savedErrno;
-	int rc;
-
-	if (offset < 0 || count == 0 || !hfsFdIsHfs(fd)) {
-		return 0;
-	}
-	openFile = hfs_acquire_file(fd, true);
-	if (openFile == NULL || !openFile->writable ||
-	    (openFile->flags & O_APPEND) != 0 ||
-	    !hfs_lib_async_direct_shape(openFile, count, (uint64_t)offset)) {
-		if (openFile != NULL) {
-			hfs_release_open_file(openFile);
-		}
-		return 0;
-	}
-	direct = calloc(1, sizeof(*direct));
-	if (direct == NULL) {
-		hfs_release_open_file(openFile);
-		errno = ENOMEM;
-		return -1;
-	}
-	direct->openFile = openFile;
-	direct->write = true;
-	direct->writeOffset = (uint64_t)offset;
-	if (hfsAsyncCreateDirect(callback, context, &direct->request) != 0) {
-		hfs_release_open_file(openFile);
-		free(direct);
-		return -1;
-	}
-	*requestOut = direct->request;
-	rc = hfsIoWriteAtAsync(openFile->file, buffer, count, (uint64_t)offset,
-				       hfs_lib_async_direct_done, direct);
-	if (rc == 0) {
-		hfsAsyncRecordDirectSubmit(direct->request);
-		return 1;
-	}
-	*requestOut = NULL;
-	savedErrno = errno;
-	hfsAsyncDiscardDirect(direct->request);
-	hfs_release_open_file(openFile);
-	free(direct);
-	errno = savedErrno;
-	return savedErrno == EAGAIN ? 0 : -1;
-}
-
-/* Submit a positioned read through the async core. */
-int hfs_lib_async_pread(int fd, void *buf, size_t count, off_t offset,
-			HfsAsyncCallback callback, void *context,
-			HfsAsyncRequest **requestOut) {
-	int direct = hfs_lib_async_try_pread(fd, buf, count, offset, callback,
-						 context, requestOut);
-	if (direct != 0) {
-		return direct > 0 ? 0 : -1;
-	}
-	return hfsAsyncPread(fd, buf, count, offset, callback, context, requestOut);
-}
-
-/* Submit a positioned write through the async core. */
-int hfs_lib_async_pwrite(int fd, const void *buf, size_t count, off_t offset,
-			 HfsAsyncCallback callback, void *context,
-			 HfsAsyncRequest **requestOut) {
-	int direct = hfs_lib_async_try_pwrite(fd, buf, count, offset, callback,
-						  context, requestOut);
-	if (direct != 0) {
-		return direct > 0 ? 0 : -1;
-	}
-	return hfsAsyncPwrite(fd, buf, count, offset, callback, context, requestOut);
-}
-
-/* Submit a positioned vector read through the async core. */
-int hfs_lib_async_preadv(int fd, const struct iovec *iov, int iovcnt,
-			 off_t offset, HfsAsyncCallback callback, void *context,
-			 HfsAsyncRequest **requestOut) {
-	return hfsAsyncPreadv(fd, iov, iovcnt, offset, callback, context, requestOut);
-}
-
-/* Submit a positioned vector write through the async core. */
-int hfs_lib_async_pwritev(int fd, const struct iovec *iov, int iovcnt,
-			  off_t offset, HfsAsyncCallback callback, void *context,
-			  HfsAsyncRequest **requestOut) {
-	return hfsAsyncPwritev(fd, iov, iovcnt, offset, callback, context, requestOut);
-}
-
-/* Submit an fsync through the async core. */
-int hfs_lib_async_fsync(int fd, HfsAsyncCallback callback, void *context,
-			 HfsAsyncRequest **requestOut) {
-	return hfsAsyncFsync(fd, callback, context, requestOut);
 }
 
 /*

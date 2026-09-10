@@ -34,19 +34,11 @@ os.mkdir(root)
 fd = os.open(root + "/mixed-vector", os.O_CREAT | os.O_RDWR | os.O_TRUNC, 0o600)
 assert os.pwrite(fd, b"A" * unit, 0) == unit
 
-# A heap segment followed by a registered DMA segment must share one bounded
-# logical request instead of issuing one synchronous request per segment.
+# Two ordinary heap segments must share one bounded logical request instead
+# of issuing one synchronous request per segment.
 libc = ctypes.CDLL(None, use_errno=True)
-libc.hfsDmaAlloc.argtypes = [ctypes.c_size_t, ctypes.c_size_t]
-libc.hfsDmaAlloc.restype = ctypes.c_void_p
-libc.hfsDmaFree.argtypes = [ctypes.c_void_p]
-dma = libc.hfsDmaAlloc(4, 0)
-assert dma
-ctypes.memmove(dma, b"BBBB", 4)
-dma_view = memoryview((ctypes.c_ubyte * 4).from_address(dma))
-assert os.pwritev(fd, [b"left", dma_view], 3) == 8
+assert os.pwritev(fd, [b"left", b"BBBB"], 3) == 8
 assert os.pread(fd, 8, 3) == b"leftBBBB"
-libc.hfsDmaFree(dma)
 
 # Repeated fallocate over an already allocated range must hit the fast check.
 fallocate = libc.fallocate

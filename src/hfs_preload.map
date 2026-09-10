@@ -25,11 +25,3 @@ GLIBC_2.28 {
 GLIBC_2.33 {
     global: stat64; lstat64; fstat64; fstatat64;
 };
-
-HFS_0.1 {
-    global: hfs_lib_async_pread; hfs_lib_async_pwrite;
-            hfs_lib_async_preadv; hfs_lib_async_pwritev;
-            hfs_lib_async_fsync; hfsAsyncCancel; hfsAsyncWait;
-            hfsAsyncResult; hfsAsyncRelease; hfsRegisterBuffer;
-            hfsUnregisterBuffer; hfsDmaAlloc; hfsDmaFree;
-};

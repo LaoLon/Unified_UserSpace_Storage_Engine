@@ -1,5 +1,9 @@
 # HFS Registered DMA Async Ring Shard 开发计划
 
+> 架构收口说明（2026-09-10）：本文件为历史计划。HFS 已收敛为 POSIX-only，
+> 对外 registered-DMA、`hfs_lib_async_*` 和 async ring ABI 已删除；后续优化只在
+> 完整 POSIX 路径内部复用 DMA pool、direct 检测和 bounded pipeline。
+
 > **状态**：待开发
 > **Shard**：shard-60
 > **唯一技术路线**：固定深度 DMA buffer ring + direct async 多请求提交 + 固定完成队列

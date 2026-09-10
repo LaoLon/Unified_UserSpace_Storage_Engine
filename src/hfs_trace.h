@@ -36,6 +36,7 @@ typedef enum HfsTracePhase {
 typedef enum HfsTraceBufferKind {
     HFS_TRACE_BUFFER_NONE = 0,
     HFS_TRACE_BUFFER_CALLER,
+    /* Reserved for traces written by the retired registered-DMA API. */
     HFS_TRACE_BUFFER_REGISTERED,
     HFS_TRACE_BUFFER_DMA_LEASE,
     HFS_TRACE_BUFFER_VECTOR,

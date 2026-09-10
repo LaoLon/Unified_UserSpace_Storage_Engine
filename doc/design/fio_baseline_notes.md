@@ -321,3 +321,6 @@ POSIX 路径并运行 HFS registered-DMA/direct-async 矩阵。普通 FIO 使用
 peak 均达到 32，`io_copy_ops=0`，但它是分阶段 read/write companion workload，不能
 作为与 FIO `randrw` 完全同负载的吞吐数字。当前 FIO 没有 HFS async engine；若需要严格
 的“FIO 普通 vs FIO 高性能”对照，仍需新增 `hfs_async` ioengine。
+
+该 async/DMA 路径随后按 POSIX-only 架构决策退役；本节数据保留作历史对照，当前 FIO
+和数据库性能回归只使用 HFS 完整 POSIX 路径。

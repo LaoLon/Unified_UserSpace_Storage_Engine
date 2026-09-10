@@ -1,5 +1,8 @@
 # HFS 普通 POSIX 路径与高性能路径 NVMe 对比
 
+> Historical comparison. The HFS public async/DMA path described below was retired
+> after this measurement; current HFS exposes only the complete POSIX path.
+
 ## 结论先行
 
 本轮确认了两条路径都能在同一块 NVMe `Nvme0n1` 上工作：
@@ -70,4 +73,3 @@
 1. 普通 POSIX 路径具备完整 fd、offset、append、元数据和同步 durability 语义，但普通用户 buffer 通常需要 DMA staging 和 copy。
 2. 高性能路径可以形成真实 outstanding window，depth 32 时 backend/queue 均达到 32，且没有 bounce copy。
 3. 若要得到“FIO 普通路径 vs FIO 高性能路径”的完全同一负载数字，需要新增 HFS async FIO ioengine；当前 FIO plugin 只有 raw SPDK engine，不能代表 HFS async ABI。
-

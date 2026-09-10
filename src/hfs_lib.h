@@ -12,7 +12,6 @@
 #include <time.h>
 
 #include "hfs.h"
-#include "hfs_async.h"
 
 /* Size of the fd table shared by all HFS file descriptors. */
 #define HFS_FD_TABLE_SIZE	65536
@@ -36,15 +35,6 @@ bool hfs_lib_is_fork_child(void);
 void hfs_lib_fini(void);
 /* Return the mounted filesystem instance, or NULL before init. */
 Hfs *hfs_lib_get_fs(void);
-
-/* Register DMA-capable memory for experimental asynchronous direct I/O. */
-int hfsRegisterBuffer(void *buffer, size_t length);
-/* Unregister DMA memory; returns EBUSY while requests still reference it. */
-int hfsUnregisterBuffer(void *buffer);
-/* Allocate DMA memory for explicit zero-copy asynchronous I/O. */
-void *hfsDmaAlloc(size_t size, size_t alignment);
-/* Release memory returned by hfsDmaAlloc. */
-void hfsDmaFree(void *buffer);
 
 /* Open a file/dir under the HFS mount prefix. */
 int hfs_lib_open(const char *path, int flags, mode_t mode);
@@ -131,21 +121,5 @@ int hfs_lib_futimens(int fd, const struct timespec times[2]);
 int hfs_lib_posix_fadvise(int fd, off_t offset, off_t len, int advice);
 /* fcntl for HFS fds: flags and fd duplication. */
 int hfs_lib_fcntl(int fd, int cmd, long arg);
-
-/* Submit positioned I/O and fsync through the bounded async executor. */
-int hfs_lib_async_pread(int fd, void *buf, size_t count, off_t offset,
-			HfsAsyncCallback callback, void *context,
-			HfsAsyncRequest **requestOut);
-int hfs_lib_async_pwrite(int fd, const void *buf, size_t count, off_t offset,
-			 HfsAsyncCallback callback, void *context,
-			 HfsAsyncRequest **requestOut);
-int hfs_lib_async_preadv(int fd, const struct iovec *iov, int iovcnt,
-			 off_t offset, HfsAsyncCallback callback, void *context,
-			 HfsAsyncRequest **requestOut);
-int hfs_lib_async_pwritev(int fd, const struct iovec *iov, int iovcnt,
-			  off_t offset, HfsAsyncCallback callback, void *context,
-			  HfsAsyncRequest **requestOut);
-int hfs_lib_async_fsync(int fd, HfsAsyncCallback callback, void *context,
-			 HfsAsyncRequest **requestOut);
 
 #endif /* HFS_LIB_H */

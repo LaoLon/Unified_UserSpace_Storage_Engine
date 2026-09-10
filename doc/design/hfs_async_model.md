@@ -1,4 +1,7 @@
-# HFS asynchronous request model
+# HFS asynchronous request model (Retired)
+
+> Historical design record only. The public async/DMA path was removed on 2026-09-10;
+> see `doc/design/hfs_posix_only_architecture.md` for the current architecture.
 
 > Status: shard-52/53 registered-DMA direct path and data-plane closeout (2026-09-09). Large, full-unit aligned positioned I/O
 > binds a public request directly to a bounded SPDK child parent; unsupported shapes retain the

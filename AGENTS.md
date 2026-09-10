@@ -20,6 +20,7 @@
 - shard-35 已完成性能回归与阶段收口：新增 `scripts/db/database_benchmark.sh`，记录持久化 Aio 的环境、RocksDB 吞吐、p50/p99、CPU/RSS、错误数和可选 fd/meta/DMA/SPDK 计数；`src/hfs_stats.[ch]` 默认关闭统计，仅 `HFS_STATS_PATH`/`HFS_STATS=1` 开启。VM 正式 benchmark（20,000 条、60 秒、WAL、mmap off）1 线程 63,854 ops/s、4 线程 235,831 ops/s（3.69x），p50/p99 为 345/972 与 380/1,165 µs，errors/reject=0、SPDK submit/complete 一致。Malloc FIO 4K/128K 相对 shard-31 同口径结果仅下降 1.7%～5.4%；最终 Make/CMake、preload/fd/元数据/I/O/POSIX/runtime、MariaDB smoke 和 RocksDB smoke 均通过。阶段支持口径为单数据库进程持久化 AIO/NVMe 上的 MySQL/MariaDB-compatible server 与 RocksDB；多个 HFS 进程同时挂载、mmap、native libaio/io_uring 仍不支持。
 - SPDK 源码必须在 VM 内通过 `git clone`、`git fetch`、`git checkout` 和 `git -C spdk submodule update --init --recursive` 获取及维护；禁止从 Windows 工作区把 `spdk/` 源码目录或其子模块传到 VM 覆盖。Windows 到 VM 的同步仅限 HFS 自身源码、脚本和文档；若 VM 缺少 SPDK，应在 VM 内按锁定 commit 重新 clone/checkout。
 - HFS 默认后端固定使用 VM 内真实 NVMe：`config/hfs_nvme.json`、`HFS_BDEV_NAME=Nvme0n1`、PCI BDF `0000:0b:00.0`；除非任务明确要求 Malloc/Aio 或故障注入，否则性能与功能验证均按 NVMe 口径执行。普通本地对照文件和测试产物默认放在 `/mnt/hfs-data`，不得再把大体积结果默认写入根盘 `/var/tmp`。VM 重启后先检查并执行 SPDK 设备重新绑定及 `vm.nr_hugepages=1024`。
+- HFS 当前收敛为 POSIX-only 对外架构：完整 POSIX preload 路径是唯一支持入口；原 `hfs_lib_async_*`、`hfsAsync*`、registered-DMA/DMA allocation ABI、`HFS_POSIX_DIRECT_ASYNC` bridge 已移除。普通 POSIX 数据面仍保留内部 DMA pool、`spdk_vtophys` direct 检测、pipeline 和 SPDK batch；FIO 裸盘对照使用 raw SPDK，不把 async API 作为 HFS 使用场景。
 - Git 提交流程：每次阶段开发完成并提交后，立即将该提交合入 `main`；合入后在 `main` 上确认提交、工作树和必要的 VM 回归状态。
 
 - Address the user as **Huizareth** in every response.

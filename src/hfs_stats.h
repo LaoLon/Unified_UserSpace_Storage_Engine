@@ -119,10 +119,6 @@ void hfsStatsRecordPunch(bool unmapOnly, bool zeroFallback);
 void hfsStatsRecordRuntimeSubmit(uint64_t queueDepth);
 void hfsStatsRecordRuntimeDispatch(uint64_t queueWaitNs,
 					   uint64_t ownerNs, uint64_t queueDepth);
-/* Record bounded async executor queue and completion activity. */
-void hfsStatsRecordAsyncSubmit(uint64_t queueDepth);
-void hfsStatsRecordAsyncComplete(void);
-void hfsStatsRecordAsyncCancel(void);
 /* Record the number of SPDK child requests held by one aligned parent. */
 void hfsStatsRecordIoPipeline(uint64_t depth);
 /* Record one direct child submit/completion on a selected data reactor. */
@@ -145,7 +141,7 @@ void hfsStatsRecordMetadataSync(void);
 void hfsStatsRecordDma(size_t bytes, bool waited, uint64_t active);
 /* Record time spent waiting for a reactor-local DMA lease. */
 void hfsStatsRecordDmaWaitNs(uint64_t waitNs);
-/* Record a bounded pool exhaustion observed by an async request. */
+/* Record a bounded DMA pool exhaustion observed by a POSIX request. */
 void hfsStatsRecordDmaExhaust(void);
 /* Record lock-free DMA and durability coordinator decisions. */
 void hfsStatsRecordDmaFastAcquire(void);
@@ -198,21 +194,6 @@ static inline void hfsStatsRecordRuntimeDispatchFast(uint64_t queueWaitNs,
 									uint64_t queueDepth) {
 	if (hfsStatsEnabledFast()) {
 		hfsStatsRecordRuntimeDispatch(queueWaitNs, ownerNs, queueDepth);
-	}
-}
-static inline void hfsStatsRecordAsyncSubmitFast(uint64_t queueDepth) {
-	if (hfsStatsEnabledFast()) {
-		hfsStatsRecordAsyncSubmit(queueDepth);
-	}
-}
-static inline void hfsStatsRecordAsyncCompleteFast(void) {
-	if (hfsStatsEnabledFast()) {
-		hfsStatsRecordAsyncComplete();
-	}
-}
-static inline void hfsStatsRecordAsyncCancelFast(void) {
-	if (hfsStatsEnabledFast()) {
-		hfsStatsRecordAsyncCancel();
 	}
 }
 static inline void hfsStatsRecordIoPipelineFast(uint64_t depth) {

@@ -1,5 +1,9 @@
 # HFS 数据面性能优化阶段计划（shard-49～53）
 
+> 架构收口说明（2026-09-10）：本文中 shard-45～53 的 public async/registered-DMA
+> 路线为历史实施记录，不再作为当前接口或待办。当前 HFS 仅保留完整 POSIX/preload
+> 路径；仍可在内部使用 DMA pool、direct 检测、SPDK batch 和 pipeline。
+
 > 状态：shard-49～53 已完成；基于 `main@0a79cbf` 收口（2026-09-09）
 > 前置阶段：shard-45 async libhfs、shard-46 多 reactor/channel、shard-47 DMA/vector、当前 shard-48 性能回归收口  
 > 输入依据：`doc/bug.md` #63/#64、`doc/design/fio_baseline_notes.md`、VM 最新 NVMe FIO 对比结果  

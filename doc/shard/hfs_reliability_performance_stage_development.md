@@ -1,5 +1,9 @@
 # HFS 可靠性与性能优化阶段计划（shard-36 起）
 
+> 当前架构收口（2026-09-10）：HFS 对外仅保留完整 POSIX/preload 路径。本文早期
+> shard-45 以后关于 public async/registered-DMA 的段落是历史实施记录，不再代表当前 ABI；
+> 后续性能优化仅针对 POSIX 路径内部实现。
+
 > 状态：shard-36～42 核心实现已完成，正确性闸门 A 已通过；shard-43 已先落地可移植 v5 页/WAL 格式基础和离线恢复校验，shard-44 已加入 v4 脏范围 checkpoint 与受限 group commit 基础，shard-45 已完成 async libhfs executor 及公开 aligned positioned direct child path，shard-46 已完成可选多 data reactor/channel 基础与跨 reactor 完成顺序修复，shard-47 第一阶段已完成分级 DMA pool、DMA-capable direct path 和 native vector 尝试，后续又将 async batch 规划从 O(n²) 降为 O(n)；shard-48 已开始收口，新增三轮数据库 benchmark 汇总和单进程加速库产品决策；运行时仍使用 v4，v5 迁移、设备 WAL 提交和 SPDK 原生 libaio/io_uring ABI 仍待后续阶段<br>
 > 制定日期：2026-09-05  
 > 适用基线：`main@91db26a`（shard-36 已完成）
