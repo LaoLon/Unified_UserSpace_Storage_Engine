@@ -469,8 +469,8 @@ min、max、p50/p99/p99.9，不能只保留最好一轮。
   6.67k/25.0k QPS。
 - 当前 VM 没有 `/dev/nvme*`，且 `/root/code/spdk/build/fio/spdk_bdev` 不存在，
   direct-NVMe 项输出 `SKIP direct NVMe: spdk_fio_plugin_missing; no_nvme_device`；
-  真实 NVMe 仍沿用 `doc/performance/stage2_nvme_native_baseline.md` 的已存证据，待具备
-  设备授权和 plugin 后按本脚本原始矩阵补跑。
+  旧版环境的 direct-NVMe skip 不再作为当前性能结论；最新真实 NVMe 结果统一见
+  `doc/performance/hfs_final_performance_baseline_20260913.md`，后续复测必须沿用该基线口径并按本脚本保留原始矩阵。
 
 ## 10. 统一观测字段与报告格式
 
