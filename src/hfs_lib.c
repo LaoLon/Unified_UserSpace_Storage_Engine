@@ -2667,121 +2667,210 @@ static int hfs_lib_fsync_open_file(HfsOpenFile *openFile, bool dataOnly) {
 	return 0;
 }
 
-/* Process one bounded group-commit epoch while preserving POSIX barriers. */
+/* One unique runtime/blob target admitted into a durability epoch. */
+typedef struct HfsDurabilityTarget {
+	HfsOpenFile *openFile;
+	HfsFile *file;
+	HfsInodeRuntime *runtime;
+	uint64_t inodeId;
+} HfsDurabilityTarget;
+
+/* Process one epoch without holding per-file locks across device waits. */
 static int hfs_lib_process_durability_batch(
 	Hfs *fs, HfsDurabilityRequest **requests, size_t requestCount) {
-	HfsOpenFile **lockedFiles;
-	HfsInodeRuntime **lockedRuntimes;
-	size_t lockedCount = 0;
+	HfsDurabilityTarget *targets;
+	size_t targetCount = 0;
 	size_t i;
 	int savedErrno = 0;
 	int rc = 0;
 	bool metadataNeeded = false;
+	bool strongRequest = false;
+	bool allDataOnly = true;
+	bool combinedBarrier = false;
 
 	if (fs == NULL || requests == NULL || requestCount == 0) {
 		return -EINVAL;
 	}
+	for (i = 0; i < requestCount; i++) {
+		if (!requests[i]->dataOnly) {
+			allDataOnly = false;
+			break;
+		}
+	}
 	hfsStatsRecordDurabilityBatchFast(requestCount);
-	lockedFiles = calloc(requestCount, sizeof(*lockedFiles));
-	lockedRuntimes = calloc(requestCount, sizeof(*lockedRuntimes));
-	if (lockedFiles == NULL || lockedRuntimes == NULL) {
-		free(lockedFiles);
-		free(lockedRuntimes);
+	targets = calloc(requestCount, sizeof(*targets));
+	if (targets == NULL) {
 		return -ENOMEM;
 	}
 
-	/* Hold every description's I/O lock through the shared post-commit barrier. */
+	/* Admission waits for already-running data I/O, then releases all locks. */
 	for (i = 0; i < requestCount; i++) {
 		HfsOpenFile *openFile = requests[i]->openFile;
-		bool duplicate = false;
+		HfsInodeRuntime *runtime;
 		size_t j;
 
-		for (j = 0; j < lockedCount; j++) {
-			if (lockedFiles[j] == openFile) {
-				duplicate = true;
-				break;
-			}
-		}
-		if (duplicate) {
-			continue;
+		if (openFile == NULL) {
+			savedErrno = EIO;
+			rc = -1;
+			break;
 		}
 		pthread_mutex_lock(&openFile->ioLock);
-		lockedFiles[lockedCount] = openFile;
-		lockedRuntimes[lockedCount] = NULL;
-		if (openFile->runtime != NULL) {
-			for (j = 0; j < lockedCount; j++) {
-				if (lockedRuntimes[j] == openFile->runtime) {
-					break;
-				}
-			}
-			if (j == lockedCount) {
-				if (hfsLibSyncWriteLock(openFile->runtime) != 0) {
-					savedErrno = errno != 0 ? errno : EBUSY;
-					rc = -1;
-					pthread_mutex_unlock(&openFile->ioLock);
-					break;
-				}
-				lockedRuntimes[lockedCount] = openFile->runtime;
-			}
+		runtime = openFile->runtime;
+		if (runtime != NULL && hfsLibSyncWriteLock(runtime) != 0) {
+			savedErrno = errno != 0 ? errno : EBUSY;
+			pthread_mutex_unlock(&openFile->ioLock);
+			rc = -1;
+			break;
 		}
-		lockedCount++;
-	}
-
-	/* Synchronize each blob's metadata without issuing one flush per caller. */
-	if (rc == 0) {
-		for (i = 0; i < lockedCount; i++) {
-			if (lockedRuntimes[i] != NULL && lockedFiles[i]->file != NULL &&
-				hfsSyncData(lockedFiles[i]->file) != 0) {
-				savedErrno = errno != 0 ? errno : EIO;
-				rc = -1;
+		for (j = 0; j < targetCount; j++) {
+			if ((runtime != NULL && targets[j].runtime == runtime) ||
+				(runtime == NULL && targets[j].openFile == openFile)) {
 				break;
 			}
 		}
-		for (i = 0; i < requestCount; i++) {
-			hfsDurabilityTraceRecord(requests[i]->openFile->inodeId,
-				"data-barrier", rc == 0 ? 0 : -savedErrno);
+		if (j == targetCount) {
+			targets[targetCount].openFile = openFile;
+			targets[targetCount].file = openFile->file;
+			targets[targetCount].runtime = runtime;
+			targets[targetCount].inodeId = openFile->inodeId;
+			targetCount++;
 		}
+		if (runtime != NULL) {
+			hfsLibRwlockUnlock(&runtime->syncLock);
+		}
+		pthread_mutex_unlock(&openFile->ioLock);
 	}
+	hfsStatsRecordDurabilityDataTargetFast(targetCount);
+
+	/* Stage A: synchronize each unique blob without holding POSIX locks. */
 	if (rc == 0) {
-		hfsFsyncCrashPoint(1);
-		hfsMetaWriteLock();
-		if (g_fs == NULL || g_fs != fs) {
-			savedErrno = ENODEV;
-			rc = -1;
-		} else {
-			/* Fold lock-free write publication into this shared metadata epoch. */
-			hfsInodeRuntimeDrainPendingLocked(fs);
-			for (i = 0; i < requestCount; i++) {
-				if (!requests[i]->dataOnly) {
-					metadataNeeded = true;
+		hfsStatsRecordDurabilityDataBatchFast();
+		/* Same-size data-only writes need only one device barrier, not blob metadata sync. */
+		if (allDataOnly) {
+			bool needsMetadata = false;
+
+			hfsMetaReadLock();
+			for (i = 0; i < targetCount; i++) {
+				struct hfs_inode *inode = hfsMetaFindById(fs,
+					targets[i].inodeId);
+
+				if (inode == NULL ||
+					hfsMetaInodeDirty(fs, targets[i].inodeId) ||
+					(targets[i].runtime != NULL &&
+					 hfsInodeRuntimeGetLogicalSize(targets[i].runtime) !=
+					 inode->size)) {
+					needsMetadata = true;
 					break;
 				}
 			}
-			/* A data-only call still commits size/extent changes; timestamps may be
-			 * included as a safe stronger ordering when another inode is dirty. */
-			if (fs->metaDirty) {
-				metadataNeeded = true;
+			hfsLibRwlockUnlock(&g_metaLock);
+			if (!needsMetadata) {
+				hfsStatsRecordDurabilityFlushFast();
+				if (hfsDeviceFlush(fs) != 0) {
+					savedErrno = errno != 0 ? errno : EIO;
+					rc = -1;
+				} else {
+					combinedBarrier = true;
+				}
 			}
-			if (metadataNeeded && hfsMetaCommitDirty(fs) != 0) {
+		}
+		if (rc == 0 && !combinedBarrier) {
+			for (i = 0; i < targetCount; i++) {
+				if (targets[i].file != NULL && hfsSyncData(targets[i].file) != 0) {
+					savedErrno = errno != 0 ? errno : EIO;
+					rc = -1;
+					break;
+				}
+			}
+		}
+		for (i = 0; i < requestCount; i++) {
+			hfsDurabilityTraceRecordEpoch(requests[i]->epochId,
+					requests[i]->openFile->inodeId,
+					"data-barrier", rc == 0 ? 0 : -savedErrno);
+		}
+	}
+
+	/* Stage B: publish one metadata image for the whole epoch. */
+	if (rc == 0) {
+		hfsFsyncCrashPoint(1);
+		if (!combinedBarrier) {
+			hfsMetaWriteLock();
+			if (g_fs == NULL || g_fs != fs) {
+				savedErrno = ENODEV;
+				rc = -1;
+			} else {
+				for (i = 0; i < requestCount; i++) {
+					if (!requests[i]->dataOnly) {
+						strongRequest = true;
+						break;
+					}
+				}
+				/* A data-only barrier needs metadata only for this inode's size/extent. */
+				if (!strongRequest) {
+					for (i = 0; i < targetCount; i++) {
+						struct hfs_inode *inode = hfsMetaFindById(fs,
+							targets[i].inodeId);
+
+						if (inode == NULL ||
+							hfsMetaInodeDirty(fs, targets[i].inodeId) ||
+							(targets[i].runtime != NULL &&
+							 hfsInodeRuntimeGetLogicalSize(targets[i].runtime) !=
+							 inode->size)) {
+							metadataNeeded = true;
+							break;
+						}
+					}
+				} else {
+					metadataNeeded = true;
+				}
+				/* Merge timestamp overlays only when a metadata image is required. */
+				if (metadataNeeded) {
+					hfsInodeRuntimeDrainPendingLocked(fs);
+				}
+				if (metadataNeeded) {
+					hfsStatsRecordDurabilityMetadataCommitFast();
+					if (hfsMetaCommitDirty(fs) != 0) {
+						savedErrno = errno != 0 ? errno : EIO;
+						rc = -1;
+					}
+				}
+				if (!metadataNeeded && !strongRequest) {
+					hfsStatsRecordFdatasyncFastPath();
+				}
+			}
+			hfsLibRwlockUnlock(&g_metaLock);
+		} else {
+			/* The combined data-only barrier already proved metadata is unchanged. */
+			hfsStatsRecordFdatasyncFastPath();
+			for (i = 0; i < requestCount; i++) {
+				hfsDurabilityTraceRecordEpoch(requests[i]->epochId,
+					requests[i]->openFile->inodeId,
+					"metadata-skip", 0);
+			}
+		}
+		for (i = 0; i < requestCount; i++) {
+			if (!combinedBarrier) {
+				hfsDurabilityTraceRecordEpoch(requests[i]->epochId,
+					requests[i]->openFile->inodeId,
+					metadataNeeded ? "metadata-commit" : "metadata-skip",
+					rc == 0 ? 0 : -savedErrno);
+			}
+		}
+	}
+
+	/* Stage C: issue one durable device barrier without per-file locks. */
+	if (rc == 0) {
+		hfsFsyncCrashPoint(2);
+		if (!combinedBarrier) {
+			hfsStatsRecordDurabilityFlushFast();
+			if (hfsDeviceFlush(fs) != 0) {
 				savedErrno = errno != 0 ? errno : EIO;
 				rc = -1;
 			}
 		}
 		for (i = 0; i < requestCount; i++) {
-			hfsDurabilityTraceRecord(requests[i]->openFile->inodeId,
-				metadataNeeded ? "metadata-commit" : "metadata-skip",
-				rc == 0 ? 0 : -savedErrno);
-		}
-		pthread_rwlock_unlock(&g_metaLock);
-	}
-	if (rc == 0) {
-		hfsFsyncCrashPoint(2);
-		if (hfsDeviceFlush(fs) != 0) {
-			savedErrno = errno != 0 ? errno : EIO;
-			rc = -1;
-		}
-		for (i = 0; i < requestCount; i++) {
-			hfsDurabilityTraceRecord(requests[i]->openFile->inodeId,
+			hfsDurabilityTraceRecordEpoch(requests[i]->epochId,
+				requests[i]->openFile->inodeId,
 				"post-metadata-barrier", rc == 0 ? 0 : -savedErrno);
 		}
 	}
@@ -2789,14 +2878,6 @@ static int hfs_lib_process_durability_batch(
 		hfsFsyncCrashPoint(3);
 	}
 
-	for (i = lockedCount; i > 0; i--) {
-		size_t index = i - 1U;
-
-		if (lockedRuntimes[index] != NULL) {
-			pthread_rwlock_unlock(&lockedRuntimes[index]->syncLock);
-		}
-		pthread_mutex_unlock(&lockedFiles[index]->ioLock);
-	}
 	for (i = 0; i < requestCount; i++) {
 		if (rc == 0) {
 			requests[i]->result = 0;
@@ -2806,8 +2887,7 @@ static int hfs_lib_process_durability_batch(
 			requests[i]->error = savedErrno != 0 ? savedErrno : EIO;
 		}
 	}
-	free(lockedFiles);
-	free(lockedRuntimes);
+	free(targets);
 	return 0;
 }
 

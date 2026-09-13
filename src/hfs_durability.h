@@ -12,6 +12,7 @@ struct HfsOpenFile;
 /* One caller waiting for a mount-level durability epoch. */
 typedef struct HfsDurabilityRequest {
 	struct HfsOpenFile *openFile;
+	uint64_t epochId;
 	bool dataOnly;
 	int result;
 	int error;
@@ -31,6 +32,9 @@ typedef struct HfsDurabilityCoordinator HfsDurabilityCoordinator;
 void hfsDurabilityTraceInit(void);
 /* Record one fsync phase without changing the caller-visible errno value. */
 void hfsDurabilityTraceRecord(uint64_t inodeId, const char *phase, int result);
+/* Record one fsync phase and associate it with a durability epoch. */
+void hfsDurabilityTraceRecordEpoch(uint64_t epochId, uint64_t inodeId,
+		const char *phase, int result);
 /* Write the optional trace after all HFS activity has stopped. */
 void hfsDurabilityTraceFini(void);
 

@@ -29,6 +29,7 @@
 /* One optional trace event emitted only by the synchronous durability path. */
 typedef struct HfsDurabilityTraceEvent {
 	uint64_t sequence;
+	uint64_t epochId;
 	uint64_t inodeId;
 	int result;
 	char phase[HFS_DURABILITY_TRACE_PHASE_SIZE];
@@ -68,6 +69,7 @@ struct HfsDurabilityCoordinator {
 	size_t depth;
 	uint32_t windowUs;
 	uint32_t maxBatch;
+	uint64_t nextEpoch;
 	bool stopping;
 	bool started;
 };
@@ -150,6 +152,9 @@ static void *hfsDurabilityWorker(void *arg) {
 		coordinator->tail = NULL;
 		coordinator->depth = 0;
 		pthread_mutex_unlock(&coordinator->lock);
+		/* One bounded request batch is one durable epoch. */
+		coordinator->nextEpoch++;
+		hfsStatsRecordDurabilityEpochFast();
 
 		request = batchHead;
 		while (request != NULL && count < coordinator->maxBatch) {
@@ -185,8 +190,10 @@ static void *hfsDurabilityWorker(void *arg) {
 		request = batchHead;
 		for (index = 0; index < count; index++) {
 			requests[index] = request;
+			request->epochId = coordinator->nextEpoch;
 			request = request->next;
 		}
+		hfsStatsRecordDurabilityEpochWaiterFast(count > 1 ? count - 1U : 0U);
 		hfsStatsRecordDurabilityLeaderFast();
 		for (index = 1; index < count; index++) {
 			hfsStatsRecordDurabilityWaiterFast();
@@ -377,7 +384,8 @@ void hfsDurabilityTraceInit(void) {
 }
 
 /* Append a bounded in-memory event while preserving the public errno value. */
-void hfsDurabilityTraceRecord(uint64_t inodeId, const char *phase, int result) {
+void hfsDurabilityTraceRecordEpoch(uint64_t epochId, uint64_t inodeId,
+		const char *phase, int result) {
 	HfsDurabilityTraceEvent *event;
 	int savedErrno = errno;
 
@@ -388,12 +396,18 @@ void hfsDurabilityTraceRecord(uint64_t inodeId, const char *phase, int result) {
 	if (g_hfsDurabilityTraceCount < HFS_DURABILITY_TRACE_MAX_EVENTS) {
 		event = &g_hfsDurabilityTrace[g_hfsDurabilityTraceCount++];
 		event->sequence = ++g_hfsDurabilityTraceSequence;
+		event->epochId = epochId;
 		event->inodeId = inodeId;
 		event->result = result;
 		snprintf(event->phase, sizeof(event->phase), "%s", phase);
 	}
 	pthread_mutex_unlock(&g_hfsDurabilityTraceLock);
 	errno = savedErrno;
+}
+
+/* Preserve the legacy trace API for synchronous fallback callers. */
+void hfsDurabilityTraceRecord(uint64_t inodeId, const char *phase, int result) {
+	hfsDurabilityTraceRecordEpoch(0, inodeId, phase, result);
 }
 
 /* Write trace events through direct syscalls to avoid LD_PRELOAD recursion. */
@@ -413,8 +427,9 @@ void hfsDurabilityTraceFini(void) {
 	if (fd >= 0) {
 		for (i = 0; i < g_hfsDurabilityTraceCount; i++) {
 			length = snprintf(line, sizeof(line),
-				"sequence=%"PRIu64" inode=%"PRIu64" phase=%s result=%d\n",
+				"sequence=%"PRIu64" epoch=%"PRIu64" inode=%"PRIu64" phase=%s result=%d\n",
 				g_hfsDurabilityTrace[i].sequence,
+				g_hfsDurabilityTrace[i].epochId,
 				g_hfsDurabilityTrace[i].inodeId,
 				g_hfsDurabilityTrace[i].phase,
 				g_hfsDurabilityTrace[i].result);

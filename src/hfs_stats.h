@@ -23,6 +23,12 @@ extern _Atomic uint_fast64_t hfsStatsDurabilityWaiters;
 extern _Atomic uint_fast64_t hfsStatsDurabilityBatches;
 extern _Atomic uint_fast64_t hfsStatsDurabilityBatchRequests;
 extern _Atomic uint_fast64_t hfsStatsDurabilityBatchMax;
+extern _Atomic uint_fast64_t hfsStatsDurabilityEpochs;
+extern _Atomic uint_fast64_t hfsStatsDurabilityEpochWaiters;
+extern _Atomic uint_fast64_t hfsStatsDurabilityDataTargets;
+extern _Atomic uint_fast64_t hfsStatsDurabilityDataBatches;
+extern _Atomic uint_fast64_t hfsStatsDurabilityMetadataCommits;
+extern _Atomic uint_fast64_t hfsStatsDurabilityFlushes;
 extern _Atomic uint_fast64_t hfsStatsFdatasyncFast;
 extern _Atomic uint_fast64_t hfsStatsSpdkSubmits;
 extern _Atomic uint_fast64_t hfsStatsSpdkCompletions;
@@ -176,6 +182,12 @@ void hfsStatsRecordDmaFastAcquire(void);
 void hfsStatsRecordDurabilityLeader(void);
 void hfsStatsRecordDurabilityWaiter(void);
 void hfsStatsRecordDurabilityBatch(uint64_t requestCount);
+void hfsStatsRecordDurabilityEpoch(void);
+void hfsStatsRecordDurabilityEpochWaiter(uint64_t count);
+void hfsStatsRecordDurabilityDataTarget(uint64_t count);
+void hfsStatsRecordDurabilityDataBatch(void);
+void hfsStatsRecordDurabilityMetadataCommit(void);
+void hfsStatsRecordDurabilityFlush(void);
 void hfsStatsRecordFdatasyncFast(void);
 
 static inline void hfsStatsRecordIoFast(bool write, size_t bytes, bool aligned) {
@@ -314,6 +326,36 @@ static inline void hfsStatsRecordDurabilityWaiterFast(void) {
 static inline void hfsStatsRecordDurabilityBatchFast(uint64_t requestCount) {
 	if (hfsStatsEnabledFast()) {
 		hfsStatsRecordDurabilityBatch(requestCount);
+	}
+}
+static inline void hfsStatsRecordDurabilityEpochFast(void) {
+	if (hfsStatsEnabledFast()) {
+		hfsStatsRecordDurabilityEpoch();
+	}
+}
+static inline void hfsStatsRecordDurabilityEpochWaiterFast(uint64_t count) {
+	if (hfsStatsEnabledFast()) {
+		hfsStatsRecordDurabilityEpochWaiter(count);
+	}
+}
+static inline void hfsStatsRecordDurabilityDataTargetFast(uint64_t count) {
+	if (hfsStatsEnabledFast()) {
+		hfsStatsRecordDurabilityDataTarget(count);
+	}
+}
+static inline void hfsStatsRecordDurabilityDataBatchFast(void) {
+	if (hfsStatsEnabledFast()) {
+		hfsStatsRecordDurabilityDataBatch();
+	}
+}
+static inline void hfsStatsRecordDurabilityMetadataCommitFast(void) {
+	if (hfsStatsEnabledFast()) {
+		hfsStatsRecordDurabilityMetadataCommit();
+	}
+}
+static inline void hfsStatsRecordDurabilityFlushFast(void) {
+	if (hfsStatsEnabledFast()) {
+		hfsStatsRecordDurabilityFlush();
 	}
 }
 static inline void hfsStatsRecordFdatasyncFastPath(void) {

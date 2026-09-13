@@ -59,4 +59,8 @@ PYEOF
 
 grep -q '^fdatasync_fast=[1-9]' "$STATS_PATH"
 grep -q '^durability_leader=[1-9]' "$STATS_PATH"
+grep -q '^durability_epochs=[1-9]' "$STATS_PATH"
+grep -q '^durability_data_targets=[1-9]' "$STATS_PATH"
+grep -q '^durability_data_batches=[1-9]' "$STATS_PATH"
+grep -q '^durability_flushes=[1-9]' "$STATS_PATH"
 echo "FDATASYNC STATS OK"

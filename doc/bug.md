@@ -1363,4 +1363,27 @@ Bug 等级：**致命 > 严重 > 一般**。
 - **验证**：group commit 开启时 MariaDB 持久化初始化、正常重启、SIGKILL 恢复和
   mysqlslap 并发均通过；关闭 group commit 的 legacy 路径亦通过。
 
+### 80. epoch pipeline 将同尺寸 fdatasync 误判为 metadata 变更（已修复）
+
+- **状态**：已修复（shard-65）
+- **时间**：2026-09-13
+- **等级**：一般（不破坏数据正确性，但会放大每次数据库 durability 请求的 metadata 写放大）
+- **现象**：启用新的 mount 级 durability epoch pipeline 后，普通同尺寸覆盖的
+  `fdatasync` 每次都触发 v4 blob metadata sync 和全局 metadata commit；stats 中
+  `durability_metadata_commits` 随请求数增长，`fdatasync_fast` 统计不再出现，MySQL
+  写吞吐没有达到预期。
+- **排查过程**：对比 `fdatasync_smoke.sh` 期望的 `fdatasync_fast` 与 epoch Stage A/B
+  的状态转换，发现 Stage A 在 data-only 请求上先无条件调用
+  `hfsInodeRuntimeDrainPendingLocked()`，随后 Stage B 看到时间戳 overlay 已被清空，无法
+  区分“仅数据覆盖”和“size/extent/dirty inode 变化”。
+- **根因**：metadata pending drain 被放在 data-only 语义判断之前，判断本身破坏了判断
+  所需的 dirty 状态；因此同尺寸覆盖被保守地当作 metadata transaction。
+- **修复**：在 Stage A 持有 metadata read lock 时先检查 inode dirty、runtime logical size
+  与稳定 inode size；只有确认需要 metadata 时才在 Stage B 的 metadata write lock 下
+  drain pending overlay。若 metadata 未变化，Stage A 直接执行一次 device flush，Stage B
+  跳过全局 metadata write lock，同时保留真实数据/设备持久化屏障。
+- **验证**：VM 上 fdatasync stats、POSIX contract、fd lifecycle、runtime stress、三个
+  crash boundary、MariaDB/RocksDB recovery 和 NVMe FIO 全部通过；`spdk_submit` 与
+  `spdk_complete` 闭合，未发现新的严重或致命问题。
+
 ## 通用经验总结

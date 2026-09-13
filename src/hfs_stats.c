@@ -40,6 +40,12 @@ _Atomic uint_fast64_t hfsStatsDurabilityWaiters;
 _Atomic uint_fast64_t hfsStatsDurabilityBatches;
 _Atomic uint_fast64_t hfsStatsDurabilityBatchRequests;
 _Atomic uint_fast64_t hfsStatsDurabilityBatchMax;
+_Atomic uint_fast64_t hfsStatsDurabilityEpochs;
+_Atomic uint_fast64_t hfsStatsDurabilityEpochWaiters;
+_Atomic uint_fast64_t hfsStatsDurabilityDataTargets;
+_Atomic uint_fast64_t hfsStatsDurabilityDataBatches;
+_Atomic uint_fast64_t hfsStatsDurabilityMetadataCommits;
+_Atomic uint_fast64_t hfsStatsDurabilityFlushes;
 _Atomic uint_fast64_t hfsStatsFdatasyncFast;
 static _Atomic uint_fast64_t g_hfsStatsDataReactorSubmit[HFS_STATS_MAX_DATA_REACTORS];
 static _Atomic uint_fast64_t g_hfsStatsDataReactorComplete[HFS_STATS_MAX_DATA_REACTORS];
@@ -220,6 +226,17 @@ static void hfsStatsReset(void) {
 	atomic_store_explicit(&hfsStatsDurabilityBatchRequests, 0,
 		memory_order_relaxed);
 	atomic_store_explicit(&hfsStatsDurabilityBatchMax, 0, memory_order_relaxed);
+	atomic_store_explicit(&hfsStatsDurabilityEpochs, 0, memory_order_relaxed);
+	atomic_store_explicit(&hfsStatsDurabilityEpochWaiters, 0,
+		memory_order_relaxed);
+	atomic_store_explicit(&hfsStatsDurabilityDataTargets, 0,
+		memory_order_relaxed);
+	atomic_store_explicit(&hfsStatsDurabilityDataBatches, 0,
+		memory_order_relaxed);
+	atomic_store_explicit(&hfsStatsDurabilityMetadataCommits, 0,
+		memory_order_relaxed);
+	atomic_store_explicit(&hfsStatsDurabilityFlushes, 0,
+		memory_order_relaxed);
 	atomic_store_explicit(&hfsStatsFdatasyncFast, 0, memory_order_relaxed);
 	for (unsigned int i = 0; i < HFS_STATS_MAX_DATA_REACTORS; i++) {
 		atomic_store_explicit(&g_hfsStatsDataReactorSubmit[i], 0,
@@ -796,6 +813,42 @@ void hfsStatsRecordDurabilityBatch(uint64_t requestCount) {
 	}
 }
 
+/* Record one mount-level durability epoch created by the coordinator. */
+void hfsStatsRecordDurabilityEpoch(void) {
+	atomic_fetch_add_explicit(&hfsStatsDurabilityEpochs, 1,
+		memory_order_relaxed);
+}
+
+/* Record callers that wait on an already admitted durability epoch. */
+void hfsStatsRecordDurabilityEpochWaiter(uint64_t count) {
+	atomic_fetch_add_explicit(&hfsStatsDurabilityEpochWaiters, count,
+		memory_order_relaxed);
+}
+
+/* Record unique blob/runtime targets handled by one epoch. */
+void hfsStatsRecordDurabilityDataTarget(uint64_t count) {
+	atomic_fetch_add_explicit(&hfsStatsDurabilityDataTargets, count,
+		memory_order_relaxed);
+}
+
+/* Record one deduplicated data barrier stage. */
+void hfsStatsRecordDurabilityDataBatch(void) {
+	atomic_fetch_add_explicit(&hfsStatsDurabilityDataBatches, 1,
+		memory_order_relaxed);
+}
+
+/* Record one metadata commit stage. */
+void hfsStatsRecordDurabilityMetadataCommit(void) {
+	atomic_fetch_add_explicit(&hfsStatsDurabilityMetadataCommits, 1,
+		memory_order_relaxed);
+}
+
+/* Record one device flush stage. */
+void hfsStatsRecordDurabilityFlush(void) {
+	atomic_fetch_add_explicit(&hfsStatsDurabilityFlushes, 1,
+		memory_order_relaxed);
+}
+
 /* Record a fdatasync that completed after only the data barrier. */
 void hfsStatsRecordFdatasyncFast(void) {
 	atomic_fetch_add_explicit(&hfsStatsFdatasyncFast, 1, memory_order_relaxed);
@@ -953,6 +1006,23 @@ static void hfsStatsWriteSnapshot(void) {
 		memory_order_relaxed));
 	HFS_STATS_APPEND("durability_group_batch_max=%"PRIuFAST64"\n",
 		atomic_load_explicit(&hfsStatsDurabilityBatchMax, memory_order_relaxed));
+	HFS_STATS_APPEND("durability_epochs=%"PRIuFAST64"\n",
+		atomic_load_explicit(&hfsStatsDurabilityEpochs, memory_order_relaxed));
+	HFS_STATS_APPEND("durability_epoch_waiters=%"PRIuFAST64"\n",
+		atomic_load_explicit(&hfsStatsDurabilityEpochWaiters,
+		memory_order_relaxed));
+	HFS_STATS_APPEND("durability_data_targets=%"PRIuFAST64"\n",
+		atomic_load_explicit(&hfsStatsDurabilityDataTargets,
+		memory_order_relaxed));
+	HFS_STATS_APPEND("durability_data_batches=%"PRIuFAST64"\n",
+		atomic_load_explicit(&hfsStatsDurabilityDataBatches,
+		memory_order_relaxed));
+	HFS_STATS_APPEND("durability_metadata_commits=%"PRIuFAST64"\n",
+		atomic_load_explicit(&hfsStatsDurabilityMetadataCommits,
+		memory_order_relaxed));
+	HFS_STATS_APPEND("durability_flushes=%"PRIuFAST64"\n",
+		atomic_load_explicit(&hfsStatsDurabilityFlushes,
+		memory_order_relaxed));
 	HFS_STATS_APPEND("fdatasync_fast=%"PRIuFAST64"\n",
 		atomic_load_explicit(&hfsStatsFdatasyncFast, memory_order_relaxed));
 	HFS_STATS_APPEND("spdk_submit=%"PRIuFAST64"\n",

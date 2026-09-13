@@ -397,3 +397,28 @@ VMware NVMe、HFS `numjobs=32`、原生 SPDK `iodepth=32`、`randrw=50/50`、O_D
 flush/compact 和 `ldb checkconsistency` 均通过。RocksDB 10 秒 Aio benchmark 中
 `spdk_submit == spdk_complete`、`errors=0`；顺序单线程阶段的 group batch 最大值为 1，
 应使用并发事务/WAL workload 评估真正的 group commit 合并收益。
+
+## shard-65 durability epoch pipeline：NVMe FIO 回归（2026-09-13）
+
+Shard-65 将 durability coordinator 收敛为 mount 级 epoch pipeline：admission 阶段短暂
+获取并释放 open-file/runtime 锁，按 runtime 去重 data barrier；v4 metadata intent/stable
+image 每个 epoch 最多提交一次，并且最终只执行一次 device flush。对同尺寸、无 inode dirty/size
+变化的 `fdatasync`，额外跳过无必要的 blob metadata sync 和全局 metadata write lock，但
+仍保留真实 device flush，故 POSIX durability 没有被弱化。
+
+同一块 NVMe、`Nvme0n1`、`randrw=50/50`、`O_DIRECT`、256 MiB、10 秒，HFS 使用完整
+POSIX preload + `numjobs=32`，raw SPDK 使用 `iodepth=32`，所有档位 `errors=0`：
+
+| bs | HFS IOPS | raw SPDK IOPS | HFS/raw | HFS read p50/p99 (µs) | HFS write p50/p99 (µs) |
+|---:|---:|---:|---:|---:|---:|
+| 4K | 77,249 | 121,911 | 63.4% | 395 / 889 | 399 / 889 |
+| 8K | 71,456 | 112,535 | 63.5% | 428 / 954 | 436 / 963 |
+| 16K | 61,608 | 94,063 | 65.5% | 502 / 1,090 | 506 / 1,090 |
+| 32K | 50,260 | 73,673 | 68.2% | 610 / 1,319 | 619 / 1,319 |
+| 64K | 37,623 | 53,026 | 70.9% | 815 / 1,745 | 823 / 1,761 |
+
+完整原始文件位于 VM `/mnt/hfs-data/shard65-fio-nvme/summary.tsv`。本轮 FIO 主要用于
+确认 epoch 改动没有破坏 POSIX 数据面；它不会触发数据库高频 `fsync/fdatasync` 的核心
+瓶颈。MySQL 归因样本显示 `durability_batch_max=1` 且 flush 数量基本等于 durability
+请求数，说明实际事务到达没有形成可观的 group commit；因此不能把提高 group window
+当作默认优化，也不能用跳过设备 flush 换取不符合 POSIX 的数字。
