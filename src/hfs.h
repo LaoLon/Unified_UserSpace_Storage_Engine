@@ -15,6 +15,7 @@ struct hfs_inode;
 struct hfs_io_pool;
 struct hfs_inode_runtime;
 struct hfs_meta_index;
+struct HfsIoChildProfile;
 struct spdk_bdev_desc;
 struct HfsDurabilityCoordinator;
 
@@ -40,6 +41,8 @@ typedef struct HfsCompletion {
 	/* Runtime queue credit retained until the backend callback retires. */
 	_Atomic bool runtimeCreditHeld;
 	uint32_t runtimeReactorId;
+	/* Optional profiling child owned by the synchronous I/O request. */
+	struct HfsIoChildProfile *profileChild;
 } HfsCompletion;
 
 /* Operations recorded by one request-private SPDK result object. */

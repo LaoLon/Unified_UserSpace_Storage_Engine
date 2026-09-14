@@ -1386,4 +1386,91 @@ Bug 等级：**致命 > 严重 > 一般**。
   crash boundary、MariaDB/RocksDB recovery 和 NVMe FIO 全部通过；`spdk_submit` 与
   `spdk_complete` 闭合，未发现新的严重或致命问题。
 
+### 81. profiling 公开头文件缺少 size_t 定义（已修复）
+
+- **状态**：已修复（task90150022 P0-1）
+- **时间**：2026-09-15
+- **等级**：一般（新增 profiling 模块无法完成编译）
+- **现象**：VM 上首次执行 `make -B app lib` 时，`src/hfs_profile.c` 编译失败，编译器
+  报告 `hfs_profile.h` 中 `hfsProfileBegin()` 的 `size_t` 未定义。
+- **排查过程**：确认报错来自新增公共头文件，而不是调用方 include 顺序；该头文件只
+  引入了 `stdbool.h`、`stdatomic.h` 和 `stdint.h`，没有提供 `size_t` 的标准定义。
+- **根因**：公共函数声明直接使用 `size_t`，但遗漏了对应的 `<stddef.h>` 依赖。
+- **修复**：在 `src/hfs_profile.h` 显式加入 `<stddef.h>`，使头文件自洽并不依赖间接
+  include。
+- **验证**：修复后重新执行 VM 强制构建，继续检查后续编译与链接结果。
+
+### 82. trace sampled mode 保留无 parent 的事件导致 ring 溢出（已修复）
+
+- **状态**：已修复（task90150022 P0-1）
+- **时间**：2026-09-15
+- **等级**：一般（只影响 profiling 证据完整性，不改变 HFS 数据语义）
+- **现象**：8 job NVMe profiling probe 设置 `HFS_TRACE_SAMPLE=100` 后，profile 行本身
+  可以保持单调，但 trace 快照仍报告大量 `dropped`，无法满足可信基线的
+  `trace_dropped=0` 守恒检查。
+- **排查过程**：检查 `hfsTraceEmitDetail()` 的采样条件，发现只有非零
+  `parentId/requestId` 且不命中采样间隔时才丢弃；metadata、thread-wait 等没有关联
+  parent 的事件仍全部写入每线程 4096 项 ring，在高并发运行中持续覆盖旧事件。
+- **根因**：采样策略只过滤“已关联但未命中”的事件，没有把未关联事件视为当前采样
+  窗口之外的数据。
+- **修复**：采样间隔大于 1 时，`sampleId==0` 的普通事件和未命中的 parent/request
+  事件统一丢弃；parent profile 使用同一规则，保持 profile 与 child trace 的采样一致。
+- **验证**：重新构建后用 `HFS_TRACE_SAMPLE=100` 复测，检查 `trace_dropped=0`、profile
+  单调性和 `spdk_submit=spdk_complete`。
+
+### 83. profiling ring 容量不足以容纳文档规定的 sample=100（已修复）
+
+- **状态**：已修复（task90150022 P0-1）
+- **时间**：2026-09-15
+- **等级**：一般（只影响 profiling 快照完整性）
+- **现象**：过滤掉无 parent 事件后，8 job、5 秒、`HFS_TRACE_SAMPLE=100` 的 probe
+  仍在每个 data thread 产生约 2.6–3.1K 条覆盖丢弃记录，无法稳定满足
+  `trace_dropped=0`。
+- **排查过程**：按线程统计快照中的 ring 记录和 dropped marker，确认不是 profile 单调性
+  或 SPDK submit/complete 不闭合；单线程 owner 没有丢失，data thread 在 4096 项容量
+  下因 sampled request 仍产生多阶段事件而覆盖旧记录。
+- **根因**：原固定 4096 项容量面向低并发 trace smoke，低于任务规定的高并发采样
+  workload 的短时事件峰值。
+- **修复**：将每线程 trace ring 扩大到 16384 项；仍保持 per-thread ownership、无锁
+  写入和 bounded snapshot，不改变 profiling 关闭时的正式性能路径。
+- **验证**：重新构建后再次运行 sample=100 probe，要求 dropped=0、profile_invalid=0、
+  errors=0 且 `spdk_submit=spdk_complete`。
+
+### 84. 独立 Blobstore benchmark 缺少 bdev event callback（已修复）
+
+- **状态**：已修复（task90150022 P0-2 A2）
+- **时间**：2026-09-15
+- **等级**：一般（仅新增 benchmark 无法启动）
+- **现象**：A2 首次运行在 SPDK 初始化阶段退出，日志为
+  `spdk_bdev_open_ext_v2: Missing event callback function`。
+- **排查过程**：确认 NVMe 已由 `uio_pci_generic` 接管、hugepages 正常，且错误发生在
+  `spdk_bdev_create_bs_dev_ext()` 调用之后、blobstore 初始化之前。
+- **根因**：SPDK blob-bdev bridge 要求调用方提供 bdev event callback；新 benchmark
+  为简化代码传入了 `NULL`，不满足 API 前置条件。
+- **修复**：增加最小的无状态事件回调并传给 `spdk_bdev_create_bs_dev_ext()`；benchmark
+  不改变设备事件语义，只在事件发生时保持进程可继续运行。
+- **验证**：重新编译 A2 benchmark 后重跑 NVMe Blobstore workload，并检查退出码和
+  `errors=0`。
+
+### 85. A2 Blobstore 基线与 HFS 共享 NVMe 时破坏 HFS 元数据（已规避）
+
+- **状态**：已规避（task90150022 P0-2 测试隔离）
+- **时间**：2026-09-15
+- **等级**：严重（错误的基线顺序会让后续 HFS 挂载失败；不影响产品路径）
+- **现象**：在已经格式化为 HFS 的 `Nvme0n1` 上运行 A2 后，随后启动 A3 报告
+  `hfs_lib_init failed`；HFS 日志显示 `hfsMetaInit failed`。A2 自身的 I/O 计数仍为
+  `errors=0`，但底层 Blobstore 已不再是可供 HFS 继续挂载的状态。
+- **排查过程**：对比 A2 benchmark 与 HFS mount 的调用路径，确认 A2 使用
+  `spdk_bs_init()`，而不是只读加载；在 SPDK Blobstore 实现中该调用会在底层设备上
+  初始化新的 super block 和 metadata 区域。复现顺序为 HFS 格式化 → A2 → A3，A3
+  失败；将 NVMe 重新 `HFS_FORMAT=1` 后，A3 立即恢复并通过。
+- **根因**：A2 是 raw Blobstore 层基线，必须在独立的干净 Blobstore 状态上运行；
+  HFS 自身也管理同一 SPDK Blobstore。两者不能在同一块介质上交替复用而不重新格式化，
+  否则 A2 的初始化会覆盖 HFS metadata。
+- **修复/规避**：结果口径将 A2 与 A3/A4 分成独立介质状态；A2 全部样本在
+  `spdk_bs_init()` 建立的 raw Blobstore 状态下完成，A2 后显式重新执行 HFS 格式化再
+  运行 A3/A4。没有修改正式 HFS 数据面，也没有把 A2 的设备重初始化误报为 HFS bug。
+- **验证**：重新格式化后 A3 4K/8 线程、64 线程读写均通过且 `errors=0`；A4 正式
+  4K/32-job 样本随后通过且 `err=0`。结果文档记录了该顺序约束。
+
 ## 通用经验总结

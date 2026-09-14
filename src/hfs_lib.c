@@ -23,6 +23,7 @@
 #include "hfs_lib.h"
 #include "hfs_log.h"
 #include "hfs_meta.h"
+#include "hfs_profile.h"
 #include "hfs_runtime.h"
 #include "hfs_stats.h"
 #include "hfs_trace.h"
@@ -532,6 +533,20 @@ static HfsOpenFile *hfs_acquire_file(int fd, bool requireData) {
 		return NULL;
 	}
 	return openFile;
+}
+
+/* Close one optional profile while preserving the caller's errno value. */
+static void hfsProfileEndCall(HfsIoProfile *profile, ssize_t result)
+{
+	int savedErrno;
+
+	if (profile == NULL || !profile->enabled) {
+		return;
+	}
+	savedErrno = errno;
+	hfsProfileFinish(profile, result < 0 ? -savedErrno : 0);
+	hfsProfileSetCurrent(NULL);
+	errno = savedErrno;
 }
 
 /* Validate an iovec array and return its total length without allocating. */
@@ -1496,31 +1511,40 @@ ssize_t hfs_lib_pread(int fd, void *buf, size_t count, off_t offset) {
 	struct hfs_inode *in;
 	uint64_t fileSize;
 	ssize_t n;
+	HfsIoProfile profile = {0};
 
 	if (count == 0) {
 		return 0;
 	}
+	if (hfsProfileBegin(&profile, false, count)) {
+		hfsProfileSetCurrent(&profile);
+	}
 	if (offset < 0) {
 		errno = EINVAL;
+		hfsProfileEndCall(&profile, -1);
 		return -1;
 	}
 
 	openFile = hfs_acquire_file(fd, true);
 	if (openFile == NULL) {
+		hfsProfileEndCall(&profile, -1);
 		return -1;
 	}
+	hfsProfileParentStage(HFS_PROFILE_T1);
 	hfsMetaReadLock();
 	in = g_fs == NULL ? NULL : hfsMetaFindById(g_fs, openFile->inodeId);
 	if (g_fs == NULL) {
 		pthread_rwlock_unlock(&g_metaLock);
 		hfs_release_open_file(openFile);
 		errno = ENODEV;
+		hfsProfileEndCall(&profile, -1);
 		return -1;
 	}
 	if (in == NULL && !hfsFdGetOrphanInfo(openFile, &fileSize, NULL, NULL)) {
 		pthread_rwlock_unlock(&g_metaLock);
 		hfs_release_open_file(openFile);
 		errno = ENOENT;
+		hfsProfileEndCall(&profile, -1);
 		return -1;
 	}
 	if (in != NULL) {
@@ -1529,6 +1553,7 @@ ssize_t hfs_lib_pread(int fd, void *buf, size_t count, off_t offset) {
 	if ((uint64_t)offset >= fileSize) {
 		pthread_rwlock_unlock(&g_metaLock);
 		hfs_release_open_file(openFile);
+		hfsProfileEndCall(&profile, 0);
 		return 0;
 	}
 	if ((uint64_t)offset + count > fileSize) {
@@ -1538,6 +1563,7 @@ ssize_t hfs_lib_pread(int fd, void *buf, size_t count, off_t offset) {
 	pthread_rwlock_unlock(&g_metaLock);
 	n = hfsReadAt(openFile->file, buf, count, (uint64_t)offset);
 	hfs_release_open_file(openFile);
+	hfsProfileEndCall(&profile, n);
 	return n;
 }
 
@@ -1549,22 +1575,30 @@ ssize_t hfs_lib_pwrite(int fd, const void *buf, size_t count, off_t offset) {
 	bool append;
 	ssize_t n;
 	int savedErrno;
+	HfsIoProfile profile = {0};
 
 	if (count == 0) {
 		return 0;
 	}
+	if (hfsProfileBegin(&profile, true, count)) {
+		hfsProfileSetCurrent(&profile);
+	}
 	if (offset < 0) {
 		errno = EINVAL;
+		hfsProfileEndCall(&profile, -1);
 		return -1;
 	}
 
 	openFile = hfs_acquire_file(fd, true);
 	if (openFile == NULL) {
+		hfsProfileEndCall(&profile, -1);
 		return -1;
 	}
+	hfsProfileParentStage(HFS_PROFILE_T1);
 	if (!openFile->writable) {
 		hfs_release_open_file(openFile);
 		errno = EBADF;
+		hfsProfileEndCall(&profile, -1);
 		return -1;
 	}
 	append = (openFile->flags & O_APPEND) != 0;
@@ -1583,6 +1617,7 @@ ssize_t hfs_lib_pwrite(int fd, const void *buf, size_t count, off_t offset) {
 			pthread_mutex_unlock(&openFile->runtime->appendLock);
 			hfs_release_open_file(openFile);
 			errno = ENODEV;
+			hfsProfileEndCall(&profile, -1);
 			return -1;
 		}
 		if (in != NULL) {
@@ -1594,6 +1629,7 @@ ssize_t hfs_lib_pwrite(int fd, const void *buf, size_t count, off_t offset) {
 			pthread_mutex_unlock(&openFile->runtime->appendLock);
 			hfs_release_open_file(openFile);
 			errno = ENOENT;
+			hfsProfileEndCall(&profile, -1);
 			return -1;
 		}
 		pthread_rwlock_unlock(&g_metaLock);
@@ -1607,6 +1643,7 @@ ssize_t hfs_lib_pwrite(int fd, const void *buf, size_t count, off_t offset) {
 		}
 		hfs_release_open_file(openFile);
 		errno = n < 0 ? savedErrno : EIO;
+		hfsProfileEndCall(&profile, -1);
 		return -1;
 	}
 	hfsPublishWriteEnd(openFile, writeOffset + (uint64_t)n);
@@ -1614,6 +1651,7 @@ ssize_t hfs_lib_pwrite(int fd, const void *buf, size_t count, off_t offset) {
 		pthread_mutex_unlock(&openFile->runtime->appendLock);
 	}
 	hfs_release_open_file(openFile);
+	hfsProfileEndCall(&profile, n);
 	return n;
 }
 

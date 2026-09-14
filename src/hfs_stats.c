@@ -68,6 +68,28 @@ _Atomic uint_fast64_t hfsStatsTicketDependencyWaitNs;
 _Atomic uint_fast64_t hfsStatsTicketPromotes;
 _Atomic uint_fast64_t hfsStatsTicketPendingPeak;
 _Atomic uint_fast64_t hfsStatsTicketWakes;
+_Atomic uint_fast64_t hfsStatsMessageSubmitAcquires;
+_Atomic uint_fast64_t hfsStatsMessageSubmitWaitNs;
+_Atomic uint_fast64_t hfsStatsMessageSubmitHoldNs;
+_Atomic uint_fast64_t hfsStatsOwnerMessages;
+_Atomic uint_fast64_t hfsStatsDataMessages;
+_Atomic uint_fast64_t hfsStatsTicketConflicts;
+_Atomic uint_fast64_t hfsStatsTicketDependencies;
+_Atomic uint_fast64_t hfsStatsTicketRealWaits;
+_Atomic uint_fast64_t hfsStatsTicketScanItems;
+_Atomic uint_fast64_t hfsStatsTicketActiveSum;
+_Atomic uint_fast64_t hfsStatsTicketActiveSamples;
+_Atomic uint_fast64_t hfsStatsTicketActivePeak;
+_Atomic uint_fast64_t hfsStatsTicketWaitNs;
+_Atomic uint_fast64_t hfsStatsTicketAdmitNs;
+_Atomic uint_fast64_t hfsStatsTicketCompleteNs;
+_Atomic uint_fast64_t hfsStatsFutexWaitAttempts;
+_Atomic uint_fast64_t hfsStatsFutexWaitSuccess;
+_Atomic uint_fast64_t hfsStatsFutexEagain;
+_Atomic uint_fast64_t hfsStatsFutexEintr;
+_Atomic uint_fast64_t hfsStatsFutexSleepNs;
+_Atomic uint_fast64_t hfsStatsCompletionToWakeNs;
+_Atomic uint_fast64_t hfsStatsWakeToResumeNs;
 bool hfsStatsFastEnabledState;
 bool hfsStatsTimingState;
 
@@ -127,6 +149,22 @@ typedef struct HfsStatsShard {
 	uint64_t dmaWaitNs;
 	uint64_t dmaExhausts;
 	uint64_t dmaActivePeak;
+	uint64_t messageWaitHist[HFS_STATS_HIST_BUCKETS];
+	uint64_t messageHoldHist[HFS_STATS_HIST_BUCKETS];
+	uint64_t messageWaitCount;
+	uint64_t messageHoldCount;
+	uint64_t messageWaitNs;
+	uint64_t messageHoldNs;
+	uint64_t copyInOps;
+	uint64_t copyInBytes;
+	uint64_t copyInTicks;
+	uint64_t copyOutOps;
+	uint64_t copyOutBytes;
+	uint64_t copyOutTicks;
+	uint64_t dmaDirectRequests;
+	uint64_t dmaDirectRequestBytes;
+	uint64_t dmaStagingRequests;
+	uint64_t dmaStagingRequestBytes;
 } HfsStatsShard;
 
 /* A lock frame lets wait and hold time be measured without a global lock. */
@@ -142,6 +180,8 @@ static _Thread_local HfsStatsLockFrame
 	g_hfsStatsLockFrames[HFS_STATS_LOCK_CLASS_COUNT][HFS_STATS_MAX_LOCK_DEPTH];
 static _Thread_local unsigned int
 	g_hfsStatsLockDepth[HFS_STATS_LOCK_CLASS_COUNT];
+static _Thread_local uint64_t g_hfsStatsMessageWaitStart;
+static _Thread_local uint64_t g_hfsStatsMessageHoldStart;
 static bool g_hfsStatsInitialized;
 static char g_hfsStatsPath[PATH_MAX];
 
@@ -272,6 +312,28 @@ static void hfsStatsReset(void) {
 	atomic_store_explicit(&hfsStatsTicketPromotes, 0, memory_order_relaxed);
 	atomic_store_explicit(&hfsStatsTicketPendingPeak, 0, memory_order_relaxed);
 	atomic_store_explicit(&hfsStatsTicketWakes, 0, memory_order_relaxed);
+	atomic_store_explicit(&hfsStatsMessageSubmitAcquires, 0, memory_order_relaxed);
+	atomic_store_explicit(&hfsStatsMessageSubmitWaitNs, 0, memory_order_relaxed);
+	atomic_store_explicit(&hfsStatsMessageSubmitHoldNs, 0, memory_order_relaxed);
+	atomic_store_explicit(&hfsStatsOwnerMessages, 0, memory_order_relaxed);
+	atomic_store_explicit(&hfsStatsDataMessages, 0, memory_order_relaxed);
+	atomic_store_explicit(&hfsStatsTicketConflicts, 0, memory_order_relaxed);
+	atomic_store_explicit(&hfsStatsTicketDependencies, 0, memory_order_relaxed);
+	atomic_store_explicit(&hfsStatsTicketRealWaits, 0, memory_order_relaxed);
+	atomic_store_explicit(&hfsStatsTicketScanItems, 0, memory_order_relaxed);
+	atomic_store_explicit(&hfsStatsTicketActiveSum, 0, memory_order_relaxed);
+	atomic_store_explicit(&hfsStatsTicketActiveSamples, 0, memory_order_relaxed);
+	atomic_store_explicit(&hfsStatsTicketActivePeak, 0, memory_order_relaxed);
+	atomic_store_explicit(&hfsStatsTicketWaitNs, 0, memory_order_relaxed);
+	atomic_store_explicit(&hfsStatsTicketAdmitNs, 0, memory_order_relaxed);
+	atomic_store_explicit(&hfsStatsTicketCompleteNs, 0, memory_order_relaxed);
+	atomic_store_explicit(&hfsStatsFutexWaitAttempts, 0, memory_order_relaxed);
+	atomic_store_explicit(&hfsStatsFutexWaitSuccess, 0, memory_order_relaxed);
+	atomic_store_explicit(&hfsStatsFutexEagain, 0, memory_order_relaxed);
+	atomic_store_explicit(&hfsStatsFutexEintr, 0, memory_order_relaxed);
+	atomic_store_explicit(&hfsStatsFutexSleepNs, 0, memory_order_relaxed);
+	atomic_store_explicit(&hfsStatsCompletionToWakeNs, 0, memory_order_relaxed);
+	atomic_store_explicit(&hfsStatsWakeToResumeNs, 0, memory_order_relaxed);
 	pthread_mutex_lock(&g_hfsStatsShardLock);
 	for (shard = g_hfsStatsShards; shard != NULL; shard = shard->next) {
 		struct HfsStatsShard *next = shard->next;
@@ -395,6 +457,171 @@ void hfsStatsLockRelease(HfsStatsLockClass lockClass) {
 	}
 }
 
+/* Start timing the global SPDK message-submit mutex. */
+void hfsStatsMessageSubmitLockBefore(void) {
+	if (!hfsStatsTimingEnabled()) {
+		return;
+	}
+	(void)hfsStatsShardGet();
+	g_hfsStatsMessageWaitStart = hfsStatsNowNs();
+}
+
+/* Finish message-submit mutex wait timing after pthread_mutex_lock returns. */
+void hfsStatsMessageSubmitLockAfter(void) {
+	HfsStatsShard *shard;
+	uint64_t now;
+	uint64_t waitNs;
+
+	if (!hfsStatsTimingEnabled() || g_hfsStatsMessageWaitStart == 0) {
+		return;
+	}
+	now = hfsStatsNowNs();
+	waitNs = now >= g_hfsStatsMessageWaitStart ?
+		now - g_hfsStatsMessageWaitStart : 0;
+	g_hfsStatsMessageHoldStart = now;
+	atomic_fetch_add_explicit(&hfsStatsMessageSubmitAcquires, 1,
+		memory_order_relaxed);
+	atomic_fetch_add_explicit(&hfsStatsMessageSubmitWaitNs, waitNs,
+		memory_order_relaxed);
+	shard = hfsStatsShardGet();
+	if (shard != NULL) {
+		shard->messageWaitCount++;
+		shard->messageWaitNs += waitNs;
+		shard->messageWaitHist[hfsStatsBucket(waitNs)]++;
+	}
+}
+
+/* Finish message-submit mutex hold timing on the sending thread. */
+void hfsStatsMessageSubmitLockRelease(void) {
+	HfsStatsShard *shard;
+	uint64_t now;
+	uint64_t holdNs;
+
+	if (!hfsStatsTimingEnabled() || g_hfsStatsMessageHoldStart == 0) {
+		return;
+	}
+	now = hfsStatsNowNs();
+	holdNs = now >= g_hfsStatsMessageHoldStart ?
+		now - g_hfsStatsMessageHoldStart : 0;
+	atomic_fetch_add_explicit(&hfsStatsMessageSubmitHoldNs, holdNs,
+		memory_order_relaxed);
+	shard = hfsStatsShardGet();
+	if (shard != NULL) {
+		shard->messageHoldCount++;
+		shard->messageHoldNs += holdNs;
+		shard->messageHoldHist[hfsStatsBucket(holdNs)]++;
+	}
+	g_hfsStatsMessageWaitStart = 0;
+	g_hfsStatsMessageHoldStart = 0;
+}
+
+/* Count one SPDK message by its destination class. */
+void hfsStatsRecordMessage(bool dataMessage) {
+	if (!hfsStatsIsEnabled()) {
+		return;
+	}
+	if (dataMessage) {
+		atomic_fetch_add_explicit(&hfsStatsDataMessages, 1,
+			memory_order_relaxed);
+	} else {
+		atomic_fetch_add_explicit(&hfsStatsOwnerMessages, 1,
+			memory_order_relaxed);
+	}
+}
+
+/* Record one ticket scan with conflict and active-list information. */
+void hfsStatsRecordTicketAdmission(uint32_t scanItems,
+					uint32_t pendingDependencies,
+					uint32_t activeTickets,
+					uint64_t admitNs) {
+	if (!hfsStatsIsEnabled()) {
+		return;
+	}
+	atomic_fetch_add_explicit(&hfsStatsTicketScanItems, scanItems,
+		memory_order_relaxed);
+	atomic_fetch_add_explicit(&hfsStatsTicketDependencies,
+		pendingDependencies, memory_order_relaxed);
+	if (pendingDependencies != 0) {
+		atomic_fetch_add_explicit(&hfsStatsTicketConflicts, 1,
+			memory_order_relaxed);
+	}
+	atomic_fetch_add_explicit(&hfsStatsTicketActiveSum, activeTickets,
+		memory_order_relaxed);
+	atomic_fetch_add_explicit(&hfsStatsTicketActiveSamples, 1,
+		memory_order_relaxed);
+	hfsStatsPeak(&hfsStatsTicketActivePeak, activeTickets);
+	atomic_fetch_add_explicit(&hfsStatsTicketAdmitNs, admitNs,
+		memory_order_relaxed);
+}
+
+/* Record only a ticket wait that reached pthread_cond_wait. */
+void hfsStatsRecordTicketRealWait(uint64_t waitNs) {
+	if (hfsStatsIsEnabled()) {
+		atomic_fetch_add_explicit(&hfsStatsTicketRealWaits, 1,
+			memory_order_relaxed);
+		atomic_fetch_add_explicit(&hfsStatsTicketWaitNs, waitNs,
+			memory_order_relaxed);
+	}
+}
+
+/* Record the time spent scanning the active list during completion. */
+void hfsStatsRecordTicketCompletion(uint64_t completeNs) {
+	if (hfsStatsIsEnabled()) {
+		atomic_fetch_add_explicit(&hfsStatsTicketCompleteNs, completeNs,
+			memory_order_relaxed);
+	}
+}
+
+/* Record one futex wait syscall attempt. */
+void hfsStatsRecordFutexAttempt(void) {
+	if (hfsStatsIsEnabled()) {
+		atomic_fetch_add_explicit(&hfsStatsFutexWaitAttempts, 1,
+			memory_order_relaxed);
+	}
+}
+
+/* Record a futex syscall that slept until a wake. */
+void hfsStatsRecordFutexSuccess(uint64_t sleepNs) {
+	if (hfsStatsIsEnabled()) {
+		atomic_fetch_add_explicit(&hfsStatsFutexWaitSuccess, 1,
+			memory_order_relaxed);
+		atomic_fetch_add_explicit(&hfsStatsFutexSleepNs, sleepNs,
+			memory_order_relaxed);
+	}
+}
+
+/* Record a futex EAGAIN race that did not sleep. */
+void hfsStatsRecordFutexEagain(void) {
+	if (hfsStatsIsEnabled()) {
+		atomic_fetch_add_explicit(&hfsStatsFutexEagain, 1,
+			memory_order_relaxed);
+	}
+}
+
+/* Record a futex EINTR return that did not complete the wait. */
+void hfsStatsRecordFutexEintr(void) {
+	if (hfsStatsIsEnabled()) {
+		atomic_fetch_add_explicit(&hfsStatsFutexEintr, 1,
+			memory_order_relaxed);
+	}
+}
+
+/* Accumulate completion callback to completion-wake handoff ticks. */
+void hfsStatsRecordCompletionToWake(uint64_t ticks) {
+	if (hfsStatsIsEnabled()) {
+		atomic_fetch_add_explicit(&hfsStatsCompletionToWakeNs, ticks,
+			memory_order_relaxed);
+	}
+}
+
+/* Accumulate wake-to-application-resume ticks. */
+void hfsStatsRecordWakeToResume(uint64_t ticks) {
+	if (hfsStatsIsEnabled()) {
+		atomic_fetch_add_explicit(&hfsStatsWakeToResumeNs, ticks,
+			memory_order_relaxed);
+	}
+}
+
 /* Record one public read or write request and its alignment class. */
 void hfsStatsRecordIo(bool write, size_t bytes, bool aligned) {
 	HfsStatsShard *shard = hfsStatsShardGet();
@@ -449,6 +676,64 @@ void hfsStatsRecordCopy(uint64_t bytes) {
 	if (shard != NULL) {
 		shard->ioCopyBytes += bytes;
 		shard->ioCopyOps++;
+	}
+}
+
+/* Record a copy from application memory into a DMA staging buffer. */
+void hfsStatsRecordCopyIn(uint64_t bytes) {
+	HfsStatsShard *shard = hfsStatsShardGet();
+
+	if (shard != NULL) {
+		shard->copyInOps++;
+		shard->copyInBytes += bytes;
+	}
+}
+
+/* Record a copy from a DMA staging buffer back to application memory. */
+void hfsStatsRecordCopyOut(uint64_t bytes) {
+	HfsStatsShard *shard = hfsStatsShardGet();
+
+	if (shard != NULL) {
+		shard->copyOutOps++;
+		shard->copyOutBytes += bytes;
+	}
+}
+
+/* Record the duration of one application-to-DMA copy in SPDK ticks. */
+void hfsStatsRecordCopyInTicks(uint64_t ticks) {
+	HfsStatsShard *shard = hfsStatsShardGet();
+
+	if (shard != NULL) {
+		shard->copyInTicks += ticks;
+	}
+}
+
+/* Record the duration of one DMA-to-application copy in SPDK ticks. */
+void hfsStatsRecordCopyOutTicks(uint64_t ticks) {
+	HfsStatsShard *shard = hfsStatsShardGet();
+
+	if (shard != NULL) {
+		shard->copyOutTicks += ticks;
+	}
+}
+
+/* Record one logical request whose caller buffer was DMA-addressable. */
+void hfsStatsRecordDmaDirectRequest(uint64_t bytes) {
+	HfsStatsShard *shard = hfsStatsShardGet();
+
+	if (shard != NULL) {
+		shard->dmaDirectRequests++;
+		shard->dmaDirectRequestBytes += bytes;
+	}
+}
+
+/* Record one logical request that needed a bounded staging buffer. */
+void hfsStatsRecordDmaStagingRequest(uint64_t bytes) {
+	HfsStatsShard *shard = hfsStatsShardGet();
+
+	if (shard != NULL) {
+		shard->dmaStagingRequests++;
+		shard->dmaStagingRequestBytes += bytes;
 	}
 }
 
@@ -934,6 +1219,48 @@ static void hfsStatsAggregateShard(HfsStatsShard *total,
 	for (i = 0; i < HFS_STATS_DMA_POOL_CLASSES; i++) {
 		total->dmaPoolClass[i] += shard->dmaPoolClass[i];
 	}
+	for (i = 0; i < HFS_STATS_HIST_BUCKETS; i++) {
+		total->messageWaitHist[i] += shard->messageWaitHist[i];
+		total->messageHoldHist[i] += shard->messageHoldHist[i];
+	}
+	total->messageWaitCount += shard->messageWaitCount;
+	total->messageHoldCount += shard->messageHoldCount;
+	total->messageWaitNs += shard->messageWaitNs;
+	total->messageHoldNs += shard->messageHoldNs;
+	total->copyInOps += shard->copyInOps;
+	total->copyInBytes += shard->copyInBytes;
+	total->copyInTicks += shard->copyInTicks;
+	total->copyOutOps += shard->copyOutOps;
+	total->copyOutBytes += shard->copyOutBytes;
+	total->copyOutTicks += shard->copyOutTicks;
+	total->dmaDirectRequests += shard->dmaDirectRequests;
+	total->dmaDirectRequestBytes += shard->dmaDirectRequestBytes;
+	total->dmaStagingRequests += shard->dmaStagingRequests;
+	total->dmaStagingRequestBytes += shard->dmaStagingRequestBytes;
+}
+
+/* Return the upper bound of a logarithmic histogram quantile. */
+static uint64_t hfsStatsHistogramQuantile(const uint64_t *hist,
+					 uint64_t total,
+					 unsigned int percentile) {
+	uint64_t target;
+	uint64_t seen = 0;
+	unsigned int i;
+
+	if (hist == NULL || total == 0) {
+		return 0;
+	}
+	target = (total * percentile + 99U) / 100U;
+	if (target == 0) {
+		target = 1;
+	}
+	for (i = 0; i < HFS_STATS_HIST_BUCKETS; i++) {
+		seen += hist[i];
+		if (seen >= target) {
+			return UINT64_C(1) << i;
+		}
+	}
+	return UINT64_C(1) << (HFS_STATS_HIST_BUCKETS - 1U);
 }
 
 /* Write an aggregated key-value report without depending on HFS logging. */
@@ -1056,6 +1383,62 @@ static void hfsStatsWriteSnapshot(void) {
 		memory_order_relaxed));
 	HFS_STATS_APPEND("ticket_wakes=%"PRIuFAST64"\n",
 		atomic_load_explicit(&hfsStatsTicketWakes, memory_order_relaxed));
+	HFS_STATS_APPEND("message_submit_lock_acquire=%"PRIuFAST64"\n",
+		atomic_load_explicit(&hfsStatsMessageSubmitAcquires, memory_order_relaxed));
+	HFS_STATS_APPEND("message_submit_lock_wait_ticks=%"PRIuFAST64"\n",
+		atomic_load_explicit(&hfsStatsMessageSubmitWaitNs, memory_order_relaxed));
+	HFS_STATS_APPEND("message_submit_lock_hold_ticks=%"PRIuFAST64"\n",
+		atomic_load_explicit(&hfsStatsMessageSubmitHoldNs, memory_order_relaxed));
+	HFS_STATS_APPEND("owner_message_count=%"PRIuFAST64"\n",
+		atomic_load_explicit(&hfsStatsOwnerMessages, memory_order_relaxed));
+	HFS_STATS_APPEND("data_message_count=%"PRIuFAST64"\n",
+		atomic_load_explicit(&hfsStatsDataMessages, memory_order_relaxed));
+	HFS_STATS_APPEND("message_submit_lock_wait_p50_ns=%"PRIu64"\n",
+		hfsStatsHistogramQuantile(total.messageWaitHist, total.messageWaitCount, 50));
+	HFS_STATS_APPEND("message_submit_lock_wait_p95_ns=%"PRIu64"\n",
+		hfsStatsHistogramQuantile(total.messageWaitHist, total.messageWaitCount, 95));
+	HFS_STATS_APPEND("message_submit_lock_wait_p99_ns=%"PRIu64"\n",
+		hfsStatsHistogramQuantile(total.messageWaitHist, total.messageWaitCount, 99));
+	HFS_STATS_APPEND("message_submit_lock_hold_p50_ns=%"PRIu64"\n",
+		hfsStatsHistogramQuantile(total.messageHoldHist, total.messageHoldCount, 50));
+	HFS_STATS_APPEND("message_submit_lock_hold_p95_ns=%"PRIu64"\n",
+		hfsStatsHistogramQuantile(total.messageHoldHist, total.messageHoldCount, 95));
+	HFS_STATS_APPEND("message_submit_lock_hold_p99_ns=%"PRIu64"\n",
+		hfsStatsHistogramQuantile(total.messageHoldHist, total.messageHoldCount, 99));
+	HFS_STATS_APPEND("ticket_conflict_count=%"PRIuFAST64"\n",
+		atomic_load_explicit(&hfsStatsTicketConflicts, memory_order_relaxed));
+	HFS_STATS_APPEND("ticket_dependency_count=%"PRIuFAST64"\n",
+		atomic_load_explicit(&hfsStatsTicketDependencies, memory_order_relaxed));
+	HFS_STATS_APPEND("ticket_real_wait_count=%"PRIuFAST64"\n",
+		atomic_load_explicit(&hfsStatsTicketRealWaits, memory_order_relaxed));
+	HFS_STATS_APPEND("ticket_scan_items_total=%"PRIuFAST64"\n",
+		atomic_load_explicit(&hfsStatsTicketScanItems, memory_order_relaxed));
+	HFS_STATS_APPEND("ticket_active_list_length_sum=%"PRIuFAST64"\n",
+		atomic_load_explicit(&hfsStatsTicketActiveSum, memory_order_relaxed));
+	HFS_STATS_APPEND("ticket_active_list_length_samples=%"PRIuFAST64"\n",
+		atomic_load_explicit(&hfsStatsTicketActiveSamples, memory_order_relaxed));
+	HFS_STATS_APPEND("ticket_active_list_length_peak=%"PRIuFAST64"\n",
+		atomic_load_explicit(&hfsStatsTicketActivePeak, memory_order_relaxed));
+	HFS_STATS_APPEND("ticket_wait_ticks=%"PRIuFAST64"\n",
+		atomic_load_explicit(&hfsStatsTicketWaitNs, memory_order_relaxed));
+	HFS_STATS_APPEND("ticket_admit_ticks=%"PRIuFAST64"\n",
+		atomic_load_explicit(&hfsStatsTicketAdmitNs, memory_order_relaxed));
+	HFS_STATS_APPEND("ticket_complete_ticks=%"PRIuFAST64"\n",
+		atomic_load_explicit(&hfsStatsTicketCompleteNs, memory_order_relaxed));
+	HFS_STATS_APPEND("futex_wait_attempt=%"PRIuFAST64"\n",
+		atomic_load_explicit(&hfsStatsFutexWaitAttempts, memory_order_relaxed));
+	HFS_STATS_APPEND("futex_wait_success=%"PRIuFAST64"\n",
+		atomic_load_explicit(&hfsStatsFutexWaitSuccess, memory_order_relaxed));
+	HFS_STATS_APPEND("futex_eagain=%"PRIuFAST64"\n",
+		atomic_load_explicit(&hfsStatsFutexEagain, memory_order_relaxed));
+	HFS_STATS_APPEND("futex_eintr=%"PRIuFAST64"\n",
+		atomic_load_explicit(&hfsStatsFutexEintr, memory_order_relaxed));
+	HFS_STATS_APPEND("futex_sleep_ticks=%"PRIuFAST64"\n",
+		atomic_load_explicit(&hfsStatsFutexSleepNs, memory_order_relaxed));
+	HFS_STATS_APPEND("completion_to_wake_ticks=%"PRIuFAST64"\n",
+		atomic_load_explicit(&hfsStatsCompletionToWakeNs, memory_order_relaxed));
+	HFS_STATS_APPEND("wake_to_application_resume_ticks=%"PRIuFAST64"\n",
+		atomic_load_explicit(&hfsStatsWakeToResumeNs, memory_order_relaxed));
 	HFS_STATS_APPEND("stats_shards=%"PRIu64"\n", shardCount);
 	for (i = 0; i < HFS_STATS_LOCK_CLASS_COUNT; i++) {
 		HFS_STATS_APPEND("lock_%s_wait_count=%"PRIu64"\n", lockNames[i],
@@ -1123,8 +1506,22 @@ static void hfsStatsWriteSnapshot(void) {
 	HFS_STATS_APPEND("io_copy_ops=%"PRIu64"\n", total.ioCopyOps);
 	HFS_STATS_APPEND("io_direct_bytes=%"PRIu64"\n", total.ioDirectBytes);
 	HFS_STATS_APPEND("io_direct_ops=%"PRIu64"\n", total.ioDirectOps);
+	HFS_STATS_APPEND("dma_direct_count=%"PRIu64"\n",
+		total.dmaDirectRequests);
+	HFS_STATS_APPEND("dma_direct_bytes=%"PRIu64"\n",
+		total.dmaDirectRequestBytes);
+	HFS_STATS_APPEND("staging_count=%"PRIu64"\n",
+		total.dmaStagingRequests);
+	HFS_STATS_APPEND("staging_bytes=%"PRIu64"\n",
+		total.dmaStagingRequestBytes);
 	HFS_STATS_APPEND("io_vector_bytes=%"PRIu64"\n", total.ioVectorBytes);
 	HFS_STATS_APPEND("io_vector_ops=%"PRIu64"\n", total.ioVectorOps);
+	HFS_STATS_APPEND("copy_in_ops=%"PRIu64"\n", total.copyInOps);
+	HFS_STATS_APPEND("copy_in_bytes=%"PRIu64"\n", total.copyInBytes);
+	HFS_STATS_APPEND("copy_in_ticks=%"PRIu64"\n", total.copyInTicks);
+	HFS_STATS_APPEND("copy_out_ops=%"PRIu64"\n", total.copyOutOps);
+	HFS_STATS_APPEND("copy_out_bytes=%"PRIu64"\n", total.copyOutBytes);
+	HFS_STATS_APPEND("copy_out_ticks=%"PRIu64"\n", total.copyOutTicks);
 	HFS_STATS_APPEND("resize_checks=%"PRIu64"\n", total.resizeChecks);
 	HFS_STATS_APPEND("resize_fast_hits=%"PRIu64"\n", total.resizeFastHits);
 	HFS_STATS_APPEND("resize_requests=%"PRIu64"\n", total.resizeRequests);
@@ -1179,6 +1576,7 @@ static void hfsStatsWriteSnapshot(void) {
 void hfsStatsInit(void) {
 	const char *path;
 	const char *enabled;
+	const char *profile;
 
 	if (g_hfsStatsInitialized) {
 		return;
@@ -1189,6 +1587,7 @@ void hfsStatsInit(void) {
 	hfsStatsFastEnabledState = false;
 	path = getenv("HFS_STATS_PATH");
 	enabled = getenv("HFS_STATS");
+	profile = getenv("HFS_PROFILE");
 	if (path != NULL && path[0] != '\0') {
 		if (snprintf(g_hfsStatsPath, sizeof(g_hfsStatsPath), "%s", path) >=
 		    (int)sizeof(g_hfsStatsPath)) {
@@ -1198,7 +1597,8 @@ void hfsStatsInit(void) {
 		snprintf(g_hfsStatsPath, sizeof(g_hfsStatsPath),
 			"/var/tmp/hfs-stats-%ld.txt", (long)getpid());
 	}
-	hfsStatsTimingState = hfsStatsBool(getenv("HFS_STATS_TIMING")) &&
+	hfsStatsTimingState = (hfsStatsBool(getenv("HFS_STATS_TIMING")) ||
+		(profile != NULL && !strcasecmp(profile, "timing"))) &&
 		g_hfsStatsPath[0] != '\0';
 	hfsStatsFastEnabledState = g_hfsStatsPath[0] != '\0';
 	g_hfsStatsInitialized = true;

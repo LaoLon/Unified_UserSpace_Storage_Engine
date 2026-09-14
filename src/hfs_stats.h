@@ -49,6 +49,28 @@ extern _Atomic uint_fast64_t hfsStatsTicketDependencyWaitNs;
 extern _Atomic uint_fast64_t hfsStatsTicketPromotes;
 extern _Atomic uint_fast64_t hfsStatsTicketPendingPeak;
 extern _Atomic uint_fast64_t hfsStatsTicketWakes;
+extern _Atomic uint_fast64_t hfsStatsMessageSubmitAcquires;
+extern _Atomic uint_fast64_t hfsStatsMessageSubmitWaitNs;
+extern _Atomic uint_fast64_t hfsStatsMessageSubmitHoldNs;
+extern _Atomic uint_fast64_t hfsStatsOwnerMessages;
+extern _Atomic uint_fast64_t hfsStatsDataMessages;
+extern _Atomic uint_fast64_t hfsStatsTicketConflicts;
+extern _Atomic uint_fast64_t hfsStatsTicketDependencies;
+extern _Atomic uint_fast64_t hfsStatsTicketRealWaits;
+extern _Atomic uint_fast64_t hfsStatsTicketScanItems;
+extern _Atomic uint_fast64_t hfsStatsTicketActiveSum;
+extern _Atomic uint_fast64_t hfsStatsTicketActiveSamples;
+extern _Atomic uint_fast64_t hfsStatsTicketActivePeak;
+extern _Atomic uint_fast64_t hfsStatsTicketWaitNs;
+extern _Atomic uint_fast64_t hfsStatsTicketAdmitNs;
+extern _Atomic uint_fast64_t hfsStatsTicketCompleteNs;
+extern _Atomic uint_fast64_t hfsStatsFutexWaitAttempts;
+extern _Atomic uint_fast64_t hfsStatsFutexWaitSuccess;
+extern _Atomic uint_fast64_t hfsStatsFutexEagain;
+extern _Atomic uint_fast64_t hfsStatsFutexEintr;
+extern _Atomic uint_fast64_t hfsStatsFutexSleepNs;
+extern _Atomic uint_fast64_t hfsStatsCompletionToWakeNs;
+extern _Atomic uint_fast64_t hfsStatsWakeToResumeNs;
 extern bool hfsStatsFastEnabledState;
 extern bool hfsStatsTimingState;
 
@@ -153,9 +175,18 @@ void hfsStatsRecordQueueDrain(uint32_t reactorId, uint64_t batchSize);
 /* Record internal POSIX range-ticket admission and dependency progress. */
 void hfsStatsRecordTicketAdmit(uint32_t pendingDependencies,
 				       uint32_t activeTickets);
+/* Record ticket admission scan/conflict details and elapsed timing. */
+void hfsStatsRecordTicketAdmission(uint32_t scanItems,
+					uint32_t pendingDependencies,
+					uint32_t activeTickets,
+					uint64_t admitNs);
 void hfsStatsRecordTicketReady(void);
 void hfsStatsRecordTicketComplete(void);
 void hfsStatsRecordTicketDependencyWait(uint64_t waitNs);
+/* Record only a ticket wait that actually entered a condition-variable sleep. */
+void hfsStatsRecordTicketRealWait(uint64_t waitNs);
+/* Record the ticket completion scan duration. */
+void hfsStatsRecordTicketCompletion(uint64_t completeNs);
 void hfsStatsRecordTicketPromote(uint32_t count);
 void hfsStatsRecordTicketWake(void);
 /* Record actual data I/O callbacks submitted to and completed by SPDK. */
@@ -189,6 +220,26 @@ void hfsStatsRecordDurabilityDataBatch(void);
 void hfsStatsRecordDurabilityMetadataCommit(void);
 void hfsStatsRecordDurabilityFlush(void);
 void hfsStatsRecordFdatasyncFast(void);
+/* Record one message-submit lock acquisition and its wait/hold durations. */
+void hfsStatsMessageSubmitLockBefore(void);
+void hfsStatsMessageSubmitLockAfter(void);
+void hfsStatsMessageSubmitLockRelease(void);
+void hfsStatsRecordMessage(bool dataMessage);
+/* Record futex outcomes without logging on the hot path. */
+void hfsStatsRecordFutexAttempt(void);
+void hfsStatsRecordFutexSuccess(uint64_t sleepNs);
+void hfsStatsRecordFutexEagain(void);
+void hfsStatsRecordFutexEintr(void);
+/* Record the two completion handoff intervals in profile ticks. */
+void hfsStatsRecordCompletionToWake(uint64_t ticks);
+void hfsStatsRecordWakeToResume(uint64_t ticks);
+/* Record direction-specific staging copy counters. */
+void hfsStatsRecordCopyIn(uint64_t bytes);
+void hfsStatsRecordCopyOut(uint64_t bytes);
+void hfsStatsRecordCopyInTicks(uint64_t ticks);
+void hfsStatsRecordCopyOutTicks(uint64_t ticks);
+void hfsStatsRecordDmaDirectRequest(uint64_t bytes);
+void hfsStatsRecordDmaStagingRequest(uint64_t bytes);
 
 static inline void hfsStatsRecordIoFast(bool write, size_t bytes, bool aligned) {
 	if (hfsStatsEnabledFast()) {
@@ -361,6 +412,36 @@ static inline void hfsStatsRecordDurabilityFlushFast(void) {
 static inline void hfsStatsRecordFdatasyncFastPath(void) {
 	if (hfsStatsEnabledFast()) {
 		hfsStatsRecordFdatasyncFast();
+	}
+}
+static inline void hfsStatsRecordCopyInFast(uint64_t bytes) {
+	if (hfsStatsEnabledFast()) {
+		hfsStatsRecordCopyIn(bytes);
+	}
+}
+static inline void hfsStatsRecordCopyOutFast(uint64_t bytes) {
+	if (hfsStatsEnabledFast()) {
+		hfsStatsRecordCopyOut(bytes);
+	}
+}
+static inline void hfsStatsRecordCopyInTicksFast(uint64_t ticks) {
+	if (hfsStatsTimingFastEnabled()) {
+		hfsStatsRecordCopyInTicks(ticks);
+	}
+}
+static inline void hfsStatsRecordCopyOutTicksFast(uint64_t ticks) {
+	if (hfsStatsTimingFastEnabled()) {
+		hfsStatsRecordCopyOutTicks(ticks);
+	}
+}
+static inline void hfsStatsRecordDmaDirectRequestFast(uint64_t bytes) {
+	if (hfsStatsEnabledFast()) {
+		hfsStatsRecordDmaDirectRequest(bytes);
+	}
+}
+static inline void hfsStatsRecordDmaStagingRequestFast(uint64_t bytes) {
+	if (hfsStatsEnabledFast()) {
+		hfsStatsRecordDmaStagingRequest(bytes);
 	}
 }
 

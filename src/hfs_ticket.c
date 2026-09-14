@@ -132,6 +132,9 @@ int hfsPosixTicketAdmit(HfsPosixIoTicket *ticket)
 {
 	HfsPosixIoTicket *current;
 	HfsInodeRuntime *runtime;
+	uint32_t scanItems = 0;
+	uint64_t admitStartNs = hfsStatsTimingFastEnabled() ? hfsStatsNowNs() : 0;
+	uint64_t admitNs;
 
 	if (ticket == NULL || ticket->runtime == NULL) {
 		errno = EINVAL;
@@ -153,6 +156,7 @@ int hfsPosixTicketAdmit(HfsPosixIoTicket *ticket)
 	ticket->submitSeq = ++runtime->nextTicketSeq;
 	for (current = runtime->ticketHead; current != NULL;
 	     current = current->next) {
+		scanItems++;
 		if (current->submitSeq < ticket->submitSeq &&
 		    hfsPosixTicketConflicts(current, ticket)) {
 			ticket->pendingDependencies++;
@@ -166,6 +170,10 @@ int hfsPosixTicketAdmit(HfsPosixIoTicket *ticket)
 	ticket->ready = ticket->pendingDependencies == 0;
 	ticket->dependencyWait = !ticket->ready;
 	pthread_mutex_unlock(&runtime->ticketLock);
+	admitNs = admitStartNs != 0 ? hfsStatsNowNs() : 0;
+	hfsStatsRecordTicketAdmission(scanItems, ticket->pendingDependencies,
+		runtime->ticketCount,
+		admitNs >= admitStartNs ? admitNs - admitStartNs : 0);
 	hfsStatsRecordTicketAdmit(ticket->pendingDependencies,
 		runtime->ticketCount);
 	hfsPosixTicketTrace(ticket, HFS_TRACE_TICKET_ADMIT, 0);
@@ -181,20 +189,26 @@ int hfsPosixTicketWaitReady(HfsPosixIoTicket *ticket)
 {
 	uint64_t waitStartNs;
 	int result;
+	bool slept = false;
 
 	if (ticket == NULL || !ticket->admitted) {
 		errno = EINVAL;
 		return -1;
 	}
-	waitStartNs = hfsStatsNowNs();
+	waitStartNs = hfsStatsTimingFastEnabled() ? hfsStatsNowNs() : 0;
 	pthread_mutex_lock(&ticket->waitLock);
 	while (!ticket->ready && !ticket->done) {
+		slept = true;
 		pthread_cond_wait(&ticket->waitCondition, &ticket->waitLock);
 	}
 	result = ticket->result;
 	pthread_mutex_unlock(&ticket->waitLock);
-	if (ticket->dependencyWait) {
-		hfsStatsRecordTicketDependencyWait(hfsStatsNowNs() - waitStartNs);
+	if (ticket->dependencyWait && slept) {
+		uint64_t waitNow = waitStartNs != 0 ? hfsStatsNowNs() : 0;
+		uint64_t waitNs = waitNow >= waitStartNs ? waitNow - waitStartNs : 0;
+
+		hfsStatsRecordTicketDependencyWait(waitNs);
+		hfsStatsRecordTicketRealWait(waitNs);
 		hfsPosixTicketTrace(ticket, HFS_TRACE_TICKET_DEP_WAIT, result);
 	}
 	return result == 0 ? 0 : -1;
@@ -207,6 +221,7 @@ void hfsPosixTicketComplete(HfsPosixIoTicket *ticket, int result)
 	HfsPosixIoTicket **link;
 	HfsInodeRuntime *runtime;
 	uint32_t promoted = 0;
+	uint64_t completeStartNs = hfsStatsTimingFastEnabled() ? hfsStatsNowNs() : 0;
 
 	if (ticket == NULL || !ticket->admitted || ticket->runtime == NULL) {
 		return;
@@ -243,6 +258,12 @@ void hfsPosixTicketComplete(HfsPosixIoTicket *ticket, int result)
 	}
 	pthread_cond_broadcast(&runtime->ticketAvailable);
 	pthread_mutex_unlock(&runtime->ticketLock);
+	{
+		uint64_t completeNow = completeStartNs != 0 ? hfsStatsNowNs() : 0;
+		uint64_t completeNs = completeNow >= completeStartNs ?
+			completeNow - completeStartNs : 0;
+		hfsStatsRecordTicketCompletion(completeNs);
+	}
 	if (promoted != 0) {
 		hfsStatsRecordTicketPromote(promoted);
 	}

@@ -45,6 +45,7 @@ set(HFS_CORE_SRC
   src/hfs_meta_index.c
   src/hfs_log.c
   src/hfs_stats.c
+  src/hfs_profile.c
   src/hfs_trace.c
   src/hfs_durability.c
   src/hfs_lib.c

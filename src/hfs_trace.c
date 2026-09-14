@@ -13,7 +13,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define HFS_TRACE_RING_CAPACITY 4096U
+#define HFS_TRACE_RING_CAPACITY 16384U
 
 /* Each thread owns one ring, so event recording does not take a global lock. */
 typedef struct HfsTraceThread {
@@ -150,6 +150,7 @@ static const char *hfsTracePhaseName(HfsTracePhase phase)
     case HFS_TRACE_TICKET_DEP_WAIT: return "ticket_dependency_wait";
     case HFS_TRACE_TICKET_READY: return "ticket_ready";
     case HFS_TRACE_TICKET_WAKE: return "ticket_wake";
+    case HFS_TRACE_PARENT_PROFILE: return "parent_profile";
     default: return "unknown";
     }
 }
@@ -269,7 +270,9 @@ void hfsTraceEmitDetail(HfsTracePhase phase,
         return;
     }
     sampleId = parentId != 0 ? parentId : requestId;
-    if (g_traceSample > 1 && sampleId != 0 && (sampleId % g_traceSample) != 0) {
+    /* Drop uncorrelated events in sampled mode so the ring remains bounded. */
+    if (g_traceSample > 1 &&
+        (sampleId == 0 || (sampleId % g_traceSample) != 0)) {
         return;
     }
     thread = hfsTraceThreadGet();
@@ -303,6 +306,9 @@ void hfsTraceEmitDetail(HfsTracePhase phase,
     event->operation = (uint8_t)operation;
     event->bufferKind = (uint8_t)bufferKind;
     event->reserved = 0;
+    event->profileChildCount = 0;
+    event->profileValid = 0;
+    memset(event->profileTicks, 0, sizeof(event->profileTicks));
 }
 
 /* Preserve the compact legacy call shape for ordinary data-path events. */
@@ -493,6 +499,56 @@ void hfsTraceThreadWake(HfsTraceOperation operation,
                        (uint32_t)metadataOperation, 0, result);
 }
 
+/* Append one parent profile event without allocating a second trace record. */
+void hfsTraceEmitProfile(uint64_t parentId,
+                         uint64_t bytes,
+                         uint32_t flags,
+                         uint32_t childCount,
+                         const uint64_t ticks[12],
+                         bool monotonic,
+                         int32_t result)
+{
+    HfsTraceThread *thread;
+    HfsTraceEvent *event;
+    uint64_t sampleId;
+    uint64_t sequence;
+    unsigned int i;
+
+    if (!hfsTraceEnabledFast() || ticks == NULL) {
+        return;
+    }
+    sampleId = parentId;
+    /* Parent profiles use the same sampling rule as their child events. */
+    if (g_traceSample > 1 &&
+        (sampleId == 0 || (sampleId % g_traceSample) != 0)) {
+        return;
+    }
+    thread = hfsTraceThreadGet();
+    if (thread == NULL) {
+        return;
+    }
+    sequence = thread->writeSequence++;
+    if (sequence >= HFS_TRACE_RING_CAPACITY) {
+        thread->dropped++;
+    }
+    event = &thread->events[sequence % HFS_TRACE_RING_CAPACITY];
+    memset(event, 0, sizeof(*event));
+    event->sequence = sequence;
+    event->timestampNs = hfsTraceNowNs();
+    event->requestId = parentId;
+    event->parentId = parentId;
+    event->bytes = bytes;
+    event->profileChildCount = childCount;
+    event->profileValid = monotonic ? 1U : 0U;
+    event->phase = HFS_TRACE_PARENT_PROFILE;
+    event->operation = (flags & 1U) != 0 ? HFS_TRACE_OPERATION_WRITE :
+                       HFS_TRACE_OPERATION_READ;
+    event->result = result;
+    for (i = 0; i < 12U; i++) {
+        event->profileTicks[i] = ticks[i];
+    }
+}
+
 /* Write all per-thread rings as a tab-separated snapshot at shutdown. */
 static void hfsTraceWriteSnapshot(void)
 {
@@ -506,7 +562,7 @@ static void hfsTraceWriteSnapshot(void)
     if (file == NULL) {
         return;
     }
-    fprintf(file, "sequence\ttid\ttimestamp_ns\tphase\toperation\tbuffer_kind\trequest_id\tparent_id\tinode_id\toffset\tbytes\tunits\tqueue_depth\treactor\trange_buckets\tpool_class\tlock_class\tlock_id\twake_reason\tmetadata_op\tduration_ns\tresult\n");
+    fprintf(file, "sequence\ttid\ttimestamp_ns\tphase\toperation\tbuffer_kind\trequest_id\tparent_id\tinode_id\toffset\tbytes\tunits\tqueue_depth\treactor\trange_buckets\tpool_class\tlock_class\tlock_id\twake_reason\tmetadata_op\tduration_ns\tresult\tprofile_child_count\tprofile_valid\tprofile_t0\tprofile_t1\tprofile_t2\tprofile_t3\tprofile_t4\tprofile_t5\tprofile_t6\tprofile_t7\tprofile_t8\tprofile_t9\tprofile_t10\tprofile_t11\n");
     pthread_mutex_lock(&g_traceLock);
     for (thread = g_traceThreads; thread != NULL; thread = thread->next) {
         uint64_t count = thread->writeSequence;
@@ -519,7 +575,7 @@ static void hfsTraceWriteSnapshot(void)
             if (event->sequence != sequence) {
                 continue;
             }
-            fprintf(file, "%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%s\t%s\t%s\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%u\t%u\t%u\t%u\t%u\t%s\t%u\t%s\t%s\t%" PRIu64 "\t%d\n",
+            fprintf(file, "%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%s\t%s\t%s\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%u\t%u\t%u\t%u\t%u\t%s\t%u\t%s\t%s\t%" PRIu64 "\t%d\t%u\t%u\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\n",
                     event->sequence, thread->threadId, event->timestampNs,
                     hfsTracePhaseName((HfsTracePhase)event->phase),
                     hfsTraceOperationName((HfsTraceOperation)event->operation),
@@ -531,7 +587,14 @@ static void hfsTraceWriteSnapshot(void)
                     hfsTraceLockName(event->lockClass), event->lockId,
                     hfsTraceWakeName(event->wakeReason),
                     hfsTraceMetadataName(event->metadataOperation),
-                    event->durationNs, event->result);
+                    event->durationNs, event->result, event->profileChildCount,
+                    event->profileValid, event->profileTicks[0],
+                    event->profileTicks[1], event->profileTicks[2],
+                    event->profileTicks[3], event->profileTicks[4],
+                    event->profileTicks[5], event->profileTicks[6],
+                    event->profileTicks[7], event->profileTicks[8],
+                    event->profileTicks[9], event->profileTicks[10],
+                    event->profileTicks[11]);
         }
         fprintf(file, "# thread=%" PRIu64 " dropped=%" PRIu64 "\n",
                 thread->threadId, thread->dropped);

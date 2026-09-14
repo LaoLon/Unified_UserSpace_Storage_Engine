@@ -19,6 +19,7 @@
 #include <spdk/thread.h>
 
 #include "hfs_log.h"
+#include "hfs_profile.h"
 #include "hfs_runtime.h"
 #include "hfs_stats.h"
 #include "hfs_trace.h"
@@ -101,12 +102,16 @@ static _Thread_local bool g_hfsRuntimeDataThread;
 
 /* Serialize producers before entering SPDK's lockless message ring. */
 static void hfsRuntimeSendMessage(struct spdk_thread *thread,
-					spdk_msg_fn fn, void *ctx) {
+					spdk_msg_fn fn, void *ctx, bool dataMessage) {
 	if (thread == NULL || fn == NULL) {
 		return;
 	}
+	hfsStatsMessageSubmitLockBefore();
 	pthread_mutex_lock(&g_runtime.messageSubmitLock);
+	hfsStatsMessageSubmitLockAfter();
+	hfsStatsRecordMessage(dataMessage);
 	spdk_thread_send_msg(thread, fn, ctx);
+	hfsStatsMessageSubmitLockRelease();
 	pthread_mutex_unlock(&g_runtime.messageSubmitLock);
 }
 
@@ -134,6 +139,7 @@ static int hfsRuntimeMutexUnlock(pthread_mutex_t *lock) {
 typedef struct HfsRuntimeMessage {
 	spdk_msg_fn fn;
 	void *ctx;
+	void *profileChild;
 	uint64_t enqueueNs;
 } HfsRuntimeMessage;
 
@@ -206,6 +212,7 @@ static void hfsRuntimeDispatchMessage(void *arg) {
 		memory_order_relaxed) - 1U;
 	atomic_fetch_add_explicit(&g_runtime.inflight, 1, memory_order_relaxed);
 	queueWaitNs = hfsStatsNowNs() - message->enqueueNs;
+	hfsProfileChildDequeue(message->profileChild);
 	ownerStartNs = hfsStatsNowNs();
 	message->fn(message->ctx);
 	ownerNs = hfsStatsNowNs() - ownerStartNs;
@@ -249,6 +256,7 @@ static void hfsRuntimeDispatchBatch(void *arg) {
 								    memory_order_relaxed),
 				     0, 0, 0, waitNs, 0);
 		}
+		hfsProfileChildDequeue(item->profileChild);
 		if (timing) {
 			depth = atomic_fetch_sub_explicit(&g_runtime.queued, 1,
 				memory_order_relaxed) - 1U;
@@ -352,6 +360,7 @@ static void hfsRuntimeDispatchDataBatch(void *arg) {
 					     currentQueueDepth, reactor->index, 0, 0,
 					     queueWaitNs, 0);
 			}
+			hfsProfileChildDequeue(item->profileChild);
 			if (timing) {
 				depth = atomic_fetch_sub_explicit(&g_runtime.queued, 1,
 						memory_order_relaxed) - 1U;
@@ -739,7 +748,7 @@ static int hfsRuntimeStartDataReactors(void) {
 
 			if (thread != NULL) {
 				hfsRuntimeSendMessage(thread, hfsRuntimeDataStopMessage,
-						 reactor);
+						 reactor, true);
 			}
 		}
 		for (uint32_t j = 1; j <= created; j++) {
@@ -777,7 +786,7 @@ static void hfsRuntimeStopDataReactors(void) {
 			&reactor->spdkThread, memory_order_acquire);
 
 		if (thread != NULL) {
-			hfsRuntimeSendMessage(thread, hfsRuntimeDataStopMessage, reactor);
+		hfsRuntimeSendMessage(thread, hfsRuntimeDataStopMessage, reactor, true);
 		}
 	}
 	for (i = 1; i < g_runtime.dataReactorCount; i++) {
@@ -892,10 +901,11 @@ int hfsRuntimeSubmit(spdk_msg_fn fn, void *ctx) {
 			queueDepth = atomic_fetch_add_explicit(&g_runtime.queued, 1,
 				memory_order_relaxed) + 1U;
 			hfsStatsRecordRuntimeSubmitFast(queueDepth);
-			hfsRuntimeSendMessage(thread, hfsRuntimeDispatchMessage, message);
+			hfsRuntimeSendMessage(thread, hfsRuntimeDispatchMessage, message,
+						 false);
 			message = NULL;
 		} else {
-				hfsRuntimeSendMessage(thread, fn, ctx);
+			hfsRuntimeSendMessage(thread, fn, ctx, false);
 		}
 	}
 
@@ -910,7 +920,10 @@ submit_done:
 }
 
 /* Submit one message to a non-global data reactor. */
-int hfsRuntimeSubmitData(uint32_t reactorId, spdk_msg_fn fn, void *ctx) {
+/* Submit a direct data message and retain the optional profiling child. */
+static int hfsRuntimeSubmitDataWithProfile(uint32_t reactorId,
+						 spdk_msg_fn fn, void *ctx,
+						 void *profileChild) {
 	HfsRuntimeMessage *message = NULL;
 	HfsRuntimeDataReactor *reactor;
 	struct spdk_thread *thread;
@@ -953,6 +966,7 @@ int hfsRuntimeSubmitData(uint32_t reactorId, spdk_msg_fn fn, void *ctx) {
 		}
 		message->fn = fn;
 		message->ctx = ctx;
+	message->profileChild = profileChild;
 		message->enqueueNs = hfsStatsNowNs();
 	}
 	if (hfsRuntimeIsForkChild() ||
@@ -962,13 +976,15 @@ int hfsRuntimeSubmitData(uint32_t reactorId, spdk_msg_fn fn, void *ctx) {
 	}
 	HFS_STATS_SPDK_SUBMIT();
 	if (message != NULL) {
+		hfsProfileChildEnqueue(profileChild, 0);
 		queueDepth = atomic_fetch_add_explicit(&g_runtime.queued, 1,
 						memory_order_relaxed) + 1U;
 		hfsStatsRecordRuntimeSubmitFast(queueDepth);
-		hfsRuntimeSendMessage(thread, hfsRuntimeDispatchMessage, message);
+		hfsRuntimeSendMessage(thread, hfsRuntimeDispatchMessage, message,
+					 true);
 		message = NULL;
 	} else {
-		hfsRuntimeSendMessage(thread, fn, ctx);
+		hfsRuntimeSendMessage(thread, fn, ctx, true);
 	}
 
 data_submit_done:
@@ -979,6 +995,11 @@ data_submit_done:
 	atomic_fetch_sub_explicit(&g_runtime.submitters, 1,
 					memory_order_release);
 	return rc;
+}
+
+/* Submit one direct data message without a profile child. */
+int hfsRuntimeSubmitData(uint32_t reactorId, spdk_msg_fn fn, void *ctx) {
+	return hfsRuntimeSubmitDataWithProfile(reactorId, fn, ctx, NULL);
 }
 
 /* Queue one request on a data reactor and coalesce concurrent submissions. */
@@ -1052,7 +1073,8 @@ int hfsRuntimeSubmitDataBatch(uint32_t reactorId, HfsRuntimeBatchItem *item,
 				hfsStatsNowNs() - creditWaitStartNs : 0);
 		}
 		directFallback = true;
-		rc = hfsRuntimeSubmitData(reactorId, fn, ctx);
+		rc = hfsRuntimeSubmitDataWithProfile(reactorId, fn, ctx,
+			item->profileChild);
 		goto data_batch_done;
 	}
 	if (creditWaited) {
@@ -1083,6 +1105,7 @@ int hfsRuntimeSubmitDataBatch(uint32_t reactorId, HfsRuntimeBatchItem *item,
 	} else {
 		reactor->batchHead = item;
 	}
+	hfsProfileChildEnqueue(item->profileChild, 0);
 	reactor->batchTail = item;
 	if (!reactor->batchScheduled) {
 		reactor->batchScheduled = true;
@@ -1101,7 +1124,7 @@ int hfsRuntimeSubmitDataBatch(uint32_t reactorId, HfsRuntimeBatchItem *item,
 		     (uint32_t)queueDepth, reactorId, 0, 0, 0, 0);
 	HFS_STATS_SPDK_SUBMIT();
 	if (notify) {
-		hfsRuntimeSendMessage(thread, hfsRuntimeDispatchDataBatch, reactor);
+		hfsRuntimeSendMessage(thread, hfsRuntimeDispatchDataBatch, reactor, true);
 	}
 
 data_batch_done:
@@ -1176,6 +1199,7 @@ int hfsRuntimeSubmitBatch(HfsRuntimeBatchItem *item, spdk_msg_fn fn, void *ctx) 
 	} else {
 		g_runtime.batchHead = item;
 	}
+	hfsProfileChildEnqueue(item->profileChild, 0);
 	g_runtime.batchTail = item;
 	if (!g_runtime.batchScheduled) {
 		g_runtime.batchScheduled = true;
@@ -1184,7 +1208,7 @@ int hfsRuntimeSubmitBatch(HfsRuntimeBatchItem *item, spdk_msg_fn fn, void *ctx) 
 	pthread_mutex_unlock(&g_runtime.batchLock);
 	HFS_STATS_SPDK_SUBMIT();
 	if (notify) {
-		hfsRuntimeSendMessage(thread, hfsRuntimeDispatchBatch, NULL);
+		hfsRuntimeSendMessage(thread, hfsRuntimeDispatchBatch, NULL, false);
 	}
 
 submit_done:
@@ -1470,7 +1494,7 @@ int hfsRuntimeStop(void) {
 			}
 			sched_yield();
 		} while (true);
-		hfsRuntimeSendMessage(thread, hfsRuntimeStopMessage, &g_runtime);
+		hfsRuntimeSendMessage(thread, hfsRuntimeStopMessage, &g_runtime, false);
 	}
 
 	pthread_join(g_runtime.owner, NULL);
@@ -1508,6 +1532,7 @@ void hfsRuntimeCompletionComplete(HfsCompletion *completion) {
 		HFS_LOG_ERROR("SPDK completion arrived outside owner thread");
 	}
 	atomic_store_explicit(&completion->state, HFS_COMPLETION_DONE, memory_order_release);
+	hfsProfileChildWake(completion == NULL ? NULL : completion->profileChild);
 	/* Record the wake immediately before futex wake so caller handoff is visible. */
 	hfsTraceEmitDetail(HFS_TRACE_COMPLETION_WAKE,
 		(HfsTraceOperation)completion->traceOperation,
@@ -1554,6 +1579,7 @@ bool hfsRuntimeCompletionWait(HfsCompletion *completion, uint32_t timeoutMs) {
 				errno = ETIMEDOUT;
 					while (atomic_load_explicit(&completion->state,
 						memory_order_acquire) != HFS_COMPLETION_DONE) {
+						hfsStatsRecordFutexAttempt();
 						syscall(SYS_futex, (int *)&completion->state,
 							FUTEX_WAIT_PRIVATE, HFS_COMPLETION_TIMED_OUT,
 							NULL, NULL, 0);
@@ -1566,13 +1592,27 @@ bool hfsRuntimeCompletionWait(HfsCompletion *completion, uint32_t timeoutMs) {
 			}
 			continue;
 		}
+		{
+			uint64_t sleepStart = hfsStatsNowNs();
+
+			hfsStatsRecordFutexAttempt();
 		rc = syscall(SYS_futex, (int *)&completion->state, FUTEX_WAIT_PRIVATE,
 			     HFS_COMPLETION_PENDING, &remaining, NULL, 0);
+			if (rc == 0) {
+				hfsStatsRecordFutexSuccess(hfsStatsNowNs() >= sleepStart ?
+					hfsStatsNowNs() - sleepStart : 0);
+			} else if (errno == EAGAIN) {
+				hfsStatsRecordFutexEagain();
+			} else if (errno == EINTR) {
+				hfsStatsRecordFutexEintr();
+			}
+		}
 		if (rc != 0 && errno != EAGAIN && errno != EINTR) {
 			completed = false;
 			break;
 		}
 	}
+	hfsProfileChildWaitReturn(completion->profileChild);
 	hfsTraceEmitDetail(HFS_TRACE_COMPLETION_WAIT_END,
 		(HfsTraceOperation)completion->traceOperation,
 		(HfsTraceBufferKind)completion->traceBufferKind,

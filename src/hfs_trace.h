@@ -46,7 +46,8 @@ typedef enum HfsTracePhase {
     HFS_TRACE_TICKET_ADMIT,
     HFS_TRACE_TICKET_DEP_WAIT,
     HFS_TRACE_TICKET_READY,
-    HFS_TRACE_TICKET_WAKE
+    HFS_TRACE_TICKET_WAKE,
+    HFS_TRACE_PARENT_PROFILE
 } HfsTracePhase;
 
 /* Buffer kinds distinguish caller buffers from internal bounce buffers. */
@@ -167,6 +168,9 @@ typedef struct HfsTraceEvent {
     uint8_t operation;
     uint8_t bufferKind;
     uint8_t reserved;
+    uint32_t profileChildCount;
+    uint32_t profileValid;
+    uint64_t profileTicks[12];
 } HfsTraceEvent;
 
 extern _Atomic bool hfsTraceEnabledState;
@@ -258,6 +262,15 @@ void hfsTraceThreadWake(HfsTraceOperation operation,
                         uint32_t reactorId,
                         uint32_t poolClass,
                         int32_t result);
+
+/* Record one parent T0..T11 profile row for offline stage attribution. */
+void hfsTraceEmitProfile(uint64_t parentId,
+                         uint64_t bytes,
+                         uint32_t flags,
+                         uint32_t childCount,
+                         const uint64_t ticks[12],
+                         bool monotonic,
+                         int32_t result);
 
 /* Fast branch used by hot paths before constructing event arguments. */
 static inline bool hfsTraceEnabledFast(void)

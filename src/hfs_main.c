@@ -1,12 +1,17 @@
 #include <fcntl.h>
+#include <inttypes.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <unistd.h>
 
 #include <spdk/log.h>
 
 #include "hfs.h"
 #include "hfs_internal.h"
+#include "hfs_io.h"
 #include "hfs_lib.h"
 #include "hfs_log.h"
 #include "hfs_meta.h"
@@ -27,6 +32,173 @@
 	}						\
 } while (0)
 
+typedef struct HfsInternalBenchWorker {
+	HfsFile *file;
+	uint8_t *buffer;
+	size_t bytes;
+	uint64_t rangeBytes;
+	uint64_t unitSize;
+	uint64_t endNs;
+	bool write;
+	uint64_t seed;
+	_Atomic uint64_t *operations;
+	_Atomic uint64_t *errors;
+} HfsInternalBenchWorker;
+
+/* Return a monotonic nanosecond clock for the internal data-path benchmark. */
+static uint64_t hfsInternalBenchNowNs(void) {
+	struct timespec ts;
+
+	if (clock_gettime(CLOCK_MONOTONIC_RAW, &ts) != 0) {
+		return 0;
+	}
+	return (uint64_t)ts.tv_sec * UINT64_C(1000000000) +
+		(uint64_t)ts.tv_nsec;
+}
+
+/* Advance a private pseudo-random state without taking a shared lock. */
+static uint64_t hfsInternalBenchNext(HfsInternalBenchWorker *worker) {
+	uint64_t value = worker->seed;
+
+	value ^= value << 13;
+	value ^= value >> 7;
+	value ^= value << 17;
+	worker->seed = value;
+	return value;
+}
+
+/* Parse a positive benchmark setting while keeping the default deterministic. */
+static uint64_t hfsInternalBenchEnv(const char *name, uint64_t fallback) {
+	const char *value = getenv(name);
+	char *end = NULL;
+	unsigned long long parsed;
+
+	if (value == NULL || value[0] == '\0') {
+		return fallback;
+	}
+	parsed = strtoull(value, &end, 10);
+	return end == value || *end != '\0' || parsed == 0 ? fallback : parsed;
+}
+
+/* Run positioned I/O directly through HfsFile and the normal data engine. */
+static void *hfsInternalBenchWorkerMain(void *arg) {
+	HfsInternalBenchWorker *worker = arg;
+
+	while (hfsInternalBenchNowNs() < worker->endNs) {
+		uint64_t maxUnit = (worker->rangeBytes - worker->bytes) /
+			worker->unitSize;
+		uint64_t offset = (maxUnit == 0 ? 0 :
+			(hfsInternalBenchNext(worker) % (maxUnit + 1U))) *
+			worker->unitSize;
+		ssize_t result = worker->write ?
+			hfsWriteAt(worker->file, worker->buffer, worker->bytes, offset) :
+			hfsReadAt(worker->file, worker->buffer, worker->bytes, offset);
+
+		if (result == (ssize_t)worker->bytes) {
+			atomic_fetch_add_explicit(worker->operations, 1,
+				memory_order_relaxed);
+		} else {
+			atomic_fetch_add_explicit(worker->errors, 1,
+				memory_order_relaxed);
+		}
+	}
+	return NULL;
+}
+
+/* Benchmark the internal HFS data path after mount and blob preparation. */
+static int hfsInternalBenchmark(Hfs *fs) {
+	HfsFile file = {0};
+	pthread_t *threads = NULL;
+	HfsInternalBenchWorker *workers = NULL;
+	uint64_t operations;
+	uint64_t errors;
+	_Atomic uint64_t operationCount = 0;
+	_Atomic uint64_t errorCount = 0;
+	uint64_t bytes = hfsInternalBenchEnv("HFS_INTERNAL_BENCH_BS", 4096);
+	uint64_t threadCount = hfsInternalBenchEnv("HFS_INTERNAL_BENCH_THREADS", 32);
+	uint64_t duration = hfsInternalBenchEnv("HFS_INTERNAL_BENCH_SECONDS", 5);
+	uint64_t rangeBytes = hfsInternalBenchEnv("HFS_INTERNAL_BENCH_SIZE", 256U << 20);
+	const char *rw = getenv("HFS_INTERNAL_BENCH_RW");
+	uint64_t startNs;
+	uint64_t endNs;
+	uint64_t finishNs;
+	uint64_t i;
+	uint64_t allocatedWorkers = 0;
+	uint64_t startedWorkers = 0;
+	int rc = -1;
+
+	if (fs == NULL || bytes == 0 || threadCount > 256 || rangeBytes < bytes ||
+		rangeBytes % fs->unitSize != 0 || bytes % fs->unitSize != 0) {
+		fprintf(stderr, "invalid internal benchmark settings\n");
+		return -1;
+	}
+	file.fs = fs;
+	if (!hfsOpen(&file) || hfsResizeTo(&file, rangeBytes) != 0) {
+		fprintf(stderr, "internal benchmark blob preparation failed\n");
+		goto cleanup;
+	}
+	threads = calloc(threadCount, sizeof(*threads));
+	workers = calloc(threadCount, sizeof(*workers));
+	if (threads == NULL || workers == NULL) {
+		goto cleanup;
+	}
+	startNs = hfsInternalBenchNowNs();
+	endNs = startNs + duration * UINT64_C(1000000000);
+	for (i = 0; i < threadCount; i++) {
+		workers[i].file = &file;
+		workers[i].buffer = hfsIoDmaAlloc(bytes, 4096);
+		workers[i].bytes = bytes;
+		workers[i].rangeBytes = rangeBytes;
+		workers[i].unitSize = fs->unitSize;
+		workers[i].endNs = endNs;
+		workers[i].write = rw != NULL && strcasecmp(rw, "randwrite") == 0;
+		workers[i].seed = UINT64_C(0x9e3779b97f4a7c15) + i * 17U;
+		workers[i].operations = &operationCount;
+		workers[i].errors = &errorCount;
+		if (workers[i].buffer == NULL) {
+			atomic_store_explicit(&errorCount, 1, memory_order_relaxed);
+			break;
+		}
+		allocatedWorkers++;
+		if (pthread_create(&threads[i], NULL, hfsInternalBenchWorkerMain,
+			&workers[i]) != 0) {
+			atomic_store_explicit(&errorCount, 1, memory_order_relaxed);
+			break;
+		}
+		startedWorkers++;
+	}
+	for (i = 0; i < startedWorkers; i++) {
+		pthread_join(threads[i], NULL);
+	}
+	operations = atomic_load_explicit(&operationCount, memory_order_relaxed);
+	errors = atomic_load_explicit(&errorCount, memory_order_relaxed);
+	finishNs = hfsInternalBenchNowNs();
+	if (finishNs <= startNs) {
+		finishNs = startNs + 1;
+	}
+	printf("A3 internal bs=%"PRIu64" rw=%s threads=%"PRIu64
+	       " seconds=%"PRIu64" iops=%.2f errors=%"PRIu64"\n",
+	       bytes, workers != NULL && workers[0].write ? "randwrite" : "randread",
+	       startedWorkers,
+	       duration, (double)operations * 1e9 /
+	       (double)(finishNs - startNs), errors);
+	rc = errors == 0 ? 0 : -1;
+
+cleanup:
+	if (workers != NULL) {
+		for (i = 0; i < allocatedWorkers; i++) {
+			hfsIoDmaFree(workers[i].buffer);
+		}
+	}
+	free(workers);
+	free(threads);
+	if (file.blob != NULL) {
+		hfsClose(&file);
+		hfsDeleteBlobById(&file);
+	}
+	return rc;
+}
+
 int main(int argc, char *argv[]) {
 	if (hfs_lib_init() != 0) {
 		fprintf(stderr, "hfs_lib_init failed\n");
@@ -34,6 +206,11 @@ int main(int argc, char *argv[]) {
 	}
 
 	Hfs *fs = hfs_lib_get_fs();
+	if (getenv("HFS_INTERNAL_BENCH") != NULL) {
+		int benchmarkRc = hfsInternalBenchmark(fs);
+		hfs_lib_fini();
+		return benchmarkRc;
+	}
 
 	/*
 	 * Reload the super blob id within the same process: verifies that
