@@ -12,7 +12,7 @@
 - `messageSubmitLock`、ticket、futex completion、DMA direct/staging、copy-in/copy-out 统计。
 - A1 raw SPDK bdev benchmark、A2 raw SPDK Blobstore benchmark、A3 HFS internal data path benchmark。
 - A4 完整 HFS POSIX 路径的 4K `psync`、`numjobs=32` 正式读写样本：每项 10 秒 ramp、30 秒 runtime、3 次取 median。
-- A0 raw SPDK NVMe 未执行：VM 当前没有可用的 raw NVMe/perf 可执行程序，FIO 也没有 `spdk`/`nvme` engine；没有用其他层替代 A0。
+- A0 raw SPDK NVMe 已补做只读能力/短测：设备由 SPDK 通过 PCIe `0000:0b:00.0` 接管，`spdk_nvme_perf` 可用；未在 HFS 所有的裸设备上执行 raw randwrite，避免破坏当前文件系统状态。
 
 关键判断：当前最值得优先处理的是每请求 completion 到应用线程恢复的同步边界，其次是 reactor ingress/message queue 和 POSIX open-file/inode 上下文；ticket 冲突在读路径为 0、写路径比例很低，staging copy 有成本但不是第一热点。
 
@@ -26,6 +26,7 @@
 | CPU | Intel Core i5-14600KF |
 | NVMe | PCI `0000:0b:00.0`，SPDK bdev `Nvme0n1` |
 | PCI driver | `uio_pci_generic` |
+| raw NVMe tool | `/root/code/HFS_BASE_SPDK/spdk/build/bin/spdk_nvme_perf` |
 | hugepages | 1024 × 2 MiB |
 | HFS POSIX workload | FIO `psync`，`--thread=1 --numjobs=32`，4K，`direct=0` |
 | HFS mount prefix | `/fio/` |
@@ -159,7 +160,17 @@ profile tick frequency 为 2.5 GHz；下表单位为微秒，完整 p50/p95/p99 
 
 ### A0 与测试隔离说明
 
-A0 只做能力检查，没有 raw NVMe API 可执行文件可运行，因此标记为 `SKIP/ENVIRONMENT`，不伪造数值。
+此前结果文档因检查了错误的 SPDK 构建路径，将 A0 误判为 `SKIP/ENVIRONMENT`；本次复核已纠正。PCI `0000:0b:00.0` 的内核绑定为 `uio_pci_generic`，因此系统不会创建 `/dev/nvme0n1`，这正是 SPDK 用户态接管 NVMe 后的预期现象；设备本身可由 raw SPDK 工具直接枚举。
+
+使用 `/root/code/HFS_BASE_SPDK/spdk/build/bin/spdk_nvme_perf -q 32 -o 4k -w randread -t 3 -r 'trtype:PCIe traddr:0000:0b:00.0'` 完成只读短测，结果为：
+
+```text
+Attached to NVMe Controller at PCIE (0000:0b:00.0) [15ad:07f0]
+Total: 383038.74 IOPS, 1496.25 MiB/s, average latency 83.53 us
+command exit: 0
+```
+
+本次没有在 HFS 当前持有的裸 NVMe 上执行 raw randwrite；完整 A0 读写矩阵仍不属于本轮已完成的正式基线。
 
 A2 调用 `spdk_bs_init()`，按 SPDK 语义会在底层设备上初始化新的 Blobstore super block/metadata；不能在 HFS 已格式化的同一 NVMe 状态上运行后继续直接挂载 HFS。实际执行顺序为：A2 在 raw Blobstore 状态采样，随后 `HFS_FORMAT=1` 重新建立 HFS，再执行 A3/A4。该问题已记录为 `doc/bug.md` 条目 85。
 
@@ -182,6 +193,7 @@ ticket scheduler 暂不作为第一优化点：randread conflict/dependency/real
 - VM CMake Release configure/build。
 - A1/A2 benchmark 强制编译。
 - A4 profiling：`profile_invalid=0`、`trace_dropped=0`、SPDK submit/complete 闭合、errors=0。
+- A0 raw SPDK NVMe 只读短测：设备枚举成功，命令正常退出，`383038.74 IOPS`、`1496.25 MiB/s`。
 - `scripts/db/posix_contract_test.sh`。
 - `scripts/db/io_fast_path_smoke.sh`。
 
