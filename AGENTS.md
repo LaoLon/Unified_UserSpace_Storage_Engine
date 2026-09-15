@@ -47,6 +47,8 @@
 
 ## 项目记忆（必读）
 
+任务文档输出规则：当用户输入的文件路径 basename 匹配 `task` 加 8 位日期/任务编号（例如 `task09151930`、`task09150832`）时，按该任务执行，并将最终结果只输出为 `doc/task_result/<task_basename>_result.md`；默认不要在 `doc/task_result` 下创建 JSON、TSV、日志、证据目录或其他临时文件，临时证据应放在外部临时目录并在任务完成后清理。
+
 1. 使用 `E:\Code\ssh\pool.py`、`E:\Code\ssh\sync_to_vm.py` 连接虚拟机和上传 HFS 本地文件；SPDK 必须在 VM 内通过 Git 获取，禁止同步 Windows 侧 `spdk/` 目录
 2. 虚拟机环境信息见 `E:\Code\workspace.yaml`
 3. 每次先编辑本地文件，然后同步到虚拟机
