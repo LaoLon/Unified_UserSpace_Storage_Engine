@@ -40,6 +40,9 @@ uint32_t hfsRuntimeDataReactorFor(const Hfs *fs, uint64_t blobId,
 					 uint64_t logicalUnit);
 struct spdk_io_channel *hfsRuntimeDataChannel(const Hfs *fs,
 						 uint32_t reactorId);
+/* Snapshot queue and backend-credit depth for reactor attribution. */
+uint32_t hfsRuntimeDataInFlight(uint32_t reactorId);
+uint32_t hfsRuntimeDataQueueDepth(uint32_t reactorId);
 /* Stop accepting work, drain SPDK state, and join the owner pthread. */
 int hfsRuntimeStop(void);
 /* Mark subsystem configuration complete so runtime teardown can finalize it. */

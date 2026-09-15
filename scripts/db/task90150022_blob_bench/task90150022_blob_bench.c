@@ -15,12 +15,14 @@ typedef struct BlobBenchOp {
 	BlobBench *bench;
 	void *buffer;
 	uint64_t startTick;
+	uint32_t channelIndex;
 } BlobBenchOp;
 
 struct BlobBench {
 	struct spdk_blob_store *bs;
 	struct spdk_blob *blob;
-	struct spdk_io_channel *channel;
+	struct spdk_io_channel **channels;
+	uint32_t channelCount;
 	spdk_blob_id blobId;
 	const char *bdevName;
 	uint32_t blockBytes;
@@ -128,9 +130,16 @@ static void blobBenchUnload(BlobBench *bench, int rc) {
 		spdk_app_stop(bench->rc);
 		return;
 	}
-	if (bench->channel != NULL) {
-		spdk_bs_free_io_channel(bench->channel);
-		bench->channel = NULL;
+	if (bench->channels != NULL) {
+		uint32_t i;
+
+		for (i = 0; i < bench->channelCount; i++) {
+			if (bench->channels[i] != NULL) {
+				spdk_bs_free_io_channel(bench->channels[i]);
+			}
+		}
+		free(bench->channels);
+		bench->channels = NULL;
 	}
 	spdk_bs_unload(bench->bs, blobBenchUnloadDone, bench);
 }
@@ -159,11 +168,13 @@ static void blobBenchMaybeFinish(BlobBench *bench) {
 		return;
 	}
 	bench->finishedOps = 1;
-	printf("A2 blob bdev=%s bs=%"PRIu32" rw=%s qd=%"PRIu32
+	printf("A2 blob bdev=%s bs=%"PRIu32" rw=%s channels=%"PRIu32
+	       " qd=%"PRIu32" qd_per_channel=%"PRIu32
 	       " iops=%.2f avg_us=%.3f p50_us=%.3f p99_us=%.3f errors=%"PRIu64"\n",
 	       bench->bdevName, bench->blockBytes,
 	       getenv("TASK_BLOB_RW") != NULL ? getenv("TASK_BLOB_RW") : "randread",
-	       bench->queueDepth,
+	       bench->channelCount, bench->queueDepth,
+	       (bench->queueDepth + bench->channelCount - 1U) / bench->channelCount,
 	       (double)bench->completed / (double)bench->durationSeconds,
 	       (double)bench->totalLatencyTicks * 1e6 /
 	       (double)bench->ticksHz / (double)(bench->completed == 0 ? 1 : bench->completed),
@@ -198,10 +209,10 @@ static void blobBenchSubmit(BlobBenchOp *op) {
 	bench->outstanding++;
 	bench->submitted++;
 	if (rw != NULL && strcasecmp(rw, "randwrite") == 0) {
-		spdk_blob_io_write(bench->blob, bench->channel, op->buffer,
+		spdk_blob_io_write(bench->blob, bench->channels[op->channelIndex], op->buffer,
 			offset, bench->ioUnits, blobBenchIoDone, op);
 	} else {
-		spdk_blob_io_read(bench->blob, bench->channel, op->buffer,
+		spdk_blob_io_read(bench->blob, bench->channels[op->channelIndex], op->buffer,
 			offset, bench->ioUnits, blobBenchIoDone, op);
 	}
 }
@@ -233,14 +244,22 @@ static void blobBenchIoDone(void *arg, int bserrno) {
 static void blobBenchStartIo(BlobBench *bench) {
 	uint32_t i;
 
-	bench->channel = spdk_bs_alloc_io_channel(bench->bs);
+	bench->channels = calloc(bench->channelCount, sizeof(*bench->channels));
 	bench->ops = calloc(bench->queueDepth, sizeof(*bench->ops));
-	if (bench->channel == NULL || bench->ops == NULL) {
+	if (bench->channels == NULL || bench->ops == NULL) {
 		blobBenchUnload(bench, -ENOMEM);
 		return;
 	}
+	for (i = 0; i < bench->channelCount; i++) {
+		bench->channels[i] = spdk_bs_alloc_io_channel(bench->bs);
+		if (bench->channels[i] == NULL) {
+			blobBenchUnload(bench, -ENOMEM);
+			return;
+		}
+	}
 	for (i = 0; i < bench->queueDepth; i++) {
 		bench->ops[i].bench = bench;
+		bench->ops[i].channelIndex = i % bench->channelCount;
 		bench->ops[i].buffer = spdk_malloc(bench->blockBytes, 4096, NULL,
 			SPDK_ENV_LCORE_ID_ANY, SPDK_MALLOC_DMA);
 		if (bench->ops[i].buffer == NULL) {
@@ -383,6 +402,10 @@ int main(int argc, char **argv) {
 	bench.bdevName = bench.bdevName != NULL ? bench.bdevName : "Nvme0n1";
 	bench.blockBytes = (uint32_t)blobBenchEnv("TASK_BLOB_BS", 4096);
 	bench.queueDepth = (uint32_t)blobBenchEnv("TASK_BLOB_QD", 32);
+	bench.channelCount = (uint32_t)blobBenchEnv("TASK_BLOB_CHANNELS", 1);
+	if (bench.channelCount > 4) {
+		bench.channelCount = 4;
+	}
 	if (bench.queueDepth > 64) {
 		bench.queueDepth = 64;
 	}

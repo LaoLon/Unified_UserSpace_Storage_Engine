@@ -20,7 +20,6 @@
 #define HFS_STATS_IO_SIZE_BUCKETS 16U
 #define HFS_STATS_DMA_SIZE_CLASSES 8U
 #define HFS_STATS_DMA_POOL_CLASSES 4U
-#define HFS_STATS_MAX_DATA_REACTORS 8U
 #define HFS_STATS_MAX_LOCK_DEPTH 8U
 #define HFS_STATS_TICKET_SCAN_BUCKETS 7U
 #define HFS_STATS_SNAPSHOT_BYTES (128U * 1024U)
@@ -50,6 +49,15 @@ _Atomic uint_fast64_t hfsStatsDurabilityFlushes;
 _Atomic uint_fast64_t hfsStatsFdatasyncFast;
 static _Atomic uint_fast64_t g_hfsStatsDataReactorSubmit[HFS_STATS_MAX_DATA_REACTORS];
 static _Atomic uint_fast64_t g_hfsStatsDataReactorComplete[HFS_STATS_MAX_DATA_REACTORS];
+#define HFS_STATS_REACTOR_METRIC_COUNT 7U
+static _Atomic uint_fast64_t g_hfsStatsReactorMetricSum[HFS_STATS_MAX_DATA_REACTORS][HFS_STATS_REACTOR_METRIC_COUNT];
+static _Atomic uint_fast64_t g_hfsStatsReactorMetricCount[HFS_STATS_MAX_DATA_REACTORS][HFS_STATS_REACTOR_METRIC_COUNT];
+static _Atomic uint_fast64_t g_hfsStatsReactorMetricMax[HFS_STATS_MAX_DATA_REACTORS][HFS_STATS_REACTOR_METRIC_COUNT];
+static _Atomic uint_fast64_t g_hfsStatsReactorMetricHist[HFS_STATS_MAX_DATA_REACTORS][HFS_STATS_REACTOR_METRIC_COUNT][HFS_STATS_HIST_BUCKETS];
+static _Atomic uint_fast64_t g_hfsStatsReactorPollCalls[HFS_STATS_MAX_DATA_REACTORS];
+static _Atomic uint_fast64_t g_hfsStatsReactorPollBusy[HFS_STATS_MAX_DATA_REACTORS];
+static _Atomic uint_fast64_t g_hfsStatsReactorPollGapSumNs[HFS_STATS_MAX_DATA_REACTORS];
+static _Atomic uint_fast64_t g_hfsStatsReactorPollGapMaxNs[HFS_STATS_MAX_DATA_REACTORS];
 _Atomic uint_fast64_t hfsStatsSpdkSubmits;
 _Atomic uint_fast64_t hfsStatsSpdkCompletions;
 _Atomic uint_fast64_t hfsStatsSpdkRejects;
@@ -222,6 +230,93 @@ static unsigned int hfsStatsBucket(uint64_t value) {
 	return bucket;
 }
 
+/* Keep the reactor metric indexes stable for the key-value snapshot. */
+enum HfsStatsReactorMetric {
+	HFS_STATS_REACTOR_TB0_TB1 = 0,
+	HFS_STATS_REACTOR_TB1_TB2,
+	HFS_STATS_REACTOR_T6_T7,
+	HFS_STATS_REACTOR_INFLIGHT_SUBMIT,
+	HFS_STATS_REACTOR_INFLIGHT_COMPLETE,
+	HFS_STATS_REACTOR_QUEUE_SUBMIT,
+	HFS_STATS_REACTOR_QUEUE_COMPLETE
+};
+
+/* Update one lock-free reactor metric sample and its percentile histogram. */
+static void hfsStatsRecordReactorMetric(uint32_t reactorId,
+						unsigned int metric, uint64_t value) {
+	uint_fast64_t current;
+	unsigned int bucket;
+
+	if (reactorId >= HFS_STATS_MAX_DATA_REACTORS ||
+	    metric >= HFS_STATS_REACTOR_METRIC_COUNT ||
+	    !hfsStatsIsEnabled()) {
+		return;
+	}
+	atomic_fetch_add_explicit(&g_hfsStatsReactorMetricSum[reactorId][metric],
+		value, memory_order_relaxed);
+	atomic_fetch_add_explicit(&g_hfsStatsReactorMetricCount[reactorId][metric],
+		1, memory_order_relaxed);
+	current = atomic_load_explicit(
+		&g_hfsStatsReactorMetricMax[reactorId][metric], memory_order_relaxed);
+	while (current < value && !atomic_compare_exchange_weak_explicit(
+		&g_hfsStatsReactorMetricMax[reactorId][metric], &current, value,
+		memory_order_relaxed, memory_order_relaxed)) {
+		/* Retry with the refreshed maximum. */
+	}
+	bucket = hfsStatsBucket(value);
+	atomic_fetch_add_explicit(
+		&g_hfsStatsReactorMetricHist[reactorId][metric][bucket], 1,
+		memory_order_relaxed);
+}
+
+/* Record the split backend stages and depths observed by one data reactor. */
+void hfsStatsRecordBackendMetrics(uint32_t reactorId,
+					  uint64_t tb0Tb1Ns, uint64_t tb1Tb2Ns,
+					  uint64_t t6T7Ns, uint64_t submitInflight,
+					  uint64_t completeInflight,
+					  uint64_t submitQueueDepth,
+					  uint64_t completeQueueDepth) {
+	hfsStatsRecordReactorMetric(reactorId, HFS_STATS_REACTOR_TB0_TB1,
+		tb0Tb1Ns);
+	hfsStatsRecordReactorMetric(reactorId, HFS_STATS_REACTOR_TB1_TB2,
+		tb1Tb2Ns);
+	hfsStatsRecordReactorMetric(reactorId, HFS_STATS_REACTOR_T6_T7,
+		t6T7Ns);
+	hfsStatsRecordReactorMetric(reactorId, HFS_STATS_REACTOR_INFLIGHT_SUBMIT,
+		submitInflight);
+	hfsStatsRecordReactorMetric(reactorId,
+		HFS_STATS_REACTOR_INFLIGHT_COMPLETE, completeInflight);
+	hfsStatsRecordReactorMetric(reactorId, HFS_STATS_REACTOR_QUEUE_SUBMIT,
+		submitQueueDepth);
+	hfsStatsRecordReactorMetric(reactorId, HFS_STATS_REACTOR_QUEUE_COMPLETE,
+		completeQueueDepth);
+}
+
+/* Record one data-reactor poll and the gap since its previous poll. */
+void hfsStatsRecordReactorPoll(uint32_t reactorId, bool busy,
+					 uint64_t gapNs) {
+	if (reactorId >= HFS_STATS_MAX_DATA_REACTORS || !hfsStatsIsEnabled()) {
+		return;
+	}
+	atomic_fetch_add_explicit(&g_hfsStatsReactorPollCalls[reactorId], 1,
+		memory_order_relaxed);
+	if (busy) {
+		atomic_fetch_add_explicit(&g_hfsStatsReactorPollBusy[reactorId], 1,
+			memory_order_relaxed);
+	}
+	atomic_fetch_add_explicit(&g_hfsStatsReactorPollGapSumNs[reactorId], gapNs,
+		memory_order_relaxed);
+	{
+		uint_fast64_t current = atomic_load_explicit(
+			&g_hfsStatsReactorPollGapMaxNs[reactorId], memory_order_relaxed);
+		while (current < gapNs && !atomic_compare_exchange_weak_explicit(
+			&g_hfsStatsReactorPollGapMaxNs[reactorId], &current, gapNs,
+			memory_order_relaxed, memory_order_relaxed)) {
+			/* Retry with the refreshed maximum. */
+		}
+	}
+}
+
 /* Map a ticket scan length to the report's fixed diagnostic buckets. */
 static unsigned int hfsStatsTicketScanBucket(uint32_t scanItems) {
 	if (scanItems == 0) {
@@ -312,6 +407,29 @@ static void hfsStatsReset(void) {
 			memory_order_relaxed);
 		atomic_store_explicit(&g_hfsStatsDataReactorComplete[i], 0,
 			memory_order_relaxed);
+		atomic_store_explicit(&g_hfsStatsReactorPollCalls[i], 0,
+			memory_order_relaxed);
+		atomic_store_explicit(&g_hfsStatsReactorPollBusy[i], 0,
+			memory_order_relaxed);
+		atomic_store_explicit(&g_hfsStatsReactorPollGapSumNs[i], 0,
+			memory_order_relaxed);
+		atomic_store_explicit(&g_hfsStatsReactorPollGapMaxNs[i], 0,
+			memory_order_relaxed);
+		for (unsigned int metric = 0;
+		     metric < HFS_STATS_REACTOR_METRIC_COUNT; metric++) {
+			atomic_store_explicit(&g_hfsStatsReactorMetricSum[i][metric], 0,
+				memory_order_relaxed);
+			atomic_store_explicit(&g_hfsStatsReactorMetricCount[i][metric], 0,
+				memory_order_relaxed);
+			atomic_store_explicit(&g_hfsStatsReactorMetricMax[i][metric], 0,
+				memory_order_relaxed);
+			for (unsigned int bucket = 0;
+			     bucket < HFS_STATS_HIST_BUCKETS; bucket++) {
+				atomic_store_explicit(
+					&g_hfsStatsReactorMetricHist[i][metric][bucket], 0,
+					memory_order_relaxed);
+			}
+		}
 	}
 	atomic_store_explicit(&hfsStatsSpdkSubmits, 0, memory_order_relaxed);
 	atomic_store_explicit(&hfsStatsSpdkCompletions, 0, memory_order_relaxed);
@@ -1608,6 +1726,55 @@ static void hfsStatsWriteSnapshot(void) {
 		HFS_STATS_APPEND("queue_reactor_%u_drain_items=%"PRIuFAST64"\n", i,
 			atomic_load_explicit(&hfsStatsQueueDrainItems[i],
 			memory_order_relaxed));
+	}
+	{
+		static const char *const reactorMetricNames[HFS_STATS_REACTOR_METRIC_COUNT] = {
+			"tb0_tb1_ns", "tb1_tb2_ns", "t6_t7_ns", "inflight_submit",
+			"inflight_complete", "queue_submit", "queue_complete"
+		};
+		for (i = 0; i < HFS_STATS_MAX_DATA_REACTORS; i++) {
+			HFS_STATS_APPEND("reactor_%u_poll_calls=%"PRIuFAST64"\n", i,
+				atomic_load_explicit(&g_hfsStatsReactorPollCalls[i],
+				memory_order_relaxed));
+			HFS_STATS_APPEND("reactor_%u_poll_busy=%"PRIuFAST64"\n", i,
+				atomic_load_explicit(&g_hfsStatsReactorPollBusy[i],
+				memory_order_relaxed));
+			HFS_STATS_APPEND("reactor_%u_poll_gap_sum_ns=%"PRIuFAST64"\n", i,
+				atomic_load_explicit(&g_hfsStatsReactorPollGapSumNs[i],
+				memory_order_relaxed));
+			HFS_STATS_APPEND("reactor_%u_poll_gap_max_ns=%"PRIuFAST64"\n", i,
+				atomic_load_explicit(&g_hfsStatsReactorPollGapMaxNs[i],
+				memory_order_relaxed));
+			for (j = 0; j < HFS_STATS_REACTOR_METRIC_COUNT; j++) {
+				uint64_t hist[HFS_STATS_HIST_BUCKETS];
+				uint64_t count = atomic_load_explicit(
+					&g_hfsStatsReactorMetricCount[i][j], memory_order_relaxed);
+				uint64_t sum = atomic_load_explicit(
+					&g_hfsStatsReactorMetricSum[i][j], memory_order_relaxed);
+				unsigned int bucket;
+
+				for (bucket = 0; bucket < HFS_STATS_HIST_BUCKETS; bucket++) {
+					hist[bucket] = atomic_load_explicit(
+						&g_hfsStatsReactorMetricHist[i][j][bucket],
+						memory_order_relaxed);
+				}
+				HFS_STATS_APPEND("reactor_%u_%s_count=%"PRIu64"\n", i,
+					reactorMetricNames[j], count);
+				HFS_STATS_APPEND("reactor_%u_%s_sum=%"PRIu64"\n", i,
+					reactorMetricNames[j], sum);
+				HFS_STATS_APPEND("reactor_%u_%s_avg=%"PRIu64"\n", i,
+					reactorMetricNames[j], count == 0 ? 0 : sum / count);
+				HFS_STATS_APPEND("reactor_%u_%s_max=%"PRIuFAST64"\n", i,
+					reactorMetricNames[j], atomic_load_explicit(
+						&g_hfsStatsReactorMetricMax[i][j], memory_order_relaxed));
+				HFS_STATS_APPEND("reactor_%u_%s_p50=%"PRIu64"\n", i,
+					reactorMetricNames[j], hfsStatsHistogramQuantile(hist, count, 50));
+				HFS_STATS_APPEND("reactor_%u_%s_p95=%"PRIu64"\n", i,
+					reactorMetricNames[j], hfsStatsHistogramQuantile(hist, count, 95));
+				HFS_STATS_APPEND("reactor_%u_%s_p99=%"PRIu64"\n", i,
+					reactorMetricNames[j], hfsStatsHistogramQuantile(hist, count, 99));
+			}
+		}
 	}
 	HFS_STATS_APPEND("io_read_ops=%"PRIu64"\n", total.ioReadOps);
 	HFS_STATS_APPEND("io_write_ops=%"PRIu64"\n", total.ioWriteOps);

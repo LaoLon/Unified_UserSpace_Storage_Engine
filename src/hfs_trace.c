@@ -1,5 +1,7 @@
 #define _GNU_SOURCE
 
+#define _GNU_SOURCE
+
 #include "hfs_trace.h"
 
 #include <errno.h>
@@ -10,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/syscall.h>
+#include <sched.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -128,6 +131,9 @@ static const char *hfsTracePhaseName(HfsTracePhase phase)
     case HFS_TRACE_RUNTIME_DEQUEUE: return "runtime_dequeue";
     case HFS_TRACE_SPDK_SUBMIT: return "spdk_submit";
     case HFS_TRACE_SPDK_COMPLETE: return "spdk_complete";
+    case HFS_TRACE_BACKEND_TB0: return "backend_tb0";
+    case HFS_TRACE_BACKEND_TB1: return "backend_tb1";
+    case HFS_TRACE_BACKEND_TB2: return "backend_tb2";
     case HFS_TRACE_METADATA_PUBLISH: return "metadata_publish";
     case HFS_TRACE_PARENT_START: return "parent_start";
     case HFS_TRACE_CHILD_START: return "child_start";
@@ -295,6 +301,7 @@ void hfsTraceEmitDetail(HfsTracePhase phase,
     event->units = units;
     event->queueDepth = queueDepth;
     event->reactorId = reactorId;
+    event->cpu = (uint32_t)sched_getcpu();
     event->rangeBucketCount = rangeBucketCount;
     event->poolClass = poolClass;
     event->lockClass = lockClass;
@@ -538,6 +545,7 @@ void hfsTraceEmitProfile(uint64_t parentId,
     event->requestId = parentId;
     event->parentId = parentId;
     event->bytes = bytes;
+    event->cpu = (uint32_t)sched_getcpu();
     event->profileChildCount = childCount;
     event->profileValid = monotonic ? 1U : 0U;
     event->phase = HFS_TRACE_PARENT_PROFILE;
@@ -562,7 +570,7 @@ static void hfsTraceWriteSnapshot(void)
     if (file == NULL) {
         return;
     }
-    fprintf(file, "sequence\ttid\ttimestamp_ns\tphase\toperation\tbuffer_kind\trequest_id\tparent_id\tinode_id\toffset\tbytes\tunits\tqueue_depth\treactor\trange_buckets\tpool_class\tlock_class\tlock_id\twake_reason\tmetadata_op\tduration_ns\tresult\tprofile_child_count\tprofile_valid\tprofile_t0\tprofile_t1\tprofile_t2\tprofile_t3\tprofile_t4\tprofile_t5\tprofile_t6\tprofile_t7\tprofile_t8\tprofile_t9\tprofile_t10\tprofile_t11\n");
+    fprintf(file, "sequence\ttid\tcpu\ttimestamp_ns\tphase\toperation\tbuffer_kind\trequest_id\tparent_id\tinode_id\toffset\tbytes\tunits\tqueue_depth\treactor\trange_buckets\tpool_class\tlock_class\tlock_id\twake_reason\tmetadata_op\tduration_ns\tresult\tprofile_child_count\tprofile_valid\tprofile_t0\tprofile_t1\tprofile_t2\tprofile_t3\tprofile_t4\tprofile_t5\tprofile_t6\tprofile_t7\tprofile_t8\tprofile_t9\tprofile_t10\tprofile_t11\n");
     pthread_mutex_lock(&g_traceLock);
     for (thread = g_traceThreads; thread != NULL; thread = thread->next) {
         uint64_t count = thread->writeSequence;
@@ -575,8 +583,9 @@ static void hfsTraceWriteSnapshot(void)
             if (event->sequence != sequence) {
                 continue;
             }
-            fprintf(file, "%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%s\t%s\t%s\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%u\t%u\t%u\t%u\t%u\t%s\t%u\t%s\t%s\t%" PRIu64 "\t%d\t%u\t%u\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\n",
-                    event->sequence, thread->threadId, event->timestampNs,
+            fprintf(file, "%" PRIu64 "\t%" PRIu64 "\t%u\t%" PRIu64 "\t%s\t%s\t%s\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%u\t%u\t%u\t%u\t%u\t%s\t%u\t%s\t%s\t%" PRIu64 "\t%d\t%u\t%u\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\n",
+                    event->sequence, thread->threadId, event->cpu,
+                    event->timestampNs,
                     hfsTracePhaseName((HfsTracePhase)event->phase),
                     hfsTraceOperationName((HfsTraceOperation)event->operation),
                     hfsTraceBufferName((HfsTraceBufferKind)event->bufferKind),

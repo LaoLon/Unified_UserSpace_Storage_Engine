@@ -25,6 +25,9 @@ typedef enum HfsTracePhase {
     HFS_TRACE_RUNTIME_DEQUEUE,
     HFS_TRACE_SPDK_SUBMIT,
     HFS_TRACE_SPDK_COMPLETE,
+    HFS_TRACE_BACKEND_TB0,
+    HFS_TRACE_BACKEND_TB1,
+    HFS_TRACE_BACKEND_TB2,
     HFS_TRACE_METADATA_PUBLISH,
     HFS_TRACE_PARENT_START,
     HFS_TRACE_CHILD_START,
@@ -157,6 +160,7 @@ typedef struct HfsTraceEvent {
     uint32_t units;
     uint32_t queueDepth;
     uint32_t reactorId;
+    uint32_t cpu;
     uint32_t rangeBucketCount;
     uint32_t poolClass;
     uint32_t lockClass;

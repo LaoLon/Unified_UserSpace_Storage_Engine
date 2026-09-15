@@ -1493,4 +1493,20 @@ Bug 等级：**致命 > 严重 > 一般**。
   switch 与 per-reactor submit/complete 做并发归因；保留原始 stats 供后续复现，后续应为
   queued 计数增加饱和减法和配对断言，并补充专门的 runtime counter 单测。
 
+### 87. task09151930 汇总脚本遗漏 TB0-TB1/TB1-TB2 中位数（已修复）
+
+- **状态**：已修复
+- **时间**：2026-09-15
+- **等级**：一般（仅影响任务报告汇总字段，不影响原始 trace）
+- **现象**：`fio_samples.tsv` 已包含 `TB0-TB1_us_avg_us` 和 `TB1-TB2_us_avg_us`，但
+  `fixed_medians.tsv`/`deployment_medians.tsv` 中对应列为 0。
+- **排查过程**：对比单样本 trace 汇总与分组中位数，确认 TB 阶段事件计数和单样本平均值均
+  非零；检查 `task09151930_summary.py` 的 numeric key 列表后发现使用了不存在的旧字段名。
+- **根因**：分组汇总代码使用 `TB0-TB1_avg_us`/`TB1-TB2_avg_us`，而解析器实际生成的
+  字段名带有单位后缀 `_us_avg_us`，导致 `number()` 对缺失字段返回 0。
+- **修复**：将分组中位数 numeric key 改为实际解析字段名，并重新运行 144 样本汇总；原始
+  trace 和 `fio_samples.tsv` 未修改。
+- **验证**：修复后固定组和部署组的 TB0-TB1/TB1-TB2 中位数均恢复为非零值，FIO
+  errors=0 且每个样本 `spdk_submit=spdk_complete`。
+
 ## 通用经验总结

@@ -657,6 +657,7 @@ static void *hfsRuntimeDataMain(void *arg) {
 	struct spdk_thread *thread;
 	char name[32];
 	sigset_t previousSignalMask;
+	uint64_t lastPollNs = 0;
 	bool signalMaskSaved = false;
 	int rc;
 
@@ -690,7 +691,16 @@ static void *hfsRuntimeDataMain(void *arg) {
 	spdk_set_thread(thread);
 	g_hfsRuntimeDataThread = true;
 	while (!spdk_thread_is_exited(thread)) {
-		spdk_thread_poll(thread, 0, 0);
+		int pollResult = spdk_thread_poll(thread, 0, 0);
+
+		/* Poll telemetry is enabled only for the explicit timing profile. */
+		if (hfsStatsTimingFastEnabled()) {
+			uint64_t nowNs = hfsStatsNowNs();
+			uint64_t gapNs = lastPollNs != 0 && nowNs >= lastPollNs ?
+				nowNs - lastPollNs : 0;
+			hfsStatsRecordReactorPoll(reactor->index, pollResult > 0, gapNs);
+			lastPollNs = nowNs;
+		}
 	}
 	g_hfsRuntimeDataThread = false;
 	spdk_set_thread(NULL);
@@ -1382,12 +1392,44 @@ uint32_t hfsRuntimeDataReactorFor(const Hfs *fs, uint64_t blobId,
 
 /* Return the channel owned by one selected data reactor. */
 struct spdk_io_channel *hfsRuntimeDataChannel(const Hfs *fs,
-						 uint32_t reactorId) {
+							 uint32_t reactorId) {
 	if (fs == NULL || fs->dataChannels == NULL ||
 	    reactorId >= fs->dataReactorCount) {
 		return NULL;
 	}
 	return fs->dataChannels[reactorId];
+}
+
+/* Return the current backend credit count for one data reactor. */
+uint32_t hfsRuntimeDataInFlight(uint32_t reactorId) {
+	HfsRuntimeDataReactor *reactor;
+	uint32_t value;
+
+	if (reactorId == 0 || g_runtime.dataReactors == NULL ||
+	    reactorId >= g_runtime.dataReactorCount) {
+		return 0;
+	}
+	reactor = &g_runtime.dataReactors[reactorId - 1U];
+	pthread_mutex_lock(&reactor->batchLock);
+	value = reactor->inflight;
+	pthread_mutex_unlock(&reactor->batchLock);
+	return value;
+}
+
+/* Return the queued item count for one data reactor. */
+uint32_t hfsRuntimeDataQueueDepth(uint32_t reactorId) {
+	HfsRuntimeDataReactor *reactor;
+	uint32_t value;
+
+	if (reactorId == 0 || g_runtime.dataReactors == NULL ||
+	    reactorId >= g_runtime.dataReactorCount) {
+		return 0;
+	}
+	reactor = &g_runtime.dataReactors[reactorId - 1U];
+	pthread_mutex_lock(&reactor->batchLock);
+	value = reactor->queueDepth;
+	pthread_mutex_unlock(&reactor->batchLock);
+	return value;
 }
 
 /* Mark subsystem setup complete so shutdown can run the matching finalizer. */

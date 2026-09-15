@@ -134,6 +134,11 @@ typedef struct HfsIoRequest {
 	HfsIoChildProfile profileChild;
 	uint64_t traceParentId;
 	uint64_t traceSubmitNs;
+	uint64_t backendTb0StatsNs;
+	uint64_t backendTb1StatsNs;
+	uint64_t backendTb1Tb2Ns;
+	uint64_t backendSubmitInflight;
+	uint64_t backendSubmitQueueDepth;
 	HfsTraceBufferKind traceBufferKind;
 } HfsIoRequest;
 
@@ -714,14 +719,37 @@ static void hfsIoStart(void *arg) {
 	HfsFile *file = request->file;
 	struct spdk_io_channel *channel = request->channel != NULL
 		? request->channel : file->fs->channel;
+	uint64_t traceTb1Ns;
+	uint64_t traceTb2Ns;
 
 	if (hfsRequestCompletionInjected(request->result.operation)) {
 		hfsIoDone(request, -EIO);
 		return;
 	}
+	/* TB0 is the entry into the reactor-side backend start function. */
+	request->backendTb0StatsNs = hfsStatsTimingFastEnabled() ?
+		hfsStatsNowNs() : 0;
+	hfsTraceEmit(HFS_TRACE_BACKEND_TB0,
+			hfsIoTraceOperation(request->operation), request->traceBufferKind,
+			request->result.requestId, request->traceParentId, file->inodeId,
+			request->offset, request->units * file->fs->unitSize,
+			(uint32_t)request->units, 0, request->dataReactor, 0, 0, 0, 0);
 	hfsProfileChildSubmit(&request->profileChild);
 	/* Count one real SPDK data callback window, separate from queue dispatch depth. */
 	hfsStatsRecordIoSubmitFast();
+	request->backendSubmitInflight = atomic_load_explicit(
+		&hfsStatsIoOutstanding, memory_order_relaxed);
+	request->backendSubmitQueueDepth = hfsRuntimeDataQueueDepth(
+		request->dataReactor);
+	request->backendTb1StatsNs = hfsStatsTimingFastEnabled() ?
+		hfsStatsNowNs() : 0;
+	traceTb1Ns = hfsTraceNowNs();
+	hfsTraceEmit(HFS_TRACE_BACKEND_TB1,
+			hfsIoTraceOperation(request->operation), request->traceBufferKind,
+			request->result.requestId, request->traceParentId, file->inodeId,
+			request->offset, request->units * file->fs->unitSize,
+			(uint32_t)request->units, request->backendSubmitQueueDepth,
+			request->dataReactor, 0, 0, 0, 0);
 	if (request->vector) {
 		if (request->operation == HFS_IO_READ) {
 			spdk_blob_io_readv(file->blob, channel, request->iov,
@@ -732,34 +760,52 @@ static void hfsIoStart(void *arg) {
 					  request->iovcnt, request->offset, request->units,
 					  hfsIoDone, request);
 		}
-		return;
+	} else {
+		switch (request->operation) {
+		case HFS_IO_READ:
+			spdk_blob_io_read(file->blob, channel, request->buffer,
+					  request->offset, request->units,
+					  hfsIoDone, request);
+			break;
+		case HFS_IO_WRITE:
+			spdk_blob_io_write(file->blob, channel, request->buffer,
+					   request->offset, request->units,
+					   hfsIoDone, request);
+			break;
+		case HFS_IO_UNMAP:
+			spdk_blob_io_unmap(file->blob, channel, request->offset,
+					   request->units, hfsIoDone, request);
+			break;
+		case HFS_IO_WRITE_ZEROES:
+			spdk_blob_io_write_zeroes(file->blob, channel,
+						 request->offset, request->units,
+						 hfsIoDone, request);
+			break;
+		}
 	}
-	switch (request->operation) {
-	case HFS_IO_READ:
-		spdk_blob_io_read(file->blob, channel, request->buffer,
-				  request->offset, request->units,
-				  hfsIoDone, request);
-		break;
-	case HFS_IO_WRITE:
-		spdk_blob_io_write(file->blob, channel, request->buffer,
-				   request->offset, request->units,
-				   hfsIoDone, request);
-		break;
-	case HFS_IO_UNMAP:
-		spdk_blob_io_unmap(file->blob, channel, request->offset,
-				   request->units, hfsIoDone, request);
-		break;
-	case HFS_IO_WRITE_ZEROES:
-		spdk_blob_io_write_zeroes(file->blob, channel,
-					 request->offset, request->units,
-					 hfsIoDone, request);
-		break;
+	traceTb2Ns = hfsTraceNowNs();
+	hfsTraceEmit(HFS_TRACE_BACKEND_TB2,
+		hfsIoTraceOperation(request->operation), request->traceBufferKind,
+		request->result.requestId, request->traceParentId, file->inodeId,
+		request->offset, request->units * file->fs->unitSize,
+		(uint32_t)request->units, request->backendSubmitQueueDepth,
+		request->dataReactor, 0, 0,
+		traceTb2Ns >= traceTb1Ns ? traceTb2Ns - traceTb1Ns : 0, 0);
+	if (request->backendTb0StatsNs != 0 && request->backendTb1StatsNs != 0) {
+		uint64_t nowNs = hfsStatsNowNs();
+
+		request->backendTb1Tb2Ns = nowNs >= request->backendTb1StatsNs ?
+			nowNs - request->backendTb1StatsNs : 0;
 	}
 }
 
 /* Capture an SPDK completion code before waking the synchronous caller. */
 static void hfsIoDone(void *arg, int bserrno) {
 	HfsIoRequest *request = arg;
+	uint64_t completeStatsNs = hfsStatsTimingFastEnabled() ?
+		hfsStatsNowNs() : 0;
+	uint64_t completeInflight = hfsRuntimeDataInFlight(request->dataReactor);
+	uint64_t completeQueueDepth = hfsRuntimeDataQueueDepth(request->dataReactor);
 	uint64_t durationNs = 0;
 	uint64_t traceRequestId;
 	uint64_t traceParentId;
@@ -778,6 +824,15 @@ static void hfsIoDone(void *arg, int bserrno) {
 	hfsStatsRecordIoCompleteFast();
 	if (request->dataPath) {
 		hfsStatsRecordDataReactorCompleteFast(request->dataReactor);
+	}
+	if (request->backendTb0StatsNs != 0 && request->backendTb1StatsNs != 0 &&
+	    completeStatsNs >= request->backendTb1StatsNs) {
+		hfsStatsRecordBackendMetrics(request->dataReactor,
+			request->backendTb1StatsNs - request->backendTb0StatsNs,
+			request->backendTb1Tb2Ns,
+			completeStatsNs - request->backendTb1StatsNs,
+			request->backendSubmitInflight, completeInflight,
+			request->backendSubmitQueueDepth, completeQueueDepth);
 	}
 	/* Snapshot all request fields before waking a waiter that may unwind a stack request. */
 	traceRequestId = request->result.requestId;

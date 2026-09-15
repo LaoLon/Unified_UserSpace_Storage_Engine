@@ -74,6 +74,21 @@ extern _Atomic uint_fast64_t hfsStatsWakeToResumeNs;
 extern bool hfsStatsFastEnabledState;
 extern bool hfsStatsTimingState;
 
+/* The runtime exposes a bounded set of data-reactor telemetry slots. */
+#define HFS_STATS_MAX_DATA_REACTORS 8U
+
+/* Record backend timing, depth samples, and reactor poll activity. */
+void hfsStatsRecordBackendMetrics(uint32_t reactorId,
+					  uint64_t tb0Tb1Ns,
+					  uint64_t tb1Tb2Ns,
+					  uint64_t t6T7Ns,
+					  uint64_t submitInflight,
+					  uint64_t completeInflight,
+					  uint64_t submitQueueDepth,
+					  uint64_t completeQueueDepth);
+void hfsStatsRecordReactorPoll(uint32_t reactorId, bool busy,
+					 uint64_t gapNs);
+
 /* Fine-grained ticket timings used by the second-stage attribution task. */
 typedef enum HfsStatsTicketMetric {
 	HFS_STATS_TICKET_ADMIT_LOCK_WAIT = 0,
