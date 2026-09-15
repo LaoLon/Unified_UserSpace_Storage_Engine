@@ -25,9 +25,15 @@ struct HfsDurabilityCoordinator;
 #define HFS_INODE_RUNTIME_BUCKET_COUNT 256U
 
 /* Completion state shared by one asynchronous SPDK request. */
-typedef struct HfsCompletion {
+typedef struct __attribute__((aligned(64))) HfsCompletion {
+	/* Keep the futex word alone on its cacheline. */
 	atomic_int state;
-	/* Optional trace identity copied into wait and wake events. */
+	uint8_t stateCachelinePadding[60];
+	/* Keep callback-side credit retirement away from the waiter state. */
+	_Atomic bool runtimeCreditHeld;
+	uint32_t runtimeReactorId;
+	uint8_t callbackCachelinePadding[55];
+	/* Trace and profile metadata are read and written only on diagnostic paths. */
 	uint64_t traceRequestId;
 	uint64_t traceParentId;
 	uint64_t traceInodeId;
@@ -38,12 +44,16 @@ typedef struct HfsCompletion {
 	uint16_t traceReserved;
 	uint32_t traceMetadataOperation;
 	uint64_t traceStageStartNs;
-	/* Runtime queue credit retained until the backend callback retires. */
-	_Atomic bool runtimeCreditHeld;
-	uint32_t runtimeReactorId;
 	/* Optional profiling child owned by the synchronous I/O request. */
 	struct HfsIoChildProfile *profileChild;
 } HfsCompletion;
+
+_Static_assert(sizeof(atomic_int) == 4, "HfsCompletion assumes a 32-bit futex word");
+_Static_assert(offsetof(HfsCompletion, state) == 0, "completion state must be first");
+_Static_assert(offsetof(HfsCompletion, runtimeCreditHeld) == 64,
+	"completion credit must have its own cacheline");
+_Static_assert(offsetof(HfsCompletion, traceRequestId) == 128,
+	"completion trace data must have its own cacheline");
 
 /* Operations recorded by one request-private SPDK result object. */
 typedef enum HfsRequestOperation {

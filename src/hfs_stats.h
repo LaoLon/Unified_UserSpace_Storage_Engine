@@ -85,7 +85,8 @@ void hfsStatsRecordBackendMetrics(uint32_t reactorId,
 					  uint64_t submitInflight,
 					  uint64_t completeInflight,
 					  uint64_t submitQueueDepth,
-					  uint64_t completeQueueDepth);
+					  uint64_t completeQueueDepth,
+					  uint64_t pollGapAtCompleteNs);
 void hfsStatsRecordReactorPoll(uint32_t reactorId, bool busy,
 					 uint64_t gapNs);
 

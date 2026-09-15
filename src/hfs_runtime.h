@@ -43,6 +43,8 @@ struct spdk_io_channel *hfsRuntimeDataChannel(const Hfs *fs,
 /* Snapshot queue and backend-credit depth for reactor attribution. */
 uint32_t hfsRuntimeDataInFlight(uint32_t reactorId);
 uint32_t hfsRuntimeDataQueueDepth(uint32_t reactorId);
+/* Return the elapsed time since the previous poll completed for one reactor. */
+uint64_t hfsRuntimeDataPollGapNs(uint32_t reactorId);
 /* Stop accepting work, drain SPDK state, and join the owner pthread. */
 int hfsRuntimeStop(void);
 /* Mark subsystem configuration complete so runtime teardown can finalize it. */

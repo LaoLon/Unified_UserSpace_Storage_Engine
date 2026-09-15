@@ -49,7 +49,7 @@ _Atomic uint_fast64_t hfsStatsDurabilityFlushes;
 _Atomic uint_fast64_t hfsStatsFdatasyncFast;
 static _Atomic uint_fast64_t g_hfsStatsDataReactorSubmit[HFS_STATS_MAX_DATA_REACTORS];
 static _Atomic uint_fast64_t g_hfsStatsDataReactorComplete[HFS_STATS_MAX_DATA_REACTORS];
-#define HFS_STATS_REACTOR_METRIC_COUNT 7U
+#define HFS_STATS_REACTOR_METRIC_COUNT 8U
 static _Atomic uint_fast64_t g_hfsStatsReactorMetricSum[HFS_STATS_MAX_DATA_REACTORS][HFS_STATS_REACTOR_METRIC_COUNT];
 static _Atomic uint_fast64_t g_hfsStatsReactorMetricCount[HFS_STATS_MAX_DATA_REACTORS][HFS_STATS_REACTOR_METRIC_COUNT];
 static _Atomic uint_fast64_t g_hfsStatsReactorMetricMax[HFS_STATS_MAX_DATA_REACTORS][HFS_STATS_REACTOR_METRIC_COUNT];
@@ -238,7 +238,8 @@ enum HfsStatsReactorMetric {
 	HFS_STATS_REACTOR_INFLIGHT_SUBMIT,
 	HFS_STATS_REACTOR_INFLIGHT_COMPLETE,
 	HFS_STATS_REACTOR_QUEUE_SUBMIT,
-	HFS_STATS_REACTOR_QUEUE_COMPLETE
+	HFS_STATS_REACTOR_QUEUE_COMPLETE,
+	HFS_STATS_REACTOR_POLL_GAP_COMPLETE
 };
 
 /* Update one lock-free reactor metric sample and its percentile histogram. */
@@ -275,7 +276,8 @@ void hfsStatsRecordBackendMetrics(uint32_t reactorId,
 					  uint64_t t6T7Ns, uint64_t submitInflight,
 					  uint64_t completeInflight,
 					  uint64_t submitQueueDepth,
-					  uint64_t completeQueueDepth) {
+					  uint64_t completeQueueDepth,
+					  uint64_t pollGapAtCompleteNs) {
 	hfsStatsRecordReactorMetric(reactorId, HFS_STATS_REACTOR_TB0_TB1,
 		tb0Tb1Ns);
 	hfsStatsRecordReactorMetric(reactorId, HFS_STATS_REACTOR_TB1_TB2,
@@ -290,6 +292,8 @@ void hfsStatsRecordBackendMetrics(uint32_t reactorId,
 		submitQueueDepth);
 	hfsStatsRecordReactorMetric(reactorId, HFS_STATS_REACTOR_QUEUE_COMPLETE,
 		completeQueueDepth);
+	hfsStatsRecordReactorMetric(reactorId,
+		HFS_STATS_REACTOR_POLL_GAP_COMPLETE, pollGapAtCompleteNs);
 }
 
 /* Record one data-reactor poll and the gap since its previous poll. */
@@ -1730,7 +1734,8 @@ static void hfsStatsWriteSnapshot(void) {
 	{
 		static const char *const reactorMetricNames[HFS_STATS_REACTOR_METRIC_COUNT] = {
 			"tb0_tb1_ns", "tb1_tb2_ns", "t6_t7_ns", "inflight_submit",
-			"inflight_complete", "queue_submit", "queue_complete"
+			"inflight_complete", "queue_submit", "queue_complete",
+			"poll_gap_complete_ns"
 		};
 		for (i = 0; i < HFS_STATS_MAX_DATA_REACTORS; i++) {
 			HFS_STATS_APPEND("reactor_%u_poll_calls=%"PRIuFAST64"\n", i,

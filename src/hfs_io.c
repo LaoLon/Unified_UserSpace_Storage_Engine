@@ -806,6 +806,7 @@ static void hfsIoDone(void *arg, int bserrno) {
 		hfsStatsNowNs() : 0;
 	uint64_t completeInflight = hfsRuntimeDataInFlight(request->dataReactor);
 	uint64_t completeQueueDepth = hfsRuntimeDataQueueDepth(request->dataReactor);
+	uint64_t completePollGapNs = hfsRuntimeDataPollGapNs(request->dataReactor);
 	uint64_t durationNs = 0;
 	uint64_t traceRequestId;
 	uint64_t traceParentId;
@@ -832,7 +833,8 @@ static void hfsIoDone(void *arg, int bserrno) {
 			request->backendTb1Tb2Ns,
 			completeStatsNs - request->backendTb1StatsNs,
 			request->backendSubmitInflight, completeInflight,
-			request->backendSubmitQueueDepth, completeQueueDepth);
+			request->backendSubmitQueueDepth, completeQueueDepth,
+			completePollGapNs);
 	}
 	/* Snapshot all request fields before waking a waiter that may unwind a stack request. */
 	traceRequestId = request->result.requestId;

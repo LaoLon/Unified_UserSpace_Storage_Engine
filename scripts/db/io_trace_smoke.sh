@@ -20,12 +20,25 @@ from pathlib import Path
 
 path = Path(os.environ["TRACE_PATH"])
 lines = path.read_text(encoding="utf-8").splitlines()
-if not lines or not lines[0].startswith("sequence\ttid\ttimestamp_ns\tphase"):
+if not lines:
     raise SystemExit("trace header missing")
+header = lines[0].split("\t")
+required_header = {"sequence", "tid", "cpu", "timestamp_ns", "phase",
+                   "request_id", "parent_id", "reactor"}
+if not required_header.issubset(set(header)):
+    raise SystemExit("trace header missing")
+header_index = {name: index for index, name in enumerate(header)}
 for column in ("lock_class", "lock_id", "wake_reason", "metadata_op"):
-    if column not in lines[0].split("\t"):
+    if column not in header_index:
         raise SystemExit(f"trace column missing: {column}")
-phases = {line.split("\t", 4)[3] for line in lines[1:] if not line.startswith("#")}
+phases = set()
+for line in lines[1:]:
+    if line.startswith("#"):
+        continue
+    fields = line.split("\t")
+    if len(fields) != len(header):
+        raise SystemExit("trace row width mismatch")
+    phases.add(fields[header_index["phase"]])
 required = {"io_enter", "io_exit", "buffer_classify",
             "spdk_submit", "spdk_complete", "runtime_enqueue",
             "runtime_dequeue", "lock_wait_begin", "lock_acquired",

@@ -1509,4 +1509,21 @@ Bug 等级：**致命 > 严重 > 一般**。
 - **验证**：修复后固定组和部署组的 TB0-TB1/TB1-TB2 中位数均恢复为非零值，FIO
   errors=0 且每个样本 `spdk_submit=spdk_complete`。
 
+### 88. IO trace smoke 误拒绝当前 trace header（已修复）
+
+- **状态**：已修复
+- **时间**：2026-09-15
+- **等级**：一般（仅误报 trace smoke 失败，不影响 HFS 数据路径）
+- **现象**：启用 `HFS_TRACE_PATH` 后，request-local fast I/O 本身通过，但
+  `scripts/db/io_trace_smoke.sh` 报告 `trace header missing`。
+- **排查过程**：读取生成的 `hfs_trace.c` 快照格式，确认当前 header 是
+  `sequence\ttid\tcpu\ttimestamp_ns\tphase...`；smoke 脚本却要求不含 `cpu` 的旧
+  固定前缀，并按旧列号读取 phase，因此在检查阶段集合前就退出。
+- **根因**：trace header 扩展加入 CPU 列后，校验脚本仍依赖旧的固定列顺序，未按
+  字段名解析兼容格式。
+- **修复**：改为按稳定必需字段集合校验 header，并用字段名索引读取 phase 与行宽；
+  中间字段扩展不再破坏 smoke 校验。
+- **验证**：重新运行 IO trace smoke，检查所有必需阶段、copy-in/out、锁/metadata/
+  completion 事件及 trace 文件正常生成。
+
 ## 通用经验总结

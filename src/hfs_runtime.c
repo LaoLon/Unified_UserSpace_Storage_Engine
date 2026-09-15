@@ -53,6 +53,8 @@ typedef struct HfsRuntimeDataReactor {
 	uint32_t maxDepth;
 	unsigned int index;
 	int cpu;
+	uint32_t idleBackoffUs;
+	_Atomic uint64_t lastPollExitNs;
 	bool threadCreated;
 	bool ready;
 	int initRc;
@@ -86,6 +88,8 @@ struct hfs_runtime_state {
 	HfsRuntimeDataReactor *dataReactors;
 	uint32_t dataReactorCount;
 	uint64_t dataStripeBytes;
+	bool waitModeAdaptive;
+	uint64_t waitSpinNs;
 };
 
 static struct hfs_runtime_state g_runtime = {
@@ -99,6 +103,17 @@ static _Atomic bool g_ownerViolationLogged;
 /* Owner identity is immutable for a runtime generation and needs no mutex lookup. */
 static _Thread_local bool g_hfsRuntimeOwnerThread;
 static _Thread_local bool g_hfsRuntimeDataThread;
+
+/* Parse a boolean environment switch with a safe enabled default. */
+static bool hfsRuntimeBoolEnv(const char *name, bool defaultValue) {
+	const char *value = getenv(name);
+
+	if (value == NULL || value[0] == '\0') {
+		return defaultValue;
+	}
+	return strcmp(value, "0") != 0 && strcasecmp(value, "false") != 0 &&
+		strcasecmp(value, "off") != 0 && strcasecmp(value, "no") != 0;
+}
 
 /* Serialize producers before entering SPDK's lockless message ring. */
 static void hfsRuntimeSendMessage(struct spdk_thread *thread,
@@ -180,6 +195,15 @@ static bool hfsRuntimeRemaining(const struct timespec *deadline,
 static void hfsRuntimeFutexWake(HfsCompletion *completion) {
 	syscall(SYS_futex, (int *)&completion->state, FUTEX_WAKE_PRIVATE,
 		INT_MAX, NULL, NULL, 0);
+}
+
+/* Issue a short architecture-specific pause during a gated adaptive wait. */
+static inline void hfsRuntimeCpuRelax(void) {
+#if defined(__x86_64__) || defined(__i386__)
+	__asm__ volatile("pause" ::: "memory");
+#else
+	sched_yield();
+#endif
 }
 
 /* Start the asynchronous subsystem finalizer before exiting the owner thread. */
@@ -419,7 +443,7 @@ static int hfsRuntimeOwnerCpuEnv(void) {
 	unsigned long parsed;
 
 	if (value == NULL || value[0] == '\0') {
-		return -1;
+		return hfsRuntimeBoolEnv("HFS_REACTOR_PIN", false) ? 0 : -1;
 	}
 	errno = 0;
 	parsed = strtoul(value, &end, 10);
@@ -538,12 +562,19 @@ static uint32_t hfsRuntimeDataReactorCountEnv(void) {
 
 	if (value == NULL || value[0] == '\0') {
 		cpuCount = sysconf(_SC_NPROCESSORS_ONLN);
-		dataCount = cpuCount > 1 ? (uint32_t)cpuCount / 2U : 1U;
+		if (cpuCount <= 1) {
+			dataCount = 1U;
+		} else if (cpuCount <= 8) {
+			/* Three polling threads leave the remaining CPUs to the application. */
+			dataCount = 2U;
+		} else {
+			dataCount = (uint32_t)cpuCount / 4U;
+		}
 		if (dataCount == 0) {
 			dataCount = 1;
 		}
-		if (dataCount > HFS_RUNTIME_MAX_DATA_REACTORS - 1U) {
-			dataCount = HFS_RUNTIME_MAX_DATA_REACTORS - 1U;
+		if (dataCount > 4U) {
+			dataCount = 4U;
 		}
 		return dataCount + 1U;
 	}
@@ -553,17 +584,6 @@ static uint32_t hfsRuntimeDataReactorCountEnv(void) {
 		return 1;
 	}
 	return (uint32_t)parsed;
-}
-
-/* Parse a boolean environment switch with a safe enabled default. */
-static bool hfsRuntimeBoolEnv(const char *name, bool defaultValue) {
-	const char *value = getenv(name);
-
-	if (value == NULL || value[0] == '\0') {
-		return defaultValue;
-	}
-	return strcmp(value, "0") != 0 && strcasecmp(value, "false") != 0 &&
-		strcasecmp(value, "off") != 0 && strcasecmp(value, "no") != 0;
 }
 
 /* Parse a bounded per-reactor queue depth for POSIX backpressure. */
@@ -601,6 +621,44 @@ static uint64_t hfsRuntimeDataStripeBytesEnv(void) {
 	return (uint64_t)parsed << 10;
 }
 
+/* Parse the bounded idle poll backoff in microseconds; zero preserves busy-polling. */
+static uint32_t hfsRuntimeIdleBackoffUsEnv(void) {
+	const char *value = getenv("HFS_REACTOR_IDLE_BACKOFF_US");
+	char *end = NULL;
+	unsigned long parsed;
+
+	if (value == NULL || value[0] == '\0') {
+		return 0;
+	}
+	errno = 0;
+	parsed = strtoul(value, &end, 10);
+	if (errno != 0 || end == value || *end != '\0' || parsed > 1000000UL) {
+		return 0;
+	}
+	return (uint32_t)parsed;
+}
+
+/* Parse the optional adaptive wait window, expressed in microseconds. */
+static uint64_t hfsRuntimeWaitSpinNsEnv(void) {
+	const char *value = getenv("HFS_WAIT_SPIN_US");
+	char *end = NULL;
+	double parsed;
+
+	if (value == NULL || value[0] == '\0') {
+		value = getenv("HFS_ADAPTIVE_SPIN_US");
+	}
+	if (value == NULL || value[0] == '\0') {
+		return 0;
+	}
+	errno = 0;
+	parsed = strtod(value, &end);
+	if (errno != 0 || end == value || *end != '\0' || parsed != parsed ||
+	    parsed < 0.0 || parsed > 5.0) {
+		return 0;
+	}
+	return (uint64_t)(parsed * 1000.0 + 0.5);
+}
+
 /* Return the optional CPU affinity entry for one data reactor. */
 static int hfsRuntimeDataCpuEnv(unsigned int index) {
 	const char *value = getenv("HFS_DATA_REACTOR_CPUS");
@@ -636,7 +694,8 @@ static int hfsRuntimeDataCpuEnv(unsigned int index) {
 			return -1;
 		}
 	}
-	return -1;
+	/* Missing entries fall back to owner+index only for the explicit pin mode. */
+	return hfsRuntimeBoolEnv("HFS_REACTOR_PIN", false) ? (int)index + 1 : -1;
 }
 
 /* Publish one data reactor's SPDK thread and initialization result. */
@@ -658,6 +717,7 @@ static void *hfsRuntimeDataMain(void *arg) {
 	char name[32];
 	sigset_t previousSignalMask;
 	uint64_t lastPollNs = 0;
+	unsigned int idlePolls = 0;
 	bool signalMaskSaved = false;
 	int rc;
 
@@ -691,7 +751,12 @@ static void *hfsRuntimeDataMain(void *arg) {
 	spdk_set_thread(thread);
 	g_hfsRuntimeDataThread = true;
 	while (!spdk_thread_is_exited(thread)) {
-		int pollResult = spdk_thread_poll(thread, 0, 0);
+		int pollResult;
+
+		pollResult = spdk_thread_poll(thread, 0, 0);
+		atomic_store_explicit(&reactor->lastPollExitNs,
+			hfsStatsTimingFastEnabled() ? hfsStatsNowNs() : 0,
+			memory_order_release);
 
 		/* Poll telemetry is enabled only for the explicit timing profile. */
 		if (hfsStatsTimingFastEnabled()) {
@@ -700,6 +765,31 @@ static void *hfsRuntimeDataMain(void *arg) {
 				nowNs - lastPollNs : 0;
 			hfsStatsRecordReactorPoll(reactor->index, pollResult > 0, gapNs);
 			lastPollNs = nowNs;
+		}
+		if (reactor->idleBackoffUs != 0 && pollResult == 0) {
+			bool idle;
+
+			pthread_mutex_lock(&reactor->batchLock);
+			idle = reactor->queueDepth == 0 && reactor->inflight == 0 &&
+				!reactor->queueClosed;
+			pthread_mutex_unlock(&reactor->batchLock);
+			if (idle) {
+				idlePolls++;
+				if (idlePolls >= 8U) {
+					struct timespec delay = {
+						.tv_sec = reactor->idleBackoffUs / 1000000U,
+						.tv_nsec = (long)(reactor->idleBackoffUs % 1000000U) * 1000L,
+					};
+
+					(void)nanosleep(&delay, NULL);
+					idlePolls = 0;
+				}
+			} else {
+				idlePolls = 0;
+			}
+		} else if (pollResult != 0) {
+			/* A message or completion immediately returns to busy polling. */
+			idlePolls = 0;
 		}
 	}
 	g_hfsRuntimeDataThread = false;
@@ -746,6 +836,7 @@ static int hfsRuntimeStartDataReactors(void) {
 
 		reactor->index = i;
 		reactor->cpu = hfsRuntimeDataCpuEnv(i - 1U);
+		reactor->idleBackoffUs = hfsRuntimeIdleBackoffUsEnv();
 		pthread_mutex_init(&reactor->lock, NULL);
 		pthread_cond_init(&reactor->stateChanged, NULL);
 		pthread_mutex_init(&reactor->batchLock, NULL);
@@ -844,6 +935,7 @@ static void hfsRuntimeStopDataReactors(void) {
 /* Start the owner pthread once and wait for SPDK initialization. */
 int hfsRuntimeStart(void) {
 	const char *batchEnv;
+	const char *waitMode;
 	int rc;
 
 	HFS_RUNTIME_STATE_LOCK(&g_runtime.lock);
@@ -862,6 +954,11 @@ int hfsRuntimeStart(void) {
 	g_runtime.batchEnabled = (batchEnv == NULL || strcmp(batchEnv, "0") != 0) &&
 		g_runtime.posixQueueEnabled;
 	g_runtime.dataStripeBytes = hfsRuntimeDataStripeBytesEnv();
+	waitMode = getenv("HFS_WAIT_MODE");
+	g_runtime.waitModeAdaptive = waitMode != NULL &&
+		!strcasecmp(waitMode, "adaptive");
+	g_runtime.waitSpinNs = g_runtime.waitModeAdaptive ?
+		hfsRuntimeWaitSpinNsEnv() : 0;
 
 	rc = pthread_create(&g_runtime.owner, NULL, hfsRuntimeOwnerMain, NULL);
 	if (rc != 0) {
@@ -1432,6 +1529,25 @@ uint32_t hfsRuntimeDataQueueDepth(uint32_t reactorId) {
 	return value;
 }
 
+/* Estimate scheduler or poll delay using the previous poll completion timestamp. */
+uint64_t hfsRuntimeDataPollGapNs(uint32_t reactorId) {
+	HfsRuntimeDataReactor *reactor;
+	uint64_t lastPollExitNs;
+	uint64_t nowNs;
+
+	if (!hfsStatsTimingFastEnabled() || reactorId == 0 ||
+	    g_runtime.dataReactors == NULL ||
+	    reactorId >= g_runtime.dataReactorCount) {
+		return 0;
+	}
+	reactor = &g_runtime.dataReactors[reactorId - 1U];
+	lastPollExitNs = atomic_load_explicit(&reactor->lastPollExitNs,
+		memory_order_acquire);
+	nowNs = hfsStatsNowNs();
+	return lastPollExitNs != 0 && nowNs >= lastPollExitNs ?
+		nowNs - lastPollExitNs : 0;
+}
+
 /* Mark subsystem setup complete so shutdown can run the matching finalizer. */
 void hfsRuntimeMarkSubsystemReady(void) {
 	atomic_store_explicit(&g_runtime.subsystemsReady, true,
@@ -1595,32 +1711,44 @@ void hfsRuntimeCompletionReset(HfsCompletion *completion) {
 
 /* Complete one request and wake any blocked business thread. */
 void hfsRuntimeCompletionComplete(HfsCompletion *completion) {
-	HFS_STATS_SPDK_COMPLETE();
+	bool diagnostics;
+
+	if (completion == NULL) {
+		return;
+	}
+	diagnostics = hfsStatsEnabledFast() || hfsStatsTimingFastEnabled() ||
+		hfsTraceEnabledFast();
+	if (hfsStatsEnabledFast()) {
+		HFS_STATS_SPDK_COMPLETE();
+	}
 	hfsRuntimeDataCreditRelease(completion);
-	if (!hfsRuntimeIsOwnerThread() &&
+	if (diagnostics && !hfsRuntimeIsOwnerThread() &&
 	    !atomic_exchange_explicit(&g_ownerViolationLogged, true, memory_order_relaxed)) {
 		HFS_LOG_ERROR("SPDK completion arrived outside owner thread");
 	}
 	atomic_store_explicit(&completion->state, HFS_COMPLETION_DONE, memory_order_release);
-	hfsProfileChildWake(completion == NULL ? NULL : completion->profileChild);
-	/* Record the wake immediately before futex wake so caller handoff is visible. */
-	hfsTraceEmitDetail(HFS_TRACE_COMPLETION_WAKE,
-		(HfsTraceOperation)completion->traceOperation,
-		(HfsTraceBufferKind)completion->traceBufferKind,
-		completion->traceRequestId, completion->traceParentId,
-		completion->traceInodeId, completion->traceOffset,
-		completion->traceBytes, 0,
-		(uint32_t)atomic_load_explicit(&g_runtime.queued, memory_order_relaxed),
-		0, 0, 0, 0, 0, HFS_TRACE_WAKE_COMPLETION,
-		completion->traceMetadataOperation, 0, 0);
+	if (diagnostics) {
+		hfsProfileChildWake(completion->profileChild);
+		/* Record the wake immediately before futex wake for diagnostics. */
+		hfsTraceEmitDetail(HFS_TRACE_COMPLETION_WAKE,
+			(HfsTraceOperation)completion->traceOperation,
+			(HfsTraceBufferKind)completion->traceBufferKind,
+			completion->traceRequestId, completion->traceParentId,
+			completion->traceInodeId, completion->traceOffset,
+			completion->traceBytes, 0,
+			(uint32_t)atomic_load_explicit(&g_runtime.queued, memory_order_relaxed),
+			0, 0, 0, 0, 0, HFS_TRACE_WAKE_COMPLETION,
+			completion->traceMetadataOperation, 0, 0);
+	}
 	hfsRuntimeFutexWake(completion);
 }
 
-/* Wait for one request without consuming CPU in the calling thread. */
+/* Wait for one request with an optional bounded adaptive spin before futex sleep. */
 bool hfsRuntimeCompletionWait(HfsCompletion *completion, uint32_t timeoutMs) {
 	struct timespec deadline;
 	struct timespec remaining;
 	uint64_t traceStartNs = hfsTraceNowNs();
+	uint64_t spinStartNs;
 	int expected;
 	int rc;
 	bool completed = true;
@@ -1637,6 +1765,21 @@ bool hfsRuntimeCompletionWait(HfsCompletion *completion, uint32_t timeoutMs) {
 
 	clock_gettime(CLOCK_MONOTONIC, &deadline);
 	hfsRuntimeAddMs(&deadline, timeoutMs);
+	if (g_runtime.waitModeAdaptive && g_runtime.waitSpinNs != 0 &&
+	    atomic_load_explicit(&completion->state, memory_order_acquire) ==
+		HFS_COMPLETION_PENDING) {
+		spinStartNs = hfsStatsNowNs();
+		while (atomic_load_explicit(&completion->state, memory_order_acquire) ==
+		       HFS_COMPLETION_PENDING) {
+			uint64_t nowNs = hfsStatsNowNs();
+
+			if (spinStartNs == 0 || nowNs < spinStartNs ||
+			    nowNs - spinStartNs >= g_runtime.waitSpinNs) {
+				break;
+			}
+			hfsRuntimeCpuRelax();
+		}
+	}
 	while (atomic_load_explicit(&completion->state, memory_order_acquire) !=
 	       HFS_COMPLETION_DONE) {
 		if (!hfsRuntimeRemaining(&deadline, &remaining)) {
