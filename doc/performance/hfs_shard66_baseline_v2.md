@@ -49,3 +49,15 @@ failed formal sample makes the harness exit nonzero.
   than ten percent of T6–T7 on the best topology, close the backend-poll direction.
 - Use `HFS_IO_POOL_CLASS_COUNTS` only for a gated 16K pool A/B when lease wait exceeds
   three percent. Do not change allocator behavior or introduce registered buffers.
+
+## Revised short task09160035 result
+
+On 2026-09-16 the revised short contract was run against the real NVMe bdev with
+fresh format/prefill, trace/stats disabled, and no active HFS/FIO process before the
+run. The correctness precheck passed. The first A-layout shared-file 4K randread,
+32-job sample returned 58,277.97 IOPS with zero FIO errors and 595% process CPU,
+below the task's 70K stop gate. Its prefill took 272.261 seconds and the following
+prefill exceeded the short-run wall-clock budget, so the harness stopped before B or
+adaptive samples. This is a gate-stop diagnostic result, not a completed median or a
+new performance baseline; defaults remain unchanged. Raw evidence is retained under
+`/mnt/hfs-data/task09160035-short/A` on the VM.

@@ -1526,4 +1526,48 @@ Bug 等级：**致命 > 严重 > 一般**。
 - **验证**：重新运行 IO trace smoke，检查所有必需阶段、copy-in/out、锁/metadata/
   completion 事件及 trace 文件正常生成。
 
+### 89. Shard-66 trace-off 轮询热路径无条件原子写（已修复）
+
+- **状态**：已修复
+- **时间**：2026-09-16
+- **等级**：严重（trace-off/stats-off 下每次 data-reactor poll 都增加一次 release 原子写，显著降低正式 I/O 吞吐）
+- **现象**：Shard-66 正式前置检查的 4K randread 单 job 仅约 1.8K IOPS，明显低于
+  shard-66 前隔离版本约 6.1K IOPS；错误数为 0，但平均延迟约 0.55 ms。
+- **排查过程**：在 `818c872` 的父提交隔离 worktree 上以相同 VM、NVMe、CPU 亲和、
+  FIO 和 HFS 环境复测，得到约 6.1K IOPS。逐项检查 shard-66 差异后，发现
+  `hfsRuntimeDataMain` 在每次 `spdk_thread_poll` 后都执行 `lastPollExitNs` 的
+  release 原子写，即使 stats/trace timing 完全关闭；该变量只供 attribution 的
+  poll-gap 统计使用。
+- **根因**：诊断用 poll-gap 采集没有被 `hfsStatsTimingFastEnabled()` 门控，原子写
+  落入默认 busy-poll 热路径，放大了每次同步 I/O 的 CPU/调度成本。
+- **修复**：仅在 timing profile 开启时记录 `lastPollExitNs`；trace-off/stats-off
+  的正式路径不再执行该原子写，保留 attribution 统计语义。
+- **验证**：修复后重新构建并以正式前置口径复测；确认单 job IOPS 恢复到父版本量级，
+  再继续执行 Shard-66A 矩阵及后续门禁。
+
+### 90. 真实 NVMe 新分配 Blob 的稀疏写间隙泄露旧介质数据（已修复）
+
+- **状态**：已修复
+- **时间**：2026-09-16
+- **等级**：严重（稀疏文件读取可能返回新分配单元中的旧数据，违反 POSIX 零填充语义）
+- **现象**：在真实 NVMe、`uio_pci_generic` 和 `HFS_FORMAT=1` 条件下，
+  `io_fast_path_smoke.sh` 的 sparse-read 检查失败；文件只在 3 个整单元之后写入
+  `tail`，读取前面的稀疏区域得到随机旧数据而不是零。`posix_contract_test.sh`
+  其余契约通过，FIO/请求错误数为 0。
+- **排查过程**：确认 VM hugepages=1024、NVMe BDF `0000:0b:00.0` 已由
+  `uio_pci_generic` 接管，排除 Aio/Malloc 和环境未初始化。检查创建文件和写入路径，
+  发现新建 Blob 默认是 thick Blob；`hfsResizeTo` 只扩展后端空间，写入从旧 EOF
+  跳到更高 offset 时没有先清零 `[oldEOF, offset)` 间隙。真实 NVMe 返回了新分配
+  单元中的旧介质内容，Aio 零文件镜像因此没有暴露该问题。
+- **根因**：HFS 只在截断增长路径清零逻辑文件间隙，普通 `pwrite` 的稀疏扩展路径
+  只更新了物理大小和最终 inode size，未落实 POSIX 的零填充语义。
+- **修复**：在 POSIX 写入口按 inode 的共享逻辑 EOF 判断是否为扩展写；扩展写取得
+  `writeGapLock` 后重新读取 EOF，先扩展 Blob，再通过现有 `hfsIoZeroRange` 清零
+  `[oldEOF, offset)`，并一直持锁到用户数据写入和 inode size 发布完成。这样既保证
+  稀疏间隙为零，也避免并发扩展写互相覆盖；未扩展的 steady-state 写不进入该锁。
+  中间尝试把清零逻辑放进 `hfsIoWriteAt`，曾暴露并发写重叠间隙问题，已移除。
+- **验证**：重新构建后，在真实 NVMe 上复跑 `posix_contract_test.sh` 和
+  `io_fast_path_smoke.sh`，确认 sparse read、并发 positioned write、向量 I/O、
+  KEEP_SIZE、PUNCH_HOLE 以及边缘校验全部通过。
+
 ## 通用经验总结

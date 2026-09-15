@@ -8,6 +8,7 @@ CONFIG="${2:-$ROOT/config/hfs_db_aio.json}"
 IMAGE="${3:-/var/tmp/hfs-shard31.img}"
 RUN_DIR="${4:-/var/tmp/hfs-shard31}"
 LOCK_PATH="$RUN_DIR/hfs.lock"
+BDEV_NAME="${HFS_BDEV_NAME:-Aio0}"
 
 if [[ ! -f "$LIB" || ! -f "$CONFIG" ]]; then
 	echo "usage: $0 [libhfs.so] [config] [image] [run-dir]" >&2
@@ -15,13 +16,18 @@ if [[ ! -f "$LIB" || ! -f "$CONFIG" ]]; then
 fi
 
 mkdir -p "$RUN_DIR"
-EFFECTIVE_CONFIG="$RUN_DIR/hfs_db_aio.json"
-sed "s#\"filename\": \"[^\"]*\"#\"filename\": \"${IMAGE}\"#" \
-	"$CONFIG" > "$EFFECTIVE_CONFIG"
-HFS_RECREATE=1 bash "$ROOT/scripts/db/prepare_hfs_db_bdev.sh" "$IMAGE" 1G
+if [[ "$BDEV_NAME" == "Aio0" ]]; then
+	EFFECTIVE_CONFIG="$RUN_DIR/hfs_db_aio.json"
+	sed "s#\"filename\": \"[^\"]*\"#\"filename\": \"${IMAGE}\"#" \
+		"$CONFIG" > "$EFFECTIVE_CONFIG"
+	HFS_RECREATE=1 bash "$ROOT/scripts/db/prepare_hfs_db_bdev.sh" "$IMAGE" 1G
+else
+	# Use the supplied real-device configuration without creating a file-backed bdev.
+	EFFECTIVE_CONFIG="$CONFIG"
+fi
 
 env LD_PRELOAD="$LIB" HFS_CONFIG_PATH="$EFFECTIVE_CONFIG" \
-	HFS_BDEV_NAME=Aio0 HFS_LOCK_PATH="$LOCK_PATH" HFS_FORMAT=1 \
+	HFS_BDEV_NAME="$BDEV_NAME" HFS_LOCK_PATH="$LOCK_PATH" HFS_FORMAT=1 \
 	python3 - <<'PYEOF'
 import ctypes
 import errno

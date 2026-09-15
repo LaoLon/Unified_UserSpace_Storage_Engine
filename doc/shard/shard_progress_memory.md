@@ -107,7 +107,8 @@
 - 已实现 66A 基线 v2 harness/summary、66B 小核默认拓扑与 `HFS_REACTOR_PIN`、gated idle backoff、66C cacheline completion 与 bounded adaptive wait，以及 66D poll-gap 观测。
 - 实现提交为 `818c872`（`feat: implement shard-66 sync boundary optimizations`），已在 `main`。
 - VM Make/CMake、POSIX/ticket/trace/runtime/metadata/durability/persistent 回归及 MariaDB/RocksDB 缩短端到端 smoke 已通过。
-- 66A 完整五次 NVMe 矩阵和 66B/66C 性能门禁尚未完成；当前 smoke 不作为正式性能结论。
+- 2026-09-16 按修改后的 `task09160035` 短测版在真实 NVMe 上复跑：`posix_contract_test.sh` 和 `io_fast_path_smoke.sh` 均通过；A 布局首个共享文件 4K randread/32-job 样本为 58,277.97 IOPS、595% CPU，低于 70K 停止线，随后按门禁停止，未运行 B 或 adaptive。
+- 因 A 门禁触发，没有采纳新的 topology/pinning/wait-mode 默认值；完整五次 NVMe 矩阵和正式 66B/66C 性能门禁仍未完成。
 - 正式全矩阵入口为 `scripts/db/shard66_baseline_v2.sh`，汇总工具为 `scripts/db/shard66_summary.py`；详细实施记录见 `doc/shard/hfs_posix_sync_boundary_topology_shard_plan.md` 和 `doc/performance/hfs_shard66_baseline_v2.md`。
 
 ## 共享验证边界与性能观测口径

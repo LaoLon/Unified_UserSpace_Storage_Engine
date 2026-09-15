@@ -76,6 +76,7 @@ void hfsInodeRuntimeFini(Hfs *fs) {
 			}
 			pthread_rwlock_destroy(&runtime->syncLock);
 			pthread_mutex_destroy(&runtime->appendLock);
+			pthread_mutex_destroy(&runtime->writeGapLock);
 			pthread_mutex_destroy(&runtime->resizeLock);
 			free(runtime);
 			runtime = next;
@@ -128,8 +129,18 @@ HfsInodeRuntime *hfsInodeRuntimeGet(Hfs *fs, uint64_t inodeId) {
 		errno = rc;
 		return NULL;
 	}
+	rc = pthread_mutex_init(&runtime->writeGapLock, NULL);
+	if (rc != 0) {
+		pthread_mutex_destroy(&runtime->appendLock);
+		pthread_mutex_destroy(&runtime->resizeLock);
+		free(runtime);
+		pthread_mutex_unlock(&fs->inodeRuntimeLock);
+		errno = rc;
+		return NULL;
+	}
 	rc = pthread_rwlock_init(&runtime->syncLock, NULL);
 	if (rc != 0) {
+		pthread_mutex_destroy(&runtime->writeGapLock);
 		pthread_mutex_destroy(&runtime->appendLock);
 		pthread_mutex_destroy(&runtime->resizeLock);
 		free(runtime);
@@ -140,6 +151,7 @@ HfsInodeRuntime *hfsInodeRuntimeGet(Hfs *fs, uint64_t inodeId) {
 	rc = pthread_mutex_init(&runtime->ticketLock, NULL);
 	if (rc != 0) {
 		pthread_rwlock_destroy(&runtime->syncLock);
+		pthread_mutex_destroy(&runtime->writeGapLock);
 		pthread_mutex_destroy(&runtime->appendLock);
 		pthread_mutex_destroy(&runtime->resizeLock);
 		free(runtime);
@@ -151,6 +163,7 @@ HfsInodeRuntime *hfsInodeRuntimeGet(Hfs *fs, uint64_t inodeId) {
 	if (rc != 0) {
 		pthread_mutex_destroy(&runtime->ticketLock);
 		pthread_rwlock_destroy(&runtime->syncLock);
+		pthread_mutex_destroy(&runtime->writeGapLock);
 		pthread_mutex_destroy(&runtime->appendLock);
 		pthread_mutex_destroy(&runtime->resizeLock);
 		free(runtime);
@@ -165,6 +178,7 @@ HfsInodeRuntime *hfsInodeRuntimeGet(Hfs *fs, uint64_t inodeId) {
 		pthread_cond_destroy(&runtime->ticketAvailable);
 		pthread_mutex_destroy(&runtime->ticketLock);
 		pthread_rwlock_destroy(&runtime->syncLock);
+		pthread_mutex_destroy(&runtime->writeGapLock);
 		pthread_mutex_destroy(&runtime->appendLock);
 		pthread_mutex_destroy(&runtime->resizeLock);
 		free(runtime);
@@ -186,6 +200,7 @@ HfsInodeRuntime *hfsInodeRuntimeGet(Hfs *fs, uint64_t inodeId) {
 				pthread_cond_destroy(&runtime->ticketAvailable);
 				pthread_mutex_destroy(&runtime->ticketLock);
 				pthread_rwlock_destroy(&runtime->syncLock);
+				pthread_mutex_destroy(&runtime->writeGapLock);
 				pthread_mutex_destroy(&runtime->appendLock);
 				pthread_mutex_destroy(&runtime->resizeLock);
 				free(runtime);

@@ -754,15 +754,14 @@ static void *hfsRuntimeDataMain(void *arg) {
 		int pollResult;
 
 		pollResult = spdk_thread_poll(thread, 0, 0);
-		atomic_store_explicit(&reactor->lastPollExitNs,
-			hfsStatsTimingFastEnabled() ? hfsStatsNowNs() : 0,
-			memory_order_release);
 
 		/* Poll telemetry is enabled only for the explicit timing profile. */
 		if (hfsStatsTimingFastEnabled()) {
 			uint64_t nowNs = hfsStatsNowNs();
 			uint64_t gapNs = lastPollNs != 0 && nowNs >= lastPollNs ?
 				nowNs - lastPollNs : 0;
+			atomic_store_explicit(&reactor->lastPollExitNs, nowNs,
+				memory_order_release);
 			hfsStatsRecordReactorPoll(reactor->index, pollResult > 0, gapNs);
 			lastPollNs = nowNs;
 		}

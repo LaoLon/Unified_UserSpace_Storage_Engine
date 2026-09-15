@@ -280,3 +280,19 @@ IOPS = 线程数 / 平均单请求时延
   randread/randwrite, jobs 1/8). The full 5-run 4K/16K/64K × two file models ×
   randread/randwrite × jobs 1/8/16/32 matrix remains a formal long-run measurement; no
   performance gate or default adaptive/pinning recommendation is claimed from the smoke.
+
+### 13.6 Revised short task09160035 rerun
+
+- The revised short-test contract was executed on the real NVMe backend only, with
+  `Nvme0n1`, `uio_pci_generic`, `vm.nr_hugepages=1024`, fresh format/prefill per sample,
+  trace/stats off, and no concurrent HFS/FIO processes. The quick
+  `posix_contract_test.sh` and `io_fast_path_smoke.sh` correctness checks both passed.
+- The first A-layout formal sample (five total reactors, data CPUs 1-4, shared file, 4K
+  randread, 32 jobs) measured `58,277.97 IOPS`, zero FIO errors, and `595%` process CPU.
+  Its fresh 256 MiB-per-job shared-file prefill took `272.261 s`; the next prefill exceeded
+  the short-run wall-clock budget. Because the first A randread is below the task's
+  `70K IOPS` stop gate, B topology and adaptive-wait samples were not run.
+- No topology, pinning, or wait-mode default was changed. The full five-run matrix and
+  its formal performance decision remain open. The real-NVMe sparse-extension issue found
+  during the rerun is recorded as bug 90; its concurrent-safe EOF-gap fix is included in
+  the current working changes and passed the quick correctness suite.

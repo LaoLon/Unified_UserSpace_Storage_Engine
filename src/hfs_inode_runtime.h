@@ -25,6 +25,8 @@ typedef struct hfs_inode_runtime {
 	_Atomic uint64_t pendingCtimeNs;
 	_Atomic bool pendingMetadata;
 	pthread_mutex_t resizeLock;
+	/* Serialize writes that must materialize an EOF gap before publication. */
+	pthread_mutex_t writeGapLock;
 	pthread_mutex_t appendLock;
 	pthread_rwlock_t syncLock;
 	/* Serialize overlapping ranges without taking the global hash buckets. */

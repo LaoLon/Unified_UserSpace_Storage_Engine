@@ -768,6 +768,48 @@ static ssize_t hfsWritevAt(HfsOpenFile *openFile, const struct iovec *iov,
 	return hfsWritevBounceAt(openFile, iov, iovcnt, total, offset);
 }
 
+/* Serialize EOF-extension writes while their zero-filled gaps are materialized. */
+static int hfsPrepareWriteGap(HfsOpenFile *openFile, uint64_t offset,
+			      uint64_t end, bool *lockHeld) {
+	HfsInodeRuntime *runtime;
+	uint64_t logicalSize;
+
+	if (lockHeld == NULL || openFile == NULL || openFile->file == NULL ||
+		end < offset) {
+		errno = end < offset ? EOVERFLOW : EINVAL;
+		return -1;
+	}
+	*lockHeld = false;
+	runtime = openFile->runtime;
+	if (runtime == NULL) {
+		return hfsResizeTo(openFile->file, end);
+	}
+	logicalSize = hfsInodeRuntimeGetLogicalSize(runtime);
+	if (end <= logicalSize) {
+		return hfsResizeTo(openFile->file, end);
+	}
+	pthread_mutex_lock(&runtime->writeGapLock);
+	logicalSize = hfsInodeRuntimeGetLogicalSize(runtime);
+	if (hfsResizeTo(openFile->file, end) != 0) {
+		pthread_mutex_unlock(&runtime->writeGapLock);
+		return -1;
+	}
+	if (offset > logicalSize &&
+		hfsIoZeroRange(openFile->file, logicalSize, offset - logicalSize) != 0) {
+		pthread_mutex_unlock(&runtime->writeGapLock);
+		return -1;
+	}
+	*lockHeld = true;
+	return 0;
+}
+
+/* Release the EOF-extension gate after write data and inode size publication. */
+static void hfsReleaseWriteGap(HfsOpenFile *openFile, bool lockHeld) {
+	if (lockHeld && openFile != NULL && openFile->runtime != NULL) {
+		pthread_mutex_unlock(&openFile->runtime->writeGapLock);
+	}
+}
+
 /* Publish a non-extending write through runtime state without global locking. */
 static bool hfsPublishWriteEndFast(HfsOpenFile *openFile, uint64_t end) {
 	HfsInodeRuntime *runtime;
@@ -1433,6 +1475,7 @@ ssize_t hfs_lib_write(int fd, const void *buf, size_t count) {
 	struct hfs_inode *in;
 	uint64_t writeOffset;
 	bool append;
+	bool writeGapHeld = false;
 	ssize_t n;
 	int savedErrno;
 
@@ -1483,10 +1526,20 @@ ssize_t hfs_lib_write(int fd, const void *buf, size_t count) {
 		}
 		pthread_rwlock_unlock(&g_metaLock);
 	}
+	if (hfsPrepareWriteGap(openFile, writeOffset,
+		writeOffset + (uint64_t)count, &writeGapHeld) != 0) {
+		pthread_mutex_unlock(&openFile->ioLock);
+		if (append) {
+			pthread_mutex_unlock(&openFile->runtime->appendLock);
+		}
+		hfs_release_open_file(openFile);
+		return -1;
+	}
 	n = hfsWriteAt(openFile->file, buf, count, writeOffset);
 	if (n <= 0) {
 		savedErrno = errno;
 		HFS_LOG_ERROR("sequential write failed n=%zd errno=%d", n, savedErrno);
+		hfsReleaseWriteGap(openFile, writeGapHeld);
 		pthread_mutex_unlock(&openFile->ioLock);
 		if (append) {
 			pthread_mutex_unlock(&openFile->runtime->appendLock);
@@ -1497,6 +1550,7 @@ ssize_t hfs_lib_write(int fd, const void *buf, size_t count) {
 	}
 	openFile->offset = writeOffset + (uint64_t)n;
 	hfsPublishWriteEnd(openFile, openFile->offset);
+	hfsReleaseWriteGap(openFile, writeGapHeld);
 	pthread_mutex_unlock(&openFile->ioLock);
 	if (append) {
 		pthread_mutex_unlock(&openFile->runtime->appendLock);
@@ -1573,6 +1627,7 @@ ssize_t hfs_lib_pwrite(int fd, const void *buf, size_t count, off_t offset) {
 	struct hfs_inode *in;
 	uint64_t writeOffset;
 	bool append;
+	bool writeGapHeld = false;
 	ssize_t n;
 	int savedErrno;
 	HfsIoProfile profile = {0};
@@ -1634,10 +1689,19 @@ ssize_t hfs_lib_pwrite(int fd, const void *buf, size_t count, off_t offset) {
 		}
 		pthread_rwlock_unlock(&g_metaLock);
 	}
+	if (hfsPrepareWriteGap(openFile, writeOffset,
+		writeOffset + (uint64_t)count, &writeGapHeld) != 0) {
+		if (append) {
+			pthread_mutex_unlock(&openFile->runtime->appendLock);
+		}
+		hfs_release_open_file(openFile);
+		return -1;
+	}
 	n = hfsWriteAt(openFile->file, buf, count, writeOffset);
 	if (n <= 0) {
 		savedErrno = errno;
 		HFS_LOG_ERROR("positioned write failed n=%zd errno=%d", n, savedErrno);
+		hfsReleaseWriteGap(openFile, writeGapHeld);
 		if (append) {
 			pthread_mutex_unlock(&openFile->runtime->appendLock);
 		}
@@ -1647,6 +1711,7 @@ ssize_t hfs_lib_pwrite(int fd, const void *buf, size_t count, off_t offset) {
 		return -1;
 	}
 	hfsPublishWriteEnd(openFile, writeOffset + (uint64_t)n);
+	hfsReleaseWriteGap(openFile, writeGapHeld);
 	if (append) {
 		pthread_mutex_unlock(&openFile->runtime->appendLock);
 	}
@@ -1700,6 +1765,7 @@ ssize_t hfs_lib_writev(int fd, const struct iovec *iov, int iovcnt) {
 	ssize_t n;
 	size_t total;
 	bool append;
+	bool writeGapHeld = false;
 
 	if (hfsIovTotal(iov, iovcnt, &total) != 0) {
 		return -1;
@@ -1730,11 +1796,21 @@ ssize_t hfs_lib_writev(int fd, const struct iovec *iov, int iovcnt) {
 		hfs_release_open_file(openFile);
 		return -1;
 	}
+	if (hfsPrepareWriteGap(openFile, writeOffset,
+		writeOffset + (uint64_t)total, &writeGapHeld) != 0) {
+		if (append) {
+			pthread_mutex_unlock(&openFile->runtime->appendLock);
+		}
+		pthread_mutex_unlock(&openFile->ioLock);
+		hfs_release_open_file(openFile);
+		return -1;
+	}
 	n = hfsWritevAt(openFile, iov, iovcnt, total, writeOffset);
 	if (n > 0) {
 		openFile->offset = writeOffset + (uint64_t)n;
 		hfsPublishWriteEnd(openFile, openFile->offset);
 	}
+	hfsReleaseWriteGap(openFile, writeGapHeld);
 	if (append) {
 		pthread_mutex_unlock(&openFile->runtime->appendLock);
 	}
@@ -1786,6 +1862,7 @@ ssize_t hfs_lib_pwritev(int fd, const struct iovec *iov, int iovcnt,
 	ssize_t n;
 	size_t total;
 	bool append;
+	bool writeGapHeld = false;
 
 	if (offset < 0 || hfsIovTotal(iov, iovcnt, &total) != 0) {
 		if (offset < 0) {
@@ -1817,10 +1894,19 @@ ssize_t hfs_lib_pwritev(int fd, const struct iovec *iov, int iovcnt,
 		hfs_release_open_file(openFile);
 		return -1;
 	}
+	if (hfsPrepareWriteGap(openFile, writeOffset,
+		writeOffset + (uint64_t)total, &writeGapHeld) != 0) {
+		if (append) {
+			pthread_mutex_unlock(&openFile->runtime->appendLock);
+		}
+		hfs_release_open_file(openFile);
+		return -1;
+	}
 	n = hfsWritevAt(openFile, iov, iovcnt, total, writeOffset);
 	if (n > 0) {
 		hfsPublishWriteEnd(openFile, writeOffset + (uint64_t)n);
 	}
+	hfsReleaseWriteGap(openFile, writeGapHeld);
 	if (append) {
 		pthread_mutex_unlock(&openFile->runtime->appendLock);
 	}

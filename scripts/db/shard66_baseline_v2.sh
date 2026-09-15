@@ -50,6 +50,7 @@ data_cpus=$DATA_CPUS
 app_cpus=$APP_CPUS
 trace_off_formal=1
 stats_off_formal=1
+hfs_env=$(env | awk '/^HFS_/ {print}' | sort | tr '\n' ';')
 EOF
 
 # Add the filename options for either the shared-file or per-job-file model.
