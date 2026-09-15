@@ -1,0 +1,952 @@
+# HFS 第三阶段 Reactor / Backend 并发优化任务单
+
+## 0. 本阶段核心结论
+
+上一阶段数据已经排除或降低了部分嫌疑：
+
+### Ticket 暂不作为主优化对象
+
+ticket/range/none 对 steady-state IOPS 的差异较小：
+
+```text
+read 32:
+ticket 89.9k
+range  92.4k
+none   91.1k
+
+write 32:
+ticket 68.4k
+range  68.9k
+none   69.1k
+```
+
+因此：
+
+```text
+不要重构 ticket scheduler。
+```
+
+现有 ticket lock/scan 开销可以后续优化，但不属于当前 P0。
+
+---
+
+### Open-file/metadata 暂不处理
+
+T0-T1 很小，不是当前主要问题。
+
+---
+
+### 当前最重要现象
+
+随着同步 worker 增长：
+
+```text
+T6-T7:
+read:
+1 job   43 us
+8 job  116 us
+16 job 170 us
+32 job 340 us
+
+write:
+1 job   48 us
+8 job  134 us
+16 job 230 us
+32 job 480 us
+```
+
+T6-T7 定义为：
+
+```text
+spdk_blob_io_read/write submit
+        ↓
+SPDK completion callback
+```
+
+它不是 POSIX wake latency。
+
+其中可能包含：
+
+```text
+Blobstore queue
+bdev queue
+NVMe queue
+per-reactor io_channel
+NVMe qpair
+device latency
+completion polling delay
+reactor scheduling
+```
+
+需要进一步拆分。
+
+---
+
+### Reactor 数量是当前最强性能信号
+
+固定 CPU affinity 条件：
+
+```text
+owner = CPU0
+application = CPU5-7
+```
+
+结果：
+
+```text
+            2 reactor       4 reactor
+
+read         108.7k           87.4k
+write         90.6k           67.9k
+
+CPU read       445%            657%
+CPU write      428%            629%
+```
+
+2 reactor 相比 4 reactor：
+
+```text
+read  ≈ +24%
+write ≈ +33%
+```
+
+同时 CPU 显著降低。
+
+因此第三阶段首先研究：
+
+```text
+为什么 data reactor 增加反而导致 SPDK backend latency 上升？
+```
+
+---
+
+# P0-1：完整 Reactor Count Matrix
+
+不要直接把默认 reactor 改成 2。
+
+首先测试：
+
+```text
+data reactor =
+1
+2
+3
+4
+```
+
+重点测试：
+
+```text
+4K randread
+4K randwrite
+
+jobs =
+8
+16
+32
+```
+
+每项：
+
+```text
+10s ramp
+30s runtime
+3 runs
+median
+```
+
+---
+
+## 1.1 第一组：固定 application CPU
+
+为了只研究 data reactor 数的影响：
+
+```text
+owner:
+CPU0
+
+application:
+CPU5-7
+```
+
+data reactor：
+
+```text
+1 reactor:
+CPU1
+
+2 reactor:
+CPU1-2
+
+3 reactor:
+CPU1-3
+
+4 reactor:
+CPU1-4
+```
+
+因此低 reactor 数时允许：
+
+```text
+CPU2/3/4 idle
+```
+
+这是故意的。
+
+不要把这些空闲 CPU 分给 application，否则会同时改变两个变量。
+
+该矩阵回答：
+
+```text
+reactor 数本身
+是否影响 backend latency？
+```
+
+---
+
+## 1.2 第二组：最大化整机 CPU 使用率
+
+另外做一个 deployment optimization matrix。
+
+例如：
+
+### 1 data reactor
+
+```text
+CPU0 owner
+CPU1 data
+CPU2-7 application
+```
+
+### 2 data reactor
+
+```text
+CPU0 owner
+CPU1-2 data
+CPU3-7 application
+```
+
+### 3 data reactor
+
+```text
+CPU0 owner
+CPU1-3 data
+CPU4-7 application
+```
+
+### 4 data reactor
+
+```text
+CPU0 owner
+CPU1-4 data
+CPU5-7 application
+```
+
+这一组回答：
+
+```text
+8 vCPU 环境下
+owner/data/application
+如何分配 CPU 才有最高端到端性能？
+```
+
+不要把第一组和第二组结果混为一谈。
+
+---
+
+# P0-2：拆解 T6-T7
+
+现在的：
+
+```text
+T6
+↓
+T7
+```
+
+太粗。
+
+必须进一步区分：
+
+```text
+HFS
+Blobstore
+bdev/NVMe
+reactor completion polling
+```
+
+---
+
+## 2.1 HFS submit 本身
+
+增加：
+
+```text
+TB0 = hfsIoStart entry
+
+TB1 = immediately before spdk_blob_io_read/write
+
+TB2 = immediately after spdk_blob_io_read/write returns
+```
+
+统计：
+
+```text
+TB0-TB1
+TB1-TB2
+```
+
+如果只有 ns/us 级，则排除 HFS submit wrapper。
+
+---
+
+## 2.2 每个 request 保存 backend 信息
+
+记录：
+
+```text
+target reactor id
+channel id
+submit CPU
+completion CPU
+
+reactor inflight at submit
+reactor inflight at completion
+
+global outstanding at submit
+global outstanding at completion
+```
+
+必须区分每个 data reactor。
+
+---
+
+## 2.3 使用 SPDK trace 定位 backend
+
+优先使用 SPDK 已有 tracepoint。
+
+不要第一步修改 SPDK 源码。
+
+需要尝试获得：
+
+```text
+blob submit
+bdev submit
+NVMe/qpair submit
+NVMe completion
+bdev completion
+blob completion
+HFS callback
+```
+
+如果当前 SPDK trace 无法完整提供这些边界，再考虑增加最小 instrumentation。
+
+最终希望近似得到：
+
+```text
+HFS blob submit
+      |
+      | blob overhead
+      v
+bdev submit
+      |
+      | bdev/NVMe queue + device
+      v
+NVMe completion
+      |
+      | completion propagation
+      v
+blob callback
+      |
+      v
+HFS hfsIoDone
+```
+
+---
+
+# P0-3：Per-Reactor 状态统计
+
+当前不能只看全局 outstanding。
+
+每个 data reactor 分别输出：
+
+```text
+reactor_id
+
+submit_count
+completion_count
+
+IOPS
+
+inflight:
+avg
+p50
+p95
+p99
+max
+
+queue depth:
+avg
+p50
+p95
+p99
+max
+
+batch size:
+avg
+p50
+p99
+
+T4-T5:
+avg
+p99
+
+T6-T7:
+avg
+p50
+p95
+p99
+
+poll calls/s
+poll busy count
+poll idle count
+
+CPU utilization
+```
+
+---
+
+## 3.1 检查 load balance
+
+输出：
+
+```text
+reactor0 requests %
+reactor1 requests %
+reactor2 requests %
+reactor3 requests %
+```
+
+判断当前：
+
+```text
+blobId + logical stripe
+```
+
+hash 是否真的均衡。
+
+如果出现：
+
+```text
+reactor0 = 45%
+reactor1 = 20%
+reactor2 = 20%
+reactor3 = 15%
+```
+
+需要单独分析 hash。
+
+如果接近：
+
+```text
+25/25/25/25
+```
+
+则不是负载倾斜。
+
+---
+
+# P0-4：研究 io_channel / NVMe qpair 数量
+
+这是本轮重点。
+
+确认：
+
+```text
+1 data reactor
+对应多少 SPDK io_channel？
+
+2 data reactor
+对应多少？
+
+4 data reactor
+对应多少？
+```
+
+继续确认最终 NVMe backend：
+
+```text
+每个 data channel
+是否对应独立 NVMe qpair？
+```
+
+输出实际关系：
+
+```text
+data reactor
+    ↓
+blob io channel
+    ↓
+bdev io channel
+    ↓
+NVMe qpair
+```
+
+回答：
+
+```text
+data reactor=4
+是不是实际创建了 4 套 backend submission context/qpair？
+```
+
+---
+
+## 4.1 测试 raw SPDK 多 channel/qpair scaling
+
+这是非常重要的对照实验。
+
+现在 raw Blobstore benchmark 主要是：
+
+```text
+单 SPDK execution context
+QD32
+```
+
+需要增加：
+
+```text
+1 channel
+2 channel
+4 channel
+```
+
+总 outstanding 始终保持：
+
+```text
+32
+```
+
+例如：
+
+```text
+1 channel × QD32
+
+2 channels × QD16
+
+4 channels × QD8
+```
+
+测试：
+
+```text
+4K randread
+4K randwrite
+```
+
+输出：
+
+```text
+IOPS
+avg latency
+p99
+CPU
+```
+
+---
+
+## 判断规则
+
+如果 raw Blobstore 也出现：
+
+```text
+1 channel > 2 channel > 4 channel
+```
+
+或者：
+
+```text
+2 channel > 4 channel
+```
+
+说明问题主要不是 HFS。
+
+而是：
+
+```text
+当前 NVMe / VM / SPDK backend
+对多 channel/qpair scaling 不好
+```
+
+HFS 应该根据硬件调整 reactor/channel 数。
+
+---
+
+如果：
+
+```text
+raw Blobstore:
+4 channel >= 2 channel
+
+但 HFS:
+2 reactor >> 4 reactor
+```
+
+则问题在 HFS：
+
+```text
+reactor scheduling
+ingress
+channel usage
+completion
+```
+
+继续进入 P0-5。
+
+---
+
+# P0-5：区分 Device Latency 和 Completion Poll Delay
+
+T6-T7 当前混合了：
+
+```text
+设备完成时间
++
+reactor 发现 completion 的时间
+```
+
+需要尽可能拆开。
+
+如果 SPDK trace 可以获得 NVMe CQ completion：
+
+定义：
+
+```text
+TN0 = NVMe command submit
+TN1 = NVMe completion observed by NVMe driver
+TN2 = HFS hfsIoDone callback
+```
+
+这样：
+
+```text
+TN1-TN0
+≈ NVMe/backend service
+
+TN2-TN1
+≈ SPDK completion propagation
+```
+
+---
+
+如果无法直接获得 TN1：
+
+至少统计 data reactor poll loop：
+
+```text
+last_poll_enter
+last_poll_exit
+poll gap
+```
+
+在 callback 时记录：
+
+```text
+time_since_last_poll
+```
+
+检查 4-reactor 情况是否存在异常 poll gap。
+
+---
+
+# P0-6：重新定义当前最佳并发点
+
+不要继续默认：
+
+```text
+numjobs=32
+```
+
+就是 HFS 最重要 benchmark。
+
+现有数据已经表明：
+
+```text
+read:
+16 jobs = 87.8k
+32 jobs = 87.2k
+
+write:
+16 jobs = 70.0k
+32 jobs = 68.0k
+```
+
+因此当前性能 knee 在：
+
+```text
+约 16 synchronous workers
+```
+
+后续正式性能报告必须同时包含：
+
+```text
+jobs=16
+jobs=32
+```
+
+其中：
+
+```text
+16 = throughput knee / practical configuration
+
+32 = overload / tail-latency stress
+```
+
+不能只用 32 jobs 优化，然后宣称系统整体性能更优。
+
+---
+
+# P1：Completion wait 暂缓正式修改
+
+当前：
+
+```text
+T8-T9
+
+jobs=1:
+≈18 us
+
+jobs=32:
+≈100 us
+```
+
+说明它明显受并发/CPU 调度影响。
+
+因此在 reactor topology 稳定前：
+
+```text
+不要正式实现 adaptive spin。
+不要实现 pure spin。
+不要做复杂 wake batching。
+```
+
+完成 P0-1～P0-5 后，再重新测：
+
+```text
+T8-T9
+```
+
+如果使用最佳 reactor 配置以后仍然：
+
+```text
+> 30-50 us
+```
+
+再进入 completion 优化。
+
+---
+
+# P1-2：Ticket 保持现状
+
+当前 ordering A/B 已表明：
+
+```text
+ticket 并不是当前吞吐主瓶颈。
+```
+
+保留：
+
+```text
+HFS_ORDERING=ticket
+```
+
+作为正式默认。
+
+range/none 继续作为诊断模式。
+
+不要删除现有 ticket correctness。
+
+ticket lock/scan 微优化以后再处理。
+
+---
+
+# P1-3：Staging copy 保持待办
+
+DMA direct 仍然值得后续优化。
+
+但必须等 reactor/backend 问题处理后重新测。
+
+不要现在修改 allocator。
+
+---
+
+# 本轮 Codex 只执行
+
+第一批严格限制为：
+
+```text
+P0-1 reactor count matrix
+
+P0-2 T6-T7 backend decomposition
+
+P0-3 per-reactor statistics
+
+P0-4 raw Blobstore multi-channel/qpair comparison
+
+P0-5 device/completion propagation analysis
+```
+
+暂时不要：
+
+```text
+实现 poll_ring
+修改 ticket scheduler
+实现 adaptive spin
+修改 malloc/allocator
+删除 POSIX durability
+```
+
+---
+
+# 最终需要返回的第一张表
+
+## HFS reactor scaling
+
+| reactors | jobs | read IOPS | write IOPS | read T6-T7 | write T6-T7 | read p99 | write p99 | CPU |
+| -------: | ---: | --------: | ---------: | ---------: | ----------: | -------: | --------: | --: |
+|        1 |    8 |           |            |            |             |          |           |     |
+|        1 |   16 |           |            |            |             |          |           |     |
+|        1 |   32 |           |            |            |             |          |           |     |
+|        2 |    8 |           |            |            |             |          |           |     |
+|        2 |   16 |           |            |            |             |          |           |     |
+|        2 |   32 |           |            |            |             |          |           |     |
+|        3 |    8 |           |            |            |             |          |           |     |
+|        3 |   16 |           |            |            |             |          |           |     |
+|        3 |   32 |           |            |            |             |          |           |     |
+|        4 |    8 |           |            |            |             |          |           |     |
+|        4 |   16 |           |            |            |             |          |           |     |
+|        4 |   32 |           |            |            |             |          |           |     |
+
+---
+
+# 第二张表
+
+## Raw Blobstore channel scaling
+
+| channels | QD/channel | total QD | read IOPS | write IOPS | read latency | write latency | CPU |
+| -------: | ---------: | -------: | --------: | ---------: | -----------: | ------------: | --: |
+|        1 |         32 |       32 |           |            |              |               |     |
+|        2 |         16 |       32 |           |            |              |               |     |
+|        4 |          8 |       32 |           |            |              |               |     |
+
+---
+
+# 第三张表
+
+## Per-reactor distribution
+
+| reactor | request % | IOPS | inflight avg | inflight p99 | T4-T5 avg | T6-T7 avg | CPU |
+| ------: | --------: | ---: | -----------: | -----------: | --------: | --------: | --: |
+|      R0 |           |      |              |              |           |           |     |
+|      R1 |           |      |              |              |           |           |     |
+|      R2 |           |      |              |              |           |           |     |
+|      R3 |           |      |              |              |           |           |     |
+
+---
+
+# 最终必须回答的核心问题
+
+不要只给“哪个数字最高”。
+
+必须回答：
+
+## Q1
+
+为什么：
+
+```text
+2 data reactors
+```
+
+明显优于：
+
+```text
+4 data reactors？
+```
+
+---
+
+## Q2
+
+性能下降发生在：
+
+```text
+HFS reactor layer
+```
+
+还是：
+
+```text
+SPDK Blobstore/bdev/NVMe multi-channel layer？
+```
+
+---
+
+## Q3
+
+T6-T7 增长主要来自：
+
+```text
+设备/backend queue latency
+```
+
+还是：
+
+```text
+completion poll/scheduling delay？
+```
+
+---
+
+## Q4
+
+对于当前 8-vCPU VM：
+
+```text
+最佳 data reactor 数是多少？
+```
+
+并分别给出：
+
+```text
+最高 throughput 配置
+
+最低 p99 配置
+
+最佳 throughput/CPU 配置
+```
+
+---
+
+## Q5
+
+在最佳 reactor topology 下重新测：
+
+```text
+T1-T2
+T4-T5
+T6-T7
+T8-T9
+T9-T10
+```
+
+然后重新决定下一阶段应该优化：
+
+```text
+A. reactor ingress
+B. completion wait
+C. DMA copy
+D. ticket
+E. backend/channel strategy
+```
+
+不得沿用旧优先级，必须基于新数据重新排序。
