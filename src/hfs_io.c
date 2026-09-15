@@ -1798,6 +1798,8 @@ ssize_t hfsIoReadAt(HfsFile *file, uint8_t *buffer, size_t count,
 	bool directEligible;
 	bool ticketActive = false;
 	bool ticketInitialized = false;
+	bool rangeActive = false;
+	HfsPosixOrderingMode ordering;
 	uint64_t traceId;
 	uint64_t traceStartNs;
 	uint64_t previousTraceParent;
@@ -1857,7 +1859,8 @@ ssize_t hfsIoReadAt(HfsFile *file, uint8_t *buffer, size_t count,
 		g_hfsIoTraceOperation = previousTraceOperation;
 		return -1;
 	}
-	if (hfsPosixTicketEnabled()) {
+	ordering = hfsPosixOrderingMode();
+	if (ordering == HFS_POSIX_ORDER_TICKET) {
 		ticketInitialized = hfsPosixTicketInit(&ticket, runtime, file,
 			offset, count, HFS_POSIX_TICKET_READ, traceId) == 0;
 		if (!ticketInitialized || hfsPosixTicketAdmit(&ticket) != 0 ||
@@ -1878,8 +1881,9 @@ ssize_t hfsIoReadAt(HfsFile *file, uint8_t *buffer, size_t count,
 			return -1;
 		}
 		ticketActive = true;
-	} else if (!aligned && hfsIoRangeLock(file, offset, count, false,
-									&guard) != 0) {
+	} else if (ordering != HFS_POSIX_ORDER_NONE &&
+			(ordering == HFS_POSIX_ORDER_RANGE || !aligned) &&
+		hfsIoRangeLock(file, offset, count, false, &guard) != 0) {
 		hfsIoSyncReadUnlock(runtime, &syncTrace);
 		hfsTraceEmit(HFS_TRACE_IO_EXIT, HFS_TRACE_OPERATION_READ,
 			     HFS_TRACE_BUFFER_RMW, 0, traceId, file->inodeId,
@@ -1888,12 +1892,16 @@ ssize_t hfsIoReadAt(HfsFile *file, uint8_t *buffer, size_t count,
 		g_hfsIoTraceParentId = previousTraceParent;
 		g_hfsIoTraceOperation = previousTraceOperation;
 		return -1;
+	} else if (ordering != HFS_POSIX_ORDER_NONE &&
+		(ordering == HFS_POSIX_ORDER_RANGE || !aligned)) {
+		rangeActive = true;
 	}
 	hfsProfileStage(profile, HFS_PROFILE_T2);
 	result = hfsIoReadAtLocked(file, buffer, count, offset,
-					aligned && !ticketActive,
-				   directEligible);
-	if (!ticketActive && !aligned) {
+					ordering != HFS_POSIX_ORDER_NONE && !ticketActive &&
+					!rangeActive,
+					directEligible);
+	if (rangeActive) {
 		hfsIoRangeUnlock(file, &guard);
 	}
 	if (ticketActive) {
@@ -1924,6 +1932,8 @@ ssize_t hfsIoWriteAt(HfsFile *file, const uint8_t *buffer, size_t count,
 	bool directEligible;
 	bool ticketActive = false;
 	bool ticketInitialized = false;
+	bool rangeActive = false;
+	HfsPosixOrderingMode ordering;
 	uint64_t traceId;
 	uint64_t traceStartNs;
 	uint64_t previousTraceParent;
@@ -1993,7 +2003,8 @@ ssize_t hfsIoWriteAt(HfsFile *file, const uint8_t *buffer, size_t count,
 		g_hfsIoTraceOperation = previousTraceOperation;
 		return -1;
 	}
-	if (hfsPosixTicketEnabled()) {
+	ordering = hfsPosixOrderingMode();
+	if (ordering == HFS_POSIX_ORDER_TICKET) {
 		ticketInitialized = hfsPosixTicketInit(&ticket, runtime, file,
 			offset, count, HFS_POSIX_TICKET_WRITE, traceId) == 0;
 		if (!ticketInitialized || hfsPosixTicketAdmit(&ticket) != 0 ||
@@ -2014,8 +2025,9 @@ ssize_t hfsIoWriteAt(HfsFile *file, const uint8_t *buffer, size_t count,
 			return -1;
 		}
 		ticketActive = true;
-	} else if (!aligned && hfsIoRangeLock(file, offset, count, true,
-									&guard) != 0) {
+	} else if (ordering != HFS_POSIX_ORDER_NONE &&
+			(ordering == HFS_POSIX_ORDER_RANGE || !aligned) &&
+		hfsIoRangeLock(file, offset, count, true, &guard) != 0) {
 		hfsIoSyncReadUnlock(runtime, &syncTrace);
 		hfsTraceEmit(HFS_TRACE_IO_EXIT, HFS_TRACE_OPERATION_WRITE,
 			     HFS_TRACE_BUFFER_RMW, 0, traceId, file->inodeId,
@@ -2024,12 +2036,16 @@ ssize_t hfsIoWriteAt(HfsFile *file, const uint8_t *buffer, size_t count,
 		g_hfsIoTraceParentId = previousTraceParent;
 		g_hfsIoTraceOperation = previousTraceOperation;
 		return -1;
+	} else if (ordering != HFS_POSIX_ORDER_NONE &&
+		(ordering == HFS_POSIX_ORDER_RANGE || !aligned)) {
+		rangeActive = true;
 	}
 	hfsProfileStage(profile, HFS_PROFILE_T2);
 	result = hfsIoWriteAtLocked(file, buffer, count, offset,
-					aligned && !ticketActive,
+					ordering != HFS_POSIX_ORDER_NONE && !ticketActive &&
+					!rangeActive,
 				    directEligible);
-	if (!ticketActive && !aligned) {
+	if (rangeActive) {
 		hfsIoRangeUnlock(file, &guard);
 	}
 	if (ticketActive) {

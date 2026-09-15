@@ -1473,4 +1473,24 @@ Bug 等级：**致命 > 严重 > 一般**。
 - **验证**：重新格式化后 A3 4K/8 线程、64 线程读写均通过且 `errors=0`；A4 正式
   4K/32-job 样本随后通过且 `err=0`。结果文档记录了该顺序约束。
 
+### 86. task09150832 绑核样本的 runtime queue depth peak 出现 UINT64_MAX（已隔离）
+
+- **状态**：已隔离（任务报告不使用该字段，待后续单独修复）
+- **时间**：2026-09-15
+- **等级**：一般（仅影响 runtime 统计字段，不影响本轮 I/O 正确性或 submit/complete 守恒）
+- **现象**：正式 NVMe task09150832 的 2-data-reactor/4-data-reactor affinity 样本中，
+  `runtime_queue_depth_peak` 输出为 `18446744073709551615`；同一批样本的
+  `data_reactor_N_submit=..._complete` 逐项闭合，FIO error、SPDK reject 和 HFS errors
+  均为 0。
+- **排查过程**：读取原始 `.stats` 而不是只看汇总，确认异常值来自 HFS 全局
+  `g_runtime.queued` 统计；per-reactor submit/complete、vmstat 的 `r` run queue 和
+  trace stage 数据仍然有效。对比 2-reactor、4-reactor affinity 结果发现异常只落在
+  全局 queue peak 字段，不能据此否定设备 I/O 或 ticket 结果。
+- **根因判断**：runtime 的全局 queued/inflight 统计在 data-reactor batch、direct dispatch
+  混合路径下存在计数减法与入队事件不完全配对的可能，导致 peak 记录到无符号下溢值；
+  本轮没有把这个未经最小复现确认的推断当作产品路径根因。
+- **隔离措施**：结果文档明确剔除该字段，改用 `/usr/bin/vmstat` 的 run queue/context
+  switch 与 per-reactor submit/complete 做并发归因；保留原始 stats 供后续复现，后续应为
+  queued 计数增加饱和减法和配对断言，并补充专门的 runtime counter 单测。
+
 ## 通用经验总结

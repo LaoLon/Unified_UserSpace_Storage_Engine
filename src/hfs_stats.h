@@ -74,6 +74,18 @@ extern _Atomic uint_fast64_t hfsStatsWakeToResumeNs;
 extern bool hfsStatsFastEnabledState;
 extern bool hfsStatsTimingState;
 
+/* Fine-grained ticket timings used by the second-stage attribution task. */
+typedef enum HfsStatsTicketMetric {
+	HFS_STATS_TICKET_ADMIT_LOCK_WAIT = 0,
+	HFS_STATS_TICKET_ADMIT_SCAN,
+	HFS_STATS_TICKET_ADMIT_INSERT,
+	HFS_STATS_TICKET_DEPENDENCY_WAIT,
+	HFS_STATS_TICKET_COMPLETE_LOCK_WAIT,
+	HFS_STATS_TICKET_COMPLETE_SCAN,
+	HFS_STATS_TICKET_WAKE_PROCESSING,
+	HFS_STATS_TICKET_METRIC_COUNT
+} HfsStatsTicketMetric;
+
 /* Lock classes are kept small so each thread can update a fixed shard. */
 typedef enum HfsStatsLockClass {
 	HFS_STATS_LOCK_FD = 0,
@@ -186,7 +198,11 @@ void hfsStatsRecordTicketDependencyWait(uint64_t waitNs);
 /* Record only a ticket wait that actually entered a condition-variable sleep. */
 void hfsStatsRecordTicketRealWait(uint64_t waitNs);
 /* Record the ticket completion scan duration. */
-void hfsStatsRecordTicketCompletion(uint64_t completeNs);
+void hfsStatsRecordTicketCompletion(uint64_t completeNs, uint64_t scanNs,
+					uint32_t scanItems);
+/* Record one fine-grained ticket phase duration and its scan-length bucket. */
+void hfsStatsRecordTicketMetric(HfsStatsTicketMetric metric, uint64_t durationNs);
+void hfsStatsRecordTicketScanLength(bool completion, uint32_t scanItems);
 void hfsStatsRecordTicketPromote(uint32_t count);
 void hfsStatsRecordTicketWake(void);
 /* Record actual data I/O callbacks submitted to and completed by SPDK. */

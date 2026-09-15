@@ -17,11 +17,13 @@
 static pthread_once_t g_hfsPosixTicketConfigOnce = PTHREAD_ONCE_INIT;
 static bool g_hfsPosixTicketEnabled;
 static uint32_t g_hfsPosixTicketLimit;
+static HfsPosixOrderingMode g_hfsPosixOrderingMode;
 
 /* Parse the bounded ticket scheduler configuration once per process. */
 static void hfsPosixTicketConfigInit(void)
 {
 	const char *enabled = getenv("HFS_POSIX_TICKET");
+	const char *ordering = getenv("HFS_ORDERING");
 	const char *limit = getenv("HFS_POSIX_TICKET_DEPTH");
 	char *end = NULL;
 	unsigned long parsed;
@@ -29,6 +31,18 @@ static void hfsPosixTicketConfigInit(void)
 	g_hfsPosixTicketEnabled = enabled == NULL ||
 		(!strcasecmp(enabled, "1") || !strcasecmp(enabled, "true") ||
 		 !strcasecmp(enabled, "yes") || !strcasecmp(enabled, "on"));
+	g_hfsPosixOrderingMode = g_hfsPosixTicketEnabled
+		? HFS_POSIX_ORDER_TICKET : HFS_POSIX_ORDER_RANGE;
+	if (ordering != NULL && ordering[0] != '\0') {
+		if (!strcasecmp(ordering, "ticket")) {
+			g_hfsPosixOrderingMode = HFS_POSIX_ORDER_TICKET;
+		} else if (!strcasecmp(ordering, "range")) {
+			g_hfsPosixOrderingMode = HFS_POSIX_ORDER_RANGE;
+		} else if (!strcasecmp(ordering, "none")) {
+			g_hfsPosixOrderingMode = HFS_POSIX_ORDER_NONE;
+		}
+	}
+	g_hfsPosixTicketEnabled = g_hfsPosixOrderingMode == HFS_POSIX_ORDER_TICKET;
 	g_hfsPosixTicketLimit = HFS_POSIX_TICKET_DEFAULT_LIMIT;
 	if (limit == NULL || limit[0] == '\0') {
 		return;
@@ -52,6 +66,13 @@ bool hfsPosixTicketEnabled(void)
 {
 	pthread_once(&g_hfsPosixTicketConfigOnce, hfsPosixTicketConfigInit);
 	return g_hfsPosixTicketEnabled;
+}
+
+/* Return the configured ordering mode after the one-time environment parse. */
+HfsPosixOrderingMode hfsPosixOrderingMode(void)
+{
+	pthread_once(&g_hfsPosixTicketConfigOnce, hfsPosixTicketConfigInit);
+	return g_hfsPosixOrderingMode;
 }
 
 /* Return true when two tickets must observe completion order. */
@@ -134,6 +155,10 @@ int hfsPosixTicketAdmit(HfsPosixIoTicket *ticket)
 	HfsInodeRuntime *runtime;
 	uint32_t scanItems = 0;
 	uint64_t admitStartNs = hfsStatsTimingFastEnabled() ? hfsStatsNowNs() : 0;
+	uint64_t lockStartNs = admitStartNs;
+	uint64_t scanStartNs;
+	uint64_t scanEndNs;
+	uint64_t insertStartNs;
 	uint64_t admitNs;
 
 	if (ticket == NULL || ticket->runtime == NULL) {
@@ -152,8 +177,15 @@ int hfsPosixTicketAdmit(HfsPosixIoTicket *ticket)
 		errno = ESHUTDOWN;
 		return -1;
 	}
+	if (lockStartNs != 0) {
+		uint64_t lockNow = hfsStatsNowNs();
+
+		hfsStatsRecordTicketMetric(HFS_STATS_TICKET_ADMIT_LOCK_WAIT,
+			lockNow >= lockStartNs ? lockNow - lockStartNs : 0);
+	}
 	ticket->ticketId = ++runtime->nextTicketId;
 	ticket->submitSeq = ++runtime->nextTicketSeq;
+	scanStartNs = lockStartNs != 0 ? hfsStatsNowNs() : 0;
 	for (current = runtime->ticketHead; current != NULL;
 	     current = current->next) {
 		scanItems++;
@@ -162,6 +194,8 @@ int hfsPosixTicketAdmit(HfsPosixIoTicket *ticket)
 			ticket->pendingDependencies++;
 		}
 	}
+	scanEndNs = scanStartNs != 0 ? hfsStatsNowNs() : 0;
+	insertStartNs = scanEndNs;
 	ticket->next = runtime->ticketHead;
 	runtime->ticketHead = ticket;
 	runtime->ticketCount++;
@@ -171,6 +205,12 @@ int hfsPosixTicketAdmit(HfsPosixIoTicket *ticket)
 	ticket->dependencyWait = !ticket->ready;
 	pthread_mutex_unlock(&runtime->ticketLock);
 	admitNs = admitStartNs != 0 ? hfsStatsNowNs() : 0;
+	if (scanStartNs != 0) {
+		hfsStatsRecordTicketMetric(HFS_STATS_TICKET_ADMIT_SCAN,
+			scanEndNs >= scanStartNs ? scanEndNs - scanStartNs : 0);
+		hfsStatsRecordTicketMetric(HFS_STATS_TICKET_ADMIT_INSERT,
+			admitNs >= insertStartNs ? admitNs - insertStartNs : 0);
+	}
 	hfsStatsRecordTicketAdmission(scanItems, ticket->pendingDependencies,
 		runtime->ticketCount,
 		admitNs >= admitStartNs ? admitNs - admitStartNs : 0);
@@ -209,6 +249,7 @@ int hfsPosixTicketWaitReady(HfsPosixIoTicket *ticket)
 
 		hfsStatsRecordTicketDependencyWait(waitNs);
 		hfsStatsRecordTicketRealWait(waitNs);
+		hfsStatsRecordTicketMetric(HFS_STATS_TICKET_DEPENDENCY_WAIT, waitNs);
 		hfsPosixTicketTrace(ticket, HFS_TRACE_TICKET_DEP_WAIT, result);
 	}
 	return result == 0 ? 0 : -1;
@@ -221,15 +262,29 @@ void hfsPosixTicketComplete(HfsPosixIoTicket *ticket, int result)
 	HfsPosixIoTicket **link;
 	HfsInodeRuntime *runtime;
 	uint32_t promoted = 0;
+	uint32_t scanItems = 0;
 	uint64_t completeStartNs = hfsStatsTimingFastEnabled() ? hfsStatsNowNs() : 0;
+	uint64_t completeLockStartNs = completeStartNs;
+	uint64_t scanStartNs;
+	uint64_t scanEndNs;
+	uint64_t wakeStartNs;
+	uint64_t wakeEndNs;
 
 	if (ticket == NULL || !ticket->admitted || ticket->runtime == NULL) {
 		return;
 	}
 	runtime = ticket->runtime;
 	pthread_mutex_lock(&runtime->ticketLock);
+	if (completeLockStartNs != 0) {
+		uint64_t lockNow = hfsStatsNowNs();
+
+		hfsStatsRecordTicketMetric(HFS_STATS_TICKET_COMPLETE_LOCK_WAIT,
+			lockNow >= completeLockStartNs ? lockNow - completeLockStartNs : 0);
+	}
+	scanStartNs = completeLockStartNs != 0 ? hfsStatsNowNs() : 0;
 	link = &runtime->ticketHead;
 	while (*link != NULL && *link != ticket) {
+		scanItems++;
 		link = &(*link)->next;
 	}
 	if (*link == ticket) {
@@ -240,6 +295,7 @@ void hfsPosixTicketComplete(HfsPosixIoTicket *ticket, int result)
 	}
 	for (current = runtime->ticketHead; current != NULL;
 	     current = current->next) {
+		scanItems++;
 		if (current->submitSeq <= ticket->submitSeq ||
 		    current->pendingDependencies == 0 || current->ready ||
 		    !hfsPosixTicketConflicts(ticket, current)) {
@@ -256,22 +312,32 @@ void hfsPosixTicketComplete(HfsPosixIoTicket *ticket, int result)
 			hfsPosixTicketTrace(current, HFS_TRACE_TICKET_READY, 0);
 		}
 	}
+	scanEndNs = scanStartNs != 0 ? hfsStatsNowNs() : 0;
 	pthread_cond_broadcast(&runtime->ticketAvailable);
 	pthread_mutex_unlock(&runtime->ticketLock);
 	{
 		uint64_t completeNow = completeStartNs != 0 ? hfsStatsNowNs() : 0;
 		uint64_t completeNs = completeNow >= completeStartNs ?
 			completeNow - completeStartNs : 0;
-		hfsStatsRecordTicketCompletion(completeNs);
+
+		hfsStatsRecordTicketCompletion(completeNs,
+			scanEndNs >= scanStartNs ? scanEndNs - scanStartNs : completeNs,
+			scanItems);
 	}
 	if (promoted != 0) {
 		hfsStatsRecordTicketPromote(promoted);
 	}
+	wakeStartNs = completeStartNs != 0 ? hfsStatsNowNs() : 0;
 	pthread_mutex_lock(&ticket->waitLock);
 	ticket->result = result;
 	ticket->done = true;
 	pthread_cond_broadcast(&ticket->waitCondition);
 	pthread_mutex_unlock(&ticket->waitLock);
+	wakeEndNs = wakeStartNs != 0 ? hfsStatsNowNs() : 0;
+	if (wakeStartNs != 0) {
+		hfsStatsRecordTicketMetric(HFS_STATS_TICKET_WAKE_PROCESSING,
+			wakeEndNs >= wakeStartNs ? wakeEndNs - wakeStartNs : 0);
+	}
 	hfsStatsRecordTicketComplete();
 	hfsStatsRecordTicketWake();
 	hfsPosixTicketTrace(ticket, HFS_TRACE_TICKET_WAKE, result);

@@ -412,6 +412,23 @@ static int hfsRuntimeBlockManagedSignals(sigset_t *previousMask) {
 	return pthread_sigmask(SIG_BLOCK, &managedSignals, previousMask);
 }
 
+/* Parse the optional CPU used by the metadata owner reactor. */
+static int hfsRuntimeOwnerCpuEnv(void) {
+	const char *value = getenv("HFS_OWNER_REACTOR_CPU");
+	char *end = NULL;
+	unsigned long parsed;
+
+	if (value == NULL || value[0] == '\0') {
+		return -1;
+	}
+	errno = 0;
+	parsed = strtoul(value, &end, 10);
+	if (errno != 0 || end == value || *end != '\0' || parsed > INT_MAX) {
+		return -1;
+	}
+	return (int)parsed;
+}
+
 /* Initialize SPDK and poll one SPDK thread until the runtime is stopped. */
 static void *hfsRuntimeOwnerMain(void *arg) {
 	struct spdk_env_opts opts = {
@@ -430,6 +447,17 @@ static void *hfsRuntimeOwnerMain(void *arg) {
 		return NULL;
 	}
 	signalMaskSaved = true;
+	{
+		int ownerCpu = hfsRuntimeOwnerCpuEnv();
+
+		if (ownerCpu >= 0) {
+			cpu_set_t cpuSet;
+
+			CPU_ZERO(&cpuSet);
+			CPU_SET((unsigned int)ownerCpu, &cpuSet);
+			(void)pthread_setaffinity_np(pthread_self(), sizeof(cpuSet), &cpuSet);
+		}
+	}
 	spdk_env_opts_init(&opts);
 	rc = spdk_env_init(&opts);
 	if (rc != 0) {

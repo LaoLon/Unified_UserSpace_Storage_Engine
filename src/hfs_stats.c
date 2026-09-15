@@ -22,6 +22,7 @@
 #define HFS_STATS_DMA_POOL_CLASSES 4U
 #define HFS_STATS_MAX_DATA_REACTORS 8U
 #define HFS_STATS_MAX_LOCK_DEPTH 8U
+#define HFS_STATS_TICKET_SCAN_BUCKETS 7U
 #define HFS_STATS_SNAPSHOT_BYTES (128U * 1024U)
 
 _Atomic bool hfsStatsEnabledState;
@@ -165,6 +166,11 @@ typedef struct HfsStatsShard {
 	uint64_t dmaDirectRequestBytes;
 	uint64_t dmaStagingRequests;
 	uint64_t dmaStagingRequestBytes;
+	uint64_t ticketMetricSum[HFS_STATS_TICKET_METRIC_COUNT];
+	uint64_t ticketMetricCount[HFS_STATS_TICKET_METRIC_COUNT];
+	uint64_t ticketMetricHist[HFS_STATS_TICKET_METRIC_COUNT][HFS_STATS_HIST_BUCKETS];
+	uint64_t ticketAdmissionScanLength[HFS_STATS_TICKET_SCAN_BUCKETS];
+	uint64_t ticketCompletionScanLength[HFS_STATS_TICKET_SCAN_BUCKETS];
 } HfsStatsShard;
 
 /* A lock frame lets wait and hold time be measured without a global lock. */
@@ -214,6 +220,29 @@ static unsigned int hfsStatsBucket(uint64_t value) {
 		bucket++;
 	}
 	return bucket;
+}
+
+/* Map a ticket scan length to the report's fixed diagnostic buckets. */
+static unsigned int hfsStatsTicketScanBucket(uint32_t scanItems) {
+	if (scanItems == 0) {
+		return 0;
+	}
+	if (scanItems <= 4U) {
+		return 1;
+	}
+	if (scanItems <= 8U) {
+		return 2;
+	}
+	if (scanItems <= 16U) {
+		return 3;
+	}
+	if (scanItems <= 32U) {
+		return 4;
+	}
+	if (scanItems <= 64U) {
+		return 5;
+	}
+	return 6;
 }
 
 /* Return a stable Linux thread id for correlating per-thread shards. */
@@ -551,7 +580,8 @@ void hfsStatsRecordTicketAdmission(uint32_t scanItems,
 		memory_order_relaxed);
 	hfsStatsPeak(&hfsStatsTicketActivePeak, activeTickets);
 	atomic_fetch_add_explicit(&hfsStatsTicketAdmitNs, admitNs,
-		memory_order_relaxed);
+			memory_order_relaxed);
+	hfsStatsRecordTicketScanLength(false, scanItems);
 }
 
 /* Record only a ticket wait that reached pthread_cond_wait. */
@@ -564,11 +594,50 @@ void hfsStatsRecordTicketRealWait(uint64_t waitNs) {
 	}
 }
 
+/* Record one fine-grained ticket phase in a thread-local histogram. */
+void hfsStatsRecordTicketMetric(HfsStatsTicketMetric metric, uint64_t durationNs) {
+	HfsStatsShard *shard;
+
+	if (!hfsStatsIsEnabled() || metric >= HFS_STATS_TICKET_METRIC_COUNT) {
+		return;
+	}
+	shard = hfsStatsShardGet();
+	if (shard == NULL) {
+		return;
+	}
+	shard->ticketMetricSum[metric] += durationNs;
+	shard->ticketMetricCount[metric]++;
+	shard->ticketMetricHist[metric][hfsStatsBucket(durationNs)]++;
+}
+
+/* Record the admission or completion active-list scan length bucket. */
+void hfsStatsRecordTicketScanLength(bool completion, uint32_t scanItems) {
+	HfsStatsShard *shard;
+	unsigned int bucket;
+
+	if (!hfsStatsIsEnabled()) {
+		return;
+	}
+	shard = hfsStatsShardGet();
+	if (shard == NULL) {
+		return;
+	}
+	bucket = hfsStatsTicketScanBucket(scanItems);
+	if (completion) {
+		shard->ticketCompletionScanLength[bucket]++;
+	} else {
+		shard->ticketAdmissionScanLength[bucket]++;
+	}
+}
+
 /* Record the time spent scanning the active list during completion. */
-void hfsStatsRecordTicketCompletion(uint64_t completeNs) {
+void hfsStatsRecordTicketCompletion(uint64_t completeNs, uint64_t scanNs,
+					uint32_t scanItems) {
 	if (hfsStatsIsEnabled()) {
 		atomic_fetch_add_explicit(&hfsStatsTicketCompleteNs, completeNs,
 			memory_order_relaxed);
+		hfsStatsRecordTicketMetric(HFS_STATS_TICKET_COMPLETE_SCAN, scanNs);
+		hfsStatsRecordTicketScanLength(true, scanItems);
 	}
 }
 
@@ -1237,6 +1306,19 @@ static void hfsStatsAggregateShard(HfsStatsShard *total,
 	total->dmaDirectRequestBytes += shard->dmaDirectRequestBytes;
 	total->dmaStagingRequests += shard->dmaStagingRequests;
 	total->dmaStagingRequestBytes += shard->dmaStagingRequestBytes;
+	for (i = 0; i < HFS_STATS_TICKET_METRIC_COUNT; i++) {
+		total->ticketMetricSum[i] += shard->ticketMetricSum[i];
+		total->ticketMetricCount[i] += shard->ticketMetricCount[i];
+		for (j = 0; j < HFS_STATS_HIST_BUCKETS; j++) {
+			total->ticketMetricHist[i][j] += shard->ticketMetricHist[i][j];
+		}
+	}
+	for (i = 0; i < HFS_STATS_TICKET_SCAN_BUCKETS; i++) {
+		total->ticketAdmissionScanLength[i] +=
+			shard->ticketAdmissionScanLength[i];
+		total->ticketCompletionScanLength[i] +=
+			shard->ticketCompletionScanLength[i];
+	}
 }
 
 /* Return the upper bound of a logarithmic histogram quantile. */
@@ -1267,6 +1349,13 @@ static uint64_t hfsStatsHistogramQuantile(const uint64_t *hist,
 static void hfsStatsWriteSnapshot(void) {
 	static const char *const lockNames[HFS_STATS_LOCK_CLASS_COUNT] = {
 		"fd", "meta", "io", "range_gate", "resize", "append", "runtime", "other"
+	};
+	static const char *const ticketMetricNames[HFS_STATS_TICKET_METRIC_COUNT] = {
+		"admit_lock_wait", "admit_scan", "admit_insert", "dependency_wait",
+		"complete_lock_wait", "complete_scan", "wake_processing"
+	};
+	static const char *const ticketScanNames[HFS_STATS_TICKET_SCAN_BUCKETS] = {
+		"0", "1_4", "5_8", "9_16", "17_32", "33_64", "gt64"
 	};
 	HfsStatsShard total = {0};
 	HfsStatsShard *shard;
@@ -1425,6 +1514,32 @@ static void hfsStatsWriteSnapshot(void) {
 		atomic_load_explicit(&hfsStatsTicketAdmitNs, memory_order_relaxed));
 	HFS_STATS_APPEND("ticket_complete_ticks=%"PRIuFAST64"\n",
 		atomic_load_explicit(&hfsStatsTicketCompleteNs, memory_order_relaxed));
+	for (i = 0; i < HFS_STATS_TICKET_METRIC_COUNT; i++) {
+		uint64_t count = total.ticketMetricCount[i];
+		uint64_t sum = total.ticketMetricSum[i];
+
+		HFS_STATS_APPEND("ticket_%s_count=%"PRIu64"\n",
+			ticketMetricNames[i], count);
+		HFS_STATS_APPEND("ticket_%s_sum_ns=%"PRIu64"\n",
+			ticketMetricNames[i], sum);
+		HFS_STATS_APPEND("ticket_%s_avg_ns=%"PRIu64"\n",
+			ticketMetricNames[i], count == 0 ? 0 : sum / count);
+		HFS_STATS_APPEND("ticket_%s_p50_ns=%"PRIu64"\n",
+			ticketMetricNames[i], hfsStatsHistogramQuantile(
+				total.ticketMetricHist[i], count, 50));
+		HFS_STATS_APPEND("ticket_%s_p95_ns=%"PRIu64"\n",
+			ticketMetricNames[i], hfsStatsHistogramQuantile(
+				total.ticketMetricHist[i], count, 95));
+		HFS_STATS_APPEND("ticket_%s_p99_ns=%"PRIu64"\n",
+			ticketMetricNames[i], hfsStatsHistogramQuantile(
+				total.ticketMetricHist[i], count, 99));
+	}
+	for (i = 0; i < HFS_STATS_TICKET_SCAN_BUCKETS; i++) {
+		HFS_STATS_APPEND("ticket_admission_scan_length_%s=%"PRIu64"\n",
+			ticketScanNames[i], total.ticketAdmissionScanLength[i]);
+		HFS_STATS_APPEND("ticket_completion_scan_length_%s=%"PRIu64"\n",
+			ticketScanNames[i], total.ticketCompletionScanLength[i]);
+	}
 	HFS_STATS_APPEND("futex_wait_attempt=%"PRIuFAST64"\n",
 		atomic_load_explicit(&hfsStatsFutexWaitAttempts, memory_order_relaxed));
 	HFS_STATS_APPEND("futex_wait_success=%"PRIuFAST64"\n",

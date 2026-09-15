@@ -14,6 +14,13 @@ typedef enum HfsPosixTicketOperation {
 	HFS_POSIX_TICKET_FENCE
 } HfsPosixTicketOperation;
 
+/* Select the ordering contract used by the diagnostic A/B benchmark. */
+typedef enum HfsPosixOrderingMode {
+	HFS_POSIX_ORDER_TICKET = 0,
+	HFS_POSIX_ORDER_RANGE,
+	HFS_POSIX_ORDER_NONE
+} HfsPosixOrderingMode;
+
 /* One synchronous POSIX request retained while its range dependencies drain. */
 struct hfs_posix_io_ticket {
 	HfsInodeRuntime *runtime;
@@ -37,6 +44,9 @@ struct hfs_posix_io_ticket {
 
 /* Enable the ticket scheduler unless the operator explicitly disables it. */
 bool hfsPosixTicketEnabled(void);
+
+/* Return the process-wide POSIX ordering mode selected from the environment. */
+HfsPosixOrderingMode hfsPosixOrderingMode(void);
 
 /* Initialize one stack-owned ticket before admission. */
 int hfsPosixTicketInit(HfsPosixIoTicket *ticket, HfsInodeRuntime *runtime,

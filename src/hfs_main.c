@@ -1,5 +1,6 @@
 #include <fcntl.h>
 #include <inttypes.h>
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,6 +16,7 @@
 #include "hfs_lib.h"
 #include "hfs_log.h"
 #include "hfs_meta.h"
+#include "hfs_stats.h"
 
 /*
  * Self-test program: exercises the full HFS lifecycle.
@@ -32,6 +34,15 @@
 	}						\
 } while (0)
 
+typedef struct HfsInternalBenchStart {
+	pthread_mutex_t lock;
+	pthread_cond_t condition;
+	uint64_t endNs;
+	uint32_t readyWorkers;
+	bool start;
+	bool abort;
+} HfsInternalBenchStart;
+
 typedef struct HfsInternalBenchWorker {
 	HfsFile *file;
 	uint8_t *buffer;
@@ -41,8 +52,11 @@ typedef struct HfsInternalBenchWorker {
 	uint64_t endNs;
 	bool write;
 	uint64_t seed;
+	HfsInternalBenchStart *startState;
 	_Atomic uint64_t *operations;
 	_Atomic uint64_t *errors;
+	_Atomic uint64_t *outstanding;
+	_Atomic uint64_t *outstandingPeak;
 } HfsInternalBenchWorker;
 
 /* Return a monotonic nanosecond clock for the internal data-path benchmark. */
@@ -80,9 +94,35 @@ static uint64_t hfsInternalBenchEnv(const char *name, uint64_t fallback) {
 	return end == value || *end != '\0' || parsed == 0 ? fallback : parsed;
 }
 
+/* Publish a worker's observed outstanding request peak without a lock. */
+static void hfsInternalBenchRecordPeak(_Atomic uint64_t *peak,
+						 uint64_t current) {
+	uint64_t observed = atomic_load_explicit(peak, memory_order_relaxed);
+
+	while (observed < current &&
+	       !atomic_compare_exchange_weak_explicit(peak, &observed, current,
+			memory_order_relaxed, memory_order_relaxed)) {
+		/* Retry with the refreshed peak. */
+	}
+}
+
 /* Run positioned I/O directly through HfsFile and the normal data engine. */
 static void *hfsInternalBenchWorkerMain(void *arg) {
 	HfsInternalBenchWorker *worker = arg;
+	HfsInternalBenchStart *startState = worker->startState;
+
+	pthread_mutex_lock(&startState->lock);
+	startState->readyWorkers++;
+	pthread_cond_broadcast(&startState->condition);
+	while (!startState->start && !startState->abort) {
+		pthread_cond_wait(&startState->condition, &startState->lock);
+	}
+	worker->endNs = startState->endNs;
+	if (startState->abort) {
+		pthread_mutex_unlock(&startState->lock);
+		return NULL;
+	}
+	pthread_mutex_unlock(&startState->lock);
 
 	while (hfsInternalBenchNowNs() < worker->endNs) {
 		uint64_t maxUnit = (worker->rangeBytes - worker->bytes) /
@@ -90,9 +130,15 @@ static void *hfsInternalBenchWorkerMain(void *arg) {
 		uint64_t offset = (maxUnit == 0 ? 0 :
 			(hfsInternalBenchNext(worker) % (maxUnit + 1U))) *
 			worker->unitSize;
-		ssize_t result = worker->write ?
+		ssize_t result;
+		uint64_t outstanding = atomic_fetch_add_explicit(worker->outstanding, 1,
+			memory_order_relaxed) + 1U;
+
+		hfsInternalBenchRecordPeak(worker->outstandingPeak, outstanding);
+		result = worker->write ?
 			hfsWriteAt(worker->file, worker->buffer, worker->bytes, offset) :
 			hfsReadAt(worker->file, worker->buffer, worker->bytes, offset);
+		atomic_fetch_sub_explicit(worker->outstanding, 1, memory_order_relaxed);
 
 		if (result == (ssize_t)worker->bytes) {
 			atomic_fetch_add_explicit(worker->operations, 1,
@@ -119,12 +165,18 @@ static int hfsInternalBenchmark(Hfs *fs) {
 	uint64_t duration = hfsInternalBenchEnv("HFS_INTERNAL_BENCH_SECONDS", 5);
 	uint64_t rangeBytes = hfsInternalBenchEnv("HFS_INTERNAL_BENCH_SIZE", 256U << 20);
 	const char *rw = getenv("HFS_INTERNAL_BENCH_RW");
-	uint64_t startNs;
-	uint64_t endNs;
-	uint64_t finishNs;
+	uint64_t startNs = 0;
+	uint64_t endNs = 0;
+	uint64_t finishNs = 0;
+	uint64_t actualRuntimeNs;
 	uint64_t i;
 	uint64_t allocatedWorkers = 0;
 	uint64_t startedWorkers = 0;
+	_Atomic uint64_t outstanding = 0;
+	_Atomic uint64_t outstandingPeak = 0;
+	HfsInternalBenchStart startState;
+	bool startLockInitialized = false;
+	bool startConditionInitialized = false;
 	int rc = -1;
 
 	if (fs == NULL || bytes == 0 || threadCount > 256 || rangeBytes < bytes ||
@@ -142,19 +194,32 @@ static int hfsInternalBenchmark(Hfs *fs) {
 	if (threads == NULL || workers == NULL) {
 		goto cleanup;
 	}
-	startNs = hfsInternalBenchNowNs();
-	endNs = startNs + duration * UINT64_C(1000000000);
+	if (pthread_mutex_init(&startState.lock, NULL) != 0) {
+		goto cleanup;
+	}
+	startLockInitialized = true;
+	if (pthread_cond_init(&startState.condition, NULL) != 0) {
+		goto cleanup;
+	}
+	startConditionInitialized = true;
+	startState.endNs = 0;
+	startState.readyWorkers = 0;
+	startState.start = false;
+	startState.abort = false;
 	for (i = 0; i < threadCount; i++) {
 		workers[i].file = &file;
 		workers[i].buffer = hfsIoDmaAlloc(bytes, 4096);
 		workers[i].bytes = bytes;
 		workers[i].rangeBytes = rangeBytes;
 		workers[i].unitSize = fs->unitSize;
-		workers[i].endNs = endNs;
+		workers[i].endNs = 0;
 		workers[i].write = rw != NULL && strcasecmp(rw, "randwrite") == 0;
 		workers[i].seed = UINT64_C(0x9e3779b97f4a7c15) + i * 17U;
+		workers[i].startState = &startState;
 		workers[i].operations = &operationCount;
 		workers[i].errors = &errorCount;
+		workers[i].outstanding = &outstanding;
+		workers[i].outstandingPeak = &outstandingPeak;
 		if (workers[i].buffer == NULL) {
 			atomic_store_explicit(&errorCount, 1, memory_order_relaxed);
 			break;
@@ -167,24 +232,57 @@ static int hfsInternalBenchmark(Hfs *fs) {
 		}
 		startedWorkers++;
 	}
+	if (startedWorkers != threadCount) {
+		pthread_mutex_lock(&startState.lock);
+		startState.abort = true;
+		pthread_cond_broadcast(&startState.condition);
+		pthread_mutex_unlock(&startState.lock);
+	} else {
+		pthread_mutex_lock(&startState.lock);
+		while (startState.readyWorkers != startedWorkers) {
+			pthread_cond_wait(&startState.condition, &startState.lock);
+		}
+		startNs = hfsInternalBenchNowNs();
+		endNs = startNs + duration * UINT64_C(1000000000);
+		startState.endNs = endNs;
+		startState.start = true;
+		pthread_cond_broadcast(&startState.condition);
+		pthread_mutex_unlock(&startState.lock);
+	}
 	for (i = 0; i < startedWorkers; i++) {
 		pthread_join(threads[i], NULL);
+	}
+	if (startedWorkers != threadCount) {
+		startNs = hfsInternalBenchNowNs();
+		endNs = startNs;
 	}
 	operations = atomic_load_explicit(&operationCount, memory_order_relaxed);
 	errors = atomic_load_explicit(&errorCount, memory_order_relaxed);
 	finishNs = hfsInternalBenchNowNs();
-	if (finishNs <= startNs) {
-		finishNs = startNs + 1;
+	actualRuntimeNs = finishNs > startNs ? finishNs - startNs : 1;
+	if (startState.start && finishNs <= startNs) {
+		actualRuntimeNs = 1;
 	}
-	printf("A3 internal bs=%"PRIu64" rw=%s threads=%"PRIu64
-	       " seconds=%"PRIu64" iops=%.2f errors=%"PRIu64"\n",
+	printf("A3 internal bs=%"PRIu64" rw=%s workers=%"PRIu64
+	       " actual_workers=%"PRIu64" actual_requests=%"PRIu64
+	       " actual_spdk_submits=%"PRIuFAST64" outstanding_peak=%"PRIuFAST64
+	       " runtime_ns=%"PRIu64" runtime_seconds=%.9f iops=%.2f errors=%"PRIu64"\n",
 	       bytes, workers != NULL && workers[0].write ? "randwrite" : "randread",
 	       startedWorkers,
-	       duration, (double)operations * 1e9 /
-	       (double)(finishNs - startNs), errors);
+	       startedWorkers, operations,
+	       atomic_load_explicit(&hfsStatsSpdkSubmits, memory_order_relaxed),
+	       atomic_load_explicit(&outstandingPeak, memory_order_relaxed),
+	       actualRuntimeNs, (double)actualRuntimeNs / 1e9,
+	       (double)operations * 1e9 / (double)actualRuntimeNs, errors);
 	rc = errors == 0 ? 0 : -1;
 
 cleanup:
+	if (startConditionInitialized) {
+		pthread_cond_destroy(&startState.condition);
+	}
+	if (startLockInitialized) {
+		pthread_mutex_destroy(&startState.lock);
+	}
 	if (workers != NULL) {
 		for (i = 0; i < allocatedWorkers; i++) {
 			hfsIoDmaFree(workers[i].buffer);
