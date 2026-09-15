@@ -4,6 +4,7 @@
 
 - `doc/bug.md` 是当前 Bug 记录和已知限制的优先参考；发现或修复 Bug 时立即维护它。
 - `doc/design/fio_baseline_notes.md` 保存已完成的 FIO 基线数据和测试口径。
+- `doc/shard/shard_progress_memory.md` 汇总 shard-28～35、62、63、66 的开发进度、验证结果、性能口径和当前边界；需要查看 shard 历史或现状时优先索引该文档，并以当前源码和最新测试结果交叉核对。
 - `doc/shard/mysql_rocksdb_stage_development.md` 是 shard-26 起的当前执行计划，优先于旧分片文档中尚未实施的 shard-26 及以后内容。
 - `doc/项目总结.md` 是早期项目总结，`doc/shard/libhfs_shard_development.md` 是原始分片计划；使用前必须与 Git 历史和当前源码交叉核对，不能把其中的旧目录结构、旧容量或“待实现”描述直接当作现状。
 - 需要了解当前进展时，先查看 `git log --stat` 和 `git status`，再以当前源码、测试脚本和最新文档为准。
