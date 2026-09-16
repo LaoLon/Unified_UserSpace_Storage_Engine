@@ -296,6 +296,38 @@ std::uint64_t Engine::deviceCapacityBytes(std::size_t deviceIndex) const noexcep
     return SpdkRuntime::instance().deviceCapacityBytes(deviceIndex);
 }
 
+Result<SuperblockSlots> Engine::readSuperblockSlots(std::size_t deviceIndex) const {
+    if (!processValid()) {
+        return makeError<SuperblockSlots>(Status::ForkedProcess,
+                                          "engine belongs to another process");
+    }
+    auto &runtime = SpdkRuntime::instance();
+    if (!runtime.active()) {
+        return makeError<SuperblockSlots>(Status::InvalidState, "engine is not mounted");
+    }
+    const std::uint32_t sectorSize = runtime.deviceBlockSize(deviceIndex);
+    if (sectorSize == 0 || impl_->config.metadataBlockSize == 0) {
+        return makeError<SuperblockSlots>(Status::InvalidArgument,
+                                          "device index out of range");
+    }
+    std::vector<std::byte> record(impl_->config.metadataBlockSize, std::byte{0});
+    auto readA = runtime.controlRead(deviceIndex, 0, record);
+    if (!readA.ok()) {
+        return makeError<SuperblockSlots>(readA.status(), readA.message());
+    }
+    SuperblockSlots slots;
+    std::memcpy(&slots.slotA, record.data(), sizeof(slots.slotA));
+    slots.validA = superblockValid(slots.slotA);
+    const std::uint64_t slotBOffset = kSuperblockSlotOffsetBytes / sectorSize;
+    auto readB = runtime.controlRead(deviceIndex, slotBOffset, record);
+    if (!readB.ok()) {
+        return makeError<SuperblockSlots>(readB.status(), readB.message());
+    }
+    std::memcpy(&slots.slotB, record.data(), sizeof(slots.slotB));
+    slots.validB = superblockValid(slots.slotB);
+    return slots;
+}
+
 std::uint32_t Engine::dataReactorCount() const noexcept {
     return SpdkRuntime::instance().dataReactorCount();
 }

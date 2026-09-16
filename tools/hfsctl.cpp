@@ -17,6 +17,8 @@ void printUsage() {
                  "  format --yes      destructive format of the configured device set\n"
                  "  info              mount read-only metadata and print the volume layout\n"
                  "  check             scan superblocks, checkpoints and the journal\n"
+                 "  dump              verbose per-device superblock/checkpoint/journal dump\n"
+                 "  import            Phase 2 data-plane import (not implemented yet)\n"
                  "\n"
                  "options:\n"
                  "  --config=PATH     HFS 2.0 .conf file (required)\n"
@@ -133,6 +135,19 @@ int runInfo(const hfs::Config &config) {
     return 0;
 }
 
+const hfs::Hfs2Superblock *newestSuperblock(const hfs::SuperblockSlots &slots) {
+    if (slots.validA && slots.validB) {
+        return slots.slotB.generation > slots.slotA.generation ? &slots.slotB : &slots.slotA;
+    }
+    if (slots.validA) {
+        return &slots.slotA;
+    }
+    if (slots.validB) {
+        return &slots.slotB;
+    }
+    return nullptr;
+}
+
 int runCheck(const hfs::Config &config) {
     auto created = hfs::Engine::create(config);
     if (!created.ok()) {
@@ -147,33 +162,165 @@ int runCheck(const hfs::Config &config) {
         return 1;
     }
 
-    auto journal = hfs::Journal::open(*engine, nullptr);
-    if (!journal.ok()) {
-        std::fprintf(stderr, "hfsctl: journal open failed: %s\n",
-                     journal.message().c_str());
-        (void)engine->stop().wait();
-        return 1;
+    bool ok = true;
+    std::array<std::uint8_t, 16> uuid{};
+    bool haveUuid = false;
+    const auto geometries = engine->deviceGeometries();
+    for (std::size_t i = 0; i < geometries.size(); ++i) {
+        auto slots = engine->readSuperblockSlots(i);
+        if (!slots.ok()) {
+            std::printf("device %zu: superblock read failed: %s\n", i,
+                        slots.message().c_str());
+            ok = false;
+            continue;
+        }
+        const hfs::Hfs2Superblock *sb = newestSuperblock(slots.value());
+        if (sb == nullptr) {
+            std::printf("device %zu: no valid superblock\n", i);
+            ok = false;
+            continue;
+        }
+        std::printf("device %zu (%s): SB A=%s B=%s generation=%llu replica=%u/%u\n", i,
+                    config.devices[i].bdevName.c_str(),
+                    slots.value().validA ? "valid" : "invalid",
+                    slots.value().validB ? "valid" : "invalid",
+                    static_cast<unsigned long long>(sb->generation), sb->replicaId,
+                    sb->replicaCount);
+        if (!haveUuid) {
+            uuid = sb->uuid;
+            haveUuid = true;
+        } else if (sb->uuid != uuid) {
+            std::printf("  volume uuid mismatch with device 0\n");
+            ok = false;
+        }
     }
-    auto replayed = journal.value()->replay();
-    const auto &stats = journal.value()->stats();
 
-    std::printf("checkpoint A: %s (txid %llu)\n",
-                stats.checkpointAValid ? "valid" : "empty",
-                static_cast<unsigned long long>(stats.checkpointAValid ? stats.lastCheckpointTxid : 0));
-    std::printf("checkpoint B: %s\n", stats.checkpointBValid ? "valid" : "empty");
-    std::printf("journal: head=%llu tail=%llu last_txid=%llu transactions=%u usage=%.1f%%\n",
-                static_cast<unsigned long long>(stats.head),
-                static_cast<unsigned long long>(stats.tail),
-                static_cast<unsigned long long>(stats.lastTxid), stats.validTransactions,
-                journal.value()->usageRatio() * 100.0);
-    std::printf("corruption: %s\n",
-                stats.corruption.empty() ? "none" : stats.corruption.c_str());
+    for (std::size_t i = 0; i < config.devices.size(); ++i) {
+        if (!config.devices[i].metadata) {
+            continue;
+        }
+        auto journal = hfs::Journal::open(*engine, nullptr, i);
+        if (!journal.ok()) {
+            std::printf("metadata device %zu: journal open failed: %s\n", i,
+                        journal.message().c_str());
+            ok = false;
+            continue;
+        }
+        auto replayed = journal.value()->replay();
+        const auto &stats = journal.value()->stats();
+        std::printf("metadata device %zu: checkpointA=%s(txid %llu seq %llu) "
+                    "checkpointB=%s(txid %llu seq %llu) journal head=%llu tail=%llu "
+                    "last_txid=%llu transactions=%u usage=%.1f%% corruption=%s\n",
+                    i, stats.checkpointAValid ? "valid" : "empty",
+                    static_cast<unsigned long long>(stats.checkpointATxid),
+                    static_cast<unsigned long long>(stats.checkpointASequence),
+                    stats.checkpointBValid ? "valid" : "empty",
+                    static_cast<unsigned long long>(stats.checkpointBTxid),
+                    static_cast<unsigned long long>(stats.checkpointBSequence),
+                    static_cast<unsigned long long>(stats.head),
+                    static_cast<unsigned long long>(stats.tail),
+                    static_cast<unsigned long long>(stats.lastTxid),
+                    stats.validTransactions, journal.value()->usageRatio() * 100.0,
+                    stats.corruption.empty() ? "none" : stats.corruption.c_str());
+        if (!replayed.ok() || !stats.corruption.empty()) {
+            ok = false;
+        }
+    }
 
     (void)engine->stop().wait();
-    if (!replayed.ok() || !stats.corruption.empty()) {
+    return ok ? 0 : 1;
+}
+
+int runDump(const hfs::Config &config) {
+    auto created = hfs::Engine::create(config);
+    if (!created.ok()) {
+        std::fprintf(stderr, "hfsctl: engine create failed: %s\n", created.message().c_str());
         return 1;
     }
+    auto engine = std::move(created).value();
+    auto mounted = engine->mount().wait();
+    if (!mounted.ok() || !mounted.value().ok()) {
+        std::fprintf(stderr, "hfsctl: mount failed: %s\n",
+                     mounted.ok() ? mounted.value().message().c_str() : mounted.message().c_str());
+        return 1;
+    }
+
+    const auto geometries = engine->deviceGeometries();
+    for (std::size_t i = 0; i < geometries.size(); ++i) {
+        auto slots = engine->readSuperblockSlots(i);
+        if (!slots.ok()) {
+            std::printf("device %zu: superblock read failed: %s\n", i,
+                        slots.message().c_str());
+            continue;
+        }
+        const auto &value = slots.value();
+        auto printSlot = [&](const char *label, bool valid, const hfs::Hfs2Superblock &sb) {
+            if (!valid) {
+                std::printf("  %s: invalid\n", label);
+                return;
+            }
+            std::printf("  %s: generation=%llu device=%u replica=%u/%u sector=%u meta=%u "
+                        "blocks=%llu journal=[%llu,%llu) checkpoint=[%llu,%llu) "
+                        "data=[%llu,%llu) clean=%u uuid=",
+                        label, static_cast<unsigned long long>(sb.generation), sb.deviceId,
+                        sb.replicaId, sb.replicaCount, sb.sectorSize, sb.metadataBlockSize,
+                        static_cast<unsigned long long>(sb.deviceBlocks),
+                        static_cast<unsigned long long>(sb.journalStart),
+                        static_cast<unsigned long long>(sb.journalStart + sb.journalBlocks),
+                        static_cast<unsigned long long>(sb.checkpointAStart),
+                        static_cast<unsigned long long>(sb.checkpointAStart +
+                                                        sb.checkpointBlocks),
+                        static_cast<unsigned long long>(sb.dataStart),
+                        static_cast<unsigned long long>(sb.dataStart + sb.dataBlocks),
+                        sb.cleanShutdown);
+            printUuid(sb.uuid);
+            std::printf("\n");
+        };
+        std::printf("device %zu (%s):\n", i, config.devices[i].bdevName.c_str());
+        printSlot("SB A", value.validA, value.slotA);
+        printSlot("SB B", value.validB, value.slotB);
+    }
+
+    for (std::size_t i = 0; i < config.devices.size(); ++i) {
+        if (!config.devices[i].metadata) {
+            continue;
+        }
+        auto journal = hfs::Journal::open(*engine, nullptr, i);
+        if (!journal.ok()) {
+            std::printf("metadata device %zu: journal open failed: %s\n", i,
+                        journal.message().c_str());
+            continue;
+        }
+        (void)journal.value()->replay();
+        const auto &stats = journal.value()->stats();
+        std::printf("metadata device %zu:\n", i);
+        std::printf("  checkpoint A: %s txid=%llu sequence=%llu\n",
+                    stats.checkpointAValid ? "valid" : "empty",
+                    static_cast<unsigned long long>(stats.checkpointATxid),
+                    static_cast<unsigned long long>(stats.checkpointASequence));
+        std::printf("  checkpoint B: %s txid=%llu sequence=%llu\n",
+                    stats.checkpointBValid ? "valid" : "empty",
+                    static_cast<unsigned long long>(stats.checkpointBTxid),
+                    static_cast<unsigned long long>(stats.checkpointBSequence));
+        std::printf("  journal: head=%llu tail=%llu last_txid=%llu transactions=%u "
+                    "usage=%.1f%% corruption=%s\n",
+                    static_cast<unsigned long long>(stats.head),
+                    static_cast<unsigned long long>(stats.tail),
+                    static_cast<unsigned long long>(stats.lastTxid),
+                    stats.validTransactions, journal.value()->usageRatio() * 100.0,
+                    stats.corruption.empty() ? "none" : stats.corruption.c_str());
+    }
+
+    (void)engine->stop().wait();
     return 0;
+}
+
+int runImport(const hfs::Config &config) {
+    (void)config;
+    std::fprintf(stderr,
+                 "hfsctl: import requires the Phase 2 data plane (namespace/extent write "
+                 "path); not implemented yet\n");
+    return 2;
 }
 
 } // namespace
@@ -241,6 +388,12 @@ int main(int argc, char **argv) {
     }
     if (command == "check") {
         return runCheck(parsed.value());
+    }
+    if (command == "dump") {
+        return runDump(parsed.value());
+    }
+    if (command == "import") {
+        return runImport(parsed.value());
     }
 
     std::fprintf(stderr, "hfsctl: command '%s' is not implemented\n", command.c_str());

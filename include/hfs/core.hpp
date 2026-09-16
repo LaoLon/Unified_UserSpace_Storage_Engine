@@ -24,6 +24,14 @@ struct FormatOptions {
     bool confirm = false;
 };
 
+/* Superblock A/B slots read back from one device (tools/acceptance). */
+struct SuperblockSlots {
+    bool validA = false;
+    bool validB = false;
+    Hfs2Superblock slotA{};
+    Hfs2Superblock slotB{};
+};
+
 /* Engine owns the parsed config, the process lock and (Phase 1+) the SPDK
  * runtime and device set. */
 class HFS_API Engine {
@@ -62,6 +70,9 @@ public:
     Result<void> flushDevice(std::size_t deviceIndex);
     std::uint32_t deviceBlockSize(std::size_t deviceIndex) const noexcept;
     std::uint64_t deviceCapacityBytes(std::size_t deviceIndex) const noexcept;
+
+    /* Raw superblock slots of one device (requires an active runtime). */
+    Result<SuperblockSlots> readSuperblockSlots(std::size_t deviceIndex) const;
 
     /* Runtime diagnostics used by acceptance tests. */
     std::uint32_t dataReactorCount() const noexcept;

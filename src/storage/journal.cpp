@@ -123,6 +123,8 @@ struct Journal::Impl {
     bool checkpointBValid = false;
     std::uint64_t checkpointATxid = 0;
     std::uint64_t checkpointBTxid = 0;
+    std::uint64_t checkpointASequence = 0;
+    std::uint64_t checkpointBSequence = 0;
     std::string corruption;
     Stats statsCache;
 
@@ -340,9 +342,11 @@ struct Journal::Impl {
         if (writeA) {
             checkpointAValid = true;
             checkpointATxid = lastTxid;
+            checkpointASequence = head;
         } else {
             checkpointBValid = true;
             checkpointBTxid = lastTxid;
+            checkpointBSequence = head;
         }
         log::info("checkpoint written: slot=%c txid=%llu sequence=%llu bytes=%zu",
                   writeA ? 'A' : 'B', static_cast<unsigned long long>(lastTxid),
@@ -357,6 +361,10 @@ struct Journal::Impl {
         statsCache.lastCheckpointTxid =
             std::max(checkpointAValid ? checkpointATxid : 0,
                      checkpointBValid ? checkpointBTxid : 0);
+        statsCache.checkpointATxid = checkpointATxid;
+        statsCache.checkpointBTxid = checkpointBTxid;
+        statsCache.checkpointASequence = checkpointASequence;
+        statsCache.checkpointBSequence = checkpointBSequence;
         statsCache.checkpointAValid = checkpointAValid;
         statsCache.checkpointBValid = checkpointBValid;
         statsCache.validTransactions = validTransactions;
@@ -426,6 +434,8 @@ Result<std::unique_ptr<Journal>> Journal::create(std::unique_ptr<JournalDevice> 
     }
     impl.checkpointATxid = txidA;
     impl.checkpointBTxid = txidB;
+    impl.checkpointASequence = sequenceA;
+    impl.checkpointBSequence = sequenceB;
 
     const bool useA = impl.checkpointAValid &&
                       (!impl.checkpointBValid || impl.checkpointATxid >= impl.checkpointBTxid);

@@ -448,7 +448,9 @@ struct SpdkRuntime::Impl {
         }
         envReady = true;
 
-        rc = waitForDevices(metadata, 10000);
+        const int deviceWaitMs = static_cast<int>(std::min<std::uint64_t>(
+            config.metadataWaitTimeoutMs == 0 ? 5000 : config.metadataWaitTimeoutMs, 5000));
+        rc = waitForDevices(metadata, deviceWaitMs);
         if (rc != 0) {
             closeDevicesLocked();
             spdk_set_thread(nullptr);

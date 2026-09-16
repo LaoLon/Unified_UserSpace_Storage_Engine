@@ -118,6 +118,85 @@ int main() {
         HFS_TEST_CHECK(engine4->stop().wait().value().ok());
     }
 
+    /* explicit volume_uuid mismatch fails closed */
+    {
+        std::string uuidText = validConfigText(lockPath);
+        HFS_TEST_CHECK(replaceAll(uuidText, "volume_uuid = auto",
+                                  "volume_uuid = 00112233445566778899aabbccddeeff"));
+        auto uuidParsed = hfs::parseConfig(uuidText, "uuid-config");
+        HFS_TEST_CHECK(uuidParsed.ok());
+
+        auto uuidEngine = hfs::Engine::create(uuidParsed.value());
+        HFS_TEST_CHECK(uuidEngine.ok());
+        HFS_TEST_CHECK(uuidEngine.value()->format({true}).wait().value().ok());
+        HFS_TEST_CHECK(uuidEngine.value()->stop().wait().value().ok());
+
+        /* the same explicit uuid mounts */
+        auto sameEngine = hfs::Engine::create(uuidParsed.value());
+        HFS_TEST_CHECK(sameEngine.ok());
+        HFS_TEST_CHECK(sameEngine.value()->mount().wait().value().ok());
+        HFS_TEST_CHECK(sameEngine.value()->stop().wait().value().ok());
+
+        /* a different explicit uuid is rejected */
+        std::string otherText = uuidText;
+        HFS_TEST_CHECK(replaceAll(otherText, "volume_uuid = 00112233445566778899aabbccddeeff",
+                                  "volume_uuid = ffeeddccbbaa99887766554433221100"));
+        auto otherParsed = hfs::parseConfig(otherText, "other-uuid");
+        HFS_TEST_CHECK(otherParsed.ok());
+        auto otherEngine = hfs::Engine::create(otherParsed.value());
+        HFS_TEST_CHECK(otherEngine.ok());
+        auto wrongUuid = otherEngine.value()->mount().wait();
+        HFS_TEST_CHECK(wrongUuid.ok());
+        HFS_TEST_CHECK(!wrongUuid.value().ok());
+        HFS_TEST_CHECK(wrongUuid.value().status() == hfs::Status::Corrupt);
+        HFS_TEST_CHECK(otherEngine.value()->stop().wait().value().ok());
+    }
+
+    /* stored geometry mismatch fails closed */
+    {
+        auto created5 = hfs::Engine::create(parsed.value());
+        HFS_TEST_CHECK(created5.ok());
+        auto engine5 = std::move(created5).value();
+        HFS_TEST_CHECK(engine5->format({true}).wait().value().ok());
+        HFS_TEST_CHECK(engine5->mount().wait().value().ok());
+
+        auto slots = engine5->readSuperblockSlots(0);
+        HFS_TEST_CHECK(slots.ok());
+        HFS_TEST_CHECK(slots.value().validA);
+        hfs::Hfs2Superblock tampered = slots.value().slotA;
+        tampered.dataBlocks -= 1; /* keeps ranges valid but breaks the geometry match */
+        hfs::superblockFinalize(tampered);
+        std::vector<std::byte> record(hfs::kSuperblockRecordSize, std::byte{0});
+        std::memcpy(record.data(), &tampered, sizeof(tampered));
+        HFS_TEST_CHECK(engine5->writeDeviceBlocks(0, 0, record).ok());
+        HFS_TEST_CHECK(engine5->flushDevice(0).ok());
+        HFS_TEST_CHECK(engine5->stop().wait().value().ok());
+
+        auto created6 = hfs::Engine::create(parsed.value());
+        HFS_TEST_CHECK(created6.ok());
+        auto engine6 = std::move(created6).value();
+        auto badGeometry = engine6->mount().wait();
+        HFS_TEST_CHECK(badGeometry.ok());
+        HFS_TEST_CHECK(!badGeometry.value().ok());
+        HFS_TEST_CHECK(badGeometry.value().status() == hfs::Status::Corrupt);
+        HFS_TEST_CHECK(engine6->stop().wait().value().ok());
+    }
+
+    /* a configured but missing bdev is rejected (bounded wait) */
+    {
+        std::string missingText = validConfigText(lockPath);
+        HFS_TEST_CHECK(replaceAll(missingText, "bdev_name = Nvme0n1",
+                                  "bdev_name = Nvme9n1"));
+        auto missingParsed = hfs::parseConfig(missingText, "missing-device");
+        HFS_TEST_CHECK(missingParsed.ok());
+        auto missingEngine = hfs::Engine::create(missingParsed.value());
+        HFS_TEST_CHECK(missingEngine.ok());
+        auto armed = missingEngine.value()->mount().wait();
+        HFS_TEST_CHECK(armed.ok());
+        HFS_TEST_CHECK(!armed.value().ok());
+        HFS_TEST_CHECK(missingEngine.value()->stop().wait().value().ok());
+    }
+
     ::unlink(lockPath.c_str());
     std::printf("format_mount_test: ok\n");
     return 0;

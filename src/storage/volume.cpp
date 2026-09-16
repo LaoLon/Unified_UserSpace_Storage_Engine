@@ -307,6 +307,17 @@ Result<VolumeInfo> mountVolume(SpdkRuntime &runtime, const Config &config) {
         volume.devices.push_back(stored);
     }
 
+    if (config.volumeUuid != "auto") {
+        auto expected = resolveUuid(config.volumeUuid);
+        if (!expected.ok()) {
+            return makeError<VolumeInfo>(expected.status(), expected.message());
+        }
+        if (volume.uuid != expected.value()) {
+            return makeError<VolumeInfo>(
+                Status::Corrupt, "volume uuid does not match the configured volume_uuid");
+        }
+    }
+
     log::info("volume mounted: generation=%llu devices=%zu clean=%d",
               static_cast<unsigned long long>(volume.generation), volume.devices.size(),
               volume.cleanShutdown ? 1 : 0);

@@ -76,6 +76,10 @@ public:
         std::uint64_t tail = 0;        /* first un-checkpointed slot sequence */
         std::uint64_t lastTxid = 0;    /* last replayed/committed transaction */
         std::uint64_t lastCheckpointTxid = 0;
+        std::uint64_t checkpointATxid = 0;
+        std::uint64_t checkpointBTxid = 0;
+        std::uint64_t checkpointASequence = 0;
+        std::uint64_t checkpointBSequence = 0;
         bool checkpointAValid = false;
         bool checkpointBValid = false;
         std::uint32_t validTransactions = 0;
