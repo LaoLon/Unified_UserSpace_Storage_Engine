@@ -524,6 +524,9 @@ struct Hfs2Superblock {
     std::uint32_t format_version;
     std::uint32_t feature_flags;
     std::uint32_t device_id;
+    std::uint32_t replica_id;
+    std::uint32_t replica_count;
+    std::uint32_t reserved0;
     std::array<std::byte, 16> uuid;
     std::uint64_t generation;
     std::uint64_t device_blocks;
@@ -544,6 +547,12 @@ struct Hfs2Superblock {
     std::uint32_t crc32c;
 };
 ```
+
+`*_start`/`*_blocks` 均以 `metadata_block_size` 为单位，`device_blocks` 是设备容量换算后的
+metadata block 数。Superblock slot A 位于偏移 0，slot B 位于 4 MiB（region 共 8 MiB）。
+`replica_id` 是设备在 metadata 副本中的序号，`replica_count` 等于配置的
+`metadata_replication`；两者在单盘 format 时也必须写入并校验。
+CRC32C 覆盖 `crc32c` 字段之前的全部字节。
 
 实际 layout 由 geometry 计算并写入 superblock；`checkpoint_a/b` 是 checkpoint region
 内的两个槽位，不与 metadata region 起点混用。A/B 写入顺序为：写非当前副本 → 对相关

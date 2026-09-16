@@ -15,8 +15,9 @@
 >
 > 进度：Shard-68 已完成（2026-09-16；Make/CMake、parser/生命周期/task 单测、
 > ASAN+UBSAN、hfsctl validate，VM 验证通过）；Shard-69 已完成（2026-09-16；SPDK env/
-> subsystem/reactor 所有权、R=2 自动拓扑、fork/双进程保护、doorbell、clean shutdown，
-> Make/CMake/CTest 4/4 通过）
+> subsystem/reactor 所有权、R=2 自动拓扑、fork/双进程保护、doorbell、clean shutdown）；
+> Shard-70 已完成（2026-09-16；CRC32C、superblock A/B + geometry、format/mount、
+> hfsctl format/info、损坏 fail closed，Make/CMake/CTest 7/7 通过）
 
 ---
 
@@ -142,6 +143,12 @@ VM 环境口径（2026-09-16 起）：
 ## 3. Phase 1：raw bdev 与磁盘格式
 
 ### Shard-70：bdev set、superblock 与 format
+
+> 状态：已完成（2026-09-16）。交付 `Hfs2Superblock` A/B（magic/version/replica 字段/
+> geometry/generation/clean flag/CRC32C）、`computeGeometry`、`formatVolume`/`mountVolume`
+> 控制路径、`hfsctl format --yes`/`info`；VM 单盘 format→mount→块写读回→槽位损坏选择→
+> 双槽损坏 fail closed 全部通过。双盘真实验收受 VM 硬件限制（仅一块 NVMe），逻辑由
+> geometry 单测覆盖，待第二块盘可用时补测。
 
 **交付物**：逐盘 geometry/UUID/最小容量校验；`Hfs2Superblock` A/B（magic、版本、
 device_id、volume uuid、replica id、`metadata_replica_count` feature flag、generation、

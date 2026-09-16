@@ -12,6 +12,7 @@ Bug 等级：**致命 > 严重 > 一般**。
 - 1：已修复（Shard-68，段错误）。
 - 2：已修复（Shard-69，bdev attach 被静默跳过）。
 - 3：已修复（Shard-69，reactor 退出时 channel 残留）。
+- 4：已修复（Shard-70，控制 I/O 实参求值顺序）。
 
 ## Bug 记录
 
@@ -47,6 +48,17 @@ Bug 等级：**致命 > 严重 > 一般**。
 - **根因**：channel 销毁是线程消息，不是同步释放。
 - **修复**：释放 channel 后对所属 reactor 线程做有界 poll 排空（`drainThreadMessages`），metadata reactor 关闭 descriptor 后同样处理。
 - **验证结果**：退出日志无 channel/poller 报错，`channelCount()` 停止后为 0。
+
+### 4. 控制 I/O 实参求值顺序导致 moved-from shared_ptr 解引用（已修复）
+
+- **状态**：已修复
+- **等级**：严重
+- **时间**：2026-09-16（Shard-70）
+- **现象**：`format_mount_test` 首次控制路径写入时，metadata reactor 在 `controlSubmitTrampoline` 中 SIGSEGV。
+- **排查过程**：日志确认消息 ctx 与 shared_ptr 入队时都有效；崩溃位于投递执行阶段。核对 C++ 规则后确认 `submitControlIo(io->device, std::move(io))` 的实参求值顺序未定义，GCC 先执行 move，再对已清空的 shared_ptr 取 `device`。
+- **根因**：同一条调用表达式中既解引用又从同一 shared_ptr 移出。
+- **修复**：移出前先取出 `device` 到局部变量，禁止在实参里混合解引用与 move。
+- **验证结果**：Make/CMake/CTest 7/7、hfsctl `format --yes`/`info` 全部通过。
 
 ## 记录模板
 
