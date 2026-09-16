@@ -19,6 +19,7 @@ endif
 CORE_SRC := $(sort $(wildcard $(PROJECT_ROOT)/src/common/*.cpp) \
                    $(wildcard $(PROJECT_ROOT)/src/config/*.cpp) \
                    $(wildcard $(PROJECT_ROOT)/src/core/*.cpp) \
+                   $(wildcard $(PROJECT_ROOT)/src/metadata/*.cpp) \
                    $(wildcard $(PROJECT_ROOT)/src/runtime/*.cpp) \
                    $(wildcard $(PROJECT_ROOT)/src/storage/*.cpp))
 CORE_OBJ := $(patsubst $(PROJECT_ROOT)/src/%.cpp,$(BUILD_DIR)/obj/%.o,$(CORE_SRC))
@@ -30,7 +31,8 @@ TEST_SRC := $(filter-out $(PROJECT_ROOT)/tests/engine_lifecycle_test.cpp \
                          $(PROJECT_ROOT)/tests/spdk_runtime_test.cpp \
                          $(PROJECT_ROOT)/tests/format_mount_test.cpp \
                          $(PROJECT_ROOT)/tests/journal_device_test.cpp \
-                         $(PROJECT_ROOT)/tests/data_path_device_test.cpp,$(TEST_SRC))
+                         $(PROJECT_ROOT)/tests/data_path_device_test.cpp \
+                         $(PROJECT_ROOT)/tests/file_api_test.cpp,$(TEST_SRC))
 endif
 TEST_BIN := $(patsubst $(PROJECT_ROOT)/tests/%.cpp,$(BUILD_DIR)/bin/%,$(TEST_SRC))
 LIB_LINK := -L$(BUILD_DIR)/lib -lhfs_core -Wl,-rpath,$(BUILD_DIR)/lib -lpthread
@@ -125,6 +127,13 @@ $(BUILD_DIR)/bin/data_path_device_test: $(PROJECT_ROOT)/tests/data_path_device_t
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -I$(PROJECT_ROOT)/tests -o $@ $^ $(SPDK_LINK) -lpthread $(LDFLAGS)
 endif
+
+# Namespace/inode/directory-index structure test.
+NAMESPACE_TEST_SRC := $(PROJECT_ROOT)/tests/namespace_test.cpp \
+                      $(PROJECT_ROOT)/src/metadata/namespace.cpp
+$(BUILD_DIR)/bin/namespace_test: $(NAMESPACE_TEST_SRC)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -I$(PROJECT_ROOT)/tests -o $@ $^ -lpthread $(LDFLAGS)
 
 test: $(TEST_BIN)
 	@for test_bin in $(TEST_BIN); do echo "== $$test_bin"; $$test_bin || exit 1; done

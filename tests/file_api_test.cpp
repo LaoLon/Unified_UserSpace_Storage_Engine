@@ -1,0 +1,168 @@
+#include <cstdio>
+#include <memory>
+#include <string>
+#include <unistd.h>
+#include <vector>
+
+#include "hfs/config.hpp"
+#include "hfs/core.hpp"
+#include "hfs/file.hpp"
+#include "test_support.hpp"
+
+using namespace hfs;
+
+int main() {
+    const std::string lockPath =
+        "/tmp/hfs2-fileapi-" + std::to_string(::getpid()) + ".lock";
+    auto parsed = parseConfig(validConfigText(lockPath), "file_api_test");
+    HFS_TEST_CHECK(parsed.ok());
+
+    {
+        auto created = Engine::create(parsed.value());
+        HFS_TEST_CHECK(created.ok());
+        auto engine = std::move(created).value();
+        HFS_TEST_CHECK(engine->format({true}).wait().value().ok());
+        HFS_TEST_CHECK(engine->mount().wait().value().ok());
+
+        {
+            auto clientResult = Client::create(*engine, ClientOptions{});
+            HFS_TEST_CHECK(clientResult.ok());
+            auto client = clientResult.value();
+
+            /* 1. root directory is empty and names are ordered */
+            auto rootPage = client->getChildren("/", "", 16).wait().value();
+            HFS_TEST_CHECK(rootPage.ok() && rootPage.value().entries.empty());
+
+            /* 2. create/open semantics through the path API */
+            auto dbDir =
+                client->open("/db", OpenFlags::Create | OpenFlags::Directory).wait().value();
+            HFS_TEST_CHECK(dbDir.ok());
+            auto first = client->open("/db/FILE-000001", OpenFlags::Create).wait().value();
+            HFS_TEST_CHECK(first.ok());
+            const auto firstStat = first.value()->stat();
+            HFS_TEST_CHECK(firstStat.ok() && !firstStat.value().directory);
+            HFS_TEST_CHECK(firstStat.value().logicalSize == 0);
+            HFS_TEST_CHECK(first.value()->handle().valid());
+
+            auto exclusive = client->open("/db/FILE-000001",
+                                          OpenFlags::Create | OpenFlags::Exclusive)
+                                 .wait()
+                                 .value();
+            HFS_TEST_CHECK(exclusive.status() == Status::AlreadyExists);
+            auto missing = client->open("/db/none").wait().value();
+            HFS_TEST_CHECK(missing.status() == Status::NotFound);
+            auto dirAsFile = client->open("/db").wait().value();
+            HFS_TEST_CHECK(dirAsFile.status() == Status::InvalidArgument);
+            auto fileAsDir =
+                client->open("/db/FILE-000001", OpenFlags::Directory).wait().value();
+            HFS_TEST_CHECK(fileAsDir.status() == Status::InvalidArgument);
+            auto dirOk = client->open("/db", OpenFlags::Directory).wait().value();
+            HFS_TEST_CHECK(dirOk.ok());
+
+            /* 3. ordered pages and rename through the path API */
+            for (int i = 2; i <= 5; ++i) {
+                const std::string path = "/db/FILE-00000" + std::to_string(i);
+                HFS_TEST_CHECK(client->open(path, OpenFlags::Create).wait().value().ok());
+            }
+            auto page1 = client->getChildren("/db", "", 3).wait().value();
+            HFS_TEST_CHECK(page1.ok() && page1.value().entries.size() == 3);
+            HFS_TEST_CHECK(page1.value().entries[0].name == "FILE-000001");
+            HFS_TEST_CHECK(page1.value().entries[2].name == "FILE-000003");
+            HFS_TEST_CHECK(page1.value().nextCursor == "FILE-000003");
+
+            auto page2 =
+                client->getChildren("/db", page1.value().nextCursor, 8).wait().value();
+            HFS_TEST_CHECK(page2.ok() && page2.value().entries.size() == 2);
+            HFS_TEST_CHECK(page2.value().entries[0].name == "FILE-000004");
+            HFS_TEST_CHECK(page2.value().entries[1].name == "FILE-000005");
+            HFS_TEST_CHECK(page2.value().nextCursor.empty());
+
+            HFS_TEST_CHECK(client->rename("/db/FILE-000002", "/db/FILE-000099")
+                               .wait()
+                               .value()
+                               .ok());
+            HFS_TEST_CHECK(client->open("/db/FILE-000002").wait().value().status() ==
+                           Status::NotFound);
+            auto renamed = client->open("/db/FILE-000099").wait().value();
+            HFS_TEST_CHECK(renamed.ok());
+
+            /* 4. remove keeps open handles alive; slot reuse bumps the generation */
+            auto older = client->open("/db/gen", OpenFlags::Create).wait().value();
+            HFS_TEST_CHECK(older.ok());
+            const auto olderStat = older.value()->stat();
+            HFS_TEST_CHECK(olderStat.ok());
+            HFS_TEST_CHECK(client->remove("/db/gen").wait().value().ok());
+            HFS_TEST_CHECK(older.value()->stat().ok()); /* handle survives remove */
+            older.value().reset();                     /* closes and frees the inode */
+            auto newer = client->open("/db/gen", OpenFlags::Create).wait().value();
+            HFS_TEST_CHECK(newer.ok());
+            const auto newerStat = newer.value()->stat();
+            HFS_TEST_CHECK(newerStat.ok());
+            HFS_TEST_CHECK(newerStat.value().inodeId == olderStat.value().inodeId);
+            HFS_TEST_CHECK(newerStat.value().generation != olderStat.value().generation);
+
+            /* 5. data operations report NotSupported until Shard-77/78 */
+            HFS_TEST_CHECK(first.value()->read({}, 0).wait().value().status() ==
+                           Status::NotSupported);
+            HFS_TEST_CHECK(first.value()->write({}, 0).wait().value().status() ==
+                           Status::NotSupported);
+            HFS_TEST_CHECK(first.value()->append({}).wait().value().status() ==
+                           Status::NotSupported);
+            HFS_TEST_CHECK(first.value()->truncate(4096).wait().value().status() ==
+                           Status::NotSupported);
+            HFS_TEST_CHECK(first.value()->allocate(0, 4096).wait().value().status() ==
+                           Status::NotSupported);
+            HFS_TEST_CHECK(first.value()->datasync().wait().value().status() ==
+                           Status::NotSupported);
+            HFS_TEST_CHECK(first.value()->sync().wait().value().status() ==
+                           Status::NotSupported);
+
+            /* 6. client open-file limit */
+            auto limitedResult = Client::create(*engine, ClientOptions{2});
+            HFS_TEST_CHECK(limitedResult.ok());
+            auto limited = limitedResult.value();
+            auto limit1 = limited->open("/db/FILE-000001").wait().value();
+            auto limit2 = limited->open("/db/FILE-000003").wait().value();
+            HFS_TEST_CHECK(limit1.ok() && limit2.ok());
+            auto limit3 = limited->open("/db/FILE-000004").wait().value();
+            HFS_TEST_CHECK(!limit3.ok() && limit3.status() == Status::NoMemory);
+            limit1.value().reset();
+            limit2.value().reset();
+            auto limit4 = limited->open("/db/FILE-000004").wait().value();
+            HFS_TEST_CHECK(limit4.ok());
+            limit4.value().reset();
+            limited.reset();
+
+            /* 7. closed clients reject further path calls */
+            HFS_TEST_CHECK(client->close().wait().value().ok());
+            auto afterClose = client->open("/db").wait().value();
+            HFS_TEST_CHECK(afterClose.status() == Status::InvalidState);
+
+            client.reset();
+        }
+
+        /* 8. stop is Busy while a client or open file still exists */
+        auto busyClient = Client::create(*engine, ClientOptions{});
+        HFS_TEST_CHECK(busyClient.ok());
+        auto busyFile = busyClient.value()->open("/db/FILE-000001").wait().value();
+        HFS_TEST_CHECK(busyFile.ok());
+        auto busyStop = engine->stop().wait().value();
+        HFS_TEST_CHECK(busyStop.status() == Status::Busy);
+        busyFile.value().reset();
+        busyClient.value().reset();
+        HFS_TEST_CHECK(engine->stop().wait().value().ok());
+    }
+
+    /* restore a clean formatted image for the other device tests */
+    {
+        auto created = Engine::create(parsed.value());
+        HFS_TEST_CHECK(created.ok());
+        auto engine = std::move(created).value();
+        HFS_TEST_CHECK(engine->format({true}).wait().value().ok());
+        HFS_TEST_CHECK(engine->stop().wait().value().ok());
+    }
+
+    ::unlink(lockPath.c_str());
+    std::printf("file_api_test: ok\n");
+    return 0;
+}

@@ -43,6 +43,7 @@ set(HFS_CORE_SRC
   src/core/parent_completion.cpp
   src/core/scheduler.cpp
   src/core/shard_ring.cpp
+  src/metadata/namespace.cpp
   src/runtime/spdk_runtime.cpp
   src/storage/journal.cpp
   src/storage/superblock.cpp
@@ -120,7 +121,7 @@ enable_testing()
 set(HFS_TESTS config_parser_test task_test crc_test geometry_test journal_test)
 if(HFS_WITH_SPDK)
   list(APPEND HFS_TESTS engine_lifecycle_test spdk_runtime_test format_mount_test
-       journal_device_test)
+       journal_device_test file_api_test)
 endif()
 foreach(test_name IN LISTS HFS_TESTS)
   add_executable(${test_name} tests/${test_name}.cpp)
@@ -204,6 +205,20 @@ if(HFS_WITH_SPDK)
   hfs_link_spdk(data_path_device_test)
   add_test(NAME data_path_device_test COMMAND data_path_device_test)
 endif()
+
+# Namespace/inode/directory-index structure test (internal sources, no SPDK).
+add_executable(namespace_test
+  tests/namespace_test.cpp
+  src/metadata/namespace.cpp
+)
+target_include_directories(namespace_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests
+)
+target_compile_options(namespace_test PRIVATE -fno-exceptions -fno-rtti)
+target_link_libraries(namespace_test PRIVATE Threads::Threads)
+add_test(NAME namespace_test COMMAND namespace_test)
 
 # Keep clangd's compilation database at the repository root.
 add_custom_target(compile-commands ALL

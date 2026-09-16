@@ -14,6 +14,7 @@
 #include "common/trace.hpp"
 #include "core/frame_pool.hpp"
 #include "core/operation.hpp"
+#include "metadata/namespace.hpp"
 #include "runtime/spdk_runtime.hpp"
 #include "storage/volume.hpp"
 
@@ -77,6 +78,8 @@ struct Engine::Impl {
     std::array<std::uint8_t, 16> uuid{};
     std::vector<DeviceGeometry> geometries;
     pid_t ownerPid = 0;
+    std::unique_ptr<metadata::Namespace> namespaceState;
+    std::atomic<std::uint32_t> metadataUsers{0};
 };
 
 Engine::Engine(Config config) : impl_(std::make_unique<Impl>()) {
@@ -199,6 +202,17 @@ Task<Result<void>> Engine::mount() {
         runtime.stop();
         co_return makeError(volume.status(), volume.message());
     }
+    /* Resident namespace state; durability is wired with the metadata
+     * transaction path (journal replay/checkpoint of inode records). */
+    metadata::NamespaceConfig namespaceConfig;
+    namespaceConfig.maxInodes = impl.config.maxInodes;
+    namespaceConfig.maxNamespaceBytes = impl.config.maxNamespaceBytes;
+    auto namespaceState = metadata::Namespace::create(namespaceConfig);
+    if (!namespaceState.ok()) {
+        runtime.stop();
+        co_return makeError(namespaceState.status(), namespaceState.message());
+    }
+    impl.namespaceState = std::move(namespaceState).value();
     impl.formatted = true;
     impl.uuid = volume.value().uuid;
     impl.geometries = volume.value().devices;
@@ -229,6 +243,11 @@ Task<Result<void>> Engine::stop() {
     if (impl.stopped) {
         co_return Result<void>(Status::Ok);
     }
+    /* Active clients/open files keep the namespace alive; callers must close
+     * them first (hfs2.0.md §14.3). */
+    if (impl.metadataUsers.load(std::memory_order_acquire) != 0) {
+        co_return Result<void>(Status::Busy, "clients or open files are still active");
+    }
     if (impl.mounted) {
         auto stopped = SpdkRuntime::instance().stop();
         if (!stopped.ok()) {
@@ -236,6 +255,7 @@ Task<Result<void>> Engine::stop() {
         }
         impl.mounted = false;
     }
+    impl.namespaceState.reset();
     if (impl.lockFd >= 0) {
         ::flock(impl.lockFd, LOCK_UN);
         ::close(impl.lockFd);
@@ -258,6 +278,18 @@ bool Engine::processValid() const noexcept {
 }
 
 bool Engine::formatted() const noexcept { return impl_->formatted; }
+
+metadata::Namespace *Engine::metadataNamespace() const noexcept {
+    return impl_->namespaceState.get();
+}
+
+void Engine::retainMetadataUser() noexcept {
+    impl_->metadataUsers.fetch_add(1, std::memory_order_acq_rel);
+}
+
+void Engine::releaseMetadataUser() noexcept {
+    impl_->metadataUsers.fetch_sub(1, std::memory_order_acq_rel);
+}
 
 std::array<std::uint8_t, 16> Engine::volumeUuid() const noexcept { return impl_->uuid; }
 

@@ -10,14 +10,27 @@
 
 #include "hfs/config.hpp"
 #include "hfs/export.hpp"
+#include "hfs/file.hpp"
 #include "hfs/superblock.hpp"
 #include "hfs/task.hpp"
 #include "hfs/types.hpp"
 
 namespace hfs {
 
-class File;      /* Phase 2+ */
+namespace metadata {
+class Namespace;
+}
+
+/* Internal lease that keeps the engine from stopping while client metadata
+ * users (clients and open files) are still alive (hfs2.0.md §14.3). */
+struct MetadataLease;
+
 class Operation; /* Phase 2+ */
+
+/* Options for one frontend client instance. */
+struct ClientOptions {
+    std::uint32_t maxOpenFiles = 0; /* 0 = only the namespace limits apply */
+};
 
 /* Options for the destructive volume format. */
 struct FormatOptions {
@@ -82,14 +95,21 @@ public:
 
 private:
     explicit Engine(Config config);
+    friend class Client;
+    friend struct MetadataLease;
+    /* Internal: mounted namespace state used by the frontend API. */
+    metadata::Namespace *metadataNamespace() const noexcept;
+    void retainMetadataUser() noexcept;
+    void releaseMetadataUser() noexcept;
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
 
-/* Client is the per-thread/frontend completion sink. */
+/* Client is the per-thread/frontend completion sink and path API entry. */
 class HFS_API Client {
 public:
-    static Result<std::shared_ptr<Client>> create(Engine &engine);
+    static Result<std::shared_ptr<Client>> create(Engine &engine,
+                                                  const ClientOptions &options = {});
     ~Client();
 
     Client(const Client &) = delete;
@@ -97,8 +117,17 @@ public:
 
     Task<Result<void>> close();
 
+    /* Path API; data operations on the returned File land with Shard-77. */
+    Task<Result<std::shared_ptr<File>>> open(std::string_view path,
+                                             OpenFlags flags = OpenFlags::None);
+    Task<Result<void>> remove(std::string_view path);
+    Task<Result<void>> rename(std::string_view from, std::string_view to);
+    Task<Result<DirectoryPage>> getChildren(std::string_view path,
+                                            std::string_view cursor,
+                                            std::size_t maxEntries);
+
 private:
-    explicit Client(Engine &engine);
+    explicit Client(Engine &engine, const ClientOptions &options);
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
