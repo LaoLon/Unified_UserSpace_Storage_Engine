@@ -1,84 +1,56 @@
 PROJECT_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
-SPDK_ROOT_DIR ?= $(PROJECT_ROOT)/spdk
 BUILD_DIR ?= $(PROJECT_ROOT)/build
-APP := $(BUILD_DIR)/bin/spdk-hfs
-LIB := $(BUILD_DIR)/lib/libhfs.so
-CORE_SRC := $(PROJECT_ROOT)/src/hfs.c $(PROJECT_ROOT)/src/hfs_op.c $(PROJECT_ROOT)/src/hfs_mount.c $(PROJECT_ROOT)/src/hfs_file.c $(PROJECT_ROOT)/src/hfs_io.c $(PROJECT_ROOT)/src/hfs_ticket.c $(PROJECT_ROOT)/src/hfs_inode_runtime.c $(PROJECT_ROOT)/src/hfs_log.c $(PROJECT_ROOT)/src/hfs_stats.c $(PROJECT_ROOT)/src/hfs_profile.c $(PROJECT_ROOT)/src/hfs_trace.c $(PROJECT_ROOT)/src/hfs_durability.c $(PROJECT_ROOT)/src/hfs_lib.c $(PROJECT_ROOT)/src/hfs_meta.c $(PROJECT_ROOT)/src/hfs_meta_index.c $(PROJECT_ROOT)/src/hfs_meta_v5.c $(PROJECT_ROOT)/src/hfs_preload.c $(PROJECT_ROOT)/src/hfs_runtime.c $(PROJECT_ROOT)/src/hfs_fd.c
-APP_SRC := $(CORE_SRC) $(PROJECT_ROOT)/src/hfs_main.c
-LIB_SRC := $(CORE_SRC)
-APP_OBJ := $(patsubst $(PROJECT_ROOT)/src/%.c,$(BUILD_DIR)/obj/%.o,$(APP_SRC))
-LIB_OBJ := $(patsubst $(PROJECT_ROOT)/src/%.c,$(BUILD_DIR)/obj/%.o,$(LIB_SRC))
-OBJ := $(APP_OBJ)
-DEP := $(OBJ:.o=.d)
-CONFIG ?= $(PROJECT_ROOT)/config/hfs.json
+CXX ?= g++
 
-ifeq ($(wildcard $(SPDK_ROOT_DIR)/mk/spdk.common.mk),)
-$(error SPDK submodule is missing. Run 'git submodule update --init --recursive')
-endif
+# Shard-68 skeleton build: pure C++20 core, no SPDK yet (Shard-69 adds the
+# runtime and SPDK linkage). src_legacy_frozen/ is never part of this build.
+CXXFLAGS ?= -std=c++20 -O2 -g
+CXXFLAGS += -Wall -Wextra -Wno-unused-parameter -fno-exceptions -fno-rtti \
+            -fvisibility=hidden -fvisibility-inlines-hidden -fPIC -DHFS_CORE_ABI_MAJOR=2
+INCLUDES := -I$(PROJECT_ROOT)/include -I$(PROJECT_ROOT)/src
 
-include $(SPDK_ROOT_DIR)/mk/spdk.common.mk
-include $(SPDK_ROOT_DIR)/mk/spdk.modules.mk
+CORE_SRC := $(sort $(wildcard $(PROJECT_ROOT)/src/common/*.cpp) \
+                   $(wildcard $(PROJECT_ROOT)/src/config/*.cpp) \
+                   $(wildcard $(PROJECT_ROOT)/src/core/*.cpp))
+CORE_OBJ := $(patsubst $(PROJECT_ROOT)/src/%.cpp,$(BUILD_DIR)/obj/%.o,$(CORE_SRC))
+LIB := $(BUILD_DIR)/lib/libhfs_core.so
+HFSCTL := $(BUILD_DIR)/bin/hfsctl
+TEST_SRC := $(sort $(wildcard $(PROJECT_ROOT)/tests/*_test.cpp))
+TEST_BIN := $(patsubst $(PROJECT_ROOT)/tests/%.cpp,$(BUILD_DIR)/bin/%,$(TEST_SRC))
+LIB_LINK := -L$(BUILD_DIR)/lib -lhfs_core -Wl,-rpath,$(BUILD_DIR)/lib
 
-SPDK_LIB_LIST := $(ALL_MODULES_LIST) event event_bdev
-CFLAGS += -DHFS_DEFAULT_CONFIG=\"$(CONFIG)\"
-
-include $(SPDK_ROOT_DIR)/mk/spdk.app.mk
-
-# spdk.app.mk supplies the canonical linker command; keep project objects and
-# output directories outside the SPDK source tree.
-OBJS := $(APP_OBJ)
-$(APP): $(OBJS) | $(BUILD_DIR)/bin
-
-$(LIB): $(LIB_OBJ) | $(BUILD_DIR)/lib
-	$(CC) -o $@ -shared $(CFLAGS) $(LDFLAGS) \
-		-Wl,-soname,libhfs.so \
-		-Wl,--version-script=$(PROJECT_ROOT)/src/hfs_preload.map \
-		$(LIB_OBJ) $(SPDK_LIB_LINKER_ARGS) $(ENV_LDFLAGS) $(SYS_LIBS)
-
-.PHONY: all app lib spdk spdk-configure check-spdk compile-commands run clean distclean
+.PHONY: all app lib test clean
 
 all: app
 
-app: check-spdk $(APP)
+app: $(HFSCTL)
 
-lib: check-spdk $(LIB)
+lib: $(LIB)
 
-spdk-configure:
-	@test -f $(SPDK_ROOT_DIR)/CONFIG || (cd $(SPDK_ROOT_DIR) && ./configure)
+$(LIB): $(CORE_OBJ)
+	@mkdir -p $(dir $@)
+	$(CXX) -shared -o $@ $^ $(LDFLAGS)
 
-spdk: spdk-configure
-	$(MAKE) -C $(SPDK_ROOT_DIR)
+$(HFSCTL): $(PROJECT_ROOT)/tools/hfsctl.cpp $(LIB)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -o $@ $< $(LIB_LINK) $(LDFLAGS)
 
-check-spdk:
-	@test -f $(SPDK_ROOT_DIR)/CONFIG || { echo "SPDK is not configured. Follow README.md, then run 'make spdk'." >&2; exit 1; }
-	@test -d $(SPDK_ROOT_DIR)/build/lib || { echo "SPDK is not built. Run 'make spdk' first." >&2; exit 1; }
+$(BUILD_DIR)/obj/%.o: $(PROJECT_ROOT)/src/%.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -MMD -MP -MF $(@:.o=.d) -c $< -o $@
 
-$(BUILD_DIR)/obj $(BUILD_DIR)/bin $(BUILD_DIR)/lib:
-	mkdir -p $@
+$(BUILD_DIR)/bin/%_test: $(PROJECT_ROOT)/tests/%_test.cpp $(LIB)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -I$(PROJECT_ROOT)/tests \
+		-DHFS_DEFAULT_CONF_PATH='"$(PROJECT_ROOT)/config/hfs_nvme.conf"' \
+		-o $@ $< $(LIB_LINK) $(LDFLAGS)
 
-$(BUILD_DIR)/obj/%.o: $(PROJECT_ROOT)/src/%.c | $(BUILD_DIR)/obj
-	$(CC) $(CPPFLAGS) $(CFLAGS) -I$(PROJECT_ROOT)/src -MMD -MP -MF $(@:.o=.d) -c $< -o $@
+test: $(TEST_BIN)
+	@for test_bin in $(TEST_BIN); do echo "== $$test_bin"; $$test_bin || exit 1; done
+	@echo "all tests passed"
 
-compile-commands: check-spdk
-	@command -v bear >/dev/null || { echo "bear is required" >&2; exit 1; }
-	@rm -f $(PROJECT_ROOT)/compile_commands.json
-	bear --output $(PROJECT_ROOT)/compile_commands.json -- $(MAKE) clean app
-
-HUGEPAGES_TOTAL := $(shell cat /proc/sys/vm/nr_hugepages 2>/dev/null || echo 0)
-
-run: all
-	@if [ "$(HUGEPAGES_TOTAL)" = "0" ]; then \
-		echo "No hugepages configured, allocating 1024 x 2MB..."; \
-		echo 1024 > /proc/sys/vm/nr_hugepages; \
-	fi
-	HFS_FORMAT=1 $(APP)
-
-distclean: clean
-	$(MAKE) -C $(SPDK_ROOT_DIR) clean
-
-# Override spdk.app.mk's clean (it only removes files, cannot remove the
-# build directory). SPDK is only cleaned by distclean.
 clean:
 	rm -rf $(BUILD_DIR)
 
+DEP := $(CORE_OBJ:.o=.d)
 -include $(DEP)
