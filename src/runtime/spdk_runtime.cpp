@@ -620,6 +620,68 @@ struct SpdkRuntime::Impl {
         impl->submitControlIo(device, std::move(io));
     }
 
+    /* Async data-reactor I/O request. */
+    struct DataIoCall {
+        Impl *impl = nullptr;
+        std::size_t reactorIndex = 0; /* index into reactors (data reactors 1..R) */
+        std::size_t deviceIndex = 0;
+        void *buffer = nullptr;
+        std::uint64_t offsetBlocks = 0;
+        std::uint64_t blocks = 0;
+        bool write = false;
+        void (*cb)(void *, int) = nullptr;
+        void *cbCtx = nullptr;
+    };
+
+    struct DataIoHolder {
+        void (*cb)(void *, int) = nullptr;
+        void *cbCtx = nullptr;
+    };
+
+    static void dataIoDone(struct spdk_bdev_io *bdevIo, bool success, void *arg) {
+        auto *holder = static_cast<DataIoHolder *>(arg);
+        spdk_bdev_free_io(bdevIo);
+        holder->cb(holder->cbCtx, success ? 0 : -EIO);
+        delete holder;
+    }
+
+    void submitDataIo(DataIoCall *call) {
+        if (call->reactorIndex >= reactors.size() || call->deviceIndex >= devices.size() ||
+            reactors[call->reactorIndex]->spdk == nullptr ||
+            call->deviceIndex >= reactors[call->reactorIndex]->channels.size() ||
+            devices[call->deviceIndex].desc == nullptr || call->buffer == nullptr ||
+            call->blocks == 0) {
+            call->cb(call->cbCtx, -EINVAL);
+            delete call;
+            return;
+        }
+        spdk_bdev_desc *desc = devices[call->deviceIndex].desc;
+        spdk_io_channel *channel =
+            reactors[call->reactorIndex]->channels[call->deviceIndex];
+        struct iovec iov;
+        iov.iov_base = call->buffer;
+        iov.iov_len = call->blocks * devices[call->deviceIndex].blockSize;
+        auto *holder = new DataIoHolder{call->cb, call->cbCtx};
+        const int rc = call->write
+                           ? spdk_bdev_writev_blocks(desc, channel, &iov, 1,
+                                                     call->offsetBlocks, call->blocks,
+                                                     dataIoDone, holder)
+                           : spdk_bdev_readv_blocks(desc, channel, &iov, 1,
+                                                    call->offsetBlocks, call->blocks,
+                                                    dataIoDone, holder);
+        if (rc != 0) {
+            delete holder;
+            call->cb(call->cbCtx, rc);
+        }
+        delete call;
+    }
+
+    static void dataSubmitTrampoline(void *ctx) {
+        auto *call = static_cast<DataIoCall *>(ctx);
+        Impl *impl = call->impl;
+        impl->submitDataIo(call);
+    }
+
     /* Blocking control-path block I/O helper shared by the public methods. */
     Result<void> controlIo(ControlIo::Op op, std::size_t index, std::uint64_t offsetBlocks,
                            std::span<std::byte> readTarget,
@@ -897,6 +959,85 @@ Result<void> SpdkRuntime::controlFlush(std::size_t index) {
     return impl_->controlIo(ControlIo::Op::Flush, index, 0, {}, {});
 }
 
+Result<void> SpdkRuntime::submitDataRead(std::uint32_t reactorIndex,
+                                         std::size_t deviceIndex, void *buffer,
+                                         std::uint64_t offsetBlocks, std::uint64_t blocks,
+                                         void (*cb)(void *, int), void *cbCtx) {
+    auto &impl = *impl_;
+    spdk_thread *thread = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        if (!impl.activeFlag.load(std::memory_order_acquire)) {
+            return makeError(Status::Busy, "SPDK runtime is not active");
+        }
+        if (reactorIndex + 1 >= impl.reactors.size() ||
+            impl.reactors[reactorIndex + 1]->spdk == nullptr ||
+            deviceIndex >= impl.devices.size()) {
+            return makeError(Status::InvalidArgument, "data reactor or device out of range");
+        }
+        thread = impl.reactors[reactorIndex + 1]->spdk;
+    }
+    auto *call = new Impl::DataIoCall();
+    call->impl = &impl;
+    call->reactorIndex = reactorIndex + 1;
+    call->deviceIndex = deviceIndex;
+    call->buffer = buffer;
+    call->offsetBlocks = offsetBlocks;
+    call->blocks = blocks;
+    call->write = false;
+    call->cb = cb;
+    call->cbCtx = cbCtx;
+    if (spdk_thread_send_msg(thread, Impl::dataSubmitTrampoline, call) != 0) {
+        delete call;
+        return makeError(Status::Busy, "spdk_thread_send_msg failed");
+    }
+    return Result<void>(Status::Ok);
+}
+
+Result<void> SpdkRuntime::submitDataWrite(std::uint32_t reactorIndex,
+                                          std::size_t deviceIndex, const void *buffer,
+                                          std::uint64_t offsetBlocks, std::uint64_t blocks,
+                                          void (*cb)(void *, int), void *cbCtx) {
+    auto &impl = *impl_;
+    spdk_thread *thread = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        if (!impl.activeFlag.load(std::memory_order_acquire)) {
+            return makeError(Status::Busy, "SPDK runtime is not active");
+        }
+        if (reactorIndex + 1 >= impl.reactors.size() ||
+            impl.reactors[reactorIndex + 1]->spdk == nullptr ||
+            deviceIndex >= impl.devices.size()) {
+            return makeError(Status::InvalidArgument, "data reactor or device out of range");
+        }
+        thread = impl.reactors[reactorIndex + 1]->spdk;
+    }
+    auto *call = new Impl::DataIoCall();
+    call->impl = &impl;
+    call->reactorIndex = reactorIndex + 1;
+    call->deviceIndex = deviceIndex;
+    call->buffer = const_cast<void *>(buffer);
+    call->offsetBlocks = offsetBlocks;
+    call->blocks = blocks;
+    call->write = true;
+    call->cb = cb;
+    call->cbCtx = cbCtx;
+    if (spdk_thread_send_msg(thread, Impl::dataSubmitTrampoline, call) != 0) {
+        delete call;
+        return makeError(Status::Busy, "spdk_thread_send_msg failed");
+    }
+    return Result<void>(Status::Ok);
+}
+
+bool SpdkRuntime::isDmaCapable(const void *buffer, std::size_t bytes) const noexcept {
+    if (buffer == nullptr || bytes == 0) {
+        return false;
+    }
+    std::uint64_t size = bytes;
+    const std::uint64_t physical = spdk_vtophys(buffer, &size);
+    return physical != SPDK_VTOPHYS_ERROR && size >= bytes;
+}
+
 #else /* !HFS_WITH_SPDK */
 
 struct SpdkRuntime::Impl {};
@@ -959,6 +1100,40 @@ Result<void> SpdkRuntime::controlWrite(std::size_t index, std::uint64_t offsetBl
 Result<void> SpdkRuntime::controlFlush(std::size_t index) {
     (void)index;
     return makeError(Status::NotSupported, "core built without SPDK support");
+}
+
+Result<void> SpdkRuntime::submitDataRead(std::uint32_t reactorIndex,
+                                         std::size_t deviceIndex, void *buffer,
+                                         std::uint64_t offsetBlocks, std::uint64_t blocks,
+                                         void (*cb)(void *, int), void *cbCtx) {
+    (void)reactorIndex;
+    (void)deviceIndex;
+    (void)buffer;
+    (void)offsetBlocks;
+    (void)blocks;
+    (void)cb;
+    (void)cbCtx;
+    return makeError(Status::NotSupported, "core built without SPDK support");
+}
+
+Result<void> SpdkRuntime::submitDataWrite(std::uint32_t reactorIndex,
+                                          std::size_t deviceIndex, const void *buffer,
+                                          std::uint64_t offsetBlocks, std::uint64_t blocks,
+                                          void (*cb)(void *, int), void *cbCtx) {
+    (void)reactorIndex;
+    (void)deviceIndex;
+    (void)buffer;
+    (void)offsetBlocks;
+    (void)blocks;
+    (void)cb;
+    (void)cbCtx;
+    return makeError(Status::NotSupported, "core built without SPDK support");
+}
+
+bool SpdkRuntime::isDmaCapable(const void *buffer, std::size_t bytes) const noexcept {
+    (void)buffer;
+    (void)bytes;
+    return false;
 }
 
 #endif /* HFS_WITH_SPDK */

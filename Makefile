@@ -29,7 +29,8 @@ ifeq ($(HFS_WITH_SPDK),0)
 TEST_SRC := $(filter-out $(PROJECT_ROOT)/tests/engine_lifecycle_test.cpp \
                          $(PROJECT_ROOT)/tests/spdk_runtime_test.cpp \
                          $(PROJECT_ROOT)/tests/format_mount_test.cpp \
-                         $(PROJECT_ROOT)/tests/journal_device_test.cpp,$(TEST_SRC))
+                         $(PROJECT_ROOT)/tests/journal_device_test.cpp \
+                         $(PROJECT_ROOT)/tests/data_path_device_test.cpp,$(TEST_SRC))
 endif
 TEST_BIN := $(patsubst $(PROJECT_ROOT)/tests/%.cpp,$(BUILD_DIR)/bin/%,$(TEST_SRC))
 LIB_LINK := -L$(BUILD_DIR)/lib -lhfs_core -Wl,-rpath,$(BUILD_DIR)/lib -lpthread
@@ -104,6 +105,26 @@ SCHEDULER_TEST_SRC := $(PROJECT_ROOT)/tests/scheduler_test.cpp \
 $(BUILD_DIR)/bin/scheduler_test: $(SCHEDULER_TEST_SRC)
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -I$(PROJECT_ROOT)/tests -o $@ $^ -lpthread $(LDFLAGS)
+
+# Extent planner / DMA arena / parent completion structure test.
+IO_PLANNER_TEST_SRC := $(PROJECT_ROOT)/tests/io_planner_test.cpp \
+                       $(PROJECT_ROOT)/src/common/log.cpp \
+                       $(PROJECT_ROOT)/src/common/stats.cpp \
+                       $(PROJECT_ROOT)/src/common/trace.cpp \
+                       $(PROJECT_ROOT)/src/core/dma_arena.cpp \
+                       $(PROJECT_ROOT)/src/core/extent_map.cpp \
+                       $(PROJECT_ROOT)/src/core/io_planner.cpp \
+                       $(PROJECT_ROOT)/src/core/parent_completion.cpp
+$(BUILD_DIR)/bin/io_planner_test: $(IO_PLANNER_TEST_SRC)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -I$(PROJECT_ROOT)/tests -o $@ $^ -lpthread $(LDFLAGS)
+
+# Device-backed data-path test: internal sources plus the SPDK runtime closure.
+ifeq ($(HFS_WITH_SPDK),1)
+$(BUILD_DIR)/bin/data_path_device_test: $(PROJECT_ROOT)/tests/data_path_device_test.cpp $(CORE_SRC)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -I$(PROJECT_ROOT)/tests -o $@ $^ $(SPDK_LINK) -lpthread $(LDFLAGS)
+endif
 
 test: $(TEST_BIN)
 	@for test_bin in $(TEST_BIN); do echo "== $$test_bin"; $$test_bin || exit 1; done

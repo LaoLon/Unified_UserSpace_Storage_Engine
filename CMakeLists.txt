@@ -33,9 +33,14 @@ set(HFS_CORE_SRC
   src/config/parser.cpp
   src/core/actor.cpp
   src/core/client.cpp
+  src/core/data_path.cpp
+  src/core/dma_arena.cpp
   src/core/engine.cpp
+  src/core/extent_map.cpp
   src/core/frame_pool.cpp
+  src/core/io_planner.cpp
   src/core/operation.cpp
+  src/core/parent_completion.cpp
   src/core/scheduler.cpp
   src/core/shard_ring.cpp
   src/runtime/spdk_runtime.cpp
@@ -62,9 +67,6 @@ target_include_directories(hfs_core
 target_link_libraries(hfs_core PRIVATE Threads::Threads)
 
 if(HFS_WITH_SPDK)
-  target_compile_definitions(hfs_core PRIVATE HFS_WITH_SPDK=1)
-  target_include_directories(hfs_core PRIVATE ${HFS_SPDK_ROOT}/include)
-
   # Mirror of the legacy SPDK static link set; bdev/nvme/env/thread/init are
   # the modules the runtime uses, the rest keep subsystem registration intact.
   set(SPDK_LIB_LIST
@@ -90,16 +92,24 @@ if(HFS_WITH_SPDK)
   )
   set(HFS_SYS_LIBS numa dl rt uuid ssl crypto m lz4 fuse3 keyutils aio)
 
-  target_link_libraries(hfs_core PRIVATE
-    -Wl,--whole-archive -Wl,--no-as-needed
-    ${SPDK_STATIC_LIBS}
-    -Wl,--no-whole-archive
-    -Wl,--whole-archive
-    ${DPDK_STATIC_LIBS}
-    -Wl,--no-whole-archive
-    ${ISAL_LIBS}
-    ${HFS_SYS_LIBS}
-  )
+  # Attach the SPDK runtime closure to a target (core library and the device
+  # data-path test both need it).
+  function(hfs_link_spdk target)
+    target_compile_definitions(${target} PRIVATE HFS_WITH_SPDK=1)
+    target_include_directories(${target} PRIVATE ${HFS_SPDK_ROOT}/include)
+    target_link_libraries(${target} PRIVATE
+      -Wl,--whole-archive -Wl,--no-as-needed
+      ${SPDK_STATIC_LIBS}
+      -Wl,--no-whole-archive
+      -Wl,--whole-archive
+      ${DPDK_STATIC_LIBS}
+      -Wl,--no-whole-archive
+      ${ISAL_LIBS}
+      ${HFS_SYS_LIBS}
+    )
+  endfunction()
+
+  hfs_link_spdk(hfs_core)
 endif()
 
 add_executable(hfsctl tools/hfsctl.cpp)
@@ -159,6 +169,41 @@ target_include_directories(scheduler_test PRIVATE
 target_compile_options(scheduler_test PRIVATE -fno-exceptions -fno-rtti)
 target_link_libraries(scheduler_test PRIVATE Threads::Threads)
 add_test(NAME scheduler_test COMMAND scheduler_test)
+
+# Extent planner / DMA arena / parent completion structure test.
+add_executable(io_planner_test
+  tests/io_planner_test.cpp
+  src/common/log.cpp
+  src/common/stats.cpp
+  src/common/trace.cpp
+  src/core/dma_arena.cpp
+  src/core/extent_map.cpp
+  src/core/io_planner.cpp
+  src/core/parent_completion.cpp
+)
+target_include_directories(io_planner_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests
+)
+target_compile_options(io_planner_test PRIVATE -fno-exceptions -fno-rtti)
+target_link_libraries(io_planner_test PRIVATE Threads::Threads)
+add_test(NAME io_planner_test COMMAND io_planner_test)
+
+# Device-backed data-path test: real NVMe read/write through the async data
+# reactor path (compiles the core sources directly and links SPDK).
+if(HFS_WITH_SPDK)
+  add_executable(data_path_device_test tests/data_path_device_test.cpp ${HFS_CORE_SRC})
+  target_include_directories(data_path_device_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests
+  )
+  target_compile_options(data_path_device_test PRIVATE -fno-exceptions -fno-rtti)
+  target_link_libraries(data_path_device_test PRIVATE Threads::Threads)
+  hfs_link_spdk(data_path_device_test)
+  add_test(NAME data_path_device_test COMMAND data_path_device_test)
+endif()
 
 # Keep clangd's compilation database at the repository root.
 add_custom_target(compile-commands ALL

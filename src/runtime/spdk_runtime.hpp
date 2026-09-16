@@ -52,6 +52,19 @@ public:
                               std::span<const std::byte> buffer);
     Result<void> controlFlush(std::size_t index);
 
+    /* Async data-reactor block I/O; the callback runs on the reactor thread. */
+    Result<void> submitDataRead(std::uint32_t reactorIndex, std::size_t deviceIndex,
+                                void *buffer, std::uint64_t offsetBlocks,
+                                std::uint64_t blocks, void (*cb)(void *, int),
+                                void *cbCtx);
+    Result<void> submitDataWrite(std::uint32_t reactorIndex, std::size_t deviceIndex,
+                                 const void *buffer, std::uint64_t offsetBlocks,
+                                 std::uint64_t blocks, void (*cb)(void *, int),
+                                 void *cbCtx);
+
+    /* True when the buffer is DMA-mappable through SPDK. */
+    bool isDmaCapable(const void *buffer, std::size_t bytes) const noexcept;
+
 private:
     SpdkRuntime();
     ~SpdkRuntime();
