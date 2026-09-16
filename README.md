@@ -1,5 +1,9 @@
 # HFS_BASE_SPDK
 
+> 状态（2026-09-16）：HFS 正在按 `doc/design/hfs2.0.md` 做 clean-break 重构（C++20
+> coroutine-first、raw SPDK bdev、`.conf` 配置）。下方 README 描述的是 HFS 1.x
+> 冻结线（Blobstore/preload）的构建与使用方式，仅用于旧线复现，不代表 HFS 2.0。
+
 An experimental filesystem built on SPDK Blobstore. The initial implementation is migrated from
 the `hfs` example and uses a malloc bdev configured through JSON.
 
