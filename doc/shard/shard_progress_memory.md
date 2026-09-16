@@ -111,6 +111,12 @@
 - 因 A 门禁触发，没有采纳新的 topology/pinning/wait-mode 默认值；完整五次 NVMe 矩阵和正式 66B/66C 性能门禁仍未完成。
 - 正式全矩阵入口为 `scripts/db/shard66_baseline_v2.sh`，汇总工具为 `scripts/db/shard66_summary.py`；详细实施记录见 `doc/shard/hfs_posix_sync_boundary_topology_shard_plan.md` 和 `doc/performance/hfs_shard66_baseline_v2.md`。
 
+### 2026-09-16 架构优先重设计
+
+- 复盘确认：reactor 数量、idle backoff 和等待参数不是当前主线；一次 POSIX I/O 同时经过多层锁、ticket/range 两套 ordering、linked-list batch、per-reactor DMA pool、多个 request/completion 对象和多次同步边界，时间/空间复杂度偏高。
+- 当前推荐路线已转为 Shard-67：统一 `HfsOp` 生命周期、per-shard actor ring、单一 per-inode dependency scheduler、共享按需 DMA arena、parent completion，以及 dirty-set/epoch metadata actor。
+- `doc/design/hfs_spdk_cpu_efficiency_optimization_design.md` 是新的架构设计；`doc/shard/hfs_cpu_efficiency_optimization_shard_plan.md` 是执行计划。旧 Shard-66 文档保留历史证据，但其中以 reactor 矩阵为主线的未实施计划不再作为当前路线。
+
 ## 共享验证边界与性能观测口径
 
 - SPDK 源码必须在 VM 内通过 `git clone`、`git fetch`、`git checkout` 和 `git -C spdk submodule update --init --recursive` 获取及维护；禁止从 Windows 工作区把 `spdk/` 源码目录或其子模块传到 VM 覆盖。Windows 到 VM 的同步仅限 HFS 自身源码、脚本和文档。

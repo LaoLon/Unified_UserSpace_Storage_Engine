@@ -1,10 +1,12 @@
 # Shard-66：POSIX 同步边界效率与拓扑自适应优化
 
-> **状态**：实现完成；正式 NVMe 66A 全矩阵需在目标 VM 上按 harness 执行
+> **状态**：历史记录；已实现部分保留，后续路线由 Shard-67 取代；正式 NVMe 66A 全矩阵仍需按 harness 执行
 > **基线**：`main` 当前 HEAD（Shard-65 已完成；task90150022 / task09150832 / task09151930 三阶段测量已收口）
 > **目标**：在不破坏 POSIX 语义、不弱化 durability、不引入 async API 的前提下，削减同步 POSIX 边界每请求软件成本与 CPU 浪费，把 4K~64K steady-state 性能推向实测 raw Blobstore 上限。
 > **证据来源**：`doc/task_result/task90150022_result.md`、`doc/task_result/task09150832_result.md`、`doc/task_result/task09151930_result.md`、`doc/performance/hfs_final_performance_baseline_20260913.md`
 > **不包含**：ticket scheduler 重构、fd/metadata fast path、durability 语义改动、allocator/registered-buffer 改造、pure spin 默认值、盲目扩大 reactor 数。
+
+> **路线说明（2026-09-16）**：本文保留 Shard-66 的历史测量与实现记录；其中以 reactor 数量、idle backoff 和等待参数为主线的后续计划已被 [`hfs_cpu_efficiency_optimization_shard_plan.md`](hfs_cpu_efficiency_optimization_shard_plan.md) 取代。当前开发优先级是统一 operation、inode dependency scheduler、data actor ring、共享 DMA arena 和 parent completion，reactor 数量只作为部署参数。
 
 ## 1. 三阶段测量后的架构结论
 
