@@ -1533,9 +1533,9 @@ int hfsRuntimeSubmitDataBatch(uint32_t reactorId, HfsRuntimeBatchItem *item,
 			break;
 		}
 		/*
-		 * POSIX range locks are held by the caller until this request completes.
-		 * Blocking here can invert that lock order: a full queue waits for an
-		 * earlier request while retaining a range lock needed by that request.
+		 * Inode dependency state is held by the caller until this request
+		 * completes. Blocking here can invert that lock order: a full queue
+		 * waits for an earlier request while retaining its dependency slot.
 		 * Fall back to the legacy single-message submission instead of waiting.
 		 */
 		if (timing && !creditWaited) {
@@ -2090,7 +2090,7 @@ void hfsRuntimeCompletionComplete(HfsCompletion *completion) {
 	}
 	diagnostics = hfsStatsEnabledFast() || hfsStatsTimingFastEnabled() ||
 		hfsTraceEnabledFast();
-	if (hfsStatsEnabledFast()) {
+	if (hfsStatsEnabledFast() && !completion->suppressStatsCompletion) {
 		HFS_STATS_SPDK_COMPLETE();
 	}
 	hfsRuntimeDataCreditRelease(completion);

@@ -10,6 +10,7 @@
 #include <spdk/log.h>
 
 #include "hfs_internal.h"
+#include "hfs_inode_runtime.h"
 #include "hfs_log.h"
 #include "hfs_meta.h"
 #include "hfs_meta_index.h"
@@ -891,19 +892,52 @@ static int hfsMetaEnsureWritable(const Hfs *fs) {
 	return 0;
 }
 
-/* Return true when one inode id is already waiting for a checkpoint. */
-static bool hfsMetaDirtyContains(const Hfs *fs, uint64_t inodeId) {
-	uint32_t i;
+/* Return true when one inode runtime is linked into the dirty set. */
+static bool hfsMetaDirtyContainsLocked(const Hfs *fs, uint64_t inodeId) {
+	const HfsInodeRuntime *runtime;
 
-	if (fs == NULL || fs->metaDirtyInodeIds == NULL) {
-		return false;
-	}
-	for (i = 0; i < fs->metaDirtyInodeCount; i++) {
-		if (fs->metaDirtyInodeIds[i] == inodeId) {
+	for (runtime = fs->metaDirtyHead; runtime != NULL;
+	     runtime = runtime->dirtyNext) {
+		if (runtime->inodeId == inodeId && runtime->dirtyLinked) {
 			return true;
 		}
 	}
 	return false;
+}
+
+/* Return true when one inode id is already waiting for a checkpoint. */
+static bool hfsMetaDirtyContains(const Hfs *fs, uint64_t inodeId) {
+	bool found;
+
+	if (fs == NULL || !fs->metaDirtyLockReady) {
+		return false;
+	}
+	pthread_mutex_lock((pthread_mutex_t *)&fs->metaDirtyLock);
+	found = hfsMetaDirtyContainsLocked(fs, inodeId);
+	pthread_mutex_unlock((pthread_mutex_t *)&fs->metaDirtyLock);
+	return found;
+}
+
+/* Snapshot the dirty epoch and linked-node count under the short set lock. */
+static void hfsMetaDirtySnapshot(const Hfs *fs, uint64_t *epoch,
+					uint32_t *count) {
+	if (epoch != NULL) {
+		*epoch = 0;
+	}
+	if (count != NULL) {
+		*count = 0;
+	}
+	if (fs == NULL || !fs->metaDirtyLockReady) {
+		return;
+	}
+	pthread_mutex_lock((pthread_mutex_t *)&fs->metaDirtyLock);
+	if (epoch != NULL) {
+		*epoch = fs->metaDirtyEpoch;
+	}
+	if (count != NULL) {
+		*count = fs->metaDirtyInodeCount;
+	}
+	pthread_mutex_unlock((pthread_mutex_t *)&fs->metaDirtyLock);
 }
 
 /* Expose dirty-set membership needed by fdatasync's data-only decision. */
@@ -911,38 +945,74 @@ bool hfsMetaInodeDirty(const Hfs *fs, uint64_t inodeId) {
 	return hfsMetaDirtyContains(fs, inodeId);
 }
 
-/* Clear the in-memory dirty set after a stable metadata epoch is durable. */
-static void hfsMetaDirtyClear(Hfs *fs) {
-	if (fs == NULL) {
+/* Clear dirty runtimes through one stable epoch after metadata is durable. */
+static void hfsMetaDirtyClear(Hfs *fs, uint64_t durableEpoch) {
+	HfsInodeRuntime *runtime;
+
+	if (fs == NULL || !fs->metaDirtyLockReady) {
 		return;
 	}
-	fs->metaDirtyInodeCount = 0;
-	fs->metaDirty = false;
+	pthread_mutex_lock(&fs->metaDirtyLock);
+	runtime = fs->metaDirtyHead;
+	while (runtime != NULL) {
+		HfsInodeRuntime *next = runtime->dirtyNext;
+
+		/* Keep a node if a timestamp event raced with this checkpoint. */
+		if (runtime->dirtyEpoch <= durableEpoch &&
+		    !atomic_load_explicit(&runtime->pendingMetadata,
+					   memory_order_acquire)) {
+			if (runtime->dirtyPrev != NULL) {
+				runtime->dirtyPrev->dirtyNext = runtime->dirtyNext;
+			} else {
+				fs->metaDirtyHead = runtime->dirtyNext;
+			}
+			if (runtime->dirtyNext != NULL) {
+				runtime->dirtyNext->dirtyPrev = runtime->dirtyPrev;
+			} else {
+				fs->metaDirtyTail = runtime->dirtyPrev;
+			}
+			runtime->dirtyPrev = NULL;
+			runtime->dirtyNext = NULL;
+			runtime->dirtyLinked = false;
+			if (fs->metaDirtyInodeCount != 0) {
+				fs->metaDirtyInodeCount--;
+			}
+		}
+		runtime = next;
+	}
+	atomic_store_explicit(&fs->metaDirty,
+			fs->metaDirtyInodeCount != 0, memory_order_release);
+	pthread_mutex_unlock(&fs->metaDirtyLock);
 }
 
 /* Mark one data inode for the next metadata group commit. */
 void hfsMetaMarkInodeDirty(Hfs *fs, uint64_t inodeId) {
-	uint64_t *ids;
+	HfsInodeRuntime *runtime;
 
-	if (fs == NULL || inodeId == 0) {
+	if (fs == NULL || inodeId == 0 || inodeId == UINT64_MAX ||
+	    !fs->metaDirtyLockReady) {
 		return;
 	}
-	fs->metaDirty = true;
-	if (hfsMetaDirtyContains(fs, inodeId)) {
-		return;
+	runtime = hfsInodeRuntimeGet(fs, inodeId);
+	pthread_mutex_lock(&fs->metaDirtyLock);
+	fs->metaDirtyEpoch++;
+	atomic_store_explicit(&fs->metaDirty, true, memory_order_release);
+	if (runtime != NULL) {
+		runtime->dirtyEpoch = fs->metaDirtyEpoch;
 	}
-	if (fs->metaDirtyInodeCount >= HFS_MAX_INODES) {
-		return;
-	}
-	if (fs->metaDirtyInodeIds == NULL) {
-		fs->metaDirtyInodeIds = calloc(HFS_MAX_INODES,
-					       sizeof(*fs->metaDirtyInodeIds));
-		if (fs->metaDirtyInodeIds == NULL) {
-			return;
+	if (runtime != NULL && !runtime->dirtyLinked) {
+		runtime->dirtyPrev = fs->metaDirtyTail;
+		runtime->dirtyNext = NULL;
+		if (fs->metaDirtyTail != NULL) {
+			fs->metaDirtyTail->dirtyNext = runtime;
+		} else {
+			fs->metaDirtyHead = runtime;
 		}
+		fs->metaDirtyTail = runtime;
+		runtime->dirtyLinked = true;
+		fs->metaDirtyInodeCount++;
 	}
-	ids = fs->metaDirtyInodeIds;
-	ids[fs->metaDirtyInodeCount++] = inodeId;
+	pthread_mutex_unlock(&fs->metaDirtyLock);
 }
 
 /* Append one inode table index exactly once to a bounded v4 transaction. */
@@ -964,7 +1034,7 @@ static bool hfsMetaAppendCommitIndex(uint32_t *indices, uint32_t *count,
 
 /* Merge explicit namespace changes with dirty data inodes for group commit. */
 static bool hfsMetaCollectCommitIndices(Hfs *fs, const uint32_t *indices,
-					uint32_t indexCount,
+					uint32_t indexCount, uint64_t commitEpoch,
 					uint32_t *selected,
 					uint32_t *selectedCount) {
 	uint32_t i;
@@ -976,19 +1046,31 @@ static bool hfsMetaCollectCommitIndices(Hfs *fs, const uint32_t *indices,
 			return false;
 		}
 	}
-	for (i = 0; i < fs->metaDirtyInodeCount; i++) {
-		struct hfs_inode *inode = hfsMetaFindById(fs,
-						 fs->metaDirtyInodeIds[i]);
-		uint32_t index;
+	/* The intrusive set avoids scanning the full runtime registry. */
+	pthread_mutex_lock(&fs->metaDirtyLock);
+	{
+		HfsInodeRuntime *runtime;
 
-		if (inode == NULL) {
-			continue;
-		}
-		index = (uint32_t)(inode - fs->inodes);
-		if (!hfsMetaAppendCommitIndex(selected, selectedCount, index)) {
-			return false;
+		for (runtime = fs->metaDirtyHead; runtime != NULL;
+		     runtime = runtime->dirtyNext) {
+			struct hfs_inode *inode;
+			uint32_t index;
+
+			if (runtime->dirtyEpoch > commitEpoch) {
+				continue;
+			}
+			inode = hfsMetaFindById(fs, runtime->inodeId);
+			if (inode == NULL) {
+				continue;
+			}
+			index = (uint32_t)(inode - fs->inodes);
+			if (!hfsMetaAppendCommitIndex(selected, selectedCount, index)) {
+				pthread_mutex_unlock(&fs->metaDirtyLock);
+				return false;
+			}
 		}
 	}
+	pthread_mutex_unlock(&fs->metaDirtyLock);
 	return true;
 }
 
@@ -1036,7 +1118,9 @@ static int hfsMetaCommitInternal(Hfs *fs, const uint32_t *indices,
 	HfsMetaIntentDisk intent;
 	uint32_t selectedIndices[HFS_META_INTENT_MAX_SLOTS];
 	uint32_t selectedCount;
+	uint32_t dirtyCount;
 	uint32_t fallbackBatch;
+	uint64_t commitEpoch;
 	uint64_t generation;
 	int rc = -1;
 	int savedErrno;
@@ -1050,8 +1134,10 @@ static int hfsMetaCommitInternal(Hfs *fs, const uint32_t *indices,
 		errno = E2BIG;
 		return -1;
 	}
+	hfsMetaDirtySnapshot(fs, &commitEpoch, &dirtyCount);
 	/* Allocation failure while recording a dirty id must not drop that write. */
-	if (fs->metaDirty && fs->metaDirtyInodeCount == 0) {
+	if (atomic_load_explicit(&fs->metaDirty, memory_order_acquire) &&
+	    dirtyCount == 0) {
 		if (hfsMetaSaveAll(fs) == 0) {
 			return 0;
 		}
@@ -1064,9 +1150,9 @@ static int hfsMetaCommitInternal(Hfs *fs, const uint32_t *indices,
 	 * publishing a header checksum for inode ranges that are not protected by
 	 * the intent record.
 	 */
-	if (!hfsMetaCollectCommitIndices(fs, indices, indexCount,
+	if (!hfsMetaCollectCommitIndices(fs, indices, indexCount, commitEpoch,
 					 selectedIndices, &selectedCount)) {
-		fallbackBatch = fs->metaDirtyInodeCount + indexCount;
+		fallbackBatch = dirtyCount + indexCount;
 		if (hfsMetaSaveAll(fs) == 0) {
 			hfsStatsRecordMetadataTransactionFast(fallbackBatch != 0 ?
 							      fallbackBatch : 1);
@@ -1143,7 +1229,7 @@ static int hfsMetaCommitInternal(Hfs *fs, const uint32_t *indices,
 	fs->metaGeneration = generation;
 	fs->metaDurableEpoch = generation;
 	fs->metaNeedsMigration = false;
-	hfsMetaDirtyClear(fs);
+	hfsMetaDirtyClear(fs, commitEpoch);
 	hfsStatsRecordMetadataTransactionFast(indexCount == 0 ? 1 : indexCount);
 	if (!hfsMetaIndexReady(fs) && hfsMetaIndexRebuild(fs) != 0) {
 		HFS_LOG_ERROR("metadata index rebuild deferred: %s", strerror(errno));
@@ -1158,7 +1244,7 @@ out:
 		 * a dirty data checkpoint instead remains visible and retryable.
 		 */
 		if (retainRuntimeMutation && !intentPublished) {
-			fs->metaDirty = true;
+			atomic_store_explicit(&fs->metaDirty, true, memory_order_release);
 		} else if (intentPublished) {
 			fs->metaRecoveryRequired = true;
 		} else if (hfsMetaLoadAll(fs) != 0) {
@@ -1196,11 +1282,16 @@ int hfsMetaSaveAll(Hfs *fs) {
 	uint8_t *buf;
 	size_t len;
 	uint64_t generation = fs->metaGeneration == 0 ? 1 : fs->metaGeneration;
+	uint64_t durableEpoch;
 	int rc;
 
 	if (hfsMetaEnsureWritable(fs) != 0) {
 		return -1;
 	}
+	/* Fold lock-free timestamp overlays before serializing a full image. */
+	hfsInodeRuntimeDrainPendingLocked(fs);
+	/* Preserve dirty events published while the image is being persisted. */
+	hfsMetaDirtySnapshot(fs, &durableEpoch, NULL);
 	if (hfsMetaBuildStableImage(fs, generation, &buf, &len) != 0) {
 		return -1;
 	}
@@ -1210,7 +1301,7 @@ int hfsMetaSaveAll(Hfs *fs) {
 		fs->metaGeneration = generation;
 		fs->metaDurableEpoch = generation;
 		fs->metaNeedsMigration = false;
-		hfsMetaDirtyClear(fs);
+		hfsMetaDirtyClear(fs, durableEpoch);
 	}
 	return rc;
 }
@@ -1395,7 +1486,7 @@ int hfsMetaLoadAll(Hfs *fs) {
 	}
 	fs->nextInodeId = nextInodeId;
 	fs->metaDurableEpoch = fs->metaGeneration;
-	hfsMetaDirtyClear(fs);
+	hfsMetaDirtyClear(fs, UINT64_MAX);
 
 	if (currentFormat && len >= HFS_META_INODE_OFFSET + sizeof(intent)) {
 		bool matchesPendingImage;
@@ -2115,7 +2206,7 @@ int hfsMetaCommitDirty(Hfs *fs) {
 	if (hfsMetaEnsureWritable(fs) != 0) {
 		return -1;
 	}
-	if (!fs->metaDirty) {
+	if (!atomic_load_explicit(&fs->metaDirty, memory_order_acquire)) {
 		return 0;
 	}
 	return hfsMetaCommit(fs, NULL, 0, true);
@@ -2318,9 +2409,26 @@ void hfsMetaFini(Hfs *fs) {
 	hfsMetaIndexFini(fs);
 	free(fs->inodes);
 	fs->inodes = NULL;
-	free(fs->metaDirtyInodeIds);
-	fs->metaDirtyInodeIds = NULL;
-	fs->metaDirtyInodeCount = 0;
+	if (fs->metaDirtyLockReady) {
+		HfsInodeRuntime *runtime;
+
+		pthread_mutex_lock(&fs->metaDirtyLock);
+		for (runtime = fs->metaDirtyHead; runtime != NULL;) {
+			HfsInodeRuntime *next = runtime->dirtyNext;
+
+			runtime->dirtyLinked = false;
+			runtime->dirtyPrev = NULL;
+			runtime->dirtyNext = NULL;
+			runtime = next;
+		}
+		fs->metaDirtyHead = NULL;
+		fs->metaDirtyTail = NULL;
+		fs->metaDirtyInodeCount = 0;
+		atomic_store_explicit(&fs->metaDirty, false, memory_order_release);
+		pthread_mutex_unlock(&fs->metaDirtyLock);
+		pthread_mutex_destroy(&fs->metaDirtyLock);
+		fs->metaDirtyLockReady = false;
+	}
 	fs->inodeCount = 0;
 	errno = savedErrno;
 }
@@ -2334,8 +2442,20 @@ int hfsMetaInit(Hfs *fs) {
 	struct hfs_inode *root;
 	int rc;
 
+	if (fs == NULL) {
+		errno = EINVAL;
+		return -1;
+	}
+	atomic_init(&fs->metaDirty, false);
+	if (pthread_mutex_init(&fs->metaDirtyLock, NULL) != 0) {
+		errno = ENOMEM;
+		return -1;
+	}
+	fs->metaDirtyLockReady = true;
+
 	fs->inodes = calloc(HFS_MAX_INODES, sizeof(struct hfs_inode));
 	if (fs->inodes == NULL) {
+		hfsMetaFini(fs);
 		return -1;
 	}
 	if (hfsMetaIndexInit(fs) != 0) {

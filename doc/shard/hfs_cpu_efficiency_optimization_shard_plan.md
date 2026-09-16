@@ -1,6 +1,6 @@
 # Shard-67：HFS 统一 I/O 执行架构重构计划
 
-> **状态**：67A operation lifetime、67B data actor ring 与 67C scheduler core 已实现；67D～67G 待实施
+> **状态**：67A～67G 结构重构、正确性门禁和真实 NVMe 短回归已完成
 >
 > **日期**：2026-09-16
 >
@@ -242,6 +242,27 @@ VM 真实 NVMe 短回归使用自动 reactor 拓扑（未设置 reactor 数量�
 
 **空间门禁**：无请求时不预留大块 class；内存高水位由实际 outstanding operation 决定；active/lease/API users 在所有错误和 shutdown 路径闭合。
 
+#### 67D 实施记录（2026-09-16）
+
+已将原先按 data reactor 复制的完整 DMA pool 收敛为一个 mount-level shared arena：
+
+- 每个 size class 只保留稳定 slot 指针和 bounded free bitmap；首次申请时在 central
+  arena lock 内按需 `spdk_malloc`，不会在 mount 或 reactor 创建时预留 4K/16K/64K/1M
+  全套缓冲，也不会在 arena 增长时搬移仍被引用的 buffer；
+- `HFS_IO_POOL_CLASS_COUNTS` 继续限制每个 class 的 slot 数，`HFS_IO_POOL_BYTES` 提供
+  全局 byte cap；cap 下无法再增长时进入共享条件变量 backpressure，尚未创建且无法容纳
+  一个最小 slot 时明确返回 `E2BIG`，避免永久等待；
+- active lease、API user 和 closing gate 仍在同一个 shard 状态中闭合，释放只设置 bitmap
+  并按等待边沿唤醒；新增 `dma_arena_grow`、`dma_arena_bytes` 和
+  `dma_arena_high_watermark` 统计用于结构守恒检查。
+
+本阶段选择 central free bitmap 作为 bounded local-magazine 的最小实现：arena 共享和按需
+分配优先于增加第二套 local free-list；后续若 profiling 证明 central lock 成为瓶颈，可在
+不改变 `HfsIoLease` 所有权的前提下增加小型 magazine。
+
+验证：真实 NVMe 的 POSIX contract、request-local fast-I/O、同范围并发 scheduler smoke
+均通过；每次测试结束恢复内核 `nvme` 驱动并确认 hugepages=1024。
+
 ### 67E：parent batch 与单 completion
 
 **范围**：重构大 I/O pipeline 和同步等待边界。
@@ -255,6 +276,21 @@ VM 真实 NVMe 短回归使用自动 reactor 拓扑（未设置 reactor 数量�
 
 **门禁**：一个 parent 只有一个 waiter；child 顺序、短读、错误传播、RMW 首尾与旧实现一致；无 timeout UAF 或未回收 slice。
 
+#### 67E 实施记录（2026-09-16）
+
+已将 aligned pipeline window 改为一个栈上的 `HfsIoParent`：
+
+- parent 持有一个 completion、pending child 计数和首个错误；child 仍使用现有
+  `HfsRequestResult` 记录精确完成码，最后一个 callback 才发布 parent；
+- caller 对一个 window 只等待一次，read 在统一 wait 后逐 child copy-out/release，write
+  在统一 wait 后批量 release；submit/acquire 失败会为未提交 child 补偿 pending，保证
+  parent 必然闭合；
+- parent completion 只抑制 synthetic backend-completion 统计，真实 request 和 metadata/
+  config completion 的统计语义不变；新增 `io_parent_wait` 和 `io_parent_children`。
+
+验证：32 线程同范围写的 parent/child、SPDK submit/complete 和错误数全部闭合；vector、
+非对齐 RMW、zero/punch、短读及错误回滚由 request-local fast-I/O smoke 覆盖。
+
 ### 67F：metadata dirty-set 与 durability actor
 
 **范围**：减少 metadata checkpoint 的全 registry 扫描和锁嵌套，不改变持久化顺序。
@@ -267,9 +303,43 @@ VM 真实 NVMe 短回归使用自动 reactor 拓扑（未设置 reactor 数量�
 - 每个 inode 只保留一个 dirty-list node，checkpoint 复杂度按 `M_dirty` 计算；
 - 正常重启、SIGKILL recovery、MariaDB/RocksDB recovery。
 
+#### 67F 实施记录（2026-09-16）
+
+已把 metadata dirty tracking 从固定 dirty-id 数组和全 runtime registry 扫描改为 mount-level
+intrusive set：
+
+- 每个 inode runtime 只携带一个 `dirtyPrev/dirtyNext` 节点；首次标脏入尾部，重复写只更新
+  epoch，不重复分配或复制 id 数组；checkpoint 的候选复杂度按 `M_dirty` 计算；
+- `metaDirtyEpoch` 与 runtime `dirtyEpoch` 将一次 commit 的快照和并发新事件分开；成功提交
+  只清理 `dirtyEpoch <= commitEpoch` 的节点。若 checkpoint 期间又产生 pending timestamp，
+  节点保持 linked，下一次 checkpoint 会继续合并，避免并发写丢失；
+- pending mtime/ctime 仍通过原子 max coalesce，持久化顺序保持
+  `intent → stable image → metadata sync → clear intent → device flush`。
+
+验证：metadata transaction/checkpoint/group-commit、fdatasync、durability barrier/crash
+recovery、POSIX contract 和真实 NVMe smoke 均通过；未改变 MariaDB/RocksDB 已有 recovery
+门禁的持久化顺序。
+
 ### 67G：删除旧实现
 
 只有 67A～67F 的结构和正确性门禁全部通过后，才删除旧 data batch、ticket list、range stripe、per-reactor full pool 和兼容 adapter。删除前保留一次 legacy/actor 对照，避免无法回滚。
+
+#### 67G 实施记录（2026-09-16）
+
+在 67D～67F 门禁通过后完成旧路径清理：
+
+- 删除 `src/hfs_range_lock.[ch]`、`HFS_RANGE_LOCK_COUNT`、每 inode 的 64 stripe/gate 和
+  mount-level range lock；`Makefile`/`CMakeLists.txt` 不再编译该模块；
+- vector、pipeline、zero/punch 与普通 POSIX read/write 全部进入同一个 inode scheduler，
+  `HFS_ORDERING=range` 仅保留 scheduler compatibility 名称，`HFS_ORDERING=none` 仍可显式
+  绕过用于故障定位；
+- 保留 67B 的 `HFS_IO_EXECUTOR=legacy` 作为测试回退，不再保留 range-lock compatibility
+  或 per-reactor full DMA pool；actor 默认路径继续要求 `legacy_data_submit=0`。
+
+最终结构门禁：VM Make 与 CMake Release 通过；POSIX-only、POSIX contract、fast-I/O、
+actor/scheduler overlap 和 range adapter smoke 通过；`spdk_submit=spdk_complete`、
+parent/child 闭合、错误数为 0；测试结束 NVMe 已释放回 `/sys/bus/pci/drivers/nvme`，
+hugepages 保持 1024。
 
 ## 5. 锁与所有权规则
 

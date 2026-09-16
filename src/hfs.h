@@ -9,8 +9,6 @@
 
 #include <spdk/blob.h>
 
-#include "hfs_range_lock.h"
-
 struct hfs_inode;
 struct hfs_io_pool;
 struct hfs_inode_runtime;
@@ -19,8 +17,6 @@ struct HfsIoChildProfile;
 struct spdk_bdev_desc;
 struct HfsDurabilityCoordinator;
 
-/* Number of hashed range-lock buckets shared by all mounted inodes. */
-#define HFS_RANGE_LOCK_COUNT 256U
 /* Number of buckets used for the lazy per-inode runtime registry. */
 #define HFS_INODE_RUNTIME_BUCKET_COUNT 256U
 
@@ -46,6 +42,8 @@ typedef struct __attribute__((aligned(64))) HfsCompletion {
 	uint64_t traceStageStartNs;
 	/* Optional profiling child owned by the synchronous I/O request. */
 	struct HfsIoChildProfile *profileChild;
+	/* Parent aggregators suppress the synthetic backend-completion counter. */
+	bool suppressStatsCompletion;
 } HfsCompletion;
 
 _Static_assert(sizeof(atomic_int) == 4, "HfsCompletion assumes a 32-bit futex word");
@@ -138,19 +136,21 @@ typedef struct Hfs {
 	uint64_t metaGeneration;			/* committed metadata generation */
 	uint64_t metaDurableEpoch;			/* last generation durable on the metadata blob */
 	bool metaNeedsMigration;			/* old metadata layout needs upgrade */
-	bool metaDirty;			/* in-memory inode fields need commit */
+	_Atomic bool metaDirty;		/* in-memory inode fields need commit */
 	bool metaRecoveryRequired;		/* uncertain transaction requires remount */
-	uint64_t *metaDirtyInodeIds;		/* data inodes waiting for a checkpoint */
-	uint32_t metaDirtyInodeCount;		/* number of entries in metaDirtyInodeIds */
+	pthread_mutex_t metaDirtyLock;	/* intrusive dirty-set and epoch lock */
+	bool metaDirtyLockReady;		/* protects metaDirtyLock lifetime */
+	struct hfs_inode_runtime *metaDirtyHead;
+	struct hfs_inode_runtime *metaDirtyTail;
+	uint32_t metaDirtyInodeCount;	/* number of linked dirty runtimes */
+	uint64_t metaDirtyEpoch;		/* owner-side epoch for dirty notifications */
 	struct spdk_blob *metaBlob;		/* resident metadata blob handle */
 	struct HfsDurabilityCoordinator *durability;	/* mount-level fsync coordinator */
 
-	/* Request-local range synchronization and DMA buffer pool. */
-	HfsRangeLock rangeLocks[HFS_RANGE_LOCK_COUNT];
+	/* Request-local synchronization registry and DMA buffer pool. */
 	pthread_mutex_t inodeRuntimeLock;
 	struct hfs_inode_runtime *inodeRuntimeBuckets[HFS_INODE_RUNTIME_BUCKET_COUNT];
 	struct hfs_inode_runtime *compatibilityRuntime;
-	pthread_mutex_t compatibilityResizeLock;
 	struct hfs_io_pool *ioPool;		/* bounded DMA buffer pool */
 
 

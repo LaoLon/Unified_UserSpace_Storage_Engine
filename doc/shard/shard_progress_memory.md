@@ -162,6 +162,48 @@
   contract 和 fast-I/O 均通过，结束后 NVMe 已恢复内核 `nvme` 驱动。
 - 本阶段仍不输出 CPU/吞吐提升结论，不进行 reactor 数量矩阵；下一步为 67D 共享 DMA arena。
 
+### Shard-67D：共享按需 DMA arena（2026-09-16）
+
+- `HfsIoPool` 已从按 data reactor 复制完整 4K/16K/64K/1M pool 改为一个 mount-level
+  shared arena；class 只保留稳定 slot 指针、slot count/target 和 free bitmap，首次需求
+  才分配 DMA slot，不搬移已有 buffer。
+- `HFS_IO_POOL_CLASS_COUNTS` 仍限制每个 class，`HFS_IO_POOL_BYTES` 作为全局 cap；cap
+  下的可用 slot 通过同一个 condition backpressure，无法容纳首个最小 class 时返回
+  `E2BIG`。active lease、API users、closing 和 shutdown drain 均由 central shard 管理。
+- 新增 `dma_arena_grow`、`dma_arena_bytes`、`dma_arena_high_watermark` 统计；当前实现
+  选择 central bitmap 作为 bounded local-magazine 的最小版本，未重新引入第二套 free-list。
+
+### Shard-67E：parent completion（2026-09-16）
+
+- aligned pipeline window 使用一个栈上 `HfsIoParent`，以 pending counter 和 first-error
+  聚合 child；caller 每个 window 只 wait 一次，read 完成后统一 copy-out/release，write
+  完成后批量 release。
+- acquire/start 失败会补偿未提交 child 的 pending；parent completion 仅关闭 synthetic
+  backend-completion 统计，request/metadata/config completion 仍按原语义计数。
+- 新增 `io_parent_wait`、`io_parent_children`；32 线程重叠写和 fast-I/O 的 vector、RMW、
+  zero/punch、短读、错误回滚通过。
+
+### Shard-67F：metadata dirty-set 与 epoch（2026-09-16）
+
+- mount 使用 intrusive dirty runtime list，替代固定 dirty-id 数组和全 registry bucket
+  扫描；runtime 只保留一个 dirty node，checkpoint 复杂度按当前 `M_dirty` 计算。
+- 每次 mark 更新 mount/runtime epoch；commit/save 只清理不晚于快照 epoch 的节点。并发
+  pending timestamp 在 checkpoint 窗口内继续保持 linked，下一次 checkpoint 负责合并，避免
+  丢失新的 mtime/ctime 事件。
+- metadata transaction/checkpoint/group commit、fdatasync、durability barrier/crash
+  recovery 在真实 NVMe 口径通过，持久化顺序仍是 intent、stable image、sync、publish、
+  device flush。
+
+### Shard-67G：旧 range compatibility 清理（2026-09-16）
+
+- 删除 `src/hfs_range_lock.[ch]`、64-stripe/gate 字段、`HFS_RANGE_LOCK_COUNT` 以及
+  Make/CMake 编译项；vector、pipeline、zero/punch 现在都使用同一个 inode scheduler。
+- `HFS_ORDERING=range` 只作为 scheduler compatibility 名称，`none` 保留显式绕过；
+  67B 的 `HFS_IO_EXECUTOR=legacy` 仍作为回滚对照，但默认 actor 不走 legacy data submit。
+- VM Make/CMake Release、POSIX-only/contract、fast-I/O、actor/scheduler overlap 和 range
+  adapter smoke 均通过，`spdk_submit=spdk_complete`、errors=0；测试后 NVMe 恢复内核
+  `nvme`，hugepages=1024。Shard-67 结构门禁已收口，不以 reactor 数量矩阵作为完成条件。
+
 ## 共享验证边界与性能观测口径
 
 - SPDK 源码必须在 VM 内通过 `git clone`、`git fetch`、`git checkout` 和 `git -C spdk submodule update --init --recursive` 获取及维护；禁止从 Windows 工作区把 `spdk/` 源码目录或其子模块传到 VM 覆盖。Windows 到 VM 的同步仅限 HFS 自身源码、脚本和文档。

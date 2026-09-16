@@ -18,6 +18,11 @@ extern _Atomic uint_fast64_t hfsStatsDmaReleases;
 extern _Atomic uint_fast64_t hfsStatsDmaActivePeak;
 extern _Atomic uint_fast64_t hfsStatsDmaExhausts;
 extern _Atomic uint_fast64_t hfsStatsDmaFastAcquires;
+extern _Atomic uint_fast64_t hfsStatsDmaArenaGrows;
+extern _Atomic uint_fast64_t hfsStatsDmaArenaBytes;
+extern _Atomic uint_fast64_t hfsStatsDmaArenaHighWatermark;
+extern _Atomic uint_fast64_t hfsStatsIoParentWaits;
+extern _Atomic uint_fast64_t hfsStatsIoParentChildren;
 extern _Atomic uint_fast64_t hfsStatsDurabilityLeaders;
 extern _Atomic uint_fast64_t hfsStatsDurabilityWaiters;
 extern _Atomic uint_fast64_t hfsStatsDurabilityBatches;
@@ -245,12 +250,16 @@ void hfsStatsRecordMetadataSync(void);
 
 /* Record a DMA size class, wait event and active high-water mark. */
 void hfsStatsRecordDma(size_t bytes, bool waited, uint64_t active);
-/* Record time spent waiting for a reactor-local DMA lease. */
+/* Record time spent waiting for a shared-arena DMA lease. */
 void hfsStatsRecordDmaWaitNs(uint64_t waitNs);
 /* Record a bounded DMA pool exhaustion observed by a POSIX request. */
 void hfsStatsRecordDmaExhaust(void);
 /* Record lock-free DMA and durability coordinator decisions. */
 void hfsStatsRecordDmaFastAcquire(void);
+/* Record shared-arena growth and the largest allocated byte watermark. */
+void hfsStatsRecordDmaArenaGrow(size_t bytes, uint64_t allocatedBytes);
+/* Record one parent completion wait and its child fan-out. */
+void hfsStatsRecordIoParentWait(uint64_t childCount);
 void hfsStatsRecordDurabilityLeader(void);
 void hfsStatsRecordDurabilityWaiter(void);
 void hfsStatsRecordDurabilityBatch(uint64_t requestCount);

@@ -35,14 +35,8 @@ int hfsInodeRuntimeInit(Hfs *fs) {
 		errno = ENOMEM;
 		return -1;
 	}
-	if (pthread_mutex_init(&fs->compatibilityResizeLock, NULL) != 0) {
-		pthread_mutex_destroy(&fs->inodeRuntimeLock);
-		errno = ENOMEM;
-		return -1;
-	}
 	fs->compatibilityRuntime = hfsInodeRuntimeGet(fs, UINT64_MAX);
 	if (fs->compatibilityRuntime == NULL) {
-		pthread_mutex_destroy(&fs->compatibilityResizeLock);
 		pthread_mutex_destroy(&fs->inodeRuntimeLock);
 		return -1;
 	}
@@ -61,7 +55,32 @@ void hfsInodeRuntimeFini(Hfs *fs) {
 
 		while (runtime != NULL) {
 			HfsInodeRuntime *next = runtime->next;
-			uint32_t stripe;
+
+			/* Remove the runtime from the intrusive dirty set before freeing it. */
+			if (fs->metaDirtyLockReady) {
+				pthread_mutex_lock(&fs->metaDirtyLock);
+				if (runtime->dirtyLinked) {
+					if (runtime->dirtyPrev != NULL) {
+						runtime->dirtyPrev->dirtyNext = runtime->dirtyNext;
+					} else {
+						fs->metaDirtyHead = runtime->dirtyNext;
+					}
+					if (runtime->dirtyNext != NULL) {
+						runtime->dirtyNext->dirtyPrev = runtime->dirtyPrev;
+					} else {
+						fs->metaDirtyTail = runtime->dirtyPrev;
+					}
+					runtime->dirtyLinked = false;
+					if (fs->metaDirtyInodeCount != 0) {
+						fs->metaDirtyInodeCount--;
+					}
+				}
+				if (fs->metaDirtyInodeCount == 0) {
+					atomic_store_explicit(&fs->metaDirty, false,
+						memory_order_release);
+				}
+				pthread_mutex_unlock(&fs->metaDirtyLock);
+			}
 
 			pthread_mutex_lock(&runtime->scheduler.lock);
 			runtime->scheduler.stopping = true;
@@ -70,10 +89,6 @@ void hfsInodeRuntimeFini(Hfs *fs) {
 			/* The runtime is destroyed only after HFS has stopped accepting I/O. */
 			pthread_cond_destroy(&runtime->scheduler.condition);
 			pthread_mutex_destroy(&runtime->scheduler.lock);
-			hfsRangeLockDestroy(&runtime->rangeGate);
-			for (stripe = 0; stripe < HFS_INODE_RANGE_STRIPE_COUNT; stripe++) {
-				hfsRangeLockDestroy(&runtime->rangeStripes[stripe]);
-			}
 			pthread_rwlock_destroy(&runtime->syncLock);
 			pthread_mutex_destroy(&runtime->appendLock);
 			pthread_mutex_destroy(&runtime->writeGapLock);
@@ -84,7 +99,6 @@ void hfsInodeRuntimeFini(Hfs *fs) {
 		fs->inodeRuntimeBuckets[i] = NULL;
 	}
 	fs->compatibilityRuntime = NULL;
-	pthread_mutex_destroy(&fs->compatibilityResizeLock);
 	pthread_mutex_destroy(&fs->inodeRuntimeLock);
 }
 
@@ -114,6 +128,7 @@ HfsInodeRuntime *hfsInodeRuntimeGet(Hfs *fs, uint64_t inodeId) {
 		return NULL;
 	}
 	runtime->inodeId = inodeId;
+	runtime->ownerFs = fs;
 	rc = pthread_mutex_init(&runtime->resizeLock, NULL);
 	if (rc != 0) {
 		free(runtime);
@@ -173,43 +188,6 @@ HfsInodeRuntime *hfsInodeRuntimeGet(Hfs *fs, uint64_t inodeId) {
 	}
 	runtime->scheduler.limit = 64U;
 	runtime->scheduler.stopping = false;
-	rc = hfsRangeLockInit(&runtime->rangeGate);
-	if (rc != 0) {
-		pthread_cond_destroy(&runtime->scheduler.condition);
-		pthread_mutex_destroy(&runtime->scheduler.lock);
-		pthread_rwlock_destroy(&runtime->syncLock);
-		pthread_mutex_destroy(&runtime->writeGapLock);
-		pthread_mutex_destroy(&runtime->appendLock);
-		pthread_mutex_destroy(&runtime->resizeLock);
-		free(runtime);
-		pthread_mutex_unlock(&fs->inodeRuntimeLock);
-		errno = rc;
-		return NULL;
-	}
-	{
-		uint32_t stripe;
-
-		for (stripe = 0; stripe < HFS_INODE_RANGE_STRIPE_COUNT; stripe++) {
-			rc = hfsRangeLockInit(&runtime->rangeStripes[stripe]);
-			if (rc != 0) {
-				while (stripe > 0) {
-					stripe--;
-				hfsRangeLockDestroy(&runtime->rangeStripes[stripe]);
-				}
-				hfsRangeLockDestroy(&runtime->rangeGate);
-				pthread_cond_destroy(&runtime->scheduler.condition);
-				pthread_mutex_destroy(&runtime->scheduler.lock);
-				pthread_rwlock_destroy(&runtime->syncLock);
-				pthread_mutex_destroy(&runtime->writeGapLock);
-				pthread_mutex_destroy(&runtime->appendLock);
-				pthread_mutex_destroy(&runtime->resizeLock);
-				free(runtime);
-				errno = rc;
-				pthread_mutex_unlock(&fs->inodeRuntimeLock);
-				return NULL;
-			}
-		}
-	}
 	runtime->next = fs->inodeRuntimeBuckets[bucket];
 	fs->inodeRuntimeBuckets[bucket] = runtime;
 	pthread_mutex_unlock(&fs->inodeRuntimeLock);
@@ -256,6 +234,10 @@ void hfsInodeRuntimeRecordMetadata(HfsInodeRuntime *runtime,
 	hfsInodeRuntimeAtomicMax(&runtime->pendingMtimeNs, mtimeNs);
 	hfsInodeRuntimeAtomicMax(&runtime->pendingCtimeNs, ctimeNs);
 	atomic_store_explicit(&runtime->pendingMetadata, true, memory_order_release);
+	/* Publish a dirty-set event without taking the global metadata lock. */
+	if (runtime->ownerFs != NULL && runtime->inodeId != UINT64_MAX) {
+		hfsMetaMarkInodeDirty(runtime->ownerFs, runtime->inodeId);
+	}
 }
 
 /* Read a stable-enough pending timestamp overlay for a metadata snapshot. */
@@ -286,42 +268,37 @@ void hfsInodeRuntimeDiscardPending(HfsInodeRuntime *runtime) {
 
 /* Merge coalesced timestamps into inodes while the caller owns metadata write lock. */
 void hfsInodeRuntimeDrainPendingLocked(Hfs *fs) {
-	uint32_t bucket;
+	HfsInodeRuntime *runtime;
 
 	if (fs == NULL) {
 		return;
 	}
-	/* The metadata lock must be held before entering this registry walk. */
-	pthread_mutex_lock(&fs->inodeRuntimeLock);
-	for (bucket = 0; bucket < HFS_INODE_RUNTIME_BUCKET_COUNT; bucket++) {
-		HfsInodeRuntime *runtime;
+	/* The metadata lock must be held before entering this dirty-set walk. */
+	pthread_mutex_lock(&fs->metaDirtyLock);
+	for (runtime = fs->metaDirtyHead; runtime != NULL;
+	     runtime = runtime->dirtyNext) {
+		struct hfs_inode *inode;
+		uint64_t mtimeNs;
+		uint64_t ctimeNs;
 
-		for (runtime = fs->inodeRuntimeBuckets[bucket]; runtime != NULL;
-		     runtime = runtime->next) {
-			struct hfs_inode *inode;
-			uint64_t mtimeNs;
-			uint64_t ctimeNs;
-
-			if (!atomic_exchange_explicit(&runtime->pendingMetadata, false,
-						      memory_order_acq_rel)) {
-				continue;
-			}
-			mtimeNs = atomic_load_explicit(&runtime->pendingMtimeNs,
-						       memory_order_acquire);
-			ctimeNs = atomic_load_explicit(&runtime->pendingCtimeNs,
-						       memory_order_acquire);
-			inode = hfsMetaFindById(fs, runtime->inodeId);
-			if (inode == NULL) {
-				continue;
-			}
-			if (mtimeNs > inode->mtimeNs) {
-				inode->mtimeNs = mtimeNs;
-			}
-			if (ctimeNs > inode->ctimeNs) {
-				inode->ctimeNs = ctimeNs;
-			}
-			hfsMetaMarkInodeDirty(fs, inode->id);
+		if (!atomic_exchange_explicit(&runtime->pendingMetadata, false,
+					      memory_order_acq_rel)) {
+			continue;
+		}
+		mtimeNs = atomic_load_explicit(&runtime->pendingMtimeNs,
+					       memory_order_acquire);
+		ctimeNs = atomic_load_explicit(&runtime->pendingCtimeNs,
+					       memory_order_acquire);
+		inode = hfsMetaFindById(fs, runtime->inodeId);
+		if (inode == NULL) {
+			continue;
+		}
+		if (mtimeNs > inode->mtimeNs) {
+			inode->mtimeNs = mtimeNs;
+		}
+		if (ctimeNs > inode->ctimeNs) {
+			inode->ctimeNs = ctimeNs;
 		}
 	}
-	pthread_mutex_unlock(&fs->inodeRuntimeLock);
+	pthread_mutex_unlock(&fs->metaDirtyLock);
 }

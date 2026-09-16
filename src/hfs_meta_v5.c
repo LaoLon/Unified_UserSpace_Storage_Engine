@@ -523,7 +523,7 @@ int hfsMetaV5Load(Hfs *fs, const uint8_t *image, size_t imageLen,
 	fs->inodeCount = info.inodeCount;
 	fs->nextInodeId = info.nextInodeId;
 	fs->metaGeneration = info.generation;
-	fs->metaDirty = false;
+	atomic_store_explicit(&fs->metaDirty, false, memory_order_release);
 	fs->metaNeedsMigration = false;
 	fs->metaRecoveryRequired = false;
 	if (info.walTail > info.walHead) {

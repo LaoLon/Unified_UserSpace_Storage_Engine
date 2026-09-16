@@ -543,22 +543,18 @@ int hfsResizeTo(HfsFile *file, uint64_t bytes) {
 		hfsStatsRecordResizeFast(true);
 		return 0;
 	}
-	if (runtime != NULL) {
-		pthread_mutex_lock(&runtime->resizeLock);
-	} else {
-		pthread_mutex_lock(&file->fs->compatibilityResizeLock);
+	if (runtime == NULL) {
+		errno = EIO;
+		return -1;
 	}
+	pthread_mutex_lock(&runtime->resizeLock);
 	rc = hfsResizeClusters(file, needClusters, true);
 	hfsStatsRecordResizeFast(false);
 	if (rc == 0 && runtime != NULL) {
 		atomic_store_explicit(&runtime->allocatedClusters, needClusters,
 				      memory_order_release);
 	}
-	if (runtime != NULL) {
-		pthread_mutex_unlock(&runtime->resizeLock);
-	} else {
-		pthread_mutex_unlock(&file->fs->compatibilityResizeLock);
-	}
+	pthread_mutex_unlock(&runtime->resizeLock);
 	return rc;
 }
 
@@ -576,21 +572,17 @@ int hfsResizeExact(HfsFile *file, uint64_t bytes) {
 	if (runtime == NULL && file->inodeId != 0) {
 		return -1;
 	}
-	if (runtime != NULL) {
-		pthread_mutex_lock(&runtime->resizeLock);
-	} else {
-		pthread_mutex_lock(&file->fs->compatibilityResizeLock);
+	if (runtime == NULL) {
+		errno = EIO;
+		return -1;
 	}
+	pthread_mutex_lock(&runtime->resizeLock);
 	rc = hfsResizeClusters(file, needClusters, false);
 	if (rc == 0 && runtime != NULL) {
 		atomic_store_explicit(&runtime->allocatedClusters, needClusters,
 				      memory_order_release);
 	}
-	if (runtime != NULL) {
-		pthread_mutex_unlock(&runtime->resizeLock);
-	} else {
-		pthread_mutex_unlock(&file->fs->compatibilityResizeLock);
-	}
+	pthread_mutex_unlock(&runtime->resizeLock);
 	return rc;
 }
 

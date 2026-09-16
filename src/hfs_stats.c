@@ -35,6 +35,11 @@ _Atomic uint_fast64_t hfsStatsDmaReleases;
 _Atomic uint_fast64_t hfsStatsDmaActivePeak;
 _Atomic uint_fast64_t hfsStatsDmaExhausts;
 _Atomic uint_fast64_t hfsStatsDmaFastAcquires;
+_Atomic uint_fast64_t hfsStatsDmaArenaGrows;
+_Atomic uint_fast64_t hfsStatsDmaArenaBytes;
+_Atomic uint_fast64_t hfsStatsDmaArenaHighWatermark;
+_Atomic uint_fast64_t hfsStatsIoParentWaits;
+_Atomic uint_fast64_t hfsStatsIoParentChildren;
 _Atomic uint_fast64_t hfsStatsDurabilityLeaders;
 _Atomic uint_fast64_t hfsStatsDurabilityWaiters;
 _Atomic uint_fast64_t hfsStatsDurabilityBatches;
@@ -392,6 +397,13 @@ static void hfsStatsReset(void) {
 	atomic_store_explicit(&hfsStatsDmaActivePeak, 0, memory_order_relaxed);
 	atomic_store_explicit(&hfsStatsDmaExhausts, 0, memory_order_relaxed);
 	atomic_store_explicit(&hfsStatsDmaFastAcquires, 0, memory_order_relaxed);
+	atomic_store_explicit(&hfsStatsDmaArenaGrows, 0, memory_order_relaxed);
+	atomic_store_explicit(&hfsStatsDmaArenaBytes, 0, memory_order_relaxed);
+	atomic_store_explicit(&hfsStatsDmaArenaHighWatermark, 0,
+				memory_order_relaxed);
+	atomic_store_explicit(&hfsStatsIoParentWaits, 0, memory_order_relaxed);
+	atomic_store_explicit(&hfsStatsIoParentChildren, 0,
+				memory_order_relaxed);
 	atomic_store_explicit(&hfsStatsDurabilityLeaders, 0, memory_order_relaxed);
 	atomic_store_explicit(&hfsStatsDurabilityWaiters, 0, memory_order_relaxed);
 	atomic_store_explicit(&hfsStatsDurabilityBatches, 0, memory_order_relaxed);
@@ -1282,7 +1294,7 @@ void hfsStatsRecordDma(size_t bytes, bool waited, uint64_t active) {
 	}
 }
 
-/* Record the elapsed wait for one reactor-local DMA lease. */
+/* Record the elapsed wait for one shared-arena DMA lease. */
 void hfsStatsRecordDmaWaitNs(uint64_t waitNs) {
 	HfsStatsShard *shard = hfsStatsShardGet();
 
@@ -1303,6 +1315,32 @@ void hfsStatsRecordDmaExhaust(void) {
 /* Record one successful lock-free DMA slot claim. */
 void hfsStatsRecordDmaFastAcquire(void) {
 	atomic_fetch_add_explicit(&hfsStatsDmaFastAcquires, 1, memory_order_relaxed);
+}
+
+/* Record one shared-arena slot allocation and its byte watermark. */
+void hfsStatsRecordDmaArenaGrow(size_t bytes, uint64_t allocatedBytes) {
+	uint_fast64_t current;
+
+	atomic_fetch_add_explicit(&hfsStatsDmaArenaGrows, 1,
+				memory_order_relaxed);
+	atomic_fetch_add_explicit(&hfsStatsDmaArenaBytes, bytes,
+				memory_order_relaxed);
+	current = atomic_load_explicit(&hfsStatsDmaArenaHighWatermark,
+				memory_order_relaxed);
+	while (current < allocatedBytes &&
+	       !atomic_compare_exchange_weak_explicit(
+			&hfsStatsDmaArenaHighWatermark, &current, allocatedBytes,
+			memory_order_relaxed, memory_order_relaxed)) {
+		/* Retry only when another producer advanced the same watermark. */
+	}
+}
+
+/* Record one parent completion wait and its child fan-out. */
+void hfsStatsRecordIoParentWait(uint64_t childCount) {
+	atomic_fetch_add_explicit(&hfsStatsIoParentWaits, 1,
+				memory_order_relaxed);
+	atomic_fetch_add_explicit(&hfsStatsIoParentChildren, childCount,
+				memory_order_relaxed);
 }
 
 /* Record one durability epoch leader. */
@@ -1576,6 +1614,17 @@ static void hfsStatsWriteSnapshot(void) {
 		atomic_load_explicit(&hfsStatsDmaExhausts, memory_order_relaxed));
 	HFS_STATS_APPEND("dma_fast_acquire=%"PRIuFAST64"\n",
 		atomic_load_explicit(&hfsStatsDmaFastAcquires, memory_order_relaxed));
+	HFS_STATS_APPEND("dma_arena_grow=%"PRIuFAST64"\n",
+		atomic_load_explicit(&hfsStatsDmaArenaGrows, memory_order_relaxed));
+	HFS_STATS_APPEND("dma_arena_bytes=%"PRIuFAST64"\n",
+		atomic_load_explicit(&hfsStatsDmaArenaBytes, memory_order_relaxed));
+	HFS_STATS_APPEND("dma_arena_high_watermark=%"PRIuFAST64"\n",
+		atomic_load_explicit(&hfsStatsDmaArenaHighWatermark,
+		memory_order_relaxed));
+	HFS_STATS_APPEND("io_parent_wait=%"PRIuFAST64"\n",
+		atomic_load_explicit(&hfsStatsIoParentWaits, memory_order_relaxed));
+	HFS_STATS_APPEND("io_parent_children=%"PRIuFAST64"\n",
+		atomic_load_explicit(&hfsStatsIoParentChildren, memory_order_relaxed));
 	HFS_STATS_APPEND("durability_leader=%"PRIuFAST64"\n",
 		atomic_load_explicit(&hfsStatsDurabilityLeaders, memory_order_relaxed));
 	HFS_STATS_APPEND("durability_waiter=%"PRIuFAST64"\n",

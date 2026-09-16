@@ -1098,7 +1098,8 @@ void hfs_lib_fini(void) {
 		return;
 	}
 	/* Persist dirty inode sizes before closing the last open descriptions. */
-	if (g_fs->metaDirty && hfsMetaSaveAll(g_fs) != 0) {
+	if (atomic_load_explicit(&g_fs->metaDirty, memory_order_acquire) &&
+	    hfsMetaSaveAll(g_fs) != 0) {
 		HFS_LOG_ERROR("final metadata save failed");
 	}
 	/* Close every placeholder before unmounting the blobstore. */
@@ -2733,7 +2734,7 @@ static int hfs_lib_fsync_open_file(HfsOpenFile *openFile, bool dataOnly) {
 	}
 	/* Fold lock-free write timestamps into the next durable metadata epoch. */
 	hfsInodeRuntimeDrainPendingLocked(g_fs);
-	if (!g_fs->metaDirty) {
+	if (!atomic_load_explicit(&g_fs->metaDirty, memory_order_acquire)) {
 		hfsDurabilityTraceRecord(openFile->inodeId, "metadata-skip", 0);
 		pthread_rwlock_unlock(&g_metaLock);
 		if (ioLocked) {

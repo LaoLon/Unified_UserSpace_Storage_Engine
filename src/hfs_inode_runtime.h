@@ -24,13 +24,10 @@ typedef struct hfs_inode_scheduler {
 	bool stopping;
 } HfsInodeScheduler;
 
-/* Per-inode range stripes remove cross-file collisions from the data path. */
-#define HFS_INODE_RANGE_STRIPE_COUNT 64U
-#define HFS_INODE_RANGE_STRIPE_UNITS 64U
-
 /* Runtime-only state for one persistent inode; never serialized on disk. */
 typedef struct hfs_inode_runtime {
 	uint64_t inodeId;
+	Hfs *ownerFs;
 	_Atomic uint64_t allocatedClusters;
 	/* Logical EOF shared by all open descriptions of this inode. */
 	_Atomic uint64_t logicalSize;
@@ -38,21 +35,22 @@ typedef struct hfs_inode_runtime {
 	_Atomic uint64_t pendingMtimeNs;
 	_Atomic uint64_t pendingCtimeNs;
 	_Atomic bool pendingMetadata;
+	/* Intrusive membership in the mount-level dirty inode set. */
+	bool dirtyLinked;
+	uint64_t dirtyEpoch;
+	struct hfs_inode_runtime *dirtyPrev;
+	struct hfs_inode_runtime *dirtyNext;
 	pthread_mutex_t resizeLock;
 	/* Serialize writes that must materialize an EOF gap before publication. */
 	pthread_mutex_t writeGapLock;
 	pthread_mutex_t appendLock;
 	pthread_rwlock_t syncLock;
-	/* Serialize overlapping ranges without taking the global hash buckets. */
-	HfsRangeLock rangeStripes[HFS_INODE_RANGE_STRIPE_COUNT];
-	/* Retained as a compatibility barrier for legacy callers. */
-	HfsRangeLock rangeGate;
 	/* Unified interval scheduler for read/write and future barrier operations. */
 	HfsInodeScheduler scheduler;
 	struct hfs_inode_runtime *next;
 } HfsInodeRuntime;
 
-/* Initialize the runtime registry and compatibility fallback lock. */
+/* Initialize the runtime registry and per-inode scheduler state. */
 int hfsInodeRuntimeInit(Hfs *fs);
 /* Destroy all runtime state after the filesystem has stopped accepting I/O. */
 void hfsInodeRuntimeFini(Hfs *fs);

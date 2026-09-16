@@ -1589,6 +1589,48 @@ Bug 等级：**致命 > 严重 > 一般**。
   `HFS_DATA_REACTORS` 仍完全覆盖自动值。
 - **验证**：在 VM 强制构建后，通过默认拓扑探针、POSIX contract 和 request-local
   fast-I/O smoke；8-vCPU 日志确认自动选择 `total=3/data=2`，显式 reactor 配置
- 仍按原 total-count 语义工作。
+  仍按原 total-count 语义工作。
+
+### 92. Parent completion 统计污染 SPDK submit/complete 守恒（已修复）
+
+- **状态**：已修复
+- **时间**：2026-09-16
+- **等级**：一般（仅影响结构统计和性能归因口径，不影响 I/O 数据正确性）
+- **现象**：Shard-67E 首次接入 parent completion 后，重叠写 smoke 报告
+  `spdk_submit=96`、`spdk_complete=129`；将所有通用 completion 排除后又变为
+  `spdk_complete=91`，说明统计边界同时漏计了正常的 metadata/config completion。
+- **排查过程**：沿 `hfsIoDone → hfsRequestComplete → hfsRuntimeCompletionComplete`
+  检查计数点，确认 parent 最后一个 child 完成时会发布一个额外的 `HfsCompletion`，
+  该 completion 没有对应 SPDK backend submit；同时 `HfsCompletion` 被通用
+  `HfsRequestResult`、metadata 和配置加载路径共用，不能通过全局屏蔽 completion
+  来修正 parent 的额外计数。
+- **根因**：初版使用“是否统计 backend completion”的正向标志，parent 默认参与
+  `HFS_STATS_SPDK_COMPLETE()`；修正时曾把通用 completion 误当作 parent 处理，导致
+  真实 backend callback 少计。
+- **修复**：将字段改为显式 opt-out `suppressStatsCompletion`，保持普通
+  `HfsRequestResult`/metadata/config completion 的默认统计语义，仅在
+  `hfsIoParentInit` 中抑制 synthetic parent completion；child callback 仍各自记录
+  backend completion。
+- **验证**：真实 NVMe overlap 与 range-adapter smoke 均满足
+  `spdk_submit=spdk_complete`（分别 96/96、210/210），ticket admit/ready/complete
+  闭合且 errors=0；Make/CMake Release 通过，测试后 NVMe 恢复内核 `nvme` 驱动。
+
+### 93. DMA arena 关闭通知存在丢唤醒窗口（已修复）
+
+- **状态**：已修复
+- **时间**：2026-09-16
+- **等级**：严重（退出阶段可能永久等待 active lease 或 API 使用者归零）
+- **现象**：共享 DMA arena 的 `hfsIoPoolShardFini` 在关闭期间等待条件变量；
+  最后一个 lease/API 使用者释放时若在等待线程即将进入 `pthread_cond_wait` 的窗口
+  内直接广播，通知可能先于等待建立，导致 fini 偶发卡住。
+- **排查过程**：检查 `hfsIoRelease` 与 `hfsIoPoolApiExit` 的 closing 分支，发现它们
+  都在未持有 `shard->lock` 时广播，而 fini 在持锁检查条件后进入条件等待；因此
+  广播与检查/等待不是同一互斥边界。
+- **根因**：关闭路径沿用了非关闭热路径的无锁广播优化，没有遵循条件变量的锁配对
+  规则，形成 lost-wake race。
+- **修复**：closing 分支统一先取得 `shard->lock`、广播 `available` 后解锁；正常
+  lease 释放仍只在存在 waiter 时进入锁，保留 steady-state 快路径。
+- **验证**：重新构建并运行真实 NVMe final validation；测试结束正常恢复内核
+  `nvme` 驱动、hugepages=1024，无残留进程。
 
 ## 通用经验总结
