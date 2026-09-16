@@ -36,6 +36,7 @@ set(HFS_CORE_SRC
   src/core/engine.cpp
   src/core/frame_pool.cpp
   src/core/operation.cpp
+  src/core/scheduler.cpp
   src/core/shard_ring.cpp
   src/runtime/spdk_runtime.cpp
   src/storage/journal.cpp
@@ -141,6 +142,23 @@ target_include_directories(data_plane_test PRIVATE
 target_compile_options(data_plane_test PRIVATE -fno-exceptions -fno-rtti)
 target_link_libraries(data_plane_test PRIVATE Threads::Threads)
 add_test(NAME data_plane_test COMMAND data_plane_test)
+
+# Inode dependency scheduler structure test (same internal-source approach).
+add_executable(scheduler_test
+  tests/scheduler_test.cpp
+  src/common/log.cpp
+  src/common/stats.cpp
+  src/common/trace.cpp
+  src/core/scheduler.cpp
+)
+target_include_directories(scheduler_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests
+)
+target_compile_options(scheduler_test PRIVATE -fno-exceptions -fno-rtti)
+target_link_libraries(scheduler_test PRIVATE Threads::Threads)
+add_test(NAME scheduler_test COMMAND scheduler_test)
 
 # Keep clangd's compilation database at the repository root.
 add_custom_target(compile-commands ALL

@@ -96,6 +96,15 @@ $(BUILD_DIR)/bin/data_plane_test: $(DATA_PLANE_TEST_SRC)
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -I$(PROJECT_ROOT)/tests -o $@ $^ -lpthread $(LDFLAGS)
 
+SCHEDULER_TEST_SRC := $(PROJECT_ROOT)/tests/scheduler_test.cpp \
+                      $(PROJECT_ROOT)/src/common/log.cpp \
+                      $(PROJECT_ROOT)/src/common/stats.cpp \
+                      $(PROJECT_ROOT)/src/common/trace.cpp \
+                      $(PROJECT_ROOT)/src/core/scheduler.cpp
+$(BUILD_DIR)/bin/scheduler_test: $(SCHEDULER_TEST_SRC)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -I$(PROJECT_ROOT)/tests -o $@ $^ -lpthread $(LDFLAGS)
+
 test: $(TEST_BIN)
 	@for test_bin in $(TEST_BIN); do echo "== $$test_bin"; $$test_bin || exit 1; done
 	@echo "all tests passed"
