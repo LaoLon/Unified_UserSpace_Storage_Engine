@@ -83,7 +83,7 @@
 
 ## 性能再分析与 Shard-66 之前的路线
 
-2026-09-10 性能再分析结论：当前 P0 是 POSIX 同步边界下 owner callback 串行、每 syscall 单独 completion wait；8/16 KiB 还存在 DMA class 集中等待，metadata lock 不是 FIO steady-state 主因。后续路线确定为 POSIX Reactor Queue Engine：默认 `min(4,max(1,nproc/2))` 个 data reactor、每 reactor 独立 queue/channel/DMA pool、bounded ticket in-flight、inode/range 顺序和 dirty epoch durability。8 KiB/32 job A/B 中 4 reactor 为当前最佳点（87.6K IOPS，较 1 reactor +32.4%），8 reactor 反而退化，不能无限增加 reactor。
+2026-09-10 性能再分析结论：当前 P0 是 POSIX 同步边界下 owner callback 串行、每 syscall 单独 completion wait；8/16 KiB 还存在 DMA class 集中等待，metadata lock 不是 FIO steady-state 主因。后续路线确定为 POSIX Reactor Queue Engine：每 reactor 独立 queue/channel/DMA pool、bounded ticket in-flight、inode/range 顺序和 dirty epoch durability；reactor 数量应按 CPU 自动匹配并封顶，不能无限增加 reactor。8 KiB/32 job A/B 中较少 reactor 为当前最佳点，继续增加 reactor 反而退化。
 
 ## Shard-66：同步边界与 reactor 拓扑
 
@@ -104,7 +104,7 @@
 
 ### 当前实现状态
 
-- 已实现 66A 基线 v2 harness/summary、66B 小核默认拓扑与 `HFS_REACTOR_PIN`、gated idle backoff、66C cacheline completion 与 bounded adaptive wait，以及 66D poll-gap 观测。
+- 已实现 66A 基线 v2 harness/summary、66B 按 CPU 自动选择小核拓扑与 `HFS_REACTOR_PIN`、gated idle backoff、66C cacheline completion 与 bounded adaptive wait，以及 66D poll-gap 观测。
 - 实现提交为 `818c872`（`feat: implement shard-66 sync boundary optimizations`），已在 `main`。
 - VM Make/CMake、POSIX/ticket/trace/runtime/metadata/durability/persistent 回归及 MariaDB/RocksDB 缩短端到端 smoke 已通过。
 - 2026-09-16 按修改后的 `task09160035` 短测版在真实 NVMe 上复跑：`posix_contract_test.sh` 和 `io_fast_path_smoke.sh` 均通过；A 布局首个共享文件 4K randread/32-job 样本为 58,277.97 IOPS、595% CPU，低于 70K 停止线，随后按门禁停止，未运行 B 或 adaptive。

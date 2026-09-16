@@ -19,8 +19,11 @@ The matrix is:
 | shared-file | 4K/16K/64K | randread/randwrite | 1/8/16/32 | 5 |
 | per-job-file | 4K/16K/64K | randread/randwrite | 1/8/16/32 | 5 |
 
-The default run uses the compatibility contract `HFS_DATA_REACTORS=5` (owner plus
-four data reactors) with owner CPU0, data CPUs 1–4, and application CPUs 5–7. Set
+The formal default run uses the compatibility contract `HFS_DATA_REACTORS=5` (owner plus
+four data reactors) with owner CPU0, data CPUs 1–4, and application CPUs 5–7. This
+explicit five-reactor layout is retained only so historical samples remain comparable;
+the library's automatic runtime choice is CPU-scaled (8 vCPU → owner plus two data
+reactors). Set
 `HFS_BASELINE_TOTAL_REACTORS=3` and `HFS_BASELINE_DATA_CPUS=1,2` for the 66B recommended
 two-data-reactor comparison. Both file models must be reported independently.
 

@@ -552,31 +552,46 @@ static void *hfsRuntimeOwnerMain(void *arg) {
 	return NULL;
 }
 
+/* Return the number of online logical CPUs, with a safe single-CPU fallback. */
+static uint32_t hfsRuntimeOnlineCpuCount(void) {
+	long cpuCount = sysconf(_SC_NPROCESSORS_ONLN);
+
+	if (cpuCount <= 0) {
+		return 1U;
+	}
+	if ((unsigned long)cpuCount > UINT32_MAX) {
+		return UINT32_MAX;
+	}
+	return (uint32_t)cpuCount;
+}
+
+/* Select a conservative automatic total: owner plus roughly one data reactor per four CPUs. */
+static uint32_t hfsRuntimeAutoReactorCount(void) {
+	uint32_t cpuCount = hfsRuntimeOnlineCpuCount();
+	uint32_t dataCount;
+
+	/* A single logical CPU cannot host a separate polling thread without oversubscription. */
+	if (cpuCount <= 1U) {
+		return 1U;
+	}
+	dataCount = cpuCount / 4U;
+	if (dataCount == 0U) {
+		dataCount = 1U;
+	}
+	if (dataCount > 4U) {
+		dataCount = 4U;
+	}
+	return dataCount + 1U;
+}
+
 /* Parse a bounded total reactor count; reactor zero remains the metadata owner. */
 static uint32_t hfsRuntimeDataReactorCountEnv(void) {
 	const char *value = getenv("HFS_DATA_REACTORS");
 	char *end = NULL;
 	unsigned long parsed;
-	long cpuCount;
-	uint32_t dataCount;
 
 	if (value == NULL || value[0] == '\0') {
-		cpuCount = sysconf(_SC_NPROCESSORS_ONLN);
-		if (cpuCount <= 1) {
-			dataCount = 1U;
-		} else if (cpuCount <= 8) {
-			/* Three polling threads leave the remaining CPUs to the application. */
-			dataCount = 2U;
-		} else {
-			dataCount = (uint32_t)cpuCount / 4U;
-		}
-		if (dataCount == 0) {
-			dataCount = 1;
-		}
-		if (dataCount > 4U) {
-			dataCount = 4U;
-		}
-		return dataCount + 1U;
+		return hfsRuntimeAutoReactorCount();
 	}
 	parsed = strtoul(value, &end, 10);
 	if (end == value || *end != '\0' || parsed == 0 ||
@@ -819,6 +834,12 @@ static int hfsRuntimeStartDataReactors(void) {
 	uint32_t initialized = 0;
 	uint32_t created = 0;
 	int rc;
+	const char *configured = getenv("HFS_DATA_REACTORS");
+
+	/* Make the automatic decision visible without touching the I/O hot path. */
+	HFS_LOG_INFO("reactor topology: online_cpus=%u total=%u data=%u source=%s",
+		hfsRuntimeOnlineCpuCount(), count, count > 0U ? count - 1U : 0U,
+		configured != NULL && configured[0] != '\0' ? "env" : "auto");
 
 	g_runtime.dataReactorCount = count;
 	if (count <= 1) {

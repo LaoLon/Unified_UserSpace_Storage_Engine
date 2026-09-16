@@ -113,7 +113,7 @@ IOPS = 线程数 / 平均单请求时延
 
 ### 4.1 默认值修正
 
-- `HFS_DATA_REACTORS` 未设置时：在线 CPU ≤ 8 核 → data reactor = 2（含 owner 共 3 线程轮询）；> 8 核 → min(4, nproc/4) data reactor。保留显式环境变量覆盖，范围 1-8 不变。
+- `HFS_DATA_REACTORS` 未设置时按在线逻辑 CPU 自动匹配：1 核仅使用 owner（避免额外轮询线程）；其余主机按 `clamp(floor(nproc/4), 1, 4)` 个 data reactor，total reactor 为 owner + data。这样 8 vCPU 为 2 个 data reactor、16 vCPU 封顶为 4 个；显式环境变量仍优先，范围 1-8 不变。
 - `HFS_POSIX_QUEUE_DEPTH` 默认维持 32；66A 若显示 queue depth 峰值长期 <8，可另行评估降到 16 的 A/B（不在本子 shard 默认动作内）。
 
 ### 4.2 亲和策略
@@ -231,9 +231,10 @@ IOPS = 线程数 / 平均单请求时延
 ### 13.2 66B topology and affinity
 
 - Preserved the existing total-reactor environment contract: `HFS_DATA_REACTORS=N`
-  means owner plus `N-1` data reactors. When unset, one-vCPU hosts use one data
-  reactor, 2–8-vCPU hosts use two data reactors, and larger hosts use
-  `min(4, max(1, nproc/4))` data reactors.
+  means owner plus `N-1` data reactors. When unset, one-vCPU hosts use only the
+  owner, and larger hosts use `clamp(floor(nproc/4), 1, 4)` data reactors. This
+  keeps 8-vCPU hosts at two data reactors and caps larger hosts at four; explicit
+  environment values still override the automatic choice.
 - Added `HFS_REACTOR_PIN=1`. Without explicit CPU entries it pins owner to CPU0 and
   data reactor `i` to CPU `i`; `HFS_OWNER_REACTOR_CPU` and
   `HFS_DATA_REACTOR_CPUS` remain higher-priority overrides. Application threads are

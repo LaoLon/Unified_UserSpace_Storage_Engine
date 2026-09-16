@@ -210,7 +210,7 @@ pwrite()
 
 `src/hfs_runtime.c:hfsRuntimeOwnerMain` 创建并持续 `spdk_thread_poll` 的 `hfs-owner`。owner 负责 blobstore 控制面、metadata、resize、兼容路径以及没有可用 data reactor 时的 I/O。
 
-`hfsRuntimeDataReactorCountEnv` 的代码语义是“总 reactor 数包含 owner”。未设置 `HFS_DATA_REACTORS` 时，8-vCPU VM 的默认总数为 5，即 owner 0 加 data reactor 1～4；设置环境变量时，值也表示总数，实际 data reactor 数是 `count - 1`。每个 data reactor 在 `hfsRuntimeDataMain` 中拥有独立 SPDK thread 和 polling loop。
+`hfsRuntimeDataReactorCountEnv` 的代码语义是“总 reactor 数包含 owner”。未设置 `HFS_DATA_REACTORS` 时，自动策略在 1-vCPU 主机仅保留 owner，其余主机使用 `1 + clamp(floor(nproc/4), 1, 4)` 个 total reactor；因此 8-vCPU VM 为 owner 0 加 data reactor 1～2，16-vCPU 及以上封顶为 owner 加 4 个 data reactor。设置环境变量时，值也表示总数，实际 data reactor 数是 `count - 1`。每个 data reactor 在 `hfsRuntimeDataMain` 中拥有独立 SPDK thread 和 polling loop。
 
 ### 4.2 请求流向
 
@@ -500,4 +500,3 @@ return 4096 or error to application
 ## 14. 审计结论边界
 
 本文件给出的是“当前源码实际执行的路径”和“由源码可证明的协调/复制/等待点”。它没有把任何一个点直接转换成修改方案，也没有把历史文档中的设计目标当作当前实现。若要回答具体瓶颈的时间占比，必须把本文件中的调用点与 HFS trace 字段（`io_*`、`buffer_classify`、`copy_*`、`ticket_*`、`runtime_*`、`spdk_*`、`completion_*`、`thread_wait_*`）以及系统 perf/FIO 结果逐一对应；仅凭函数名、README 或静态结构不能完成这一层归因。
-

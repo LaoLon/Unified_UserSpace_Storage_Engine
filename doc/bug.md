@@ -1570,4 +1570,25 @@ Bug 等级：**致命 > 严重 > 一般**。
   `io_fast_path_smoke.sh`，确认 sparse read、并发 positioned write、向量 I/O、
   KEEP_SIZE、PUNCH_HOLE 以及边缘校验全部通过。
 
+### 91. 自动 reactor 选择在小 CPU 主机上过度并行（已修复）
+
+- **状态**：已修复
+- **时间**：2026-09-16
+- **等级**：一般（默认线程数量可能超过单核主机的可用 CPU，增加轮询争用）
+- **现象**：未设置 `HFS_DATA_REACTORS` 时，旧逻辑在 1-vCPU 主机仍创建 owner
+  加 1 个 data reactor，在 2～7 vCPU 主机统一创建 owner 加 2 个 data reactor；
+  小型普通 CPU 环境下可能把应用线程和 SPDK poller 挤在同一组 CPU 上。
+- **排查过程**：检查 `hfsRuntimeDataReactorCountEnv` 的默认分支，发现它只在
+  `cpuCount <= 1` 时设置 data 数量为 1，并对 2～8 CPU 直接固定为 2；随后核对
+  `hfsRuntimeStartDataReactors`，确认返回值是包含 owner 的 total reactor 数，因此
+  1-vCPU 实际会启动两个轮询线程。
+- **根因**：自动策略按历史 8-vCPU VM 的经验值固定小核配置，没有把 owner 本身计入
+  CPU 预算，也没有随在线 CPU 数量连续缩放。
+- **修复**：新增安全的在线 CPU 数解析和自动 total reactor 计算：1 CPU 仅保留
+  owner；其余主机使用 `clamp(floor(nproc/4), 1, 4)` 个 data reactor；显式
+  `HFS_DATA_REACTORS` 仍完全覆盖自动值。
+- **验证**：在 VM 强制构建后，通过默认拓扑探针、POSIX contract 和 request-local
+  fast-I/O smoke；8-vCPU 日志确认自动选择 `total=3/data=2`，显式 reactor 配置
+ 仍按原 total-count 语义工作。
+
 ## 通用经验总结
