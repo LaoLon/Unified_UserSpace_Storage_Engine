@@ -304,6 +304,27 @@ rename 是单事务且无中间态；超限返回 NoMemory；RocksDB 风格文�
 
 ### Shard-77：allocator 与真实 extent map 集成
 
+> 状态：已完成（2026-09-17；持久化部分按计划留待 Shard-78/79）。交付：
+> `Allocator`（两级 bitmap + free-run index、next-fit、相邻 run 合并、
+> FREE→RESERVED→INITIALIZED→COMMITTED、单次 ≤64 extent、capacity/ENOSPC、
+> CRC 快照 serialize/deserialize、RESERVED replay 回收、`verify()` 不变量）；
+> `ExtentDescriptor`/`InodeExtentMap`（per-inode 真实 extent map，实现 `ExtentMap`
+> 查询、truncate、快照）；`PlacementPicker`（capacity_weighted/round_robin）；
+> Namespace 扩展 `reserve/commit/releaseExtents`、`extents`、`truncateFile/setSize`
+> （unlink/free 时回收 extent）；`DataPlane`（Engine 持有 DMA arena + DataPath）与
+> `File::read/write/append/allocate/truncate` 端到端数据面；`IoPlanner` 稀疏读
+> Zero child；`DataPath` 按 `child.deviceId` 选设备，DMA 直通收紧为仅 arena 拥有的
+> 缓冲（`DmaArena::owns` + `spdk_vtophys`），避免未注册堆内存被设备直接 DMA。
+> 验收：`allocator_test` 覆盖守恒/容量/ENOSPC 回滚/快照损坏/RESERVED 回收/
+> ALLOC+FREE+RESERVE 记录语义联合回放/namespace 分配一致性/双设备 placement
+> run 不跨设备（ASAN+TSAN 干净）；`file_data_test` 在真实 `Nvme0n1` 上覆盖 allocate
+> 零初始化、非对齐跨块 RMW、覆盖写、append、稀疏读零、truncate 收缩/增长、多 iovec、
+> 2 MiB 分片读写；`file_api_test` 增加数据面 smoke。CTest 17/17。
+> **边界**：namespace/extent/allocator 的 checkpoint snapshot 与 CREATE/RENAME 等
+> name-carrying 记录持久化仍待 metadata transaction path（Shard-78），crash replay
+> 在 Shard-79；双盘真实链路受 VM 单盘限制，由多设备 placement 单测与
+> planner/DataPath 的 device-local child 约束覆盖。
+
 **交付物**：two-level bitmap + free-run index；`FREE → RESERVED → INITIALIZED →
 COMMITTED`；单次 ≤64 extent 预分配；`File::allocate/truncate` 空间语义；NoSpace 判定；
 RESERVED replay 回收；释放异步回收；allocator bitmap 只随 checkpoint 写入；真实

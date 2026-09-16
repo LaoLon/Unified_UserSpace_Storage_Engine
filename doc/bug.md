@@ -24,6 +24,7 @@ Bug 等级：**致命 > 严重 > 一般**。
 - 13：已修复（Shard-75，extent 物理偏移单位不一致导致重复叠加）。
 - 14：已修复（Shard-75，DmaArena 释放不回收预算且析构泄漏缓存块）。
 - 15：已修复（Shard-76，Engine::stop 在打开 File 时销毁 namespace 导致悬空自锁死）。
+- 16：已修复（Shard-77，DataPlane 零初始化合成映射逻辑偏移全部叠加在 0）。
 
 ## Bug 记录
 
@@ -191,6 +192,17 @@ Bug 等级：**致命 > 严重 > 一般**。
 - **根因**：`stop()` 未检查活跃 client/open file 就销毁 namespace；前端状态保存裸指针，违反 hfs2.0.md §14.3“活跃 client/operation 未 drain 时 stop() 返回 Busy”。
 - **修复**：引入 `MetadataLease`（Client 及其存活 File 持有）：存活期间计数 `Engine::metadataUsers`，`stop()` 计数非零返回 Busy；`file_api_test` 增加 Busy 停止契约断言。
 - **验证结果**：`file_api_test` 通过；CTest 15/15、ASAN/TSAN 干净。
+
+### 16. DataPlane 零初始化合成映射逻辑偏移全部叠加在 0
+
+- **状态**：已修复
+- **等级**：严重（allocate 全部失败）
+- **时间**：2026-09-17（Shard-77）
+- **现象**：`file_data_test` 首次 `File::allocate` 返回 NotFound（logical range is not fully allocated）。
+- **排查过程**：`DataPlane::zeroExtents` 为运行中的每个物理 extent 都调用 `map.add(0, extentBytes, ...)`，多个逻辑区间全部落在 0 导致重叠；planner 处理完第一段后 cursor 已前移，第二段 `logicalOffset=0 != cursor` 触发 NotFound。
+- **根因**：合成 extent map 的逻辑偏移没有按 `i * extentBytes` 展开。
+- **修复**：逻辑偏移改为 `i * extentBytes`，写入偏移同步对应。
+- **验证结果**：`file_data_test` 全部场景通过；CTest 17/17、ASAN/TSAN 干净。
 
 ## 记录模板
 
