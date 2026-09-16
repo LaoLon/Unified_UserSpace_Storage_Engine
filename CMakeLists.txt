@@ -26,6 +26,7 @@ else()
 endif()
 
 set(HFS_CORE_SRC
+  src/common/crc.cpp
   src/common/log.cpp
   src/common/stats.cpp
   src/common/trace.cpp
@@ -33,6 +34,8 @@ set(HFS_CORE_SRC
   src/core/engine.cpp
   src/core/client.cpp
   src/runtime/spdk_runtime.cpp
+  src/storage/superblock.cpp
+  src/storage/volume.cpp
 )
 
 add_library(hfs_core SHARED ${HFS_CORE_SRC})
@@ -98,9 +101,9 @@ target_link_libraries(hfsctl PRIVATE hfs_core)
 target_compile_options(hfsctl PRIVATE -fno-exceptions -fno-rtti)
 
 enable_testing()
-set(HFS_TESTS config_parser_test task_test)
+set(HFS_TESTS config_parser_test task_test crc_test geometry_test)
 if(HFS_WITH_SPDK)
-  list(APPEND HFS_TESTS engine_lifecycle_test spdk_runtime_test)
+  list(APPEND HFS_TESTS engine_lifecycle_test spdk_runtime_test format_mount_test)
 endif()
 foreach(test_name IN LISTS HFS_TESTS)
   add_executable(${test_name} tests/${test_name}.cpp)

@@ -42,6 +42,14 @@ int main() {
         HFS_TEST_CHECK(client.status() == hfs::Status::InvalidState);
     }
 
+    /* format the volume so mount can validate the superblocks */
+    {
+        auto formatted = engine->format({true}).wait();
+        HFS_TEST_CHECK(formatted.ok());
+        HFS_TEST_CHECK(formatted.value().ok());
+        HFS_TEST_CHECK(engine->formatted());
+    }
+
     auto mount = engine->mount().wait();
     HFS_TEST_CHECK(mount.ok());        /* the task completed */
     HFS_TEST_CHECK(mount.value().ok()); /* the mount succeeded */

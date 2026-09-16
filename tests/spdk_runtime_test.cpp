@@ -37,12 +37,16 @@ int main() {
         HFS_TEST_CHECK(WEXITSTATUS(status) == 0);
     }
 
+    auto format = engine->format({true}).wait();
+    HFS_TEST_CHECK(format.ok());
+    HFS_TEST_CHECK(format.value().ok());
+
     auto mount = engine->mount().wait();
     HFS_TEST_CHECK(mount.ok());
     HFS_TEST_CHECK(mount.value().ok());
     HFS_TEST_CHECK(engine->mounted());
     HFS_TEST_CHECK(engine->dataReactorCount() == 2); /* 8 vCPU auto rule */
-    HFS_TEST_CHECK(engine->channelCount() == 2);     /* 1 device x 2 data reactors */
+    HFS_TEST_CHECK(engine->channelCount() == 3);     /* metadata + 2 data x 1 device */
 
     /* doorbell: the closure runs on data reactor 1 with spdk_thread_send_msg */
     std::atomic<bool> ran{false};
@@ -68,7 +72,7 @@ int main() {
     HFS_TEST_CHECK(created2.ok());
     auto engine2 = std::move(created2).value();
     HFS_TEST_CHECK(engine2->mount().wait().value().ok());
-    HFS_TEST_CHECK(engine2->channelCount() == 2);
+    HFS_TEST_CHECK(engine2->channelCount() == 3);
     HFS_TEST_CHECK(engine2->stop().wait().value().ok());
     HFS_TEST_CHECK(engine2->channelCount() == 0);
 

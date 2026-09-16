@@ -1,12 +1,16 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <span>
+#include <vector>
 
 #include "hfs/config.hpp"
 #include "hfs/export.hpp"
+#include "hfs/superblock.hpp"
 #include "hfs/task.hpp"
 #include "hfs/types.hpp"
 
@@ -14,6 +18,11 @@ namespace hfs {
 
 class File;      /* Phase 2+ */
 class Operation; /* Phase 2+ */
+
+/* Options for the destructive volume format. */
+struct FormatOptions {
+    bool confirm = false;
+};
 
 /* Engine owns the parsed config, the process lock and (Phase 1+) the SPDK
  * runtime and device set. */
@@ -26,7 +35,9 @@ public:
     Engine &operator=(const Engine &) = delete;
 
     /* Lifecycle coroutines; the caller keeps the engine alive until they are
-     * consumed. Shard-69/70 wire the SPDK runtime and the real mount. */
+     * consumed. Shard-70 wires the superblock format/mount on top of the SPDK
+     * runtime. */
+    Task<Result<void>> format(const FormatOptions &options);
     Task<Result<void>> mount();
     Task<Result<void>> drain();
     Task<Result<void>> stop();
@@ -36,6 +47,21 @@ public:
 
     /* False after fork(); all core APIs must then fail with ForkedProcess. */
     bool processValid() const noexcept;
+
+    /* Volume information from the last successful format/mount. */
+    bool formatted() const noexcept;
+    std::array<std::uint8_t, 16> volumeUuid() const noexcept;
+    std::vector<DeviceGeometry> deviceGeometries() const;
+
+    /* Control-path device block I/O (format/mount/tools); requires an active
+     * runtime and a buffer that is a multiple of the device block size. */
+    Result<void> readDeviceBlocks(std::size_t deviceIndex, std::uint64_t offsetBlocks,
+                                  std::span<std::byte> buffer);
+    Result<void> writeDeviceBlocks(std::size_t deviceIndex, std::uint64_t offsetBlocks,
+                                   std::span<const std::byte> buffer);
+    Result<void> flushDevice(std::size_t deviceIndex);
+    std::uint32_t deviceBlockSize(std::size_t deviceIndex) const noexcept;
+    std::uint64_t deviceCapacityBytes(std::size_t deviceIndex) const noexcept;
 
     /* Runtime diagnostics used by acceptance tests. */
     std::uint32_t dataReactorCount() const noexcept;

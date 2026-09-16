@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <span>
 #include <string>
 
 #include "hfs/config.hpp"
@@ -38,6 +39,18 @@ public:
     /* Acceptance/diagnostic counters. */
     std::size_t channelCount() const noexcept;
     std::int64_t ownerPid() const noexcept;
+
+    /* Device geometry of the opened bdev set. */
+    std::uint64_t deviceCapacityBytes(std::size_t index) const noexcept;
+    std::uint32_t deviceBlockSize(std::size_t index) const noexcept;
+
+    /* Control-path block I/O on the metadata reactor (format/mount/tools).
+     * The caller blocks; buffers are bounced through DMA memory. */
+    Result<void> controlRead(std::size_t index, std::uint64_t offsetBlocks,
+                             std::span<std::byte> buffer);
+    Result<void> controlWrite(std::size_t index, std::uint64_t offsetBlocks,
+                              std::span<const std::byte> buffer);
+    Result<void> controlFlush(std::size_t index);
 
 private:
     SpdkRuntime();

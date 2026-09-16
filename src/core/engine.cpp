@@ -13,6 +13,7 @@
 #include "common/stats.hpp"
 #include "common/trace.hpp"
 #include "runtime/spdk_runtime.hpp"
+#include "storage/volume.hpp"
 
 namespace hfs {
 
@@ -70,6 +71,9 @@ struct Engine::Impl {
     int lockFd = -1;
     bool mounted = false;
     bool stopped = false;
+    bool formatted = false;
+    std::array<std::uint8_t, 16> uuid{};
+    std::vector<DeviceGeometry> geometries;
     pid_t ownerPid = 0;
 };
 
@@ -131,6 +135,42 @@ Result<std::unique_ptr<Engine>> Engine::create(const Config &config) {
     return std::unique_ptr<Engine>(engine.release());
 }
 
+Task<Result<void>> Engine::format(const FormatOptions &options) {
+    auto &impl = *impl_;
+    if (!processValid()) {
+        co_return Result<void>(Status::ForkedProcess, "engine belongs to another process");
+    }
+    if (impl.stopped) {
+        co_return Result<void>(Status::InvalidState, "engine already stopped");
+    }
+    if (impl.mounted) {
+        co_return Result<void>(Status::InvalidState, "engine is mounted; stop it before format");
+    }
+
+    auto &runtime = SpdkRuntime::instance();
+    const bool startedHere = !runtime.active();
+    if (startedHere) {
+        auto started = runtime.start(impl.config);
+        if (!started.ok()) {
+            co_return started;
+        }
+    }
+    auto volume = formatVolume(runtime, impl.config, options.confirm);
+    if (volume.ok()) {
+        impl.formatted = true;
+        impl.uuid = volume.value().uuid;
+        impl.geometries = volume.value().devices;
+    }
+    if (startedHere) {
+        runtime.stop();
+    }
+    if (!volume.ok()) {
+        co_return makeError(volume.status(), volume.message());
+    }
+    log::info("engine format complete");
+    co_return Result<void>(Status::Ok);
+}
+
 Task<Result<void>> Engine::mount() {
     auto &impl = *impl_;
     if (!processValid()) {
@@ -142,17 +182,26 @@ Task<Result<void>> Engine::mount() {
     if (impl.mounted) {
         co_return Result<void>(Status::InvalidState, "engine already mounted");
     }
-    /* Shard-69: initialize SPDK env/reactors, open the bdev set and create
-     * per-reactor channels. Shard-70/71 add the superblock/journal mount. */
-    auto started = SpdkRuntime::instance().start(impl.config);
+    auto &runtime = SpdkRuntime::instance();
+    auto started = runtime.start(impl.config);
     if (!started.ok()) {
         co_return started;
     }
+    auto volume = mountVolume(runtime, impl.config);
+    if (!volume.ok()) {
+        runtime.stop();
+        co_return makeError(volume.status(), volume.message());
+    }
+    impl.formatted = true;
+    impl.uuid = volume.value().uuid;
+    impl.geometries = volume.value().devices;
     impl.mounted = true;
     stats::setEnabled(impl.config.stats);
     trace::setEnabled(impl.config.trace);
     trace::setSample(impl.config.traceSample);
-    log::info("engine mounted");
+    log::info("engine mounted: generation=%llu clean=%d",
+              static_cast<unsigned long long>(volume.value().generation),
+              volume.value().cleanShutdown ? 1 : 0);
     co_return Result<void>(Status::Ok);
 }
 
@@ -199,6 +248,52 @@ bool Engine::mounted() const noexcept { return impl_->mounted; }
 bool Engine::processValid() const noexcept {
     return impl_ != nullptr && impl_->ownerPid != 0 &&
            impl_->ownerPid == static_cast<pid_t>(::getpid());
+}
+
+bool Engine::formatted() const noexcept { return impl_->formatted; }
+
+std::array<std::uint8_t, 16> Engine::volumeUuid() const noexcept { return impl_->uuid; }
+
+std::vector<DeviceGeometry> Engine::deviceGeometries() const { return impl_->geometries; }
+
+Result<void> Engine::readDeviceBlocks(std::size_t deviceIndex, std::uint64_t offsetBlocks,
+                                      std::span<std::byte> buffer) {
+    if (!processValid()) {
+        return makeError(Status::ForkedProcess, "engine belongs to another process");
+    }
+    if (!SpdkRuntime::instance().active()) {
+        return makeError(Status::InvalidState, "engine is not mounted");
+    }
+    return SpdkRuntime::instance().controlRead(deviceIndex, offsetBlocks, buffer);
+}
+
+Result<void> Engine::writeDeviceBlocks(std::size_t deviceIndex, std::uint64_t offsetBlocks,
+                                       std::span<const std::byte> buffer) {
+    if (!processValid()) {
+        return makeError(Status::ForkedProcess, "engine belongs to another process");
+    }
+    if (!SpdkRuntime::instance().active()) {
+        return makeError(Status::InvalidState, "engine is not mounted");
+    }
+    return SpdkRuntime::instance().controlWrite(deviceIndex, offsetBlocks, buffer);
+}
+
+Result<void> Engine::flushDevice(std::size_t deviceIndex) {
+    if (!processValid()) {
+        return makeError(Status::ForkedProcess, "engine belongs to another process");
+    }
+    if (!SpdkRuntime::instance().active()) {
+        return makeError(Status::InvalidState, "engine is not mounted");
+    }
+    return SpdkRuntime::instance().controlFlush(deviceIndex);
+}
+
+std::uint32_t Engine::deviceBlockSize(std::size_t deviceIndex) const noexcept {
+    return SpdkRuntime::instance().deviceBlockSize(deviceIndex);
+}
+
+std::uint64_t Engine::deviceCapacityBytes(std::size_t deviceIndex) const noexcept {
+    return SpdkRuntime::instance().deviceCapacityBytes(deviceIndex);
 }
 
 std::uint32_t Engine::dataReactorCount() const noexcept {

@@ -116,6 +116,55 @@ void drainThreadMessages(spdk_thread *thread) {
     }
 }
 
+/* One control-path block I/O executed on the metadata reactor. */
+struct ControlIo {
+    enum class Op { Read, Write, Flush };
+    Op op = Op::Read;
+    std::size_t device = 0;
+    std::uint64_t offsetBlocks = 0;
+    std::size_t blocks = 0;
+    void *dma = nullptr; /* DMA bounce buffer for read/write */
+    std::span<std::byte> readTarget;
+    std::span<const std::byte> writeSource;
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool done = false;
+    bool abandoned = false;
+    int rc = 0;
+};
+
+int failControlIo(const std::shared_ptr<ControlIo> &io, int rc) {
+    if (io->dma != nullptr) {
+        spdk_dma_free(io->dma);
+        io->dma = nullptr;
+    }
+    std::lock_guard<std::mutex> lock(io->mutex);
+    io->rc = rc;
+    io->done = true;
+    io->cv.notify_all();
+    return rc;
+}
+
+/* Completion runs on the metadata reactor; the holder keeps the I/O alive. */
+void controlIoDone(struct spdk_bdev_io *bdev_io, bool success, void *arg) {
+    auto *holder = static_cast<std::shared_ptr<ControlIo> *>(arg);
+    std::shared_ptr<ControlIo> io = *holder;
+    delete holder;
+    spdk_bdev_free_io(bdev_io);
+
+    std::lock_guard<std::mutex> lock(io->mutex);
+    if (!io->abandoned && success && io->op == ControlIo::Op::Read && io->dma != nullptr) {
+        std::memcpy(io->readTarget.data(), io->dma, io->readTarget.size());
+    }
+    if (io->dma != nullptr) {
+        spdk_dma_free(io->dma);
+        io->dma = nullptr;
+    }
+    io->rc = success ? 0 : -EIO;
+    io->done = true;
+    io->cv.notify_all();
+}
+
 } // namespace
 
 struct SpdkRuntime::Impl {
@@ -131,7 +180,10 @@ struct SpdkRuntime::Impl {
 
     struct DeviceState {
         std::string name;
+        spdk_bdev *bdev = nullptr;
         spdk_bdev_desc *desc = nullptr;
+        std::uint64_t numBlocks = 0;
+        std::uint32_t blockSize = 0;
     };
 
     mutable std::mutex mutex;
@@ -264,7 +316,8 @@ struct SpdkRuntime::Impl {
 
     int openDevices() {
         for (auto &device : devices) {
-            if (spdk_bdev_get_by_name(device.name.c_str()) == nullptr) {
+            struct spdk_bdev *bdev = spdk_bdev_get_by_name(device.name.c_str());
+            if (bdev == nullptr) {
                 log::error("bdev '%s' not found", device.name.c_str());
                 return -ENOENT;
             }
@@ -272,8 +325,42 @@ struct SpdkRuntime::Impl {
                 log::error("cannot open bdev '%s'", device.name.c_str());
                 return -EIO;
             }
+            device.bdev = bdev;
+            device.numBlocks = spdk_bdev_get_num_blocks(bdev);
+            device.blockSize = spdk_bdev_get_block_size(bdev);
         }
         return 0;
+    }
+
+    /* Submit one control I/O; runs on the metadata reactor. */
+    void submitControlIo(std::size_t index, std::shared_ptr<ControlIo> io) {
+        if (index >= devices.size() || reactors.empty() || reactors[0]->spdk == nullptr ||
+            index >= reactors[0]->channels.size() || devices[index].desc == nullptr) {
+            failControlIo(io, -EINVAL);
+            return;
+        }
+        spdk_bdev_desc *desc = devices[index].desc;
+        spdk_io_channel *channel = reactors[0]->channels[index];
+        auto *holder = new std::shared_ptr<ControlIo>(io);
+        int rc = 0;
+        switch (io->op) {
+        case ControlIo::Op::Read:
+            rc = spdk_bdev_read_blocks(desc, channel, io->dma, io->offsetBlocks, io->blocks,
+                                       controlIoDone, holder);
+            break;
+        case ControlIo::Op::Write:
+            rc = spdk_bdev_write_blocks(desc, channel, io->dma, io->offsetBlocks, io->blocks,
+                                        controlIoDone, holder);
+            break;
+        case ControlIo::Op::Flush:
+            rc = spdk_bdev_flush(desc, channel, io->offsetBlocks, io->blocks, controlIoDone,
+                                 holder);
+            break;
+        }
+        if (rc != 0) {
+            delete holder;
+            failControlIo(io, rc);
+        }
     }
 
     /* bdev_nvme attach completes asynchronously after the config load
@@ -364,6 +451,30 @@ struct SpdkRuntime::Impl {
             return;
         }
 
+        /* Metadata reactor keeps one channel per device for control I/O. */
+        for (auto &device : devices) {
+            spdk_io_channel *channel = spdk_bdev_get_io_channel(device.desc);
+            if (channel == nullptr) {
+                rc = -ENOMEM;
+                break;
+            }
+            metadata->channels.push_back(channel);
+        }
+        if (rc != 0) {
+            for (auto *channel : metadata->channels) {
+                spdk_put_io_channel(channel);
+            }
+            metadata->channels.clear();
+            drainThreadMessages(metadata->spdk);
+            closeDevicesLocked();
+            drainThreadMessages(metadata->spdk);
+            spdk_set_thread(nullptr);
+            spdk_thread_destroy(metadata->spdk);
+            metadata->spdk = nullptr;
+            publishStartDone(rc);
+            return;
+        }
+
         pid.store(static_cast<std::int64_t>(::getpid()), std::memory_order_release);
         publishStartDone(0);
         log::info("spdk runtime ready: devices=%zu", devices.size());
@@ -372,6 +483,11 @@ struct SpdkRuntime::Impl {
             spdk_thread_poll(metadata->spdk, 0, 0);
         }
 
+        for (auto *channel : metadata->channels) {
+            spdk_put_io_channel(channel);
+        }
+        metadata->channels.clear();
+        drainThreadMessages(metadata->spdk);
         closeDevicesLocked();
         drainThreadMessages(metadata->spdk);
         spdk_set_thread(nullptr);
@@ -465,6 +581,94 @@ struct SpdkRuntime::Impl {
         }
         std::lock_guard<std::mutex> lock(mutex);
         reactors.clear();
+    }
+
+    struct ControlCall {
+        Impl *impl;
+        std::shared_ptr<ControlIo> io;
+
+        ControlCall(Impl *implPtr, std::shared_ptr<ControlIo> ioPtr)
+            : impl(implPtr), io(std::move(ioPtr)) {}
+    };
+
+    static void controlSubmitTrampoline(void *ctx) {
+        auto *call = static_cast<ControlCall *>(ctx);
+        Impl *impl = call->impl;
+        /* Read the device before any move: argument evaluation order is
+         * unspecified and a moved-from shared_ptr must not be dereferenced. */
+        std::shared_ptr<ControlIo> io = std::move(call->io);
+        const std::size_t device = io->device;
+        delete call;
+        impl->submitControlIo(device, std::move(io));
+    }
+
+    /* Blocking control-path block I/O helper shared by the public methods. */
+    Result<void> controlIo(ControlIo::Op op, std::size_t index, std::uint64_t offsetBlocks,
+                           std::span<std::byte> readTarget,
+                           std::span<const std::byte> writeSource) {
+        if (!activeFlag.load(std::memory_order_acquire)) {
+            return makeError(Status::Busy, "SPDK runtime is not active");
+        }
+        if (index >= devices.size() || devices[index].desc == nullptr || reactors.empty() ||
+            reactors[0]->spdk == nullptr) {
+            return makeError(Status::InvalidArgument, "device index out of range");
+        }
+
+        auto io = std::make_shared<ControlIo>();
+        io->op = op;
+        io->device = index;
+        io->offsetBlocks = offsetBlocks;
+        io->readTarget = readTarget;
+        io->writeSource = writeSource;
+
+        if (op != ControlIo::Op::Flush) {
+            const std::size_t size = op == ControlIo::Op::Read ? readTarget.size()
+                                                               : writeSource.size();
+            if (size == 0) {
+                return Result<void>(Status::Ok);
+            }
+            const std::uint32_t blockSize = devices[index].blockSize;
+            if (blockSize == 0 || size % blockSize != 0) {
+                return makeError(Status::InvalidArgument,
+                                 "buffer size must be a multiple of the device block size");
+            }
+            if (size > (1U << 20)) {
+                return makeError(Status::InvalidArgument, "control I/O is limited to 1 MiB");
+            }
+            io->blocks = size / blockSize;
+            io->dma = spdk_dma_zmalloc(size, 4096, nullptr);
+            if (io->dma == nullptr) {
+                return makeError(Status::NoMemory, "DMA allocation failed");
+            }
+            if (op == ControlIo::Op::Write) {
+                std::memcpy(io->dma, writeSource.data(), size);
+            }
+        } else {
+            io->blocks = devices[index].numBlocks;
+        }
+
+        auto *call = new ControlCall(this, io);
+        if (spdk_thread_send_msg(reactors[0]->spdk, controlSubmitTrampoline, call) != 0) {
+            delete call;
+            if (io->dma != nullptr) {
+                spdk_dma_free(io->dma);
+                io->dma = nullptr;
+            }
+            return makeError(Status::Busy, "spdk_thread_send_msg failed");
+        }
+
+        std::unique_lock<std::mutex> lock(io->mutex);
+        const auto timeout = std::chrono::milliseconds(config.metadataWaitTimeoutMs);
+        if (!io->cv.wait_for(lock, timeout, [&io]() { return io->done; })) {
+            io->abandoned = true;
+            return makeError(Status::TimedOut, "control I/O timed out");
+        }
+        const int rc = io->rc;
+        lock.unlock();
+        if (rc == 0) {
+            return Result<void>(Status::Ok);
+        }
+        return makeError(Status::IoError, "control I/O failed rc=" + std::to_string(rc));
     }
 };
 
@@ -645,6 +849,36 @@ std::int64_t SpdkRuntime::ownerPid() const noexcept {
     return impl_->pid.load(std::memory_order_acquire);
 }
 
+std::uint64_t SpdkRuntime::deviceCapacityBytes(std::size_t index) const noexcept {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (index >= impl_->devices.size()) {
+        return 0;
+    }
+    return impl_->devices[index].numBlocks * impl_->devices[index].blockSize;
+}
+
+std::uint32_t SpdkRuntime::deviceBlockSize(std::size_t index) const noexcept {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (index >= impl_->devices.size()) {
+        return 0;
+    }
+    return impl_->devices[index].blockSize;
+}
+
+Result<void> SpdkRuntime::controlRead(std::size_t index, std::uint64_t offsetBlocks,
+                                      std::span<std::byte> buffer) {
+    return impl_->controlIo(ControlIo::Op::Read, index, offsetBlocks, buffer, {});
+}
+
+Result<void> SpdkRuntime::controlWrite(std::size_t index, std::uint64_t offsetBlocks,
+                                       std::span<const std::byte> buffer) {
+    return impl_->controlIo(ControlIo::Op::Write, index, offsetBlocks, {}, buffer);
+}
+
+Result<void> SpdkRuntime::controlFlush(std::size_t index) {
+    return impl_->controlIo(ControlIo::Op::Flush, index, 0, {}, {});
+}
+
 #else /* !HFS_WITH_SPDK */
 
 struct SpdkRuntime::Impl {};
@@ -681,6 +915,33 @@ std::uint64_t SpdkRuntime::dataReactorThreadId(std::uint32_t index) const {
 }
 std::size_t SpdkRuntime::channelCount() const noexcept { return 0; }
 std::int64_t SpdkRuntime::ownerPid() const noexcept { return 0; }
+
+std::uint64_t SpdkRuntime::deviceCapacityBytes(std::size_t index) const noexcept {
+    (void)index;
+    return 0;
+}
+std::uint32_t SpdkRuntime::deviceBlockSize(std::size_t index) const noexcept {
+    (void)index;
+    return 0;
+}
+Result<void> SpdkRuntime::controlRead(std::size_t index, std::uint64_t offsetBlocks,
+                                      std::span<std::byte> buffer) {
+    (void)index;
+    (void)offsetBlocks;
+    (void)buffer;
+    return makeError(Status::NotSupported, "core built without SPDK support");
+}
+Result<void> SpdkRuntime::controlWrite(std::size_t index, std::uint64_t offsetBlocks,
+                                       std::span<const std::byte> buffer) {
+    (void)index;
+    (void)offsetBlocks;
+    (void)buffer;
+    return makeError(Status::NotSupported, "core built without SPDK support");
+}
+Result<void> SpdkRuntime::controlFlush(std::size_t index) {
+    (void)index;
+    return makeError(Status::NotSupported, "core built without SPDK support");
+}
 
 #endif /* HFS_WITH_SPDK */
 
