@@ -15,6 +15,10 @@ Client::Client(Engine &engine) : impl_(std::make_unique<Impl>()) {
 Client::~Client() = default;
 
 Result<std::shared_ptr<Client>> Client::create(Engine &engine) {
+    if (!engine.processValid()) {
+        return makeError<std::shared_ptr<Client>>(Status::ForkedProcess,
+                                                  "engine belongs to another process");
+    }
     if (!engine.mounted()) {
         return makeError<std::shared_ptr<Client>>(Status::InvalidState,
                                                   "engine is not mounted");
@@ -23,6 +27,9 @@ Result<std::shared_ptr<Client>> Client::create(Engine &engine) {
 }
 
 Task<Result<void>> Client::close() {
+    if (!impl_->engine->processValid()) {
+        co_return Result<void>(Status::ForkedProcess, "engine belongs to another process");
+    }
     log::info("client closed");
     co_return Result<void>(Status::Ok);
 }

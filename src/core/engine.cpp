@@ -12,6 +12,7 @@
 #include "common/log.hpp"
 #include "common/stats.hpp"
 #include "common/trace.hpp"
+#include "runtime/spdk_runtime.hpp"
 
 namespace hfs {
 
@@ -132,23 +133,33 @@ Result<std::unique_ptr<Engine>> Engine::create(const Config &config) {
 
 Task<Result<void>> Engine::mount() {
     auto &impl = *impl_;
+    if (!processValid()) {
+        co_return Result<void>(Status::ForkedProcess, "engine belongs to another process");
+    }
     if (impl.stopped) {
         co_return Result<void>(Status::InvalidState, "engine already stopped");
     }
     if (impl.mounted) {
         co_return Result<void>(Status::InvalidState, "engine already mounted");
     }
+    /* Shard-69: initialize SPDK env/reactors, open the bdev set and create
+     * per-reactor channels. Shard-70/71 add the superblock/journal mount. */
+    auto started = SpdkRuntime::instance().start(impl.config);
+    if (!started.ok()) {
+        co_return started;
+    }
     impl.mounted = true;
     stats::setEnabled(impl.config.stats);
     trace::setEnabled(impl.config.trace);
     trace::setSample(impl.config.traceSample);
-    /* Phase 0 lifecycle stub: Shard-69/70 attach the SPDK runtime and the
-     * real superblock mount. */
-    log::info("engine mounted (phase 0 lifecycle stub)");
+    log::info("engine mounted");
     co_return Result<void>(Status::Ok);
 }
 
 Task<Result<void>> Engine::drain() {
+    if (!processValid()) {
+        co_return Result<void>(Status::ForkedProcess, "engine belongs to another process");
+    }
     /* Phase 0 has no in-flight operations; Shard-73+ drains rings and
      * coroutine frames here. */
     co_return Result<void>(Status::Ok);
@@ -156,10 +167,19 @@ Task<Result<void>> Engine::drain() {
 
 Task<Result<void>> Engine::stop() {
     auto &impl = *impl_;
+    if (!processValid()) {
+        co_return Result<void>(Status::ForkedProcess, "engine belongs to another process");
+    }
     if (impl.stopped) {
         co_return Result<void>(Status::Ok);
     }
-    impl.mounted = false;
+    if (impl.mounted) {
+        auto stopped = SpdkRuntime::instance().stop();
+        if (!stopped.ok()) {
+            co_return stopped;
+        }
+        impl.mounted = false;
+    }
     if (impl.lockFd >= 0) {
         ::flock(impl.lockFd, LOCK_UN);
         ::close(impl.lockFd);
@@ -175,6 +195,30 @@ Task<Result<void>> Engine::stop() {
 const Config &Engine::config() const noexcept { return impl_->config; }
 
 bool Engine::mounted() const noexcept { return impl_->mounted; }
+
+bool Engine::processValid() const noexcept {
+    return impl_ != nullptr && impl_->ownerPid != 0 &&
+           impl_->ownerPid == static_cast<pid_t>(::getpid());
+}
+
+std::uint32_t Engine::dataReactorCount() const noexcept {
+    return SpdkRuntime::instance().dataReactorCount();
+}
+
+std::size_t Engine::channelCount() const noexcept {
+    return SpdkRuntime::instance().channelCount();
+}
+
+Result<void> Engine::postToDataReactor(std::uint32_t index, std::function<void()> fn) {
+    if (!processValid()) {
+        return makeError(Status::ForkedProcess, "engine belongs to another process");
+    }
+    return SpdkRuntime::instance().postToDataReactor(index, std::move(fn));
+}
+
+std::uint64_t Engine::dataReactorThreadId(std::uint32_t index) const {
+    return SpdkRuntime::instance().dataReactorThreadId(index);
+}
 
 std::uint32_t coreAbiMajor() noexcept {
 #ifdef HFS_CORE_ABI_MAJOR

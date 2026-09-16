@@ -1,6 +1,8 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 
 #include "hfs/config.hpp"
@@ -31,6 +33,15 @@ public:
 
     const Config &config() const noexcept;
     bool mounted() const noexcept;
+
+    /* False after fork(); all core APIs must then fail with ForkedProcess. */
+    bool processValid() const noexcept;
+
+    /* Runtime diagnostics used by acceptance tests. */
+    std::uint32_t dataReactorCount() const noexcept;
+    std::size_t channelCount() const noexcept;
+    Result<void> postToDataReactor(std::uint32_t index, std::function<void()> fn);
+    std::uint64_t dataReactorThreadId(std::uint32_t index) const;
 
 private:
     explicit Engine(Config config);
