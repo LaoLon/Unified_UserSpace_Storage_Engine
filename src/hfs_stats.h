@@ -212,7 +212,7 @@ void hfsStatsRecordLegacyDataSubmit(void);
 /* Record internal POSIX range-ticket admission and dependency progress. */
 void hfsStatsRecordTicketAdmit(uint32_t pendingDependencies,
 				       uint32_t activeTickets);
-/* Record ticket admission scan/conflict details and elapsed timing. */
+/* Record scheduler scan/conflict details and elapsed timing. */
 void hfsStatsRecordTicketAdmission(uint32_t scanItems,
 					uint32_t pendingDependencies,
 					uint32_t activeTickets,
@@ -222,10 +222,10 @@ void hfsStatsRecordTicketComplete(void);
 void hfsStatsRecordTicketDependencyWait(uint64_t waitNs);
 /* Record only a ticket wait that actually entered a condition-variable sleep. */
 void hfsStatsRecordTicketRealWait(uint64_t waitNs);
-/* Record the ticket completion scan duration. */
+/* Record the scheduler completion scan duration. */
 void hfsStatsRecordTicketCompletion(uint64_t completeNs, uint64_t scanNs,
 					uint32_t scanItems);
-/* Record one fine-grained ticket phase duration and its scan-length bucket. */
+/* Record one scheduler phase duration and its scan-length bucket. */
 void hfsStatsRecordTicketMetric(HfsStatsTicketMetric metric, uint64_t durationNs);
 void hfsStatsRecordTicketScanLength(bool completion, uint32_t scanItems);
 void hfsStatsRecordTicketPromote(uint32_t count);

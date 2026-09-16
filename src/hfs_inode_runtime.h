@@ -10,6 +10,20 @@
 struct hfs_posix_io_ticket;
 typedef struct hfs_posix_io_ticket HfsPosixIoTicket;
 
+/* One inode-local scheduler owns interval admission and dependency wakeups. */
+typedef struct hfs_inode_scheduler {
+	pthread_mutex_t lock;
+	pthread_cond_t condition;
+	HfsPosixIoTicket *root;
+	uint64_t nextTicketId;
+	uint64_t nextTicketSeq;
+	/* Monotonic epoch shared by data and future barrier operations. */
+	uint64_t epoch;
+	uint32_t count;
+	uint32_t limit;
+	bool stopping;
+} HfsInodeScheduler;
+
 /* Per-inode range stripes remove cross-file collisions from the data path. */
 #define HFS_INODE_RANGE_STRIPE_COUNT 64U
 #define HFS_INODE_RANGE_STRIPE_UNITS 64U
@@ -33,15 +47,8 @@ typedef struct hfs_inode_runtime {
 	HfsRangeLock rangeStripes[HFS_INODE_RANGE_STRIPE_COUNT];
 	/* Retained as a compatibility barrier for legacy callers. */
 	HfsRangeLock rangeGate;
-	/* Short admission lock for the POSIX range-ticket scheduler. */
-	pthread_mutex_t ticketLock;
-	pthread_cond_t ticketAvailable;
-	HfsPosixIoTicket *ticketHead;
-	uint64_t nextTicketId;
-	uint64_t nextTicketSeq;
-	uint32_t ticketCount;
-	uint32_t ticketLimit;
-	bool ticketStopping;
+	/* Unified interval scheduler for read/write and future barrier operations. */
+	HfsInodeScheduler scheduler;
 	struct hfs_inode_runtime *next;
 } HfsInodeRuntime;
 

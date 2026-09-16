@@ -63,13 +63,13 @@ void hfsInodeRuntimeFini(Hfs *fs) {
 			HfsInodeRuntime *next = runtime->next;
 			uint32_t stripe;
 
-			pthread_mutex_lock(&runtime->ticketLock);
-			runtime->ticketStopping = true;
-			pthread_cond_broadcast(&runtime->ticketAvailable);
-			pthread_mutex_unlock(&runtime->ticketLock);
+			pthread_mutex_lock(&runtime->scheduler.lock);
+			runtime->scheduler.stopping = true;
+			pthread_cond_broadcast(&runtime->scheduler.condition);
+			pthread_mutex_unlock(&runtime->scheduler.lock);
 			/* The runtime is destroyed only after HFS has stopped accepting I/O. */
-			pthread_cond_destroy(&runtime->ticketAvailable);
-			pthread_mutex_destroy(&runtime->ticketLock);
+			pthread_cond_destroy(&runtime->scheduler.condition);
+			pthread_mutex_destroy(&runtime->scheduler.lock);
 			hfsRangeLockDestroy(&runtime->rangeGate);
 			for (stripe = 0; stripe < HFS_INODE_RANGE_STRIPE_COUNT; stripe++) {
 				hfsRangeLockDestroy(&runtime->rangeStripes[stripe]);
@@ -148,7 +148,7 @@ HfsInodeRuntime *hfsInodeRuntimeGet(Hfs *fs, uint64_t inodeId) {
 		errno = rc;
 		return NULL;
 	}
-	rc = pthread_mutex_init(&runtime->ticketLock, NULL);
+	rc = pthread_mutex_init(&runtime->scheduler.lock, NULL);
 	if (rc != 0) {
 		pthread_rwlock_destroy(&runtime->syncLock);
 		pthread_mutex_destroy(&runtime->writeGapLock);
@@ -159,9 +159,9 @@ HfsInodeRuntime *hfsInodeRuntimeGet(Hfs *fs, uint64_t inodeId) {
 		errno = rc;
 		return NULL;
 	}
-	rc = pthread_cond_init(&runtime->ticketAvailable, NULL);
+	rc = pthread_cond_init(&runtime->scheduler.condition, NULL);
 	if (rc != 0) {
-		pthread_mutex_destroy(&runtime->ticketLock);
+		pthread_mutex_destroy(&runtime->scheduler.lock);
 		pthread_rwlock_destroy(&runtime->syncLock);
 		pthread_mutex_destroy(&runtime->writeGapLock);
 		pthread_mutex_destroy(&runtime->appendLock);
@@ -171,12 +171,12 @@ HfsInodeRuntime *hfsInodeRuntimeGet(Hfs *fs, uint64_t inodeId) {
 		errno = rc;
 		return NULL;
 	}
-	runtime->ticketLimit = 64U;
-	runtime->ticketStopping = false;
+	runtime->scheduler.limit = 64U;
+	runtime->scheduler.stopping = false;
 	rc = hfsRangeLockInit(&runtime->rangeGate);
 	if (rc != 0) {
-		pthread_cond_destroy(&runtime->ticketAvailable);
-		pthread_mutex_destroy(&runtime->ticketLock);
+		pthread_cond_destroy(&runtime->scheduler.condition);
+		pthread_mutex_destroy(&runtime->scheduler.lock);
 		pthread_rwlock_destroy(&runtime->syncLock);
 		pthread_mutex_destroy(&runtime->writeGapLock);
 		pthread_mutex_destroy(&runtime->appendLock);
@@ -197,8 +197,8 @@ HfsInodeRuntime *hfsInodeRuntimeGet(Hfs *fs, uint64_t inodeId) {
 				hfsRangeLockDestroy(&runtime->rangeStripes[stripe]);
 				}
 				hfsRangeLockDestroy(&runtime->rangeGate);
-				pthread_cond_destroy(&runtime->ticketAvailable);
-				pthread_mutex_destroy(&runtime->ticketLock);
+				pthread_cond_destroy(&runtime->scheduler.condition);
+				pthread_mutex_destroy(&runtime->scheduler.lock);
 				pthread_rwlock_destroy(&runtime->syncLock);
 				pthread_mutex_destroy(&runtime->writeGapLock);
 				pthread_mutex_destroy(&runtime->appendLock);

@@ -689,7 +689,7 @@ void hfsStatsRecordMessage(bool dataMessage) {
 	}
 }
 
-/* Record one ticket scan with conflict and active-list information. */
+/* Record one scheduler scan with conflict and active-count information. */
 void hfsStatsRecordTicketAdmission(uint32_t scanItems,
 					uint32_t pendingDependencies,
 					uint32_t activeTickets,
@@ -741,7 +741,7 @@ void hfsStatsRecordTicketMetric(HfsStatsTicketMetric metric, uint64_t durationNs
 	shard->ticketMetricHist[metric][hfsStatsBucket(durationNs)]++;
 }
 
-/* Record the admission or completion active-list scan length bucket. */
+/* Record the admission or completion scheduler scan-length bucket. */
 void hfsStatsRecordTicketScanLength(bool completion, uint32_t scanItems) {
 	HfsStatsShard *shard;
 	unsigned int bucket;
@@ -761,7 +761,7 @@ void hfsStatsRecordTicketScanLength(bool completion, uint32_t scanItems) {
 	}
 }
 
-/* Record the time spent scanning the active list during completion. */
+/* Record the time spent scanning overlapping scheduler nodes during completion. */
 void hfsStatsRecordTicketCompletion(uint64_t completeNs, uint64_t scanNs,
 					uint32_t scanItems) {
 	if (hfsStatsIsEnabled()) {

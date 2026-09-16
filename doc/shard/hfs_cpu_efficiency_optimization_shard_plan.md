@@ -1,6 +1,6 @@
 # Shard-67：HFS 统一 I/O 执行架构重构计划
 
-> **状态**：67A operation lifetime 与 67B data actor ring 已实现；67C～67G 待实施
+> **状态**：67A operation lifetime、67B data actor ring 与 67C scheduler core 已实现；67D～67G 待实施
 >
 > **日期**：2026-09-16
 >
@@ -211,6 +211,23 @@ data path 不再先经过 owner-side linked-list batch。每个 shard 由一个 
 - 删除 per-ticket wait mutex/cond、64 range lock 初始化及重复锁层。
 
 **语义门禁**：同范围写串行，读共享，非重叠请求并发；append gap、truncate、fsync/fdatasync、SIGKILL recovery 与旧实现一致；admit/complete 无 active 全表扫描。
+
+#### 67C 实施记录（2026-09-16）
+
+本阶段先交付 inode scheduler 的核心数据结构和 POSIX 读写适配，不提前声称已经完成所有旧锁删除：
+
+- `HfsInodeScheduler` 为每个 inode 提供一个共享 `pthread_mutex_t`、一个条件变量和一个 intrusive interval treap；ticket 节点只保留左右子树、`maxEnd` 和确定性 priority，不再初始化/销毁 per-ticket mutex/cond。
+- admission/complete 只沿 `maxEnd` 可达的重叠区间遍历，依赖计数和后继 promotion 的候选集合为 `O(log A + K)` 期望复杂度；容量等待与依赖等待共用 scheduler 条件变量，避免重复 waiter 状态。
+- `hfsIoReadAt`/`hfsIoWriteAt` 将 `HFS_ORDERING=ticket` 与兼容的 `HFS_ORDERING=range` 收敛到同一 scheduler，`HFS_ORDERING=none` 才绕过 ordering；append/resize 的同步边界保持不变。
+- `hfsIoSubmitVector`、pipeline window reservation 以及 zero/punch 路径仍暂时保留 range-lock compatibility；因此 64 个 range stripe 的初始化和最终删除留给 67G，不能把本阶段描述为旧锁全部移除。
+
+VM 真实 NVMe 短回归使用自动 reactor 拓扑（未设置 reactor 数量或 CPU 映射），并在测试结束恢复内核 `nvme` 驱动：
+
+- Make 与 CMake Release 均通过；POSIX-only API、POSIX contract、request-local fast-I/O smoke 均通过。
+- 32 线程同范围写通过：`ticket_admit=33`、`ticket_ready=33`、`ticket_complete=33`、`ticket_dependency_waits=15`、`ticket_pending_peak=8`，`spdk_submit=96`、`spdk_complete=96`、`errors=0`。
+- `HFS_ORDERING=range HFS_POSIX_TICKET=0` 兼容适配通过：`ticket_admit=26`、`ticket_complete=26`，`spdk_submit=210`、`spdk_complete=210`、`errors=0`。
+
+这些结果只证明 scheduler 的结构守恒和正确性，不输出 CPU/吞吐提升结论，也不做 reactor 数量矩阵；下一步为 67D 共享 DMA arena。
 
 ### 67D：共享 DMA arena
 

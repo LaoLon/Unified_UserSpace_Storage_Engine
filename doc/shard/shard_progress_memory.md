@@ -146,6 +146,22 @@
   contract 和 fast-I/O smoke 均通过；测试后 NVMe 已恢复内核 `nvme` 驱动。
 - 本阶段不做 reactor 数量矩阵或性能结论；下一步为 67C 统一 inode dependency scheduler。
 
+### Shard-67C：inode dependency scheduler core（2026-09-16）
+
+- 每个 inode 新增 `HfsInodeScheduler`：共享 mutex/condition、容量计数和 intrusive
+  interval treap；ticket 删除 per-ticket mutex/cond，使用 `maxEnd` 剪枝重叠候选，admit/complete
+  不再扫描 active 全表。
+- `HFS_ORDERING=ticket` 与 `HFS_ORDERING=range` 在 `hfsIoReadAt`/`hfsIoWriteAt` 统一走 scheduler，
+  `HFS_ORDERING=none` 保留显式绕过；容量等待和依赖等待共用同一条件变量。
+- vector、pipeline window、zero/punch 仍保留 compatibility range lock，64 stripe 的最终删除不在
+  本阶段范围内；因此当前是 scheduler core，而不是旧锁全部清理。
+- VM 真实 NVMe、自动 reactor 拓扑短回归通过：同范围 32 线程写
+  `ticket_admit=33/ready=33/complete=33`、`dependency_waits=15`、`pending_peak=8`，
+  `spdk_submit=96/complete=96`、errors=0；range 兼容模式
+  `admit=26/complete=26`、`spdk_submit=210/complete=210`、errors=0。Make/CMake、POSIX-only、
+  contract 和 fast-I/O 均通过，结束后 NVMe 已恢复内核 `nvme` 驱动。
+- 本阶段仍不输出 CPU/吞吐提升结论，不进行 reactor 数量矩阵；下一步为 67D 共享 DMA arena。
+
 ## 共享验证边界与性能观测口径
 
 - SPDK 源码必须在 VM 内通过 `git clone`、`git fetch`、`git checkout` 和 `git -C spdk submodule update --init --recursive` 获取及维护；禁止从 Windows 工作区把 `spdk/` 源码目录或其子模块传到 VM 覆盖。Windows 到 VM 的同步仅限 HFS 自身源码、脚本和文档。

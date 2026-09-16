@@ -2,7 +2,6 @@
 #define HFS_TICKET_H
 
 #include <stdbool.h>
-#include <pthread.h>
 #include <stdint.h>
 
 #include "hfs_inode_runtime.h"
@@ -25,11 +24,15 @@ typedef enum HfsPosixOrderingMode {
 struct hfs_posix_io_ticket {
 	HfsInodeRuntime *runtime;
 	HfsFile *file;
-	HfsPosixIoTicket *next;
-	pthread_mutex_t waitLock;
-	pthread_cond_t waitCondition;
+	/* Intrusive treap links; the scheduler owns the node while it is admitted. */
+	HfsPosixIoTicket *left;
+	HfsPosixIoTicket *right;
+	uint64_t maxEnd;
+	uint32_t priority;
 	uint64_t ticketId;
 	uint64_t submitSeq;
+	/* Monotonic scheduler epoch reserved for barrier publication. */
+	uint64_t submitEpoch;
 	uint64_t offset;
 	uint64_t length;
 	uint64_t parentId;
@@ -62,7 +65,7 @@ int hfsPosixTicketWaitReady(HfsPosixIoTicket *ticket);
 /* Retire a ticket, promote dependents, and publish the request result. */
 void hfsPosixTicketComplete(HfsPosixIoTicket *ticket, int result);
 
-/* Destroy the ticket wait primitives after completion and removal. */
+/* Release the stack-owned ticket after scheduler removal and completion. */
 void hfsPosixTicketDestroy(HfsPosixIoTicket *ticket);
 
 #endif /* HFS_TICKET_H */
