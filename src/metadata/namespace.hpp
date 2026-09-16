@@ -3,13 +3,16 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
 
 #include "hfs/file.hpp"
 #include "hfs/types.hpp"
+#include "metadata/allocator.hpp"
 #include "metadata/inode.hpp"
+#include "metadata/inode_map.hpp"
 
 namespace hfs::metadata {
 
@@ -21,6 +24,19 @@ struct NamespaceConfig {
     std::uint64_t bytesPerInode = 1024;
     /* Memory charged per visible directory entry (name bytes are extra). */
     std::uint64_t bytesPerDirectoryEntry = 64;
+    /* Data placement (Shard-77); empty deviceExtents disables allocation. */
+    std::uint64_t extentBytes = 1ULL << 20;
+    std::vector<std::uint64_t> deviceExtents;      /* region extents per data device */
+    std::vector<std::uint64_t> deviceStartExtents; /* absolute data region base */
+    PlacementPolicy placement = PlacementPolicy::CapacityWeighted;
+    std::uint64_t maxReserveExtents = 64;
+    std::uint64_t capacityOverrideExtents = 0; /* test-only usable-extents cap */
+};
+
+/* One reserved-but-not-yet-committed logical extent run. */
+struct ExtentAllocation {
+    ExtentRun run;
+    std::uint64_t logicalExtent = 0;
 };
 
 /* Resident in-memory namespace: inode table, directory indexes and the
@@ -39,7 +55,9 @@ public:
         std::uint64_t opens = 0;
         std::uint64_t removes = 0;
         std::uint64_t renames = 0;
-        std::uint64_t limitRejects = 0;  /* NoMemory rejections */
+        std::uint64_t limitRejects = 0; /* NoMemory rejections */
+        std::uint64_t allocatedExtents = 0;
+        std::uint64_t freedExtents = 0;
     };
 
     static Result<std::unique_ptr<Namespace>> create(const NamespaceConfig &config,
@@ -65,6 +83,24 @@ public:
     /* Drops one open reference; frees inodes unlinked while open. */
     Result<void> close(FileHandle handle);
     Stats stats() const;
+
+    /* Reserves extents covering the unmapped parts of [offset, offset+length);
+     * callers zero-initialize the runs and then commit (or release). */
+    Result<std::vector<ExtentAllocation>> reserveExtents(FileHandle handle,
+                                                         std::uint64_t offset,
+                                                         std::uint64_t length);
+    Result<void> commitExtents(FileHandle handle,
+                               std::span<const ExtentAllocation> allocations);
+    Result<void> releaseExtents(FileHandle handle,
+                                std::span<const ExtentAllocation> allocations);
+    Result<std::vector<ExtentDescriptor>> extents(FileHandle handle) const;
+    /* Shrinks or grows the logical size; shrinking releases extents beyond. */
+    Result<void> truncateFile(FileHandle handle, std::uint64_t size);
+    /* Grows the logical size (never shrinks). */
+    Result<void> setSize(FileHandle handle, std::uint64_t size);
+
+    std::uint64_t extentBytes() const noexcept { return config_.extentBytes; }
+    std::uint64_t deviceStartExtent(std::uint32_t deviceId) const noexcept;
 
 private:
     Namespace(const NamespaceConfig &config, Clock clock, void *clockContext);
@@ -96,6 +132,7 @@ private:
     std::uint64_t unlinkEntry(Inode &parent, std::string_view name);
     bool isAncestor(const Inode &maybeAncestor, std::uint64_t inodeId) const noexcept;
     std::uint64_t entryBytes(std::string_view name) const noexcept;
+    void releaseDescriptor(const ExtentDescriptor &descriptor) noexcept;
     static Result<std::vector<std::string_view>> splitPath(std::string_view path);
 
     mutable std::mutex mutex_;
@@ -106,6 +143,8 @@ private:
     std::vector<std::uint64_t> freeSlots_;
     std::uint64_t namespaceBytes_ = 0;
     Stats stats_;
+    std::vector<std::unique_ptr<Allocator>> allocators_;
+    PlacementPicker picker_;
 };
 
 } // namespace hfs::metadata

@@ -32,7 +32,8 @@ TEST_SRC := $(filter-out $(PROJECT_ROOT)/tests/engine_lifecycle_test.cpp \
                          $(PROJECT_ROOT)/tests/format_mount_test.cpp \
                          $(PROJECT_ROOT)/tests/journal_device_test.cpp \
                          $(PROJECT_ROOT)/tests/data_path_device_test.cpp \
-                         $(PROJECT_ROOT)/tests/file_api_test.cpp,$(TEST_SRC))
+                         $(PROJECT_ROOT)/tests/file_api_test.cpp \
+                         $(PROJECT_ROOT)/tests/file_data_test.cpp,$(TEST_SRC))
 endif
 TEST_BIN := $(patsubst $(PROJECT_ROOT)/tests/%.cpp,$(BUILD_DIR)/bin/%,$(TEST_SRC))
 LIB_LINK := -L$(BUILD_DIR)/lib -lhfs_core -Wl,-rpath,$(BUILD_DIR)/lib -lpthread
@@ -130,8 +131,21 @@ endif
 
 # Namespace/inode/directory-index structure test.
 NAMESPACE_TEST_SRC := $(PROJECT_ROOT)/tests/namespace_test.cpp \
+                      $(PROJECT_ROOT)/src/common/crc.cpp \
+                      $(PROJECT_ROOT)/src/metadata/allocator.cpp \
+                      $(PROJECT_ROOT)/src/metadata/inode_map.cpp \
                       $(PROJECT_ROOT)/src/metadata/namespace.cpp
 $(BUILD_DIR)/bin/namespace_test: $(NAMESPACE_TEST_SRC)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -I$(PROJECT_ROOT)/tests -o $@ $^ -lpthread $(LDFLAGS)
+
+# Extent allocator and extent map structure test.
+ALLOCATOR_TEST_SRC := $(PROJECT_ROOT)/tests/allocator_test.cpp \
+                      $(PROJECT_ROOT)/src/common/crc.cpp \
+                      $(PROJECT_ROOT)/src/metadata/allocator.cpp \
+                      $(PROJECT_ROOT)/src/metadata/inode_map.cpp \
+                      $(PROJECT_ROOT)/src/metadata/namespace.cpp
+$(BUILD_DIR)/bin/allocator_test: $(ALLOCATOR_TEST_SRC)
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -I$(PROJECT_ROOT)/tests -o $@ $^ -lpthread $(LDFLAGS)
 

@@ -52,6 +52,7 @@ Result<std::span<std::byte>> DmaArena::acquire(std::size_t size, std::uint32_t t
             void *buffer = sizeClass.free.back();
             sizeClass.free.pop_back();
             ++acquires_;
+            live_.insert(buffer);
             trace::event(trace::EventId::DmaAcquire, classSize, bytes_);
             return std::span<std::byte>(static_cast<std::byte *>(buffer), classSize);
         }
@@ -73,6 +74,9 @@ Result<std::span<std::byte>> DmaArena::acquire(std::size_t size, std::uint32_t t
                 return makeError<std::span<std::byte>>(Status::NoMemory,
                                                        "DMA allocation failed");
             }
+            lock.lock();
+            live_.insert(buffer);
+            lock.unlock();
             return std::span<std::byte>(static_cast<std::byte *>(buffer), classSize);
         }
         ++busy_;
@@ -100,10 +104,16 @@ void DmaArena::release(std::span<std::byte> buffer) noexcept {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         classes_[classIndex].free.push_back(buffer.data());
+        live_.erase(buffer.data());
         ++releases_;
     }
     trace::event(trace::EventId::DmaRelease, buffer.size());
     cv_.notify_one();
+}
+
+bool DmaArena::owns(const void *buffer) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return live_.count(buffer) != 0;
 }
 
 DmaArena::~DmaArena() {

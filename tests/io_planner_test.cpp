@@ -147,6 +147,30 @@ int main() {
         HFS_TEST_CHECK(!empty.ok() && empty.status() == Status::InvalidArgument);
     }
 
+    /* 6b. sparse reads materialize holes as Zero children */
+    {
+        SyntheticExtentMap map;
+        map.add(0, 4096, 0);
+        map.add(8192, 4096, 8192);
+        IoPlanner planner(plannerConfig());
+        auto planned = planner.plan(map, 0, 12288, false, true);
+        HFS_TEST_CHECK(planned.ok());
+        const auto &plan = planned.value();
+        HFS_TEST_CHECK(plan.count == 3 && plan.coveredBytes == 12288);
+        HFS_TEST_CHECK(plan.children[0].kind == IoPlanner::Child::Kind::Direct);
+        HFS_TEST_CHECK(plan.children[1].kind == IoPlanner::Child::Kind::Zero);
+        HFS_TEST_CHECK(plan.children[1].bufferOffset == 4096 &&
+                       plan.children[1].bytes == 4096);
+        HFS_TEST_CHECK(plan.children[2].kind == IoPlanner::Child::Kind::Direct);
+
+        auto tail = planner.plan(map, 12288, 4096, false, true);
+        HFS_TEST_CHECK(tail.ok() && tail.value().count == 1);
+        HFS_TEST_CHECK(tail.value().children[0].kind == IoPlanner::Child::Kind::Zero);
+
+        auto writeHole = planner.plan(map, 0, 12288, true, true);
+        HFS_TEST_CHECK(!writeHole.ok() && writeHole.status() == Status::NotFound);
+    }
+
     /* 7. DMA arena classes, backpressure, and reuse accounting */
     {
         DmaArena arena;

@@ -21,6 +21,8 @@ namespace metadata {
 class Namespace;
 }
 
+class DataPlane;
+
 /* Internal lease that keeps the engine from stopping while client metadata
  * users (clients and open files) are still alive (hfs2.0.md §14.3). */
 struct MetadataLease;
@@ -99,6 +101,8 @@ private:
     friend struct MetadataLease;
     /* Internal: mounted namespace state used by the frontend API. */
     metadata::Namespace *metadataNamespace() const noexcept;
+    /* Internal: engine-owned data plane used by File I/O. */
+    DataPlane *dataPlane() const noexcept;
     void retainMetadataUser() noexcept;
     void releaseMetadataUser() noexcept;
     struct Impl;

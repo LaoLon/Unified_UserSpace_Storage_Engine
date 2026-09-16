@@ -1,5 +1,6 @@
 #include "hfs/core.hpp"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstring>
 #include <fcntl.h>
@@ -12,15 +13,36 @@
 #include "common/log.hpp"
 #include "common/stats.hpp"
 #include "common/trace.hpp"
+#include "core/data_plane.hpp"
+#include "core/dma_arena.hpp"
 #include "core/frame_pool.hpp"
 #include "core/operation.hpp"
 #include "metadata/namespace.hpp"
 #include "runtime/spdk_runtime.hpp"
 #include "storage/volume.hpp"
 
+#if defined(HFS_WITH_SPDK)
+#include <spdk/env.h>
+#endif
+
 namespace hfs {
 
 namespace {
+
+#if defined(HFS_WITH_SPDK)
+void *dataDmaAlloc(std::size_t size, void *context) {
+    (void)context;
+    return spdk_dma_zmalloc(size, 4096, nullptr);
+}
+
+void dataDmaFree(void *ptr, void *context) {
+    (void)context;
+    spdk_dma_free(ptr);
+}
+#else
+void *dataDmaAlloc(std::size_t, void *) { return nullptr; }
+void dataDmaFree(void *, void *) {}
+#endif
 
 struct HugepageInfo {
     bool available = false;
@@ -79,6 +101,8 @@ struct Engine::Impl {
     std::vector<DeviceGeometry> geometries;
     pid_t ownerPid = 0;
     std::unique_ptr<metadata::Namespace> namespaceState;
+    std::unique_ptr<DmaArena> dmaArena;
+    std::unique_ptr<DataPlane> dataPlane;
     std::atomic<std::uint32_t> metadataUsers{0};
 };
 
@@ -207,12 +231,65 @@ Task<Result<void>> Engine::mount() {
     metadata::NamespaceConfig namespaceConfig;
     namespaceConfig.maxInodes = impl.config.maxInodes;
     namespaceConfig.maxNamespaceBytes = impl.config.maxNamespaceBytes;
+    namespaceConfig.extentBytes = impl.config.extentMb << 20;
+    namespaceConfig.placement = impl.config.placement == "round_robin"
+                                    ? metadata::PlacementPolicy::RoundRobin
+                                    : metadata::PlacementPolicy::CapacityWeighted;
+    namespaceConfig.maxReserveExtents = std::max<std::uint64_t>(1, impl.config.preallocExtents);
+    if (namespaceConfig.maxReserveExtents > 64) {
+        namespaceConfig.maxReserveExtents = 64; /* hfs2.0.md §9.4 per-transaction cap */
+    }
+    const std::uint32_t metaBlock = impl.config.metadataBlockSize;
+    if (metaBlock == 0 || impl.config.extentMb == 0 ||
+        namespaceConfig.extentBytes % metaBlock != 0) {
+        runtime.stop();
+        co_return makeError(Status::InvalidArgument,
+                            "extent size is not a multiple of the metadata block size");
+    }
+    const std::uint64_t blocksPerExtent = namespaceConfig.extentBytes / metaBlock;
+    for (std::size_t i = 0;
+         i < impl.config.devices.size() && i < volume.value().devices.size(); ++i) {
+        const DeviceConfig &device = impl.config.devices[i];
+        const bool isData =
+            std::find(impl.config.dataDevices.begin(), impl.config.dataDevices.end(),
+                      device.id) != impl.config.dataDevices.end();
+        if (!isData) {
+            continue;
+        }
+        const DeviceGeometry &geometry = volume.value().devices[i];
+        if ((geometry.dataStart * metaBlock) % namespaceConfig.extentBytes != 0) {
+            runtime.stop();
+            co_return makeError(Status::Corrupt, "data region is not extent aligned");
+        }
+        const std::uint64_t extents = geometry.dataBlocks / blocksPerExtent;
+        if (extents == 0) {
+            runtime.stop();
+            co_return makeError(Status::InvalidArgument, "device has no data extents");
+        }
+        namespaceConfig.deviceExtents.push_back(extents);
+        namespaceConfig.deviceStartExtents.push_back(geometry.dataStart * metaBlock /
+                                                     namespaceConfig.extentBytes);
+    }
     auto namespaceState = metadata::Namespace::create(namespaceConfig);
     if (!namespaceState.ok()) {
         runtime.stop();
         co_return makeError(namespaceState.status(), namespaceState.message());
     }
     impl.namespaceState = std::move(namespaceState).value();
+
+    /* Shared DMA arena and data plane (bounded by [limits] dma_arena_mb). */
+    impl.dmaArena = std::make_unique<DmaArena>();
+    impl.dmaArena->configure(impl.config.dmaArenaMb << 20, dataDmaAlloc, dataDmaFree,
+                             nullptr);
+    IoPlanner::Config plannerConfig;
+    plannerConfig.blockSize = metaBlock;
+    plannerConfig.maxChildBytes = 1U << 20;
+    plannerConfig.maxChildren = 64;
+    DataPath::Config pathConfig;
+    pathConfig.reactorIndex = 0;
+    pathConfig.timeoutMs = static_cast<std::uint32_t>(impl.config.metadataWaitTimeoutMs);
+    impl.dataPlane = std::make_unique<DataPlane>(runtime, *impl.dmaArena, plannerConfig,
+                                                 pathConfig);
     impl.formatted = true;
     impl.uuid = volume.value().uuid;
     impl.geometries = volume.value().devices;
@@ -256,6 +333,8 @@ Task<Result<void>> Engine::stop() {
         impl.mounted = false;
     }
     impl.namespaceState.reset();
+    impl.dataPlane.reset();
+    impl.dmaArena.reset();
     if (impl.lockFd >= 0) {
         ::flock(impl.lockFd, LOCK_UN);
         ::close(impl.lockFd);
@@ -282,6 +361,8 @@ bool Engine::formatted() const noexcept { return impl_->formatted; }
 metadata::Namespace *Engine::metadataNamespace() const noexcept {
     return impl_->namespaceState.get();
 }
+
+DataPlane *Engine::dataPlane() const noexcept { return impl_->dataPlane.get(); }
 
 void Engine::retainMetadataUser() noexcept {
     impl_->metadataUsers.fetch_add(1, std::memory_order_acq_rel);

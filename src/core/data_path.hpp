@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <span>
+#include <vector>
 
 #include "core/dma_arena.hpp"
 #include "core/extent_map.hpp"
@@ -27,7 +28,9 @@ public:
         std::uint64_t completes = 0;
         std::uint64_t directChildren = 0;
         std::uint64_t bounceChildren = 0;
+        std::uint64_t zeroChildren = 0;
         std::uint64_t copyBytes = 0;
+        std::uint64_t zeroBytes = 0;
         std::uint64_t parentWaits = 0;
         std::uint64_t errors = 0;
     };
@@ -52,8 +55,8 @@ private:
     IoPlanner::Config plannerConfig_;
     Config config_;
     Stats stats_;
-    std::uint32_t deviceBlockSize_ = 512;      /* device sector size */
-    std::uint32_t deviceBlocksPerMeta_ = 1;    /* sector blocks per metadata block */
+    std::vector<std::uint32_t> deviceBlockBytes_;   /* per-device sector size */
+    std::vector<std::uint32_t> deviceBlocksPerMeta_; /* sectors per metadata block */
 };
 
 } // namespace hfs

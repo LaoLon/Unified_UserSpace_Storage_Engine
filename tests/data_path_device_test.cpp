@@ -120,6 +120,34 @@ int main() {
                     unaligned.size());
         HFS_TEST_CHECK(window == expected);
 
+        /* 3b. sparse read: unmapped ranges read as zeros */
+        {
+            const std::uint64_t sparseBase = physicalByte + (16ULL << 20);
+            SyntheticExtentMap sparse;
+            sparse.add(0, metaBlock, sparseBase);
+            sparse.add(2 * metaBlock, metaBlock, sparseBase + 2 * metaBlock);
+            std::vector<std::byte> firstBlock(metaBlock);
+            std::vector<std::byte> secondBlock(metaBlock);
+            fillPattern(firstBlock, 0x55);
+            fillPattern(secondBlock, 0x66);
+            HFS_TEST_CHECK(path.write(sparse, firstBlock, 0, firstBlock.size()).ok());
+            HFS_TEST_CHECK(path.write(sparse, secondBlock, 2 * metaBlock,
+                                      secondBlock.size()).ok());
+            std::vector<std::byte> sparseRead(3 * metaBlock, std::byte{0xFF});
+            const auto beforeSparse = path.stats();
+            HFS_TEST_CHECK(path.read(sparse, sparseRead, 0, sparseRead.size()).ok());
+            const auto afterSparse = path.stats();
+            HFS_TEST_CHECK(afterSparse.zeroChildren > beforeSparse.zeroChildren);
+            HFS_TEST_CHECK(afterSparse.zeroBytes - beforeSparse.zeroBytes == metaBlock);
+            HFS_TEST_CHECK(std::memcmp(sparseRead.data(), firstBlock.data(), metaBlock) == 0);
+            for (std::size_t i = metaBlock; i < 2 * metaBlock; ++i) {
+                HFS_TEST_CHECK(sparseRead[i] == std::byte{0});
+            }
+            HFS_TEST_CHECK(
+                std::memcmp(sparseRead.data() + 2 * metaBlock, secondBlock.data(),
+                            metaBlock) == 0);
+        }
+
         /* 4. DMA-capable caller buffer takes the direct path without copies */
         auto lease = BufferLease::fromArena(arena, 1U << 20, 1000);
         HFS_TEST_CHECK(lease.ok());

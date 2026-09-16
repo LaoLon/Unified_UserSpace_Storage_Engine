@@ -17,7 +17,8 @@ std::uint64_t systemNowNs(void *) {
 
 Namespace::Namespace(const NamespaceConfig &config, Clock clock, void *clockContext)
     : config_(config), clock_(clock != nullptr ? clock : systemNowNs),
-      clockContext_(clockContext) {
+      clockContext_(clockContext),
+      picker_(config.placement, config.deviceExtents.size()) {
     inodes_.resize(kRootInodeId + 1);
     Inode &root = inodes_[kRootInodeId];
     root.id = kRootInodeId;
@@ -40,7 +41,29 @@ Result<std::unique_ptr<Namespace>> Namespace::create(const NamespaceConfig &conf
         return makeError<std::unique_ptr<Namespace>>(Status::InvalidArgument,
                                                      "invalid namespace limits");
     }
-    return std::unique_ptr<Namespace>(new Namespace(config, clock, clockContext));
+    if (config.extentBytes == 0 ||
+        config.deviceStartExtents.size() != config.deviceExtents.size()) {
+        return makeError<std::unique_ptr<Namespace>>(Status::InvalidArgument,
+                                                     "invalid extent placement config");
+    }
+    auto namespaceState = std::unique_ptr<Namespace>(new Namespace(config, clock, clockContext));
+    for (std::size_t i = 0; i < config.deviceExtents.size(); ++i) {
+        AllocatorConfig allocatorConfig;
+        allocatorConfig.deviceId = static_cast<std::uint32_t>(i);
+        allocatorConfig.totalExtents = config.deviceExtents[i];
+        allocatorConfig.maxReserveExtents = config.maxReserveExtents;
+        if (config.capacityOverrideExtents != 0 &&
+            config.capacityOverrideExtents < config.deviceExtents[i]) {
+            allocatorConfig.capacityExtents = config.capacityOverrideExtents;
+        }
+        auto allocator = Allocator::create(allocatorConfig);
+        if (!allocator.ok()) {
+            return makeError<std::unique_ptr<Namespace>>(allocator.status(),
+                                                         allocator.message());
+        }
+        namespaceState->allocators_.push_back(std::move(allocator).value());
+    }
+    return namespaceState;
 }
 
 std::uint64_t Namespace::nowNs() const noexcept { return clock_(clockContext_); }
@@ -223,6 +246,7 @@ Result<Inode *> Namespace::createInode(bool directory, std::uint64_t parent,
     inode.parent = parent;
     inode.mtimeNs = now;
     inode.ctimeNs = now;
+    inode.extents.configure(config_.extentBytes);
     if (directory) {
         inode.index = std::make_shared<DirectoryIndex>();
     }
@@ -233,6 +257,10 @@ Result<Inode *> Namespace::createInode(bool directory, std::uint64_t parent,
 
 void Namespace::freeInode(std::uint64_t inodeId) noexcept {
     Inode &inode = inodes_[inodeId];
+    for (const ExtentDescriptor &descriptor : inode.extents.snapshot()) {
+        releaseDescriptor(descriptor);
+    }
+    inode.extents.removeFrom(0);
     inode.id = 0; /* slot is free; generation is kept for the next reuse */
     inode.directory = false;
     inode.linkCount = 0;
@@ -555,6 +583,230 @@ Result<void> Namespace::close(FileHandle handle) {
         freeInode(inode.id);
     }
     return Result<void>(Status::Ok);
+}
+
+void Namespace::releaseDescriptor(const ExtentDescriptor &descriptor) noexcept {
+    if (descriptor.deviceId >= allocators_.size() ||
+        descriptor.deviceId >= config_.deviceStartExtents.size()) {
+        return;
+    }
+    const std::uint64_t regionStart = config_.deviceStartExtents[descriptor.deviceId];
+    if (descriptor.physicalExtent < regionStart) {
+        return;
+    }
+    allocators_[descriptor.deviceId]->release(descriptor.physicalExtent - regionStart,
+                                              descriptor.count);
+    stats_.freedExtents += descriptor.count;
+}
+
+Result<std::vector<ExtentAllocation>> Namespace::reserveExtents(FileHandle handle,
+                                                                std::uint64_t offset,
+                                                                std::uint64_t length) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto inodeResult = lookupInode(handle);
+    if (!inodeResult.ok()) {
+        return makeError<std::vector<ExtentAllocation>>(inodeResult.status(),
+                                                        inodeResult.message());
+    }
+    if (config_.deviceExtents.empty()) {
+        return makeError<std::vector<ExtentAllocation>>(Status::NotSupported,
+                                                        "no data devices configured");
+    }
+    if (length == 0) {
+        return makeError<std::vector<ExtentAllocation>>(Status::InvalidArgument,
+                                                        "zero-length allocation");
+    }
+    Inode &inode = *inodeResult.value();
+    const std::uint64_t extentBytes = config_.extentBytes;
+    const std::uint64_t logicalStart = offset / extentBytes;
+    const std::uint64_t logicalEnd = (offset + length + extentBytes - 1) / extentBytes;
+    const std::vector<ExtentDescriptor> descriptors = inode.extents.snapshot();
+    std::vector<ExtentAllocation> allocations;
+    std::vector<std::uint64_t> freeCounts(allocators_.size(), 0);
+
+    auto rollback = [&]() {
+        for (const ExtentAllocation &allocation : allocations) {
+            allocators_[allocation.run.deviceId]->release(allocation.run.start,
+                                                          allocation.run.count);
+        }
+        allocations.clear();
+    };
+
+    std::uint64_t cursor = logicalStart;
+    std::size_t index = 0;
+    while (cursor < logicalEnd) {
+        while (index < descriptors.size() &&
+               descriptors[index].logicalExtent + descriptors[index].count <= cursor) {
+            ++index;
+        }
+        if (index < descriptors.size() && descriptors[index].logicalExtent <= cursor) {
+            cursor = descriptors[index].logicalExtent + descriptors[index].count;
+            continue;
+        }
+        std::uint64_t runEnd = logicalEnd;
+        if (index < descriptors.size() && descriptors[index].logicalExtent < runEnd) {
+            runEnd = descriptors[index].logicalExtent;
+        }
+        std::uint64_t remaining = runEnd - cursor;
+        std::uint64_t logical = cursor;
+        while (remaining > 0) {
+            std::uint64_t device = 0;
+            std::uint64_t take = 0;
+            for (std::size_t attempt = 0; attempt < allocators_.size(); ++attempt) {
+                for (std::size_t i = 0; i < allocators_.size(); ++i) {
+                    freeCounts[i] = allocators_[i]->allocatableExtents();
+                }
+                device = picker_.pick(freeCounts);
+                take = std::min(remaining, freeCounts[device]);
+                if (take > 0) {
+                    break;
+                }
+            }
+            if (take == 0) {
+                rollback();
+                return makeError<std::vector<ExtentAllocation>>(
+                    Status::NoSpace, "no allocatable extents across data devices");
+            }
+            auto runs = allocators_[device]->reserveScattered(take);
+            if (!runs.ok()) {
+                rollback();
+                return makeError<std::vector<ExtentAllocation>>(runs.status(),
+                                                                 runs.message());
+            }
+            for (const ExtentRun &run : runs.value()) {
+                allocations.push_back(ExtentAllocation{run, logical});
+                logical += run.count;
+            }
+            remaining -= take;
+        }
+        cursor = runEnd;
+    }
+    return allocations;
+}
+
+Result<void> Namespace::commitExtents(FileHandle handle,
+                                      std::span<const ExtentAllocation> allocations) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto inodeResult = lookupInode(handle);
+    if (!inodeResult.ok()) {
+        return makeError(inodeResult.status(), inodeResult.message());
+    }
+    if (allocations.empty()) {
+        return Result<void>(Status::Ok);
+    }
+    Inode &inode = *inodeResult.value();
+    std::vector<ExtentDescriptor> descriptors;
+    descriptors.reserve(allocations.size());
+    for (const ExtentAllocation &allocation : allocations) {
+        const std::uint64_t device = allocation.run.deviceId;
+        if (device >= allocators_.size() || device >= config_.deviceStartExtents.size()) {
+            return makeError(Status::InvalidArgument, "allocation device out of range");
+        }
+        auto initialized =
+            allocators_[device]->markInitialized(allocation.run.start, allocation.run.count);
+        if (!initialized.ok()) {
+            return initialized;
+        }
+        auto committed = allocators_[device]->commit(allocation.run.start,
+                                                     allocation.run.count);
+        if (!committed.ok()) {
+            return committed;
+        }
+        ExtentDescriptor descriptor;
+        descriptor.logicalExtent = allocation.logicalExtent;
+        descriptor.physicalExtent = config_.deviceStartExtents[device] + allocation.run.start;
+        descriptor.count = allocation.run.count;
+        descriptor.deviceId = static_cast<std::uint32_t>(device);
+        descriptors.push_back(descriptor);
+        stats_.allocatedExtents += allocation.run.count;
+    }
+    auto added = inode.extents.addExtents(descriptors);
+    if (!added.ok()) {
+        return added;
+    }
+    touch(inode, nowNs(), false);
+    return Result<void>(Status::Ok);
+}
+
+Result<void> Namespace::releaseExtents(FileHandle handle,
+                                       std::span<const ExtentAllocation> allocations) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto inodeResult = lookupInode(handle);
+    if (!inodeResult.ok()) {
+        return makeError(inodeResult.status(), inodeResult.message());
+    }
+    for (const ExtentAllocation &allocation : allocations) {
+        if (allocation.run.deviceId >= allocators_.size()) {
+            return makeError(Status::InvalidArgument, "allocation device out of range");
+        }
+        auto released = allocators_[allocation.run.deviceId]->release(allocation.run.start,
+                                                                      allocation.run.count);
+        if (!released.ok()) {
+            return released;
+        }
+    }
+    return Result<void>(Status::Ok);
+}
+
+Result<std::vector<ExtentDescriptor>> Namespace::extents(FileHandle handle) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto inodeResult = lookupInode(handle);
+    if (!inodeResult.ok()) {
+        return makeError<std::vector<ExtentDescriptor>>(inodeResult.status(),
+                                                        inodeResult.message());
+    }
+    return inodeResult.value()->extents.snapshot();
+}
+
+Result<void> Namespace::truncateFile(FileHandle handle, std::uint64_t size) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto inodeResult = lookupInode(handle);
+    if (!inodeResult.ok()) {
+        return makeError(inodeResult.status(), inodeResult.message());
+    }
+    Inode &inode = *inodeResult.value();
+    const std::uint64_t extentBytes = config_.extentBytes;
+    const std::uint64_t keep = (size + extentBytes - 1) / extentBytes;
+    for (const ExtentDescriptor &descriptor : inode.extents.snapshot()) {
+        if (descriptor.logicalExtent + descriptor.count <= keep) {
+            continue;
+        }
+        if (descriptor.logicalExtent >= keep) {
+            releaseDescriptor(descriptor);
+            continue;
+        }
+        ExtentDescriptor tail = descriptor;
+        const std::uint64_t keepCount = keep - descriptor.logicalExtent;
+        tail.logicalExtent = keep;
+        tail.physicalExtent = descriptor.physicalExtent + keepCount;
+        tail.count = descriptor.count - keepCount;
+        releaseDescriptor(tail);
+    }
+    inode.extents.removeFrom(keep);
+    inode.logicalSize = size;
+    touch(inode, nowNs(), true);
+    return Result<void>(Status::Ok);
+}
+
+Result<void> Namespace::setSize(FileHandle handle, std::uint64_t size) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto inodeResult = lookupInode(handle);
+    if (!inodeResult.ok()) {
+        return makeError(inodeResult.status(), inodeResult.message());
+    }
+    Inode &inode = *inodeResult.value();
+    if (size > inode.logicalSize) {
+        inode.logicalSize = size;
+        touch(inode, nowNs(), true);
+    }
+    return Result<void>(Status::Ok);
+}
+
+std::uint64_t Namespace::deviceStartExtent(std::uint32_t deviceId) const noexcept {
+    if (deviceId >= config_.deviceStartExtents.size()) {
+        return 0;
+    }
+    return config_.deviceStartExtents[deviceId];
 }
 
 Namespace::Stats Namespace::stats() const {

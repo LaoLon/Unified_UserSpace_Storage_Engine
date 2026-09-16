@@ -19,7 +19,7 @@ public:
     };
 
     struct Child {
-        enum class Kind : std::uint8_t { Direct, HeadRmw, TailRmw };
+        enum class Kind : std::uint8_t { Direct, HeadRmw, TailRmw, Zero };
         Kind kind = Kind::Direct;
         std::uint64_t logicalOffset = 0; /* user offset of the child */
         std::uint64_t physicalBlock = 0; /* device block of the aligned span */
@@ -39,8 +39,10 @@ public:
 
     explicit IoPlanner(Config config);
 
+    /* Splits a logical I/O into device-local children. With allowHoles (reads)
+     * unmapped ranges become Zero children instead of NotFound. */
     Result<Plan> plan(const ExtentMap &map, std::uint64_t offset, std::uint64_t length,
-                      bool write) const;
+                      bool write, bool allowHoles = false) const;
 
 private:
     Config config_;

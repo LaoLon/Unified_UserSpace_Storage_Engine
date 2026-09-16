@@ -101,21 +101,35 @@ int main() {
             HFS_TEST_CHECK(newerStat.value().inodeId == olderStat.value().inodeId);
             HFS_TEST_CHECK(newerStat.value().generation != olderStat.value().generation);
 
-            /* 5. data operations report NotSupported until Shard-77/78 */
-            HFS_TEST_CHECK(first.value()->read({}, 0).wait().value().status() ==
-                           Status::NotSupported);
-            HFS_TEST_CHECK(first.value()->write({}, 0).wait().value().status() ==
-                           Status::NotSupported);
-            HFS_TEST_CHECK(first.value()->append({}).wait().value().status() ==
-                           Status::NotSupported);
-            HFS_TEST_CHECK(first.value()->truncate(4096).wait().value().status() ==
-                           Status::NotSupported);
-            HFS_TEST_CHECK(first.value()->allocate(0, 4096).wait().value().status() ==
-                           Status::NotSupported);
-            HFS_TEST_CHECK(first.value()->datasync().wait().value().status() ==
-                           Status::NotSupported);
-            HFS_TEST_CHECK(first.value()->sync().wait().value().status() ==
-                           Status::NotSupported);
+            /* 5. file data path smoke test (full matrix in file_data_test) */
+            {
+                std::vector<std::byte> pattern(8192);
+                for (std::size_t i = 0; i < pattern.size(); ++i) {
+                    pattern[i] = std::byte{static_cast<std::uint8_t>(i * 13)};
+                }
+                IoVec writeVec{pattern.data(), pattern.size()};
+                auto written = first.value()
+                                   ->write(std::span<const IoVec>(&writeVec, 1), 100,
+                                           std::stop_token{})
+                                   .wait()
+                                   .value();
+                HFS_TEST_CHECK(written.ok() && written.value().bytes == pattern.size());
+                auto resized = first.value()->stat();
+                HFS_TEST_CHECK(resized.ok() && resized.value().logicalSize == 100 + 8192);
+                std::vector<std::byte> readBack(8192, std::byte{0});
+                IoVec readVec{readBack.data(), readBack.size()};
+                auto read = first.value()
+                                ->read(std::span<IoVec>(&readVec, 1), 100,
+                                       std::stop_token{})
+                                .wait()
+                                .value();
+                HFS_TEST_CHECK(read.ok() && read.value().bytes == pattern.size());
+                HFS_TEST_CHECK(readBack == pattern);
+                HFS_TEST_CHECK(first.value()->datasync().wait().value().status() ==
+                               Status::NotSupported);
+                HFS_TEST_CHECK(first.value()->sync().wait().value().status() ==
+                               Status::NotSupported);
+            }
 
             /* 6. client open-file limit */
             auto limitedResult = Client::create(*engine, ClientOptions{2});

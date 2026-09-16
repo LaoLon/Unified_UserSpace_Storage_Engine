@@ -1,9 +1,14 @@
 #include "hfs/core.hpp"
 
+#include <algorithm>
 #include <atomic>
+#include <cstring>
 #include <memory>
+#include <vector>
 
 #include "common/log.hpp"
+#include "core/data_plane.hpp"
+#include "metadata/inode_map.hpp"
 #include "metadata/namespace.hpp"
 
 namespace hfs {
@@ -32,11 +37,28 @@ namespace {
 struct ClientState {
     Engine *engine = nullptr;
     metadata::Namespace *namespaceState = nullptr;
+    DataPlane *dataPlane = nullptr;
     ClientOptions options;
     std::shared_ptr<MetadataLease> lease;
     std::atomic<std::uint32_t> openFiles{0};
     std::atomic<bool> closed{false};
 };
+
+/* Rebuilds the per-inode extent map view for one File handle. */
+Result<metadata::InodeExtentMap> extentMapFor(const ClientState &state, FileHandle handle) {
+    auto descriptors = state.namespaceState->extents(handle);
+    if (!descriptors.ok()) {
+        return makeError<metadata::InodeExtentMap>(descriptors.status(),
+                                                   descriptors.message());
+    }
+    metadata::InodeExtentMap map;
+    map.configure(state.namespaceState->extentBytes());
+    auto restored = map.restore(descriptors.value());
+    if (!restored.ok()) {
+        return makeError<metadata::InodeExtentMap>(restored.status(), restored.message());
+    }
+    return map;
+}
 
 Result<void> validateClient(const ClientState &state) {
     if (state.engine == nullptr || !state.engine->processValid()) {
@@ -75,6 +97,7 @@ Client::Client(Engine &engine, const ClientOptions &options) : impl_(std::make_u
     impl_->state = std::make_shared<ClientState>();
     impl_->state->engine = &engine;
     impl_->state->namespaceState = engine.metadataNamespace();
+    impl_->state->dataPlane = engine.dataPlane();
     impl_->state->options = options;
     impl_->state->lease = std::make_shared<MetadataLease>(engine);
 }
@@ -188,59 +211,212 @@ Result<FileStat> File::stat() const {
 
 Task<Result<ReadResult>> File::read(std::span<IoVec> buffers, std::uint64_t offset,
                                     std::stop_token stop) {
-    (void)buffers;
-    (void)offset;
     (void)stop;
-    if (!impl_->state->engine->processValid()) {
+    auto &state = *impl_->state;
+    if (state.engine == nullptr || !state.engine->processValid()) {
         co_return Result<ReadResult>(Status::ForkedProcess,
                                      "engine belongs to another process");
     }
-    co_return makeError<ReadResult>(Status::NotSupported,
-                                    "file read lands with the allocator (Shard-77)");
+    if (state.namespaceState == nullptr || state.dataPlane == nullptr) {
+        co_return Result<ReadResult>(Status::InvalidState, "engine is not mounted");
+    }
+    std::size_t total = 0;
+    for (const IoVec &vec : buffers) {
+        if (vec.size != 0 && vec.data == nullptr) {
+            co_return makeError<ReadResult>(Status::InvalidArgument, "null iovec buffer");
+        }
+        total += vec.size;
+    }
+    if (total == 0) {
+        co_return ReadResult{0};
+    }
+    auto stat = state.namespaceState->stat(impl_->handle);
+    if (!stat.ok()) {
+        co_return makeError<ReadResult>(stat.status(), stat.message());
+    }
+    const std::uint64_t size = stat.value().logicalSize;
+    if (offset >= size) {
+        co_return ReadResult{0};
+    }
+    const std::uint64_t length = std::min<std::uint64_t>(total, size - offset);
+    auto map = extentMapFor(state, impl_->handle);
+    if (!map.ok()) {
+        co_return makeError<ReadResult>(map.status(), map.message());
+    }
+    std::uint64_t cursor = offset;
+    std::uint64_t remaining = length;
+    for (const IoVec &vec : buffers) {
+        if (remaining == 0) {
+            break;
+        }
+        const std::size_t take =
+            static_cast<std::size_t>(std::min<std::uint64_t>(vec.size, remaining));
+        auto read = state.dataPlane->read(map.value(),
+                                          std::span<std::byte>(vec.data, take), cursor,
+                                          take);
+        if (!read.ok()) {
+            co_return makeError<ReadResult>(read.status(), read.message());
+        }
+        cursor += take;
+        remaining -= take;
+    }
+    co_return ReadResult{length};
 }
 
 Task<Result<WriteResult>> File::write(std::span<const IoVec> buffers, std::uint64_t offset,
                                       std::stop_token stop) {
-    (void)buffers;
-    (void)offset;
     (void)stop;
-    if (!impl_->state->engine->processValid()) {
+    auto &state = *impl_->state;
+    if (state.engine == nullptr || !state.engine->processValid()) {
         co_return Result<WriteResult>(Status::ForkedProcess,
                                       "engine belongs to another process");
     }
-    co_return makeError<WriteResult>(Status::NotSupported,
-                                     "file write lands with the allocator (Shard-77)");
+    if (state.namespaceState == nullptr || state.dataPlane == nullptr) {
+        co_return Result<WriteResult>(Status::InvalidState, "engine is not mounted");
+    }
+    std::size_t total = 0;
+    for (const IoVec &vec : buffers) {
+        if (vec.size != 0 && vec.data == nullptr) {
+            co_return makeError<WriteResult>(Status::InvalidArgument, "null iovec buffer");
+        }
+        total += vec.size;
+    }
+    if (total == 0) {
+        co_return WriteResult{0};
+    }
+
+    /* Allocate missing extents, zero-initialize them, then commit. Extents are
+     * invisible until COMMITTED (hfs2.0.md §9.4). */
+    auto reservations = state.namespaceState->reserveExtents(impl_->handle, offset, total);
+    if (!reservations.ok()) {
+        co_return makeError<WriteResult>(reservations.status(), reservations.message());
+    }
+    if (!reservations.value().empty()) {
+        std::vector<metadata::ExtentDescriptor> descriptors;
+        descriptors.reserve(reservations.value().size());
+        for (const metadata::ExtentAllocation &allocation : reservations.value()) {
+            metadata::ExtentDescriptor descriptor;
+            descriptor.logicalExtent = allocation.logicalExtent;
+            descriptor.physicalExtent =
+                state.namespaceState->deviceStartExtent(
+                    static_cast<std::uint32_t>(allocation.run.deviceId)) +
+                allocation.run.start;
+            descriptor.count = allocation.run.count;
+            descriptor.deviceId = static_cast<std::uint32_t>(allocation.run.deviceId);
+            descriptors.push_back(descriptor);
+        }
+        auto zeroed = state.dataPlane->zeroExtents(descriptors,
+                                                   state.namespaceState->extentBytes());
+        if (!zeroed.ok()) {
+            state.namespaceState->releaseExtents(impl_->handle, reservations.value());
+            co_return makeError<WriteResult>(zeroed.status(), zeroed.message());
+        }
+        auto committed =
+            state.namespaceState->commitExtents(impl_->handle, reservations.value());
+        if (!committed.ok()) {
+            state.namespaceState->releaseExtents(impl_->handle, reservations.value());
+            co_return makeError<WriteResult>(committed.status(), committed.message());
+        }
+    }
+
+    auto map = extentMapFor(state, impl_->handle);
+    if (!map.ok()) {
+        co_return makeError<WriteResult>(map.status(), map.message());
+    }
+    std::uint64_t cursor = offset;
+    for (const IoVec &vec : buffers) {
+        if (vec.size == 0) {
+            continue;
+        }
+        auto written = state.dataPlane->write(
+            map.value(), std::span<const std::byte>(vec.data, vec.size), cursor, vec.size);
+        if (!written.ok()) {
+            co_return makeError<WriteResult>(written.status(), written.message());
+        }
+        cursor += vec.size;
+    }
+    auto resized = state.namespaceState->setSize(impl_->handle, cursor);
+    if (!resized.ok()) {
+        co_return makeError<WriteResult>(resized.status(), resized.message());
+    }
+    co_return WriteResult{total};
 }
 
 Task<Result<WriteResult>> File::append(std::span<const IoVec> buffers,
                                        std::stop_token stop) {
-    (void)buffers;
-    (void)stop;
-    if (!impl_->state->engine->processValid()) {
+    auto &state = *impl_->state;
+    if (state.engine == nullptr || !state.engine->processValid()) {
         co_return Result<WriteResult>(Status::ForkedProcess,
                                       "engine belongs to another process");
     }
-    co_return makeError<WriteResult>(Status::NotSupported,
-                                     "file append lands with the allocator (Shard-77)");
+    if (state.namespaceState == nullptr) {
+        co_return Result<WriteResult>(Status::InvalidState, "engine is not mounted");
+    }
+    auto stat = state.namespaceState->stat(impl_->handle);
+    if (!stat.ok()) {
+        co_return makeError<WriteResult>(stat.status(), stat.message());
+    }
+    auto outer = co_await write(buffers, stat.value().logicalSize, stop);
+    if (!outer.ok()) {
+        co_return makeError<WriteResult>(outer.status(), outer.message());
+    }
+    co_return outer.value();
 }
 
 Task<Result<void>> File::allocate(std::uint64_t offset, std::uint64_t length) {
-    (void)offset;
-    (void)length;
-    if (!impl_->state->engine->processValid()) {
+    auto &state = *impl_->state;
+    if (state.engine == nullptr || !state.engine->processValid()) {
         co_return Result<void>(Status::ForkedProcess, "engine belongs to another process");
     }
-    co_return makeError(Status::NotSupported,
-                        "file allocate lands with the allocator (Shard-77)");
+    if (state.namespaceState == nullptr || state.dataPlane == nullptr) {
+        co_return Result<void>(Status::InvalidState, "engine is not mounted");
+    }
+    if (length == 0) {
+        co_return Result<void>(Status::Ok);
+    }
+    auto reservations = state.namespaceState->reserveExtents(impl_->handle, offset, length);
+    if (!reservations.ok()) {
+        co_return makeError(reservations.status(), reservations.message());
+    }
+    if (!reservations.value().empty()) {
+        std::vector<metadata::ExtentDescriptor> descriptors;
+        descriptors.reserve(reservations.value().size());
+        for (const metadata::ExtentAllocation &allocation : reservations.value()) {
+            metadata::ExtentDescriptor descriptor;
+            descriptor.logicalExtent = allocation.logicalExtent;
+            descriptor.physicalExtent =
+                state.namespaceState->deviceStartExtent(
+                    static_cast<std::uint32_t>(allocation.run.deviceId)) +
+                allocation.run.start;
+            descriptor.count = allocation.run.count;
+            descriptor.deviceId = static_cast<std::uint32_t>(allocation.run.deviceId);
+            descriptors.push_back(descriptor);
+        }
+        auto zeroed = state.dataPlane->zeroExtents(descriptors,
+                                                   state.namespaceState->extentBytes());
+        if (!zeroed.ok()) {
+            state.namespaceState->releaseExtents(impl_->handle, reservations.value());
+            co_return makeError(zeroed.status(), zeroed.message());
+        }
+        auto committed =
+            state.namespaceState->commitExtents(impl_->handle, reservations.value());
+        if (!committed.ok()) {
+            state.namespaceState->releaseExtents(impl_->handle, reservations.value());
+            co_return makeError(committed.status(), committed.message());
+        }
+    }
+    co_return state.namespaceState->setSize(impl_->handle, offset + length);
 }
 
 Task<Result<void>> File::truncate(std::uint64_t size) {
-    (void)size;
-    if (!impl_->state->engine->processValid()) {
+    auto &state = *impl_->state;
+    if (state.engine == nullptr || !state.engine->processValid()) {
         co_return Result<void>(Status::ForkedProcess, "engine belongs to another process");
     }
-    co_return makeError(Status::NotSupported,
-                        "file truncate lands with the allocator (Shard-77)");
+    if (state.namespaceState == nullptr) {
+        co_return Result<void>(Status::InvalidState, "engine is not mounted");
+    }
+    co_return state.namespaceState->truncateFile(impl_->handle, size);
 }
 
 Task<Result<void>> File::datasync() {

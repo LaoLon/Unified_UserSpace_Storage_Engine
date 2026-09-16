@@ -9,7 +9,8 @@ namespace hfs {
 IoPlanner::IoPlanner(Config config) : config_(config) {}
 
 Result<IoPlanner::Plan> IoPlanner::plan(const ExtentMap &map, std::uint64_t offset,
-                                        std::uint64_t length, bool write) const {
+                                        std::uint64_t length, bool write,
+                                        bool allowHoles) const {
     (void)write;
     if (length == 0) {
         return makeError<Plan>(Status::InvalidArgument, "zero-length I/O");
@@ -40,6 +41,20 @@ Result<IoPlanner::Plan> IoPlanner::plan(const ExtentMap &map, std::uint64_t offs
 
     for (std::size_t i = 0; i < lookup.value(); ++i) {
         const ExtentView &extent = extents[i];
+        if (extent.logicalOffset != cursor && allowHoles && !write) {
+            const std::uint64_t gap = extent.logicalOffset - cursor;
+            Child child;
+            child.kind = Child::Kind::Zero;
+            child.logicalOffset = cursor;
+            child.bytes = static_cast<std::uint32_t>(gap);
+            child.spanBytes = static_cast<std::uint32_t>(gap);
+            child.bufferOffset = static_cast<std::uint32_t>(cursor - offset);
+            auto pushed = pushChild(child);
+            if (!pushed.ok()) {
+                return makeError<Plan>(pushed.status(), pushed.message());
+            }
+            cursor = extent.logicalOffset;
+        }
         if (extent.logicalOffset != cursor) {
             return makeError<Plan>(Status::NotFound,
                                    "logical range is not fully allocated");
@@ -113,7 +128,22 @@ Result<IoPlanner::Plan> IoPlanner::plan(const ExtentMap &map, std::uint64_t offs
     }
 
     if (cursor != end) {
-        return makeError<Plan>(Status::NotFound, "logical range is not fully allocated");
+        if (allowHoles && !write) {
+            Child child;
+            child.kind = Child::Kind::Zero;
+            child.logicalOffset = cursor;
+            child.bytes = static_cast<std::uint32_t>(end - cursor);
+            child.spanBytes = child.bytes;
+            child.bufferOffset = static_cast<std::uint32_t>(cursor - offset);
+            auto pushed = pushChild(child);
+            if (!pushed.ok()) {
+                return makeError<Plan>(pushed.status(), pushed.message());
+            }
+            cursor = end;
+        } else {
+            return makeError<Plan>(Status::NotFound,
+                                   "logical range is not fully allocated");
+        }
     }
     plan.coveredBytes = length;
     trace::event(trace::EventId::ExtentPlan, offset, length, plan.count,

@@ -53,13 +53,18 @@ DataPath::DataPath(SpdkRuntime &runtime, DmaArena &arena, IoPlanner::Config plan
       planner_(plannerConfig),
       plannerConfig_(plannerConfig),
       config_(config) {
-    deviceBlockSize_ = runtime_.deviceBlockSize(config_.deviceIndex);
-    if (deviceBlockSize_ == 0) {
-        deviceBlockSize_ = 512;
-    }
-    deviceBlocksPerMeta_ = plannerConfig_.blockSize / deviceBlockSize_;
-    if (deviceBlocksPerMeta_ == 0) {
-        deviceBlocksPerMeta_ = 1;
+    const std::size_t deviceCount = runtime_.deviceCount();
+    const std::size_t count = deviceCount == 0 ? 1 : deviceCount;
+    deviceBlockBytes_.assign(count, 512);
+    deviceBlocksPerMeta_.assign(count, 1);
+    for (std::size_t i = 0; i < count; ++i) {
+        std::uint32_t sector = runtime_.deviceBlockSize(i);
+        if (sector == 0) {
+            sector = 512;
+        }
+        deviceBlockBytes_[i] = sector;
+        const std::uint32_t factor = plannerConfig_.blockSize / sector;
+        deviceBlocksPerMeta_[i] = factor == 0 ? 1 : factor;
     }
 }
 
@@ -76,16 +81,11 @@ Result<void> DataPath::write(const ExtentMap &map, std::span<const std::byte> bu
 Result<void> DataPath::execute(const ExtentMap &map, std::span<std::byte> readBuffer,
                                std::span<const std::byte> writeBuffer, std::uint64_t offset,
                                std::uint64_t length, bool write) {
-    auto planResult = planner_.plan(map, offset, length, write);
+    auto planResult = planner_.plan(map, offset, length, write, !write);
     if (!planResult.ok()) {
         return makeError(planResult.status(), planResult.message());
     }
     const auto &plan = planResult.value();
-    const std::uint32_t blockSize = plannerConfig_.blockSize;
-    if (blockSize % deviceBlockSize_ != 0) {
-        return makeError(Status::InvalidArgument,
-                         "metadata block size is not a multiple of the device block size");
-    }
 
     ParentCompletion parent;
     parent.init(plan.count, nullptr, nullptr);
@@ -97,20 +97,42 @@ Result<void> DataPath::execute(const ExtentMap &map, std::span<std::byte> readBu
             parent.childDone(firstError, 0);
             continue;
         }
+        if (child.kind == IoPlanner::Child::Kind::Zero) {
+            std::memset(readBuffer.data() + child.bufferOffset, 0, child.bytes);
+            stats_.zeroBytes += child.bytes;
+            ++stats_.zeroChildren;
+            parent.childDone(0, child.bytes);
+            continue;
+        }
+        if (child.deviceId >= deviceBlockBytes_.size()) {
+            firstError = static_cast<int>(Status::InvalidArgument);
+            parent.childDone(firstError, 0);
+            continue;
+        }
+        const std::uint32_t deviceBlockBytes = deviceBlockBytes_[child.deviceId];
+        const std::uint32_t blocksPerMeta = deviceBlocksPerMeta_[child.deviceId];
+        if (plannerConfig_.blockSize % deviceBlockBytes != 0) {
+            firstError = static_cast<int>(Status::InvalidArgument);
+            parent.childDone(firstError, 0);
+            continue;
+        }
 
         BufferLease lease;
         bool direct = false;
         std::span<std::byte> directSpan;
         if (child.kind == IoPlanner::Child::Kind::Direct) {
+            /* Direct DMA is only safe for arena-owned (registered, contiguous)
+             * buffers; foreign memory may be scattered or unpinned. */
             if (write) {
                 auto slice = const_cast<std::byte *>(writeBuffer.data() + child.bufferOffset);
-                if (runtime_.isDmaCapable(slice, child.bytes)) {
+                if (arena_.owns(slice) && runtime_.isDmaCapable(slice, child.bytes)) {
                     directSpan = std::span<std::byte>(slice, child.bytes);
                     direct = true;
                 }
             } else {
                 directSpan = readBuffer.subspan(child.bufferOffset, child.bytes);
-                if (runtime_.isDmaCapable(directSpan.data(), directSpan.size())) {
+                if (arena_.owns(directSpan.data()) &&
+                    runtime_.isDmaCapable(directSpan.data(), directSpan.size())) {
                     direct = true;
                 }
             }
@@ -136,14 +158,14 @@ Result<void> DataPath::execute(const ExtentMap &map, std::span<std::byte> readBu
             ++stats_.bounceChildren;
         }
         auto span = lease.span();
-        const std::uint64_t deviceOffset = child.physicalBlock * deviceBlocksPerMeta_;
-        const std::uint64_t deviceBlocks = child.spanBytes / deviceBlockSize_;
+        const std::uint64_t deviceOffset = child.physicalBlock * blocksPerMeta;
+        const std::uint64_t deviceBlocks = child.spanBytes / deviceBlockBytes;
 
         if (child.kind != IoPlanner::Child::Kind::Direct && write) {
             /* RMW: refresh the full block, merge the user bytes, then write. */
             WaitState readState;
             auto submit =
-                runtime_.submitDataRead(config_.reactorIndex, config_.deviceIndex,
+                runtime_.submitDataRead(config_.reactorIndex, child.deviceId,
                                         span.data(), deviceOffset, deviceBlocks,
                                         childCallback, &readState);
             if (!submit.ok()) {
@@ -172,10 +194,10 @@ Result<void> DataPath::execute(const ExtentMap &map, std::span<std::byte> readBu
 
         WaitState state;
         Result<void> submit =
-            write ? runtime_.submitDataWrite(config_.reactorIndex, config_.deviceIndex,
+            write ? runtime_.submitDataWrite(config_.reactorIndex, child.deviceId,
                                              span.data(), deviceOffset, deviceBlocks,
                                              childCallback, &state)
-                  : runtime_.submitDataRead(config_.reactorIndex, config_.deviceIndex,
+                  : runtime_.submitDataRead(config_.reactorIndex, child.deviceId,
                                             span.data(), deviceOffset, deviceBlocks,
                                             childCallback, &state);
         if (!submit.ok()) {

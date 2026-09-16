@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <mutex>
 #include <span>
+#include <unordered_set>
 #include <vector>
 
 #include "hfs/types.hpp"
@@ -69,6 +70,10 @@ public:
     Result<std::span<std::byte>> acquire(std::size_t size, std::uint32_t timeoutMs);
     void release(std::span<std::byte> buffer) noexcept;
 
+    /* True when the pointer is a live slice handed out by this arena; only
+     * such slices are safe for direct (non-bounce) device DMA. */
+    bool owns(const void *buffer) const;
+
     Stats stats() const;
     static std::size_t classSizeFor(std::size_t size) noexcept; /* 0 = no class */
 
@@ -83,6 +88,7 @@ private:
     std::size_t bytes_ = 0;
     std::size_t highWatermark_ = 0;
     std::array<SizeClass, kClassCount> classes_;
+    std::unordered_set<const void *> live_;
     Allocator allocator_ = nullptr;
     Deallocator deallocator_ = nullptr;
     void *allocatorCtx_ = nullptr;
