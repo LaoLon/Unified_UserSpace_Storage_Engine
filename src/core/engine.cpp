@@ -12,6 +12,8 @@
 #include "common/log.hpp"
 #include "common/stats.hpp"
 #include "common/trace.hpp"
+#include "core/frame_pool.hpp"
+#include "core/operation.hpp"
 #include "runtime/spdk_runtime.hpp"
 #include "storage/volume.hpp"
 
@@ -98,6 +100,11 @@ Result<std::unique_ptr<Engine>> Engine::create(const Config &config) {
     auto engine = std::unique_ptr<Engine>(new Engine(config));
     auto &impl = *engine->impl_;
     impl.ownerPid = ::getpid();
+
+    /* Bounded pools sized by the config; must be applied before first use. */
+    FramePool::instance().setCapacity(
+        static_cast<std::size_t>(config.coroutineFramePool) * 1024);
+    Operation::setPoolCapacity(config.operationPool);
 
     impl.lockFd = ::open(config.processLockPath.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0644);
     if (impl.lockFd < 0) {

@@ -4,11 +4,16 @@
 #include <cstddef>
 #include <utility>
 
+#include "hfs/export.hpp"
 #include "hfs/types.hpp"
 
 namespace hfs {
 
 namespace detail {
+
+/* Bounded frame allocator hooks (implemented by the core frame pool). */
+HFS_API void *allocateTaskFrame(std::size_t size) noexcept;
+HFS_API void deallocateTaskFrame(void *ptr, std::size_t size) noexcept;
 
 /* Resumes the awaiting coroutine when the task reaches final suspend. */
 struct TaskFinalAwaiter {
@@ -44,8 +49,12 @@ public:
         void unhandled_exception() noexcept {} /* core is built without exceptions */
 
         /* Frame allocation hook; Shard-73 replaces this with the bounded pool. */
-        static void *operator new(std::size_t size) { return ::operator new(size); }
-        static void operator delete(void *ptr) noexcept { ::operator delete(ptr); }
+        static void *operator new(std::size_t size) {
+            return detail::allocateTaskFrame(size);
+        }
+        static void operator delete(void *ptr, std::size_t size) noexcept {
+            detail::deallocateTaskFrame(ptr, size);
+        }
     };
 
     Task() noexcept = default;
@@ -130,8 +139,12 @@ public:
         void return_void() noexcept { result = Result<void>(Status::Ok); }
         void unhandled_exception() noexcept {}
 
-        static void *operator new(std::size_t size) { return ::operator new(size); }
-        static void operator delete(void *ptr) noexcept { ::operator delete(ptr); }
+        static void *operator new(std::size_t size) {
+            return detail::allocateTaskFrame(size);
+        }
+        static void operator delete(void *ptr, std::size_t size) noexcept {
+            detail::deallocateTaskFrame(ptr, size);
+        }
     };
 
     Task() noexcept = default;

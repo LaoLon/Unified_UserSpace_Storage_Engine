@@ -31,8 +31,12 @@ set(HFS_CORE_SRC
   src/common/stats.cpp
   src/common/trace.cpp
   src/config/parser.cpp
-  src/core/engine.cpp
+  src/core/actor.cpp
   src/core/client.cpp
+  src/core/engine.cpp
+  src/core/frame_pool.cpp
+  src/core/operation.cpp
+  src/core/shard_ring.cpp
   src/runtime/spdk_runtime.cpp
   src/storage/journal.cpp
   src/storage/superblock.cpp
@@ -116,6 +120,27 @@ foreach(test_name IN LISTS HFS_TESTS)
     HFS_DEFAULT_CONF_PATH="${CMAKE_CURRENT_SOURCE_DIR}/config/hfs_nvme.conf")
   add_test(NAME ${test_name} COMMAND ${test_name})
 endforeach()
+
+# The data-plane structure test compiles the internal core sources directly so
+# it can run with ASAN/TSAN and without SPDK.
+add_executable(data_plane_test
+  tests/data_plane_test.cpp
+  src/common/log.cpp
+  src/common/stats.cpp
+  src/common/trace.cpp
+  src/core/actor.cpp
+  src/core/frame_pool.cpp
+  src/core/operation.cpp
+  src/core/shard_ring.cpp
+)
+target_include_directories(data_plane_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests
+)
+target_compile_options(data_plane_test PRIVATE -fno-exceptions -fno-rtti)
+target_link_libraries(data_plane_test PRIVATE Threads::Threads)
+add_test(NAME data_plane_test COMMAND data_plane_test)
 
 # Keep clangd's compilation database at the repository root.
 add_custom_target(compile-commands ALL

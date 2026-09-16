@@ -82,6 +82,20 @@ $(BUILD_DIR)/bin/%_test: $(PROJECT_ROOT)/tests/%_test.cpp $(LIB)
 		-DHFS_DEFAULT_CONF_PATH='"$(PROJECT_ROOT)/config/hfs_nvme.conf"' \
 		-o $@ $< $(LIB_LINK) $(LDFLAGS)
 
+# Data-plane structure test: compiled with internal sources so it needs no
+# SPDK and can also be built with ASAN/TSAN.
+DATA_PLANE_TEST_SRC := $(PROJECT_ROOT)/tests/data_plane_test.cpp \
+                       $(PROJECT_ROOT)/src/common/log.cpp \
+                       $(PROJECT_ROOT)/src/common/stats.cpp \
+                       $(PROJECT_ROOT)/src/common/trace.cpp \
+                       $(PROJECT_ROOT)/src/core/actor.cpp \
+                       $(PROJECT_ROOT)/src/core/frame_pool.cpp \
+                       $(PROJECT_ROOT)/src/core/operation.cpp \
+                       $(PROJECT_ROOT)/src/core/shard_ring.cpp
+$(BUILD_DIR)/bin/data_plane_test: $(DATA_PLANE_TEST_SRC)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -I$(PROJECT_ROOT)/tests -o $@ $^ -lpthread $(LDFLAGS)
+
 test: $(TEST_BIN)
 	@for test_bin in $(TEST_BIN); do echo "== $$test_bin"; $$test_bin || exit 1; done
 	@echo "all tests passed"
