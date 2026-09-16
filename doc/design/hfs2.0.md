@@ -14,7 +14,7 @@ HFS 2.0 不再是当前 HFS 的 C/Blobstore/POSIX 增量版本，而是从空的
 
 ```text
 RocksDB 8.9.1 FileSystem adapter ─┐
-                                   ├─ libhfs_core.so ─ SPDK bdev ─ NVMe
+                                   ├─ libhfs_core.so ─ SPDK bdev set ─ NVMe pool
 FIO 3.42 external ioengine ───────┘
 ```
 
@@ -28,7 +28,7 @@ Frontend
   → shard coroutine actor
   → one inode dependency scheduler
   → raw-bdev extent planner
-  → SPDK channel / NVMe
+  → SPDK channel / NVMe device set
   → completion event
   → frontend callback or poll
 ```
@@ -43,6 +43,8 @@ Frontend
 3. 新 core 直接管理 SPDK bdev，不使用 Blobstore 文件抽象，不读取旧 Blobstore 镜像。
 4. 对外只支持 RocksDB FileSystem、FIO ioengine 和新 C++ core；不恢复通用 POSIX 兼容。
 5. 旧实现只作为冻结 A/B 和数据导出工具，不能以 compatibility flag 回流到新 core。
+6. HFS 2.0 只接受统一的 `.conf` 配置文件；一个 HFS engine 可以独占并管理一个或多个
+   NVMe/SPDK bdev，后续新增的 HFS 配置必须继续加入这个文件和版本化 schema。
 
 ## 2. 取代范围和冻结策略
 
@@ -88,14 +90,15 @@ HFS 1.x frozen artifact ─ 旧 Blobstore 镜像 ─ 旧 POSIX/MariaDB/RocksDB b
 HFS 2.0                 ─ 新 raw-bdev 镜像 ─ C++20 core/FIO/RocksDB adapter
 ```
 
-两条线不能挂载同一个 bdev。HFS 2.0 不自动升级旧镜像；数据迁移只能是旧线导出普通
-文件，再由 `hfsctl import` 写入新镜像，import 工具不属于 core compatibility path。
+两条线不能共享 device set 中的任何 bdev。HFS 2.0 不自动升级旧镜像；数据迁移只能是旧线
+导出普通文件，再由 `hfsctl import` 按 `.conf` 声明的 device set 写入新镜像，import 工具
+不属于 core compatibility path。
 
 ## 3. 产品边界
 
 ### 3.1 支持
 
-- 单进程、单 engine、单 bdev 独占；
+- 单进程、单 engine，独占配置文件中声明的一个或多个 NVMe/SPDK bdev；
 - C++20 coroutine-first core API；
 - RocksDB 8.9.1 `FileSystem` adapter；
 - FIO 3.42 external ioengine；
@@ -149,7 +152,8 @@ Application process
 include/
   hfs/core.hpp              public C++20 API，opaque ownership boundary
   hfs/task.hpp              coroutine Task/awaitable contract
-  hfs/types.hpp             result、status、handle、iovec、config
+  hfs/types.hpp             result、status、handle、iovec
+  hfs/config.hpp            versioned `.conf` schema and device-set types
 
 src/
   core/engine.cpp           engine lifecycle and process lock
@@ -157,6 +161,7 @@ src/
   core/file.cpp             file handle and metadata requests
   core/operation.cpp        operation state and intrusive lifetime
   core/task.cpp             coroutine frame/promise implementation
+  config/parser.cpp         `.conf` parser, schema validation and device-set resolution
   runtime/spdk_runtime.cpp  SPDK env and reactor threads
   runtime/reactor.cpp       jthread + spdk_thread_poll actor
   runtime/shard_ring.cpp    bounded MPSC ring and doorbell
@@ -207,6 +212,7 @@ core 对外使用 C++ 类型，不暴露 SPDK、pthread、内部结构和 alloca
 namespace hfs {
 
 using FileId = std::uint64_t;
+using DeviceId = std::uint32_t;
 using RequestId = std::uint64_t;
 
 enum class Status : std::uint8_t {
@@ -301,8 +307,8 @@ RocksDB `ReadAsync` 使用 callback；FIO `getevents()` 使用 client completion
 
 engine 启动顺序：
 
-1. `Engine` 校验配置、hugepage 预算、进程锁和 bdev 名；
-2. owner `std::jthread` 初始化 SPDK env 并打开 raw bdev descriptor；
+1. `Engine` 校验 `.conf`、hugepage 预算、进程锁和完整 device set；
+2. owner `std::jthread` 初始化 SPDK env 并打开所有配置的 raw bdev descriptor；
 3. 创建一个 metadata reactor 和 `R` 个 data reactor；
 4. 每个 reactor 在自己的 `std::jthread` 中创建 `spdk_thread`，循环 `spdk_thread_poll`；
 5. 每个 reactor 在本线程获得/销毁自己的 `spdk_io_channel`；
@@ -475,21 +481,23 @@ required = ceil((SPDK baseline + DMA cap + frame pool + ring + metadata reserve)
 ```
 
 启动时比较 required 与 available，失败时报告两者并拒绝 mount。正式 VM 仍按项目口径
-使用 8 vCPU、`vm.nr_hugepages=1024`、真实 NVMe `Nvme0n1`；MALLOC/AIO 只能用于确定性
-故障注入，不替代性能结论。
+使用 8 vCPU、`vm.nr_hugepages=1024`、真实 NVMe `Nvme0n1` 的单盘 baseline；多 NVMe
+配置的性能结果必须额外报告设备数量、设备角色和 placement policy。MALLOC/AIO 只能用于
+确定性故障注入，不替代性能结论。
 
 ## 9. Raw-bdev 磁盘格式
 
 ### 9.1 Clean-break 镜像
 
-HFS 2.0 完整拥有 raw bdev：
+HFS 2.0 完整拥有配置文件中声明的全部 raw bdev；每个设备都拥有自己的物理 geometry
+和 allocator，多个设备共同组成一个逻辑 HFS volume：
 
 ```text
 Superblock A/B       8 MiB reserved
 Journal ring         default 256 MiB
 Checkpoint A/B       configurable metadata region
 Allocator state      bitmap + free-run index
-Data extents         remaining capacity
+Data extents         remaining capacity on each device
 ```
 
 旧 Blobstore magic、旧 metadata header 和 HFS 1.x image 都拒绝 mount。`hfsctl format`
@@ -502,6 +510,7 @@ struct Hfs2Superblock {
     std::uint64_t magic;
     std::uint32_t format_version;
     std::uint32_t feature_flags;
+    std::uint32_t device_id;
     std::array<std::byte, 16> uuid;
     std::uint64_t generation;
     std::uint64_t device_blocks;
@@ -526,9 +535,9 @@ struct Hfs2Superblock {
 ```
 
 实际 layout 由 geometry 计算并写入 superblock；`checkpoint_a/b` 是 checkpoint region
-内的两个槽位，不与 metadata region 起点混用。A/B 写入顺序为：写非当前副本 → device
-flush → 发布 generation。设计不假设多 sector 原子写；每个 record 都有长度、序号、CRC
-和 commit marker。
+内的两个槽位，不与 metadata region 起点混用。A/B 写入顺序为：写非当前副本 → 对相关
+device flush → 发布 generation。设计不假设多 sector 原子写；每个 record 都有长度、序号、
+CRC 和 commit marker。
 
 ### 9.3 Journal 和 checkpoint
 
@@ -565,6 +574,24 @@ FREE → RESERVED → INITIALIZED → COMMITTED
 - new extent 暴露前必须被初始化为零或完成用户数据 durable；
 - 释放可异步回收，但不能持 frontend scheduler 等 allocator；
 - TRIM/unmap 不是 v1 必需接口，不能用“设备 unmap 读零”替代逻辑零语义。
+
+### 9.5 Multi-NVMe volume
+
+配置文件中的 `data_devices` 构成一个逻辑 namespace 的数据池。每个 extent descriptor
+必须保存 `device_id`、起始 block、block 数量和 extent state；一个逻辑 I/O 可以拆成多个
+device-local child，但 child 不能跨设备提交。默认 placement 为 `capacity_weighted`，
+也可配置为 `round_robin`；v1 不实现 RAID、纠删码或隐式复制。
+
+`metadata_devices` 保存同一个 volume UUID 的 superblock、journal 和 checkpoint。配置
+中的 metadata device 全部必须可打开，metadata transaction 只有在所有 required metadata
+device 完成 flush 后才发布 generation；v1 不支持降级挂载。`data_devices` 可以包含
+metadata device，也可以只承担数据；所有声明的 device 都必须由同一个 Engine 独占，不能
+被另一 HFS 实例重复配置。
+
+`hfsctl format`、`check`、`dump` 和 `import` 都以同一个 `.conf` 为入口，并对 device set
+逐盘执行 geometry/UUID/CRC 检查。设备缺失、重复 bdev、sector/metadata geometry 不兼容
+或 volume UUID 不一致时拒绝 mount；设备容量可以不同，但必须满足各自 layout 的最小容量。
+设备故障返回可定位的 `IoError`，不得静默把数据迁移到未声明的设备。
 
 ## 10. Durability 和故障恢复
 
@@ -677,7 +704,7 @@ fio --ioengine=external:/absolute/path/fio-hfs.so job.fio
 `ioengine_ops.options` 必须登记自定义 options，并设置 `option_struct_size`：
 
 ```text
-hfs_config=/path/hfs2.json
+hfs_config=/path/hfs2.conf
 hfs_volume=/volume/name
 hfs_direct=1
 hfs_preallocate=1
@@ -797,36 +824,82 @@ reject new attach/submit
 ```
 
 活跃 client/operation 未 drain 时 `stop()` 返回 Busy，除非调用显式 drain API。SIGKILL
-不保证 clean flag，下次 mount 必须 recovery。第二进程打开相同 bdev 返回 Busy；fork child
-所有 core API 返回 ForkedProcess。
+不保证 clean flag，下次 mount 必须 recovery。第二进程打开任一已配置 bdev 或相同 volume
+返回 Busy；fork child 所有 core API 返回 ForkedProcess。
 
 ## 15. 配置、ABI 和构建
 
-### 15.1 配置
+### 15.1 `.conf` 配置（唯一入口）
 
-```json
-{
-  "bdev_name": "Nvme0n1",
-  "metadata_block_size": 4096,
-  "journal_mb": 256,
-  "checkpoint_mb": 512,
-  "extent_mb": 1,
-  "data_reactors": 0,
-  "max_data_reactors": 4,
-  "metadata_cpu": 0,
-  "data_cpus": [],
-  "ring_depth": 1024,
-  "client_depth": 32,
-  "dma_arena_mb": 512,
-  "operation_pool": 4096,
-  "coroutine_frame_pool": 4096,
-  "metadata_wait_timeout_ms": 5000,
-  "backend_retry_limit": 3
-}
+HFS 2.0 使用版本化的 INI-like `.conf` 格式，不再使用 HFS JSON 配置或散落的
+`HFS_*` 环境变量。engine、SPDK、device set、metadata、reactor、DMA、限流、恢复和
+frontend 的所有 HFS 配置都必须写入同一个文件；命令行只负责传入配置文件路径，例如
+`hfsctl --config=/path/hfs2.conf`。未知 key、重复 device 或 schema 不兼容必须拒绝启动，
+不能静默忽略。
+
+仓库当前已有的 `config/*.json` 文件属于冻结的 HFS 1.x 配置，不是 HFS 2.0 的兼容输入；
+Phase 0 创建 `.conf` parser 和新 target 后，正式命令只能接受 `.conf`。
+
+```conf
+[hfs]
+schema_version = 1
+instance_name = hfs2
+volume_uuid = auto
+process_lock = exclusive
+
+[spdk]
+env_driver = uio
+hugepages = 1024
+
+[storage]
+metadata_devices = nvme0,nvme1
+data_devices = nvme0,nvme1
+placement = capacity_weighted
+metadata_replication = 2
+require_all_devices = true
+metadata_block_size = 4096
+journal_mb = 256
+checkpoint_mb = 512
+extent_mb = 1
+
+[device.nvme0]
+bdev_name = Nvme0n1
+pci_bdf = 0000:0b:00.0
+role = metadata,data
+weight = 1
+required = true
+
+[device.nvme1]
+bdev_name = Nvme1n1
+pci_bdf = 0000:0c:00.0
+role = metadata,data
+weight = 1
+required = true
+
+[runtime]
+data_reactors = 0
+max_data_reactors = 4
+metadata_cpu = 0
+data_cpus = auto
+ring_depth = 1024
+client_depth = 32
+
+[limits]
+dma_arena_mb = 512
+operation_pool = 4096
+coroutine_frame_pool = 4096
+metadata_wait_timeout_ms = 5000
+backend_retry_limit = 3
 ```
 
-`data_reactors=0` 使用 nproc 规则；data CPU 列表必须匹配 R。正式 VM 配置仍为
-`config/hfs_nvme.json`/`Nvme0n1`/`0000:0b:00.0`。
+`metadata_devices` 和 `data_devices` 使用 `[device.<id>]` 中的逻辑 ID；设备可以只承担
+data，也可以同时承担 metadata。只配置一个 NVMe 时仍使用完全相同的 schema。正式单盘
+baseline 的配置文件为 `config/hfs_nvme.conf`，设备为 `Nvme0n1`、PCI BDF
+`0000:0b:00.0`；多盘测试必须列出实际 device set，不能通过临时环境变量追加设备。
+
+后续 HFS 配置统一按 section namespace 添加到该 `.conf` 并提升 `schema_version`，例如
+`[recovery]`、`[cache]`、`[frontend.rocksdb]` 和 `[frontend.fio]`；不得另建第二个配置
+文件来绕过 schema 校验。`data_reactors=0` 使用 nproc 规则，`data_cpus` 必须匹配 R。
 
 ### 15.2 C++ ABI
 
@@ -887,6 +960,10 @@ shared-file、randrw 50/50、4K/8K/16K/32K/64K、32 jobs、10 秒、5-run median
 trace/stats off。raw 对照使用同设备和等价 SPDK bdev queue。报告 HFS/raw、read/write
 p50/p99、CPU%、RSS、errors、submit/complete、journal bytes/op。
 
+多 NVMe 验收至少覆盖单盘、双盘和配置中全部 data device 三种 device set；每次记录
+`metadata_devices`、`data_devices`、placement、每盘容量和每盘 submit/complete。任一
+配置设备不可用、未被正确独占或数据落到了未声明设备时，功能验收失败。
+
 主 gate：4K shared-file randrw 的 HFS/raw ≥85%，CPU ≤500%，errors=0，submit/complete
 闭合，p99 不超过基线 10%。如果结构/恢复门禁失败，即使 IOPS 更高也不接受。
 
@@ -895,12 +972,12 @@ p50/p99、CPU%、RSS、errors、submit/complete、journal bytes/op。
 由 custom driver 注入 HFS Env：
 
 ```text
-hfs_db_bench --hfs-config=config/hfs2_nvme.json \
+hfs_db_bench --hfs-config=config/hfs2_nvme.conf \
   --db=/hfs2/rocksdb \
   --benchmarks=fillseq,readrandom,overwrite,readwhilewriting \
   --num=20000 --threads=8 --use_direct_io_for_flush_and_compaction=1
 
-hfs_ldb --hfs-config=config/hfs2_nvme.json \
+hfs_ldb --hfs-config=config/hfs2_nvme.conf \
   checkconsistency --db=/hfs2/rocksdb
 ```
 
@@ -965,6 +1042,7 @@ generation、CRC 和 RocksDB reopen。ext4 上运行同一逻辑 workload 对照
 
 - `src/` 使用 C++20 新目录结构；
 - 建立 `Task/Result/Engine/Client/File` 和 versioned build；
+- 建立严格的 `.conf` parser、schema version 和多-device set resolver；
 - Make/CMake 不再引用 frozen source；
 - 实现 process lock、geometry preflight 和空 engine。
 
@@ -973,6 +1051,7 @@ generation、CRC 和 RocksDB reopen。ext4 上运行同一逻辑 workload 对照
 ### Phase 1：raw bdev 和格式
 
 - SPDK env/reactor/channel owner；
+- 打开、校验并逐盘 format 配置文件声明的 NVMe device set；
 - format、A/B superblock、geometry、journal/checkpoint；
 - `hfsctl format/check/dump/import`；
 - torn record、journal full、旧 magic rejection。
@@ -982,6 +1061,7 @@ generation、CRC 和 RocksDB reopen。ext4 上运行同一逻辑 workload 对照
 - `Task` frame pool、OperationRef、MPSC shard ring、actor doorbell；
 - inode interval scheduler、extent planner、parent completion；
 - shared DMA arena、direct/bounce、read/write/append；
+- capacity-weighted/round-robin placement 和跨 device parent/child completion；
 - C++ unit/ASAN/TSAN 结构测试。
 
 ### Phase 3：namespace、allocator、durability
@@ -989,6 +1069,7 @@ generation、CRC 和 RocksDB reopen。ext4 上运行同一逻辑 workload 对照
 - inode/directory/name index；
 - 1 MiB extent allocator、RESERVED/INITIALIZED/COMMITTED；
 - logical/durable epoch、datasync/sync、crash replay；
+- metadata replica flush、设备故障 fail-closed 和多盘 recovery；
 - fault injection 和 ext4 reference model。
 
 ### Phase 4：FIO frontend

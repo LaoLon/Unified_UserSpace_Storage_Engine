@@ -9,7 +9,7 @@
 - `doc/shard/`、`doc/项目总结.md` 以及旧 shard 提交属于 HFS 1.x 历史材料，不再是当前执行计划；不得据此恢复旧功能、旧目录结构、旧容量或旧 API，也不要把新的 shard 进度继续写回 `AGENTS.md`。
 - 需要了解当前进展时，先查看 `git log --stat` 和 `git status`，再以当前源码、测试脚本和最新文档为准。
 - SPDK 源码必须在 VM 内通过 `git clone`、`git fetch`、`git checkout` 和 `git -C spdk submodule update --init --recursive` 获取及维护；禁止从 Windows 工作区把 `spdk/` 源码目录或其子模块传到 VM 覆盖。Windows 到 VM 的同步仅限 HFS 自身源码、脚本和文档；若 VM 缺少 SPDK，应在 VM 内按锁定 commit 重新 clone/checkout。
-- HFS/SPDK 正式功能和性能验证固定使用 VM 内真实 NVMe：`config/hfs_nvme.json`、`HFS_BDEV_NAME=Nvme0n1`、PCI BDF `0000:0b:00.0`。除非任务明确要求故障注入或对照实验，不使用 Malloc/Aio 替代正式口径；大体积测试结果默认写入 `/mnt/hfs-data`。
+- HFS 2.0 的目标配置和正式验证入口使用 `.conf`，单盘 baseline 为 `config/hfs_nvme.conf`、`Nvme0n1`、PCI BDF `0000:0b:00.0`；现有 `config/*.json` 仅是旧 HFS 1.x 材料，Phase 0 前不得当作新架构输入。除非任务明确要求故障注入或对照实验，不使用 Malloc/Aio 替代正式口径；大体积测试结果默认写入 `/mnt/hfs-data`。
 - 旧源码已冻结到本地 `src_legacy_frozen/`，不进入 Git、不进入构建、不作为新代码依赖。HFS 2.0 的新源码从 `src/` 重新建立，使用 C++20；旧代码只能用于考古和对照。
 - HFS 2.0 是 clean-break：直接管理 raw SPDK bdev，采用 coroutine-first core；不恢复 POSIX preload、fd/stdio wrapper、FUSE、通用 mmap、Blobstore 镜像、旧 async/registered-DMA ABI 或多进程共享挂载。
 - 当前架构尚未完成实现。Phase 0 之前不要把旧 Make/CMake source list 当作有效构建入口；新实现必须同步重建 CMake/Make、C++20 ABI 和生命周期测试。
@@ -20,7 +20,7 @@
 - 读取 `E:\Code\workspace.yaml` 获取本地路径、VM 连接信息和 SSH 默认值。
 - VM 操作使用 `E:\Code\ssh\pool.py` 提供的 `SSHPool`；临时远程脚本放在 `E:\Code\test_script\`。
 - 每次先修改 Windows 工作区文件，再按需同步 HFS 自身源码、脚本和文档到 VM。SPDK 源码及子模块必须在 VM 内通过 Git 获取和维护，禁止从 Windows 工作区同步 `spdk/` 覆盖 VM。
-- HFS/SPDK 正式功能和性能验证固定使用 VM 内真实 NVMe：`config/hfs_nvme.json`、`HFS_BDEV_NAME=Nvme0n1`、PCI BDF `0000:0b:00.0`。除非任务明确要求故障注入或对照实验，不使用 Malloc/Aio 替代正式口径。
+- HFS 2.0 正式功能和性能验证固定使用 `.conf` 配置中的真实 NVMe：单盘 baseline 为 `Nvme0n1`、PCI BDF `0000:0b:00.0`；多盘测试必须在同一 `.conf` 中声明完整 device set。除非任务明确要求故障注入或对照实验，不使用 Malloc/Aio 替代正式口径。
 - VM 重启后先确认 SPDK 设备重新绑定，并确认 `vm.nr_hugepages=1024`；大体积测试结果默认写入 `/mnt/hfs-data`，不要写满根盘 `/var/tmp`。
 - 不在没有对应实现和验证证据时声称 HFS 2.0 支持 RocksDB、FIO、恢复或性能目标；测试失败必须记录原因和当前边界。
 
