@@ -13,6 +13,7 @@
 
 #include "hfs_internal.h"
 #include "hfs_log.h"
+#include "hfs_op.h"
 #include "hfs_trace.h"
 
 /* Monotonic identifiers let diagnostics correlate one submit and completion. */
@@ -133,6 +134,7 @@ static int hfsRequestSetError(int rc) {
 /* Initialize one result object before it is submitted to the owner thread. */
 void hfsRequestInit(HfsRequestResult *result, HfsRequestOperation operation) {
 	memset(result, 0, sizeof(*result));
+	hfsOpInit(&result->op);
 	result->operation = operation;
 	result->requestId = atomic_fetch_add_explicit(&g_hfsRequestId, 1,
 						memory_order_relaxed) + 1;
@@ -165,6 +167,7 @@ void hfsRequestComplete(HfsRequestResult *result, int bserrno,
 			0, 0, 0, HFS_TRACE_META_OP_FLUSH, durationNs, bserrno);
 		result->completion.traceStageStartNs = 0;
 	}
+	hfsOpComplete(&result->op);
 	hfsRuntimeCompletionComplete(&result->completion);
 }
 
@@ -175,17 +178,28 @@ int hfsRequestWait(HfsRequestResult *result, spdk_msg_fn startFn, void *ctx) {
 	hfsRuntimeCompletionReset(&result->completion);
 	if (hfsRequestSubmitInjected(result->operation)) {
 		result->submitRc = -EIO;
+		hfsOpSubmitFailed(&result->op);
+		hfsOpReleaseCaller(&result->op);
+		return hfsRequestSetError(result->submitRc);
+	}
+	if (!hfsOpBeginSubmit(&result->op)) {
+		result->submitRc = -EINVAL;
 		return hfsRequestSetError(result->submitRc);
 	}
 	rc = hfsRuntimeSubmit(startFn, ctx);
 	result->submitRc = rc;
 	if (rc != 0) {
+		hfsOpSubmitFailed(&result->op);
+		hfsOpReleaseCaller(&result->op);
 		return hfsRequestSetError(rc);
 	}
+	(void)hfsOpMarkSubmitted(&result->op);
 	if (!hfsRuntimeCompletionWait(&result->completion,
 				      HFS_RUNTIME_TIMEOUT_MS)) {
+		hfsOpReleaseCaller(&result->op);
 		return -1;
 	}
+	hfsOpReleaseCaller(&result->op);
 	if (result->completionRc != 0) {
 		return hfsRequestSetError(result->completionRc);
 	}
@@ -200,13 +214,25 @@ int hfsRequestSubmitBatch(HfsRequestResult *result, spdk_msg_fn startFn,
 	hfsRuntimeCompletionReset(&result->completion);
 	if (hfsRequestSubmitInjected(result->operation)) {
 		result->submitRc = -EIO;
+		hfsOpSubmitFailed(&result->op);
+		hfsOpReleaseCaller(&result->op);
 		return hfsRequestSetError(result->submitRc);
+	}
+	if (!hfsOpBeginSubmit(&result->op)) {
+		result->submitRc = -EINVAL;
+		return hfsRequestSetError(result->submitRc);
+	}
+	if (batchItem != NULL) {
+		batchItem->op = &result->op;
 	}
 	rc = hfsRuntimeSubmitBatch(batchItem, startFn, ctx);
 	result->submitRc = rc;
 	if (rc != 0) {
+		hfsOpSubmitFailed(&result->op);
+		hfsOpReleaseCaller(&result->op);
 		return hfsRequestSetError(rc);
 	}
+	(void)hfsOpMarkSubmitted(&result->op);
 	return 0;
 }
 
@@ -218,13 +244,22 @@ int hfsRequestSubmitData(HfsRequestResult *result, spdk_msg_fn startFn,
 	hfsRuntimeCompletionReset(&result->completion);
 	if (hfsRequestSubmitInjected(result->operation)) {
 		result->submitRc = -EIO;
+		hfsOpSubmitFailed(&result->op);
+		hfsOpReleaseCaller(&result->op);
+		return hfsRequestSetError(result->submitRc);
+	}
+	if (!hfsOpBeginSubmit(&result->op)) {
+		result->submitRc = -EINVAL;
 		return hfsRequestSetError(result->submitRc);
 	}
 	rc = hfsRuntimeSubmitData(reactorId, startFn, ctx);
 	result->submitRc = rc;
 	if (rc != 0) {
+		hfsOpSubmitFailed(&result->op);
+		hfsOpReleaseCaller(&result->op);
 		return hfsRequestSetError(rc);
 	}
+	(void)hfsOpMarkSubmitted(&result->op);
 	return 0;
 }
 
@@ -237,19 +272,31 @@ int hfsRequestSubmitDataBatch(HfsRequestResult *result, spdk_msg_fn startFn,
 	hfsRuntimeCompletionReset(&result->completion);
 	if (hfsRequestSubmitInjected(result->operation)) {
 		result->submitRc = -EIO;
+		hfsOpSubmitFailed(&result->op);
+		hfsOpReleaseCaller(&result->op);
 		return hfsRequestSetError(result->submitRc);
 	}
 	if (batchItem == NULL) {
+		result->submitRc = -EINVAL;
+		hfsOpSubmitFailed(&result->op);
+		hfsOpReleaseCaller(&result->op);
+		return hfsRequestSetError(result->submitRc);
+	}
+	if (!hfsOpBeginSubmit(&result->op)) {
 		result->submitRc = -EINVAL;
 		return hfsRequestSetError(result->submitRc);
 	}
 	/* Keep the bounded reactor credit until this request's backend callback. */
 	batchItem->completion = &result->completion;
+	batchItem->op = &result->op;
 	rc = hfsRuntimeSubmitDataBatch(reactorId, batchItem, startFn, ctx);
 	result->submitRc = rc;
 	if (rc != 0) {
+		hfsOpSubmitFailed(&result->op);
+		hfsOpReleaseCaller(&result->op);
 		return hfsRequestSetError(rc);
 	}
+	(void)hfsOpMarkSubmitted(&result->op);
 	return 0;
 }
 
@@ -257,8 +304,10 @@ int hfsRequestSubmitDataBatch(HfsRequestResult *result, spdk_msg_fn startFn,
 int hfsRequestWaitResult(HfsRequestResult *result) {
 	if (!hfsRuntimeCompletionWait(&result->completion,
 				      HFS_RUNTIME_TIMEOUT_MS)) {
+		hfsOpReleaseCaller(&result->op);
 		return -1;
 	}
+	hfsOpReleaseCaller(&result->op);
 	if (result->completionRc != 0) {
 		return hfsRequestSetError(result->completionRc);
 	}

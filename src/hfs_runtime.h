@@ -24,6 +24,7 @@ typedef struct HfsRuntimeBatchItem {
 	uint64_t enqueueNs;
 	uint64_t traceParentId;
 	HfsCompletion *completion;
+	HfsOp *op;
 	void *profileChild;
 	struct HfsRuntimeBatchItem *next;
 } HfsRuntimeBatchItem;

@@ -19,6 +19,7 @@
 #include <spdk/thread.h>
 
 #include "hfs_log.h"
+#include "hfs_op.h"
 #include "hfs_profile.h"
 #include "hfs_runtime.h"
 #include "hfs_stats.h"
@@ -281,6 +282,9 @@ static void hfsRuntimeDispatchBatch(void *arg) {
 				     0, 0, 0, waitNs, 0);
 		}
 		hfsProfileChildDequeue(item->profileChild);
+		if (item->op != NULL) {
+			(void)hfsOpMarkSubmitted(item->op);
+		}
 		if (timing) {
 			depth = atomic_fetch_sub_explicit(&g_runtime.queued, 1,
 				memory_order_relaxed) - 1U;
@@ -385,6 +389,9 @@ static void hfsRuntimeDispatchDataBatch(void *arg) {
 					     queueWaitNs, 0);
 			}
 			hfsProfileChildDequeue(item->profileChild);
+			if (item->op != NULL) {
+				(void)hfsOpMarkSubmitted(item->op);
+			}
 			if (timing) {
 				depth = atomic_fetch_sub_explicit(&g_runtime.queued, 1,
 						memory_order_relaxed) - 1U;

@@ -36,6 +36,7 @@ include_directories(
 
 set(HFS_CORE_SRC
   src/hfs.c
+  src/hfs_op.c
   src/hfs_mount.c
   src/hfs_file.c
   src/hfs_io.c

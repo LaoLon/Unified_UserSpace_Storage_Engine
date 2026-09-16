@@ -1,6 +1,6 @@
 # Shard-67：HFS 统一 I/O 执行架构重构计划
 
-> **状态**：架构重构计划，尚未开始实现
+> **状态**：67A operation lifetime 适配层已实现；67B～67G 待实施
 >
 > **日期**：2026-09-16
 >
@@ -297,7 +297,32 @@ VM 必须使用真实 NVMe `0000:0b:00.0`、`Nvme0n1`、`config/hfs_nvme.json`�
 
 每个提交只解决一个架构边界，保留回退开关和对应的结构/正确性证据。reactor 数量不作为提交拆分依据。
 
-## 9. 参考资料
+## 9. 67A 实施记录（2026-09-16）
+
+### 已交付
+
+- 新增 `src/hfs_op.[ch]`，提供 `NEW → READY → SUBMITTED → DONE/ABORTED` 生命周期，
+  `WAIT_DEP` 状态预留给后续 inode scheduler，并以 caller/actor 双引用闭合请求生命周期。
+- `HfsRequestResult` 持有唯一 `HfsOp`；旧的 owner/data batch adapter 只传递 `HfsOp *`，
+  暂不改变 linked-list batch、ticket/range、DMA pool 或执行时序。
+- submit reject、completion callback、同步 wait 和 timeout 观察路径都走统一引用回收；
+  runtime batch dispatch 在执行边界记录 `SUBMITTED`。
+- `Makefile` 与 `CMakeLists.txt` 均纳入新模块，保持旧构建入口和 POSIX-only ABI 不变。
+
+### 验证
+
+- VM `make -B app lib`：通过。
+- VM CMake Release（`build-cmake-shard67a`）：通过。
+- 真实 NVMe `0000:0b:00.0`、`Nvme0n1`、hugepages=1024、无显式 reactor 设置下：
+  `POSIX-ONLY API OK`、`POSIX CONTRACT OK`、`REQUEST-LOCAL FAST IO OK` 均通过。
+- 测试结束已将 NVMe 从 `uio_pci_generic` 恢复到内核 `nvme`，无残留测试进程。
+
+### 边界
+
+本阶段只冻结 operation lifetime 和旧路径适配，不宣称已经降低 data ingress、依赖调度、
+DMA pool 或 parent wait 的复杂度；下一提交必须单独实现 67B per-shard actor ring。
+
+## 10. 参考资料
 
 - [`hfs_spdk_cpu_efficiency_optimization_design.md`](../design/hfs_spdk_cpu_efficiency_optimization_design.md)
 - [`hfs_posix_sync_boundary_topology_shard_plan.md`](hfs_posix_sync_boundary_topology_shard_plan.md)（历史 Shard-66 计划，reactor 调参主线已被本文取代）

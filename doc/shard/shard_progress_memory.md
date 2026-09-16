@@ -117,6 +117,18 @@
 - 当前推荐路线已转为 Shard-67：统一 `HfsOp` 生命周期、per-shard actor ring、单一 per-inode dependency scheduler、共享按需 DMA arena、parent completion，以及 dirty-set/epoch metadata actor。
 - `doc/design/hfs_spdk_cpu_efficiency_optimization_design.md` 是新的架构设计；`doc/shard/hfs_cpu_efficiency_optimization_shard_plan.md` 是执行计划。旧 Shard-66 文档保留历史证据，但其中以 reactor 矩阵为主线的未实施计划不再作为当前路线。
 
+### Shard-67A：统一 operation lifetime 适配层（2026-09-16）
+
+- 新增 `src/hfs_op.[ch]` 和 `HfsOp`：统一记录请求状态、caller/actor 引用及终态，
+  将 `HfsRequestResult` 与旧 runtime batch item 连接起来，为后续 actor ring/scheduler
+  提供稳定的 operation 身份。
+- 本阶段刻意不改变现有 linked-list batch、ticket/range、DMA pool 和同步执行时序，
+  因而不输出性能提升结论；67B 才开始替换 data ingress。
+- VM `make -B app lib`、CMake Release、POSIX-only API、POSIX contract 和 request-local
+  fast-I/O smoke 均通过；真实 NVMe 测试后已恢复内核 `nvme` 驱动，hugepages 保持 1024。
+- 当前工作树中的其它历史同步改动属于用户既有状态；本阶段新增代码边界为
+  `src/hfs_op.[ch]`、`src/hfs.[ch]`、`src/hfs_runtime.[ch]`、`Makefile` 与 `CMakeLists.txt`。
+
 ## 共享验证边界与性能观测口径
 
 - SPDK 源码必须在 VM 内通过 `git clone`、`git fetch`、`git checkout` 和 `git -C spdk submodule update --init --recursive` 获取及维护；禁止从 Windows 工作区把 `spdk/` 源码目录或其子模块传到 VM 覆盖。Windows 到 VM 的同步仅限 HFS 自身源码、脚本和文档。

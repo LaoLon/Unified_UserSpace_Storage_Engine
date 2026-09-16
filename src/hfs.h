@@ -79,9 +79,27 @@ typedef enum HfsRequestOperation {
 	HFS_REQUEST_CAPACITY,
 } HfsRequestOperation;
 
+/* Lifecycle states shared by the caller and the internal executor. */
+typedef enum HfsOpState {
+	HFS_OP_NEW = 0,
+	HFS_OP_WAIT_DEP,
+	HFS_OP_READY,
+	HFS_OP_SUBMITTED,
+	HFS_OP_DONE,
+	HFS_OP_ABORTED,
+} HfsOpState;
+
+/* Track one operation lifetime without coupling ownership to a queue node. */
+typedef struct HfsOp {
+	_Atomic uint32_t state;
+	_Atomic uint32_t references;
+	_Atomic bool actorHeld;
+} HfsOp;
+
 /* Completion result owned by exactly one synchronous SPDK request. */
 typedef struct HfsRequestResult {
 	HfsCompletion completion;
+	HfsOp op;
 	HfsRequestOperation operation;
 	uint64_t requestId;
 	uint64_t completedUnits;
