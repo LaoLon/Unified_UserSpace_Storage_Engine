@@ -13,6 +13,9 @@ Bug 等级：**致命 > 严重 > 一般**。
 - 2：已修复（Shard-69，bdev attach 被静默跳过）。
 - 3：已修复（Shard-69，reactor 退出时 channel 残留）。
 - 4：已修复（Shard-70，控制 I/O 实参求值顺序）。
+- 5：已修复（Shard-71，单例析构 join 忙轮询线程导致挂起）。
+- 6：已修复（Shard-71，旧世代 journal/checkpoint 被误读）。
+- 7：已修复（Shard-71，ring 回绕陈旧槽位被误判 corruption）。
 
 ## Bug 记录
 
@@ -59,6 +62,39 @@ Bug 等级：**致命 > 严重 > 一般**。
 - **根因**：同一条调用表达式中既解引用又从同一 shared_ptr 移出。
 - **修复**：移出前先取出 `device` 到局部变量，禁止在实参里混合解引用与 move。
 - **验证结果**：Make/CMake/CTest 7/7、hfsctl `format --yes`/`info` 全部通过。
+
+### 5. SpdkRuntime 单例析构直接 join 忙轮询 reactor 导致挂起（已修复）
+
+- **状态**：已修复
+- **等级**：严重
+- **时间**：2026-09-16（Shard-71）
+- **现象**：测试断言失败后进程不退出，主线程在 `std::jthread::~jthread` 的 join 上挂起 16 分钟以上；metadata/data reactor 仍在 100% 忙轮询。
+- **排查过程**：`gdb -p` 全线程回溯显示主线程位于 `Reactor::~Reactor` → `jthread::join`，而 reactor 线程仍在 `metadataMain`/`dataMain` poll 循环中；确认测试异常返回时 engine 未 stop，进程退出触发单例析构。
+- **根因**：`Impl` 析构没有先请求 reactor 停止就 join，忙轮询线程永远不会退出。
+- **修复**：`Impl::~Impl` 先对所有 reactor 置 stop 再做有界 join，然后清理。
+- **验证结果**：测试失败路径可正常退出；CTest 9/9 通过。
+
+### 6. 旧世代 journal/checkpoint 被误读（已修复）
+
+- **状态**：已修复
+- **等级**：严重
+- **时间**：2026-09-16（Shard-71）
+- **现象**：重新 format 后 `journal_device_test` 首个事务返回 txid 5 而不是 1；replay 应用了上一代 checkpoint 的状态。
+- **排查过程**：format 只写 superblock，不清 journal/checkpoint 区域；旧 checkpoint 头部仍带有效 magic/CRC，open 时被选中，旧 journal 事务也被当作本轮事务。
+- **根因**：journal/checkpoint 记录没有世代标识，format 也未失效旧内容。
+- **修复**：slot 与 checkpoint 头部增加 volume UUID，世代不匹配视为陈旧内容；format 清零 journal 头部与两个 checkpoint 槽首块。
+- **验证结果**：新镜像 `head=tail=last_txid=0`；journal 单测与真实设备测试通过。
+
+### 7. ring 回绕后陈旧槽位被误判为 corruption（已修复）
+
+- **状态**：已修复
+- **等级**：一般
+- **时间**：2026-09-16（Shard-71）
+- **现象**：100 次追加（跨 ring 回绕）后 replay 在 sequence 300 报 `orphan record`。
+- **排查过程**：回绕后该位置存的是同 UUID、更早事务的 RECORD 槽位；replay 只校验了 UUID，未校验槽位自带的 sequence。
+- **根因**：同世代但序号不匹配的陈旧槽位与 corruption 无法区分。
+- **修复**：replay 对 BEGIN/RECORD/COMMIT 槽校验 `sequence` 与期望位置一致，不一致按陈旧内容干净结束。
+- **验证结果**：回绕场景 replay 完整且 `corruption` 为空。
 
 ## 记录模板
 

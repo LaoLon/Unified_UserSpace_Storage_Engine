@@ -17,7 +17,9 @@
 > ASAN+UBSAN、hfsctl validate，VM 验证通过）；Shard-69 已完成（2026-09-16；SPDK env/
 > subsystem/reactor 所有权、R=2 自动拓扑、fork/双进程保护、doorbell、clean shutdown）；
 > Shard-70 已完成（2026-09-16；CRC32C、superblock A/B + geometry、format/mount、
-> hfsctl format/info、损坏 fail closed，Make/CMake/CTest 7/7 通过）
+> hfsctl format/info、损坏 fail closed）；Shard-71 已完成（2026-09-16；journal ring
+> BEGIN/RECORD/COMMIT + CRC、checkpoint A/B、通用 replay、阈值 checkpoint、`hfsctl check`，
+> Make/CMake/CTest 9/9 通过）
 
 ---
 
@@ -159,6 +161,12 @@ ranges、clean flag、CRC）；`hfsctl format --yes`；拒绝旧 Blobstore/1.x m
 字段在单盘 format 中已经落盘且可校验（多副本执行在 Shard-79，格式不再变更）。
 
 ### Shard-71：journal ring、checkpoint 与通用 replay 机制
+
+> 状态：已完成（2026-09-16）。交付 `Journal`（slot 化 ring、BEGIN/RECORD/COMMIT +
+> CRC32C、volume UUID 世代校验、阈值 checkpoint、A/B 槽轮换、superblock 发布、tail
+> 推进）、`JournalTarget`/`JournalDevice` 接口、内存设备单测（追加/回放/checkpoint/
+> 回绕/撕裂/损坏）与真实 NVMe 端到端测试、`hfsctl check`；CTest 9/9 通过。真实
+> CREATE/ALLOC 记录语义与 namespace/size/bitmap 守恒验收仍按计划留在 Shard-76/77/79。
 
 **交付物**：`BEGIN/RECORD/COMMIT + CRC` 事务格式；record 类型枚举定义（§9.3，语义实现
 随后续 shard 落地）；50% 触发、80% 强制同步 checkpoint；checkpoint 写 inactive slot →

@@ -573,6 +573,18 @@ COMMIT(txid, generation, tx_crc)
 `CREATE`、`LINK`、`UNLINK`、`RENAME`、`ALLOC`、`RESERVE`、`FREE`、`SET_SIZE`、
 `SET_TIMES`、`TRUNCATE` 和 `CHECKPOINT`。
 
+每个 journal slot 是一个 metadata block：BEGIN 槽携带 txid 与 record_count，RECORD 槽
+携带固定 payload（type/object_id/arg0/arg1），COMMIT 槽携带 tx_crc（txid 与全部 record
+payload 的 CRC32C）。slot 序号单调递增，物理位置 = `journal_start + (sequence %
+journal_blocks)`；superblock 的 `journal_head`/`journal_tail` 保存 slot 序号。slot 与
+checkpoint 头部都带 volume UUID，旧世代内容被视为 ring 结束而不是 corruption。
+checkpoint 槽头部记录 txid、sequence（checkpoint 时的 head）、generation 和 CRC；mount
+选择 txid 最大且校验通过的 checkpoint，并从其 sequence 继续 replay。replay 遇到
+sequence/txid 不连续的 slot 视为陈旧内容或 journal 结尾；遇到非空但校验无效的 slot 或
+commit CRC 不匹配则记录 corruption evidence 并停止。提交一个事务后，记录立即应用到
+内存状态机；format 会清零 journal 头部与两个 checkpoint 槽的首块，保证新镜像从空
+journal 开始。
+
 - 50% 使用率触发 checkpoint，80% 使用率优先同步 checkpoint；
 - journal 空间不足时先 checkpoint；checkpoint 失败则在 bounded timeout 后返回 NoSpace/Busy；
 - checkpoint 写 inactive slot 的完整 snapshot（namespace/inode/extent map/allocator
