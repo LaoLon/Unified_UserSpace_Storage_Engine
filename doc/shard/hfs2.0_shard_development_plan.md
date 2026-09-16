@@ -20,8 +20,9 @@
 > hfsctl format/info、损坏 fail closed）；Shard-71 已完成（2026-09-16；journal ring
 > BEGIN/RECORD/COMMIT + CRC、checkpoint A/B、通用 replay、阈值 checkpoint、`hfsctl check`）；
 > Shard-72 已完成（2026-09-16；逐盘 superblock/checkpoint/journal 校验、显式 UUID 与
-> geometry 不匹配 fail closed、缺失设备拒绝、`hfsctl dump`、`import` 骨架，
-> Make/CMake/CTest 9/9 通过）
+> geometry 不匹配 fail closed、缺失设备拒绝、`hfsctl dump`、`import` 骨架）；
+> Shard-73 已完成（2026-09-16；FramePool、Operation 池、MPSC ring、actor、completion
+> queue，ASAN/TSAN 结构门禁通过，Make/CMake/CTest 10/10）
 
 ---
 
@@ -202,6 +203,13 @@ fail closed；不静默迁移到未声明设备。
 ## 4. Phase 2：coroutine 数据面
 
 ### Shard-73：Task、Operation、ring 与 doorbell
+
+> 状态：已完成（2026-09-16）。交付 `FramePool`（size-class、有界、overflow 计数，
+> Task promise 分配钩子）、`Operation` 对象池（intrusive refcount、单次终态、
+> onComplete）、`ShardRing`（MPSC reserve/publish/drain、满则 Busy、doorbell 去重与
+> lost-wake 处理）、`ShardActor` 批量消费、`CompletionQueue`（SPSC）；tracepoints
+> `RING_*`/`ACTOR_BATCH`/`CQ_*` 已接入（`FE_SUBMIT/FE_REAP` 随 Shard-75 client 数据面）；
+> `data_plane_test` 覆盖 ASAN/TSAN、ring Busy、并发闭合、pool 无溢出。CTest 10/10。
 
 **交付物**：`Task/Result`（无异常）、coroutine frame pool、`OperationRef` 侵入式生命
 周期、per-shard MPSC ring、doorbell 去重、actor 批量消费、ring 满返回 Busy；

@@ -16,6 +16,9 @@ Bug 等级：**致命 > 严重 > 一般**。
 - 5：已修复（Shard-71，单例析构 join 忙轮询线程导致挂起）。
 - 6：已修复（Shard-71，旧世代 journal/checkpoint 被误读）。
 - 7：已修复（Shard-71，ring 回绕陈旧槽位被误判 corruption）。
+- 8：已修复（Shard-73，MPSC ring 满判定错误导致自旋）。
+- 9：已修复（Shard-73，publish 读取消费者专属 tail_ 数据竞争）。
+- 10：已修复（Shard-73，trace 全局计数多线程竞争）。
 
 ## Bug 记录
 
@@ -95,6 +98,39 @@ Bug 等级：**致命 > 严重 > 一般**。
 - **根因**：同世代但序号不匹配的陈旧槽位与 corruption 无法区分。
 - **修复**：replay 对 BEGIN/RECORD/COMMIT 槽校验 `sequence` 与期望位置一致，不一致按陈旧内容干净结束。
 - **验证结果**：回绕场景 replay 完整且 `corruption` 为空。
+
+### 8. MPSC ring 满判定错误导致 reserve 永久自旋（已修复）
+
+- **状态**：已修复
+- **等级**：严重
+- **时间**：2026-09-16（Shard-73）
+- **现象**：`data_plane_test` 在 depth=8 的 ring 写满后再次 `reserve()` 不返回，主线程 100% CPU 自旋 5 分钟以上。
+- **排查过程**：gdb attach 显示卡在 `ShardRing::reserve` 的 `yield` 分支；推导槽位 sequence 与 head 的关系发现满判定用了 `sequence + depth <= head`，而正确条件是比较 `sequence < head`（已发布未消费的槽位 sequence = 上一圈位置+1，恒小于当前 head）。
+- **根因**：满判定条件写错，已满时落入“其它生产者正在发布”的自旋分支。
+- **修复**：`sequence < head` 返回 Busy；`sequence == head` 才可预约；`sequence > head` 防御性 yield。
+- **验证结果**：ring 满立即 Busy，`data_plane_test` 通过。
+
+### 9. publish 读取消费者专属 tail_ 数据竞争（已修复）
+
+- **状态**：已修复
+- **等级**：一般
+- **时间**：2026-09-16（Shard-73）
+- **现象**：TSAN 报 `shard_ring.cpp` `drain` 与生产者线程的数据竞争。
+- **排查过程**：`publish` 为计算 high watermark 读取 `tail_`，而 `tail_` 只由消费者 `drain` 修改。
+- **根因**：违反 ring 的单写者约定。
+- **修复**：新增原子 `inFlight_`（publish 加、drain 减），watermark 由它推导，生产者不再触碰 `tail_`。
+- **验证结果**：TSAN 干净。
+
+### 10. trace 全局计数多线程竞争（已修复）
+
+- **状态**：已修复
+- **等级**：一般
+- **时间**：2026-09-16（Shard-73）
+- **现象**：TSAN 报 `trace::event` 内 `g_sequence/g_recorded` 竞争。
+- **排查过程**：多生产者测试开启 trace 后，普通 `uint64_t` 全局变量被并发读写。
+- **根因**：trace 骨架计数未原子化。
+- **修复**：改为 `std::atomic<uint64_t>`（relaxed），采样判定使用取回后的序号。
+- **验证结果**：TSAN 干净，trace 事件仍正常计数。
 
 ## 记录模板
 
