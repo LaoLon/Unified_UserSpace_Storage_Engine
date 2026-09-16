@@ -18,7 +18,9 @@
 > subsystem/reactor 所有权、R=2 自动拓扑、fork/双进程保护、doorbell、clean shutdown）；
 > Shard-70 已完成（2026-09-16；CRC32C、superblock A/B + geometry、format/mount、
 > hfsctl format/info、损坏 fail closed）；Shard-71 已完成（2026-09-16；journal ring
-> BEGIN/RECORD/COMMIT + CRC、checkpoint A/B、通用 replay、阈值 checkpoint、`hfsctl check`，
+> BEGIN/RECORD/COMMIT + CRC、checkpoint A/B、通用 replay、阈值 checkpoint、`hfsctl check`）；
+> Shard-72 已完成（2026-09-16；逐盘 superblock/checkpoint/journal 校验、显式 UUID 与
+> geometry 不匹配 fail closed、缺失设备拒绝、`hfsctl dump`、`import` 骨架，
 > Make/CMake/CTest 9/9 通过）
 
 ---
@@ -181,6 +183,13 @@ CREATE/ALLOC/FREE/RESERVE 记录语义与 namespace/size/bitmap 守恒验收推�
 Shard-76/77/79。
 
 ### Shard-72：hfsctl 与 device set 工具
+
+> 状态：已完成（2026-09-16）。交付逐盘 `readSuperblockSlots` 与 `hfsctl check`（SB A/B、
+> checkpoint、journal 汇总，corruption 非空 rc=1）、`hfsctl dump`（SB A/B 全字段 +
+> checkpoint + journal）、`hfsctl import` 骨架（Phase 2 数据面实现前 rc=2）；mount 增加
+> 显式 `volume_uuid` 校验、stored geometry 不匹配返回 Corrupt、缺失 bdev 有界等待后拒绝；
+> `format_mount_test` 覆盖 uuid/geometry/缺失设备三种 fail-closed。双盘真实验收仍受 VM
+> 单盘限制，逻辑由 parser 与 geometry 单测覆盖。
 
 **交付物**：`format/check/dump`（`import` 骨架）；逐盘 geometry/UUID/CRC 检查；
 设备缺失、重复 bdev、volume UUID 不一致时拒绝 mount；设备故障返回可定位 `IoError`。
