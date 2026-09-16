@@ -21,6 +21,8 @@ Bug 等级：**致命 > 严重 > 一般**。
 - 10：已修复（Shard-73，trace 全局计数多线程竞争）。
 - 11：已修复（Shard-74，barrier 就绪条件错误导致永远不被准入）。
 - 12：已修复（Shard-74，pending barrier 误挡更早提交的节点）。
+- 13：已修复（Shard-75，extent 物理偏移单位不一致导致重复叠加）。
+- 14：已修复（Shard-75，DmaArena 释放不回收预算且析构泄漏缓存块）。
 
 ## Bug 记录
 
@@ -155,6 +157,28 @@ Bug 等级：**致命 > 严重 > 一般**。
 - **根因**：barrier 的“禁止越过”范围应只覆盖 sequence 更大的后来者。
 - **修复**：改为 `pendingBarrier_->sequence < node.sequence` 时才拒绝。
 - **验证结果**：压力模拟不再死锁，`pendingCount=0`、全部 4096 op 完成。
+
+### 13. extent 物理偏移单位不一致导致物理地址重复叠加
+
+- **状态**：已修复
+- **等级**：严重（跨 extent/非对齐 I/O 会落到错误物理位置）
+- **时间**：2026-09-17（Shard-75）
+- **现象**：75A 代码自检发现：`SyntheticExtentMap::lookup` 裁剪时按字节调整了 `physicalBlock`，而 `IoPlanner` 又把该字段当块号乘 `blockSize` 再加字节内偏移，物理地址被叠加两次且单位混乱。
+- **排查过程**：对照 `extent_map.cpp` 裁剪公式与 `io_planner.cpp` 物理地址推导，确认同一字段在两处语义不一致；合成 fixture 的跨 extent 场景会立即暴露。
+- **根因**：`ExtentView` 物理字段同时承担“块号”和“裁剪后物理位置”两种角色，接口单位未冻结。
+- **修复**：字段改为字节口径 `physicalByte`（lookup 裁剪只加字节差），planner 使用字节偏移后换算为元数据块；`DataPath` 再按 `metadataBlockSize/deviceBlockSize` 换算为设备扇区提交。
+- **验证结果**：`io_planner_test` 跨 extent/非对齐断言通过；`data_path_device_test` 非对齐 RMW 写后回读与设备内容一致。
+
+### 14. DmaArena 释放不回收预算且析构泄漏缓存块
+
+- **状态**：已修复
+- **等级**：一般
+- **时间**：2026-09-17（Shard-75）
+- **现象**：`io_planner_test` 期望释放后 `bytes == 0` 断言失败；ASAN 报 `memAlloc` 共 8192 字节泄漏。
+- **排查过程**：检查 `release()` 只把块放回 free list，`bytes_` 从不回减；`DmaArena` 没有析构释放缓存块，进程退出时 free list 内存未归还。
+- **根因**：`bytes_` 统计语义未定义（在途用量还是保留预算），且缺少资源析构。
+- **修复**：明确 `bytes_` 为 arena 保留预算（背压 cap 的作用对象），`release()` 不回减；新增析构函数通过 `deallocator` 释放全部缓存块。
+- **验证结果**：测试改为 retained 语义断言后通过；ASAN 无泄漏；CTest 13/13。
 
 ## 记录模板
 

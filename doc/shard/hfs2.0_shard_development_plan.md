@@ -209,7 +209,8 @@ fail closed；不静默迁移到未声明设备。
 > Task promise 分配钩子）、`Operation` 对象池（intrusive refcount、单次终态、
 > onComplete）、`ShardRing`（MPSC reserve/publish/drain、满则 Busy、doorbell 去重与
 > lost-wake 处理）、`ShardActor` 批量消费、`CompletionQueue`（SPSC）；tracepoints
-> `RING_*`/`ACTOR_BATCH`/`CQ_*` 已接入（`FE_SUBMIT/FE_REAP` 随 Shard-75 client 数据面）；
+> `RING_*`/`ACTOR_BATCH`/`CQ_*` 已接入（`FE_SUBMIT/FE_REAP` 随 coroutine client
+> / File API 接入，Shard-76/77）；
 > `data_plane_test` 覆盖 ASAN/TSAN、ring Busy、并发闭合、pool 无溢出。CTest 10/10。
 
 **交付物**：`Task/Result`（无异常）、coroutine frame pool、`OperationRef` 侵入式生命
@@ -227,7 +228,7 @@ tracepoints：`FE_SUBMIT/FE_REAP/CQ_PUSH/CQ_REAP/RING_*/ACTOR_BATCH`。
 > admit callback 批量延迟派发（避免回调重入破坏状态）、`SCHED_WAIT/SCHED_ADMIT/SCHED_DONE`
 > tracepoints、`shardForFile` 文件到 shard 映射；`scheduler_test` 覆盖依赖场景、barrier
 > 顺序、32 客户端 4096 op 窗口模拟（逐次准入做冲突不变量检查）与 ASAN/TSAN。真实 NVMe
-> 32 线程重叠写与短读回滚回归随 Shard-75 数据面落地。
+> 32 线程重叠写与短读回滚回归依赖 coroutine client / File API 接入（Shard-76/77），随其落地。
 
 **交付物**：intrusive interval tree + `max_end`；read/read 并行；重叠写、RMW、append、
 truncate、gap-zero、size barrier、durability epoch 统一依赖；`hash(file_id) % R` 文件
@@ -237,6 +238,22 @@ truncate、gap-zero、size barrier、durability epoch 统一依赖；`hash(file_
 dependency waits/pending peak 统计可与操作计数对上。
 
 ### Shard-75：数据面（75A planner/parent，75B DMA/read-write）
+
+> 状态：已完成（2026-09-17）。交付 75A：`ExtentMap`/`SyntheticExtentMap`（字节口径
+> lookup 裁剪）与 `IoPlanner`（child ≤1 MiB、不跨 extent/设备；head/tail RMW；
+> 覆盖校验；空洞返回 NotFound）、`ParentCompletion`（first error、completed bytes、
+> 并发单次唤醒）；75B：`DmaArena`（4K/16K/64K/1M size class、cap 背压 Busy、
+> 可插拔分配器、RAII `BufferLease`、析构归还缓存块）、`SpdkRuntime::submitDataRead`
+> /`submitDataWrite`（data reactor channel 提交，回调在 reactor 线程）与 `isDmaCapable`
+> （`spdk_vtophys`）、`DataPath` 同步执行器（direct/bounce 双路径、RMW 合并、parent
+> 聚合、元数据块到设备扇区换算）；tracepoints `EXTENT_PLAN/PARENT_COMPLETE/DMA_*`
+> `/BDEV_*/COPY_*` 已接入。验收：`io_planner_test`（planner/arena/parent，ASAN+TSAN）
+> 与 `data_path_device_test` 在真实 `Nvme0n1` 上完成合成 4 MiB extent 的零填充、
+> 对齐/非对齐跨块 RMW 读写、DMA caller 的 direct 无拷贝路径、3 MiB 分片提交
+> （submits=completes=21、direct=2/bounce=17、copy≈10.5 MB、arena 全量回收）；
+> CTest 13/13、hfsctl 全套通过。**不构成完整文件验收**：真实 extent map 端到端与
+> placement 仍按计划在 Shard-77；32 线程重叠写/短读回滚回归随 coroutine client /
+> File API 接入（Shard-76/77）落地，当前 `DataPath` 为同步测试执行器。
 
 **75A 交付物**：parent/child 规划（child ≤1 MiB、不跨设备）；head/tail RMW；parent
 completion（first error、completed bytes、wake-all）；tracepoints：
