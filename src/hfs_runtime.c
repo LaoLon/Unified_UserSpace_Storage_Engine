@@ -41,6 +41,7 @@
 typedef struct HfsRuntimeDataReactor {
 	pthread_t owner;
 	_Atomic(struct spdk_thread *) spdkThread;
+	/* Legacy linked-list batch state retained only for the rollback executor. */
 	pthread_mutex_t lock;
 	pthread_cond_t stateChanged;
 	pthread_mutex_t batchLock;
@@ -52,6 +53,15 @@ typedef struct HfsRuntimeDataReactor {
 	uint32_t queueDepth;
 	uint32_t inflight;
 	uint32_t maxDepth;
+	/* Actor-owned fixed ring state; producers only reserve slots under ringLock. */
+	pthread_mutex_t ringLock;
+	HfsRuntimeBatchItem **ringSlots;
+	uint64_t ringHead;
+	uint64_t ringTail;
+	_Atomic uint32_t actorInflight;
+	bool ringDoorbellArmed;
+	bool ringClosed;
+	bool ringInitialized;
 	unsigned int index;
 	int cpu;
 	uint32_t idleBackoffUs;
@@ -75,6 +85,7 @@ struct hfs_runtime_state {
 	bool ready;
 	bool batchEnabled;
 	bool posixQueueEnabled;
+	bool actorExecutor;
 	uint32_t queueDepthLimit;
 	/* Serialize multi-producer SPDK ring admission to avoid tail reservation stalls. */
 	pthread_mutex_t messageSubmitLock;
@@ -114,6 +125,20 @@ static bool hfsRuntimeBoolEnv(const char *name, bool defaultValue) {
 	}
 	return strcmp(value, "0") != 0 && strcasecmp(value, "false") != 0 &&
 		strcasecmp(value, "off") != 0 && strcasecmp(value, "no") != 0;
+}
+
+/* Select the data executor while keeping an explicit rollback path for incidents. */
+static bool hfsRuntimeActorExecutorEnv(void) {
+	const char *value = getenv("HFS_IO_EXECUTOR");
+
+	if (value == NULL || value[0] == '\0' || !strcasecmp(value, "actor")) {
+		return true;
+	}
+	if (!strcasecmp(value, "legacy")) {
+		return false;
+	}
+	/* Invalid values fail safe to the known linked-list implementation. */
+	return false;
 }
 
 /* Serialize producers before entering SPDK's lockless message ring. */
@@ -304,7 +329,41 @@ static void hfsRuntimeDispatchBatch(void *arg) {
 	}
 }
 
-/* Return one bounded credit to a reactor and wake blocked producers. */
+/* Forward declaration for the per-reactor actor doorbell callback. */
+static void hfsRuntimeDispatchDataActor(void *arg);
+
+/* Return one actor credit and re-arm the doorbell when pending work was gated. */
+static void hfsRuntimeDataCreditReleaseActor(HfsRuntimeDataReactor *reactor) {
+	struct spdk_thread *thread = NULL;
+	bool notify = false;
+	uint32_t inflight;
+
+	if (reactor == NULL || !reactor->ringInitialized) {
+		return;
+	}
+	pthread_mutex_lock(&reactor->ringLock);
+	inflight = atomic_load_explicit(&reactor->actorInflight,
+		memory_order_relaxed);
+	if (inflight != 0) {
+		atomic_store_explicit(&reactor->actorInflight, inflight - 1U,
+			memory_order_release);
+	}
+	/* A full actor window may leave queued work behind a disarmed callback. */
+	if (reactor->ringHead != reactor->ringTail &&
+	    !reactor->ringDoorbellArmed) {
+		reactor->ringDoorbellArmed = true;
+		notify = true;
+		thread = atomic_load_explicit(&reactor->spdkThread,
+			memory_order_acquire);
+	}
+	pthread_mutex_unlock(&reactor->ringLock);
+	if (notify && thread != NULL) {
+		hfsStatsRecordRingDoorbellFast();
+		hfsRuntimeSendMessage(thread, hfsRuntimeDispatchDataActor, reactor, true);
+	}
+}
+
+/* Return one bounded credit to a legacy reactor and wake blocked producers. */
 static void hfsRuntimeDataCreditReleaseReactor(HfsRuntimeDataReactor *reactor) {
 	if (reactor == NULL) {
 		return;
@@ -333,7 +392,11 @@ static void hfsRuntimeDataCreditRelease(HfsCompletion *completion) {
 		return;
 	}
 	reactor = &g_runtime.dataReactors[reactorId - 1U];
-	hfsRuntimeDataCreditReleaseReactor(reactor);
+	if (g_runtime.actorExecutor) {
+		hfsRuntimeDataCreditReleaseActor(reactor);
+	} else {
+		hfsRuntimeDataCreditReleaseReactor(reactor);
+	}
 }
 
 /* Drain one data-reactor batch while retaining a bounded backend credit. */
@@ -411,6 +474,115 @@ static void hfsRuntimeDispatchDataBatch(void *arg) {
 				hfsRuntimeDataCreditReleaseReactor(reactor);
 			}
 			item = next;
+		}
+	}
+}
+
+/* Drain a fixed per-reactor ring on its owning SPDK actor. */
+static void hfsRuntimeDispatchDataActor(void *arg) {
+	HfsRuntimeDataReactor *reactor = arg;
+	HfsRuntimeBatchItem *items[HFS_RUNTIME_MAX_QUEUE_DEPTH];
+	bool timing = hfsStatsTimingFastEnabled();
+
+	if (reactor == NULL || !reactor->ringInitialized) {
+		return;
+	}
+	for (;;) {
+		uint32_t actorInflight;
+		uint32_t credits;
+		uint32_t count = 0;
+		uint64_t queued;
+		uint64_t queueDepth;
+
+		/* Snapshot a contiguous batch and advance the consumer cursor once. */
+		pthread_mutex_lock(&reactor->ringLock);
+		queued = reactor->ringTail - reactor->ringHead;
+		actorInflight = atomic_load_explicit(&reactor->actorInflight,
+			memory_order_relaxed);
+		credits = actorInflight < reactor->maxDepth ?
+			reactor->maxDepth - actorInflight : 0U;
+		if (queued > credits) {
+			queued = credits;
+		}
+		if (queued > HFS_RUNTIME_MAX_QUEUE_DEPTH) {
+			queued = HFS_RUNTIME_MAX_QUEUE_DEPTH;
+		}
+		count = (uint32_t)queued;
+		for (uint32_t i = 0; i < count; i++) {
+			uint64_t slot = reactor->ringHead % reactor->maxDepth;
+			items[i] = reactor->ringSlots[slot];
+			reactor->ringSlots[slot] = NULL;
+			reactor->ringHead++;
+		}
+		if (count != 0) {
+			atomic_store_explicit(&reactor->actorInflight,
+				actorInflight + count, memory_order_release);
+		}
+		queueDepth = reactor->ringTail - reactor->ringHead;
+		if (count == 0) {
+			/* Keep a full-window queue armed for the completion edge to re-arm. */
+			if (queueDepth == 0 ||
+			    atomic_load_explicit(&reactor->actorInflight,
+				memory_order_relaxed) >= reactor->maxDepth) {
+				reactor->ringDoorbellArmed = false;
+			}
+			pthread_mutex_unlock(&reactor->ringLock);
+			if (queueDepth == 0 || credits == 0) {
+				return;
+			}
+			continue;
+		}
+		pthread_mutex_unlock(&reactor->ringLock);
+
+		hfsStatsRecordRingItemsFast(count);
+		hfsStatsRecordQueueDrainFast(reactor->index, count);
+		for (uint32_t i = 0; i < count; i++) {
+			HfsRuntimeBatchItem *item = items[i];
+			uint64_t queueWaitNs = 0;
+			uint64_t ownerStartNs = 0;
+			uint64_t ownerNs = 0;
+			uint64_t depth = 0;
+			uint64_t nowNs;
+
+			if (item == NULL || item->fn == NULL) {
+				/* A reserved slot must never strand actor credit on corruption. */
+				hfsRuntimeDataCreditReleaseActor(reactor);
+				continue;
+			}
+			if (hfsTraceEnabledFast()) {
+				nowNs = hfsTraceNowNs();
+				queueWaitNs = item->enqueueNs != 0 && nowNs >= item->enqueueNs ?
+					nowNs - item->enqueueNs : 0;
+				hfsTraceEmit(HFS_TRACE_RUNTIME_DEQUEUE,
+					     HFS_TRACE_OPERATION_NONE,
+					     HFS_TRACE_BUFFER_NONE,
+					     0, item->traceParentId, 0, 0, 0, 0,
+					     (uint32_t)queueDepth, reactor->index, 0, 0,
+					     queueWaitNs, 0);
+			}
+			hfsProfileChildDequeue(item->profileChild);
+			if (item->op != NULL) {
+				(void)hfsOpMarkSubmitted(item->op);
+			}
+			if (timing) {
+				depth = atomic_fetch_sub_explicit(&g_runtime.queued, 1,
+					memory_order_relaxed) - 1U;
+				atomic_fetch_add_explicit(&g_runtime.inflight, 1,
+					memory_order_relaxed);
+				queueWaitNs = hfsStatsNowNs() - item->enqueueNs;
+				ownerStartNs = hfsStatsNowNs();
+			}
+			item->fn(item->ctx);
+			if (timing) {
+				ownerNs = hfsStatsNowNs() - ownerStartNs;
+				depth = atomic_fetch_sub_explicit(&g_runtime.inflight, 1,
+					memory_order_relaxed);
+				hfsStatsRecordRuntimeDispatchFast(queueWaitNs, ownerNs, depth);
+			}
+			/* Backend completions return the actor credit asynchronously. */
+			if (item->completion == NULL) {
+				hfsRuntimeDataCreditReleaseActor(reactor);
+			}
 		}
 	}
 }
@@ -790,10 +962,18 @@ static void *hfsRuntimeDataMain(void *arg) {
 		if (reactor->idleBackoffUs != 0 && pollResult == 0) {
 			bool idle;
 
-			pthread_mutex_lock(&reactor->batchLock);
-			idle = reactor->queueDepth == 0 && reactor->inflight == 0 &&
-				!reactor->queueClosed;
-			pthread_mutex_unlock(&reactor->batchLock);
+			if (g_runtime.actorExecutor) {
+				pthread_mutex_lock(&reactor->ringLock);
+				idle = reactor->ringHead == reactor->ringTail &&
+					atomic_load_explicit(&reactor->actorInflight,
+						memory_order_relaxed) == 0 && !reactor->ringClosed;
+				pthread_mutex_unlock(&reactor->ringLock);
+			} else {
+				pthread_mutex_lock(&reactor->batchLock);
+				idle = reactor->queueDepth == 0 && reactor->inflight == 0 &&
+					!reactor->queueClosed;
+				pthread_mutex_unlock(&reactor->batchLock);
+			}
 			if (idle) {
 				idlePolls++;
 				if (idlePolls >= 8U) {
@@ -871,6 +1051,21 @@ static int hfsRuntimeStartDataReactors(void) {
 		reactor->maxDepth = g_runtime.queueDepthLimit;
 		reactor->queueClosed = false;
 		initialized = i;
+		if (g_runtime.actorExecutor) {
+			reactor->ringSlots = calloc(reactor->maxDepth,
+						     sizeof(*reactor->ringSlots));
+			if (reactor->ringSlots == NULL) {
+				rc = -ENOMEM;
+				break;
+			}
+			pthread_mutex_init(&reactor->ringLock, NULL);
+			atomic_init(&reactor->actorInflight, 0);
+			reactor->ringHead = 0;
+			reactor->ringTail = 0;
+			reactor->ringDoorbellArmed = false;
+			reactor->ringClosed = false;
+			reactor->ringInitialized = true;
+		}
 		rc = pthread_create(&reactor->owner, NULL, hfsRuntimeDataMain,
 				    reactor);
 		if (rc != 0) {
@@ -917,6 +1112,12 @@ static int hfsRuntimeStartDataReactors(void) {
 				&g_runtime.dataReactors[j - 1U];
 			pthread_cond_destroy(&reactor->stateChanged);
 			pthread_cond_destroy(&reactor->queueAvailable);
+			if (reactor->ringInitialized) {
+				pthread_mutex_destroy(&reactor->ringLock);
+				reactor->ringInitialized = false;
+			}
+			free(reactor->ringSlots);
+			reactor->ringSlots = NULL;
 			pthread_mutex_destroy(&reactor->batchLock);
 			pthread_mutex_destroy(&reactor->lock);
 		}
@@ -951,6 +1152,12 @@ static void hfsRuntimeStopDataReactors(void) {
 		pthread_join(reactor->owner, NULL);
 		pthread_cond_destroy(&reactor->stateChanged);
 		pthread_cond_destroy(&reactor->queueAvailable);
+		if (reactor->ringInitialized) {
+			pthread_mutex_destroy(&reactor->ringLock);
+			reactor->ringInitialized = false;
+		}
+		free(reactor->ringSlots);
+		reactor->ringSlots = NULL;
 		pthread_mutex_destroy(&reactor->batchLock);
 		pthread_mutex_destroy(&reactor->lock);
 	}
@@ -980,12 +1187,15 @@ int hfsRuntimeStart(void) {
 	g_runtime.queueDepthLimit = hfsRuntimeQueueDepthEnv();
 	g_runtime.batchEnabled = (batchEnv == NULL || strcmp(batchEnv, "0") != 0) &&
 		g_runtime.posixQueueEnabled;
+	g_runtime.actorExecutor = hfsRuntimeActorExecutorEnv() &&
+		g_runtime.batchEnabled;
 	g_runtime.dataStripeBytes = hfsRuntimeDataStripeBytesEnv();
 	waitMode = getenv("HFS_WAIT_MODE");
 	g_runtime.waitModeAdaptive = waitMode != NULL &&
 		!strcasecmp(waitMode, "adaptive");
 	g_runtime.waitSpinNs = g_runtime.waitModeAdaptive ?
 		hfsRuntimeWaitSpinNsEnv() : 0;
+	HFS_LOG_INFO("data executor: %s", g_runtime.actorExecutor ? "actor" : "legacy");
 
 	rc = pthread_create(&g_runtime.owner, NULL, hfsRuntimeOwnerMain, NULL);
 	if (rc != 0) {
@@ -1164,6 +1374,110 @@ int hfsRuntimeSubmitData(uint32_t reactorId, spdk_msg_fn fn, void *ctx) {
 	return hfsRuntimeSubmitDataWithProfile(reactorId, fn, ctx, NULL);
 }
 
+/* Reserve one fixed ring slot and ring a data actor only on an empty edge. */
+static int hfsRuntimeSubmitDataActorBatch(uint32_t reactorId,
+						 HfsRuntimeBatchItem *item,
+						 spdk_msg_fn fn, void *ctx) {
+	HfsRuntimeDataReactor *reactor;
+	struct spdk_thread *thread;
+	uint64_t occupancy;
+	uint64_t queueDepth;
+	uint32_t actorInflight;
+	bool notify = false;
+	bool timing;
+	bool directFallback = false;
+	int rc = 0;
+
+	if (reactorId == 0) {
+		return hfsRuntimeSubmitBatch(item, fn, ctx);
+	}
+	if (item == NULL || fn == NULL || g_runtime.dataReactors == NULL ||
+	    reactorId >= g_runtime.dataReactorCount) {
+		HFS_STATS_SPDK_REJECT();
+		return -EINVAL;
+	}
+	if (hfsRuntimeIsForkChild()) {
+		HFS_STATS_SPDK_REJECT();
+		return -ECHILD;
+	}
+	reactor = &g_runtime.dataReactors[reactorId - 1U];
+	atomic_fetch_add_explicit(&g_runtime.submitters, 1, memory_order_acquire);
+	if (!atomic_load_explicit(&g_runtime.accepting, memory_order_acquire)) {
+		rc = -ESHUTDOWN;
+		goto actor_submit_done;
+	}
+	thread = atomic_load_explicit(&reactor->spdkThread, memory_order_acquire);
+	if (thread == NULL) {
+		rc = -ESHUTDOWN;
+		goto actor_submit_done;
+	}
+	timing = hfsStatsTimingFastEnabled();
+	pthread_mutex_lock(&reactor->ringLock);
+	occupancy = reactor->ringTail - reactor->ringHead;
+	actorInflight = atomic_load_explicit(&reactor->actorInflight,
+		memory_order_relaxed);
+	if (reactor->ringClosed ||
+	    !atomic_load_explicit(&g_runtime.accepting, memory_order_acquire)) {
+		rc = -ESHUTDOWN;
+		pthread_mutex_unlock(&reactor->ringLock);
+		goto actor_submit_done;
+	}
+	if (occupancy + actorInflight >= reactor->maxDepth) {
+		/* Never retain an inode dependency while waiting for an actor credit. */
+		pthread_mutex_unlock(&reactor->ringLock);
+		if (hfsRuntimeIsOwnerThread()) {
+			rc = -EAGAIN;
+			goto actor_submit_done;
+		}
+		directFallback = true;
+		rc = hfsRuntimeSubmitDataWithProfile(reactorId, fn, ctx,
+			item->profileChild);
+		goto actor_submit_done;
+	}
+	item->fn = fn;
+	item->ctx = ctx;
+	item->enqueueNs = timing ? hfsStatsNowNs() : 0;
+	item->next = NULL;
+	if (item->completion != NULL) {
+		item->completion->runtimeReactorId = reactorId;
+		atomic_store_explicit(&item->completion->runtimeCreditHeld, true,
+			memory_order_release);
+	}
+	/* Publish the operation before advancing tail; the actor owns the slot. */
+	reactor->ringSlots[reactor->ringTail % reactor->maxDepth] = item;
+	reactor->ringTail++;
+	queueDepth = reactor->ringTail - reactor->ringHead;
+	hfsProfileChildEnqueue(item->profileChild, 0);
+	hfsStatsRecordRingReservationFast();
+	if (!reactor->ringDoorbellArmed) {
+		reactor->ringDoorbellArmed = true;
+		notify = true;
+	}
+	pthread_mutex_unlock(&reactor->ringLock);
+	if (timing) {
+		uint64_t depth = atomic_fetch_add_explicit(&g_runtime.queued, 1,
+			memory_order_relaxed) + 1U;
+		hfsStatsRecordRuntimeSubmitFast(depth);
+	}
+	hfsStatsRecordQueueDepthFast(reactorId, queueDepth);
+	hfsTraceEmit(HFS_TRACE_RUNTIME_ENQUEUE,
+		     HFS_TRACE_OPERATION_NONE, HFS_TRACE_BUFFER_NONE, 0,
+		     item->traceParentId, 0, 0, 0, 0,
+		     (uint32_t)queueDepth, reactorId, 0, 0, 0, 0);
+	HFS_STATS_SPDK_SUBMIT();
+	if (notify) {
+		hfsStatsRecordRingDoorbellFast();
+		hfsRuntimeSendMessage(thread, hfsRuntimeDispatchDataActor, reactor, true);
+	}
+
+actor_submit_done:
+	if (rc != 0 && !directFallback) {
+		HFS_STATS_SPDK_REJECT();
+	}
+	atomic_fetch_sub_explicit(&g_runtime.submitters, 1, memory_order_release);
+	return rc;
+}
+
 /* Queue one request on a data reactor and coalesce concurrent submissions. */
 int hfsRuntimeSubmitDataBatch(uint32_t reactorId, HfsRuntimeBatchItem *item,
 				      spdk_msg_fn fn, void *ctx) {
@@ -1185,6 +1499,10 @@ int hfsRuntimeSubmitDataBatch(uint32_t reactorId, HfsRuntimeBatchItem *item,
 		HFS_STATS_SPDK_REJECT();
 		return -EINVAL;
 	}
+	if (g_runtime.actorExecutor) {
+		return hfsRuntimeSubmitDataActorBatch(reactorId, item, fn, ctx);
+	}
+	hfsStatsRecordLegacyDataSubmitFast();
 	if (!g_runtime.batchEnabled || !g_runtime.posixQueueEnabled) {
 		return hfsRuntimeSubmitData(reactorId, fn, ctx);
 	}
@@ -1534,9 +1852,14 @@ uint32_t hfsRuntimeDataInFlight(uint32_t reactorId) {
 		return 0;
 	}
 	reactor = &g_runtime.dataReactors[reactorId - 1U];
-	pthread_mutex_lock(&reactor->batchLock);
-	value = reactor->inflight;
-	pthread_mutex_unlock(&reactor->batchLock);
+	if (g_runtime.actorExecutor) {
+		value = atomic_load_explicit(&reactor->actorInflight,
+			memory_order_acquire);
+	} else {
+		pthread_mutex_lock(&reactor->batchLock);
+		value = reactor->inflight;
+		pthread_mutex_unlock(&reactor->batchLock);
+	}
 	return value;
 }
 
@@ -1550,9 +1873,15 @@ uint32_t hfsRuntimeDataQueueDepth(uint32_t reactorId) {
 		return 0;
 	}
 	reactor = &g_runtime.dataReactors[reactorId - 1U];
-	pthread_mutex_lock(&reactor->batchLock);
-	value = reactor->queueDepth;
-	pthread_mutex_unlock(&reactor->batchLock);
+	if (g_runtime.actorExecutor) {
+		pthread_mutex_lock(&reactor->ringLock);
+		value = (uint32_t)(reactor->ringTail - reactor->ringHead);
+		pthread_mutex_unlock(&reactor->ringLock);
+	} else {
+		pthread_mutex_lock(&reactor->batchLock);
+		value = reactor->queueDepth;
+		pthread_mutex_unlock(&reactor->batchLock);
+	}
 	return value;
 }
 
@@ -1607,10 +1936,16 @@ static void hfsRuntimeCloseDataQueues(void) {
 	for (i = 1; i < g_runtime.dataReactorCount; i++) {
 		HfsRuntimeDataReactor *reactor = &g_runtime.dataReactors[i - 1U];
 
-		pthread_mutex_lock(&reactor->batchLock);
-		reactor->queueClosed = true;
-		pthread_cond_broadcast(&reactor->queueAvailable);
-		pthread_mutex_unlock(&reactor->batchLock);
+		if (g_runtime.actorExecutor) {
+			pthread_mutex_lock(&reactor->ringLock);
+			reactor->ringClosed = true;
+			pthread_mutex_unlock(&reactor->ringLock);
+		} else {
+			pthread_mutex_lock(&reactor->batchLock);
+			reactor->queueClosed = true;
+			pthread_cond_broadcast(&reactor->queueAvailable);
+			pthread_mutex_unlock(&reactor->batchLock);
+		}
 	}
 }
 
@@ -1630,11 +1965,21 @@ static void hfsRuntimeDrainDataQueues(void) {
 			HfsRuntimeDataReactor *reactor =
 				&g_runtime.dataReactors[i - 1U];
 
-			pthread_mutex_lock(&reactor->batchLock);
-			if (reactor->queueDepth != 0 || reactor->inflight != 0) {
-				busy = true;
+			if (g_runtime.actorExecutor) {
+				pthread_mutex_lock(&reactor->ringLock);
+				if (reactor->ringHead != reactor->ringTail ||
+				    atomic_load_explicit(&reactor->actorInflight,
+					memory_order_acquire) != 0) {
+					busy = true;
+				}
+				pthread_mutex_unlock(&reactor->ringLock);
+			} else {
+				pthread_mutex_lock(&reactor->batchLock);
+				if (reactor->queueDepth != 0 || reactor->inflight != 0) {
+					busy = true;
+				}
+				pthread_mutex_unlock(&reactor->batchLock);
 			}
-			pthread_mutex_unlock(&reactor->batchLock);
 		}
 		if (!busy || hfsStatsNowNs() >= deadline) {
 			break;

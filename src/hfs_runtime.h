@@ -26,6 +26,7 @@ typedef struct HfsRuntimeBatchItem {
 	HfsCompletion *completion;
 	HfsOp *op;
 	void *profileChild;
+	/* Used by the rollback linked list; actor-ring consumers ignore this link. */
 	struct HfsRuntimeBatchItem *next;
 } HfsRuntimeBatchItem;
 /* Queue one request and coalesce concurrent submissions into one owner message. */

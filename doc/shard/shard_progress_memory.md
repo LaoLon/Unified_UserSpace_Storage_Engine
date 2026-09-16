@@ -129,6 +129,23 @@
 - 当前工作树中的其它历史同步改动属于用户既有状态；本阶段新增代码边界为
   `src/hfs_op.[ch]`、`src/hfs.[ch]`、`src/hfs_runtime.[ch]`、`Makefile` 与 `CMakeLists.txt`。
 
+### Shard-67B：data actor ring（2026-09-16）
+
+- 默认 data executor 已切换为 per-reactor fixed ring + SPDK actor；
+  `HFS_IO_EXECUTOR=legacy` 可回退到原 linked-list batch，`HFS_RUNTIME_BATCH=0`/
+  `HFS_POSIX_QUEUE=0` 仍关闭批处理。
+- producer 在短 `ringLock` 临界区完成一次槽位预约，ring 满时释放锁并走有界 direct fallback；
+  actor 批量快照 head/tail，backend credit 在 actor 内以原子计数维护，callback 只归还 credit。
+- empty→non-empty 仅发一次 doorbell；actor 在队列空或 credit 窗口满时清理 armed 位，
+  后续 completion 负责重新唤醒，避免 lost wake；shutdown 先关闭 ring，再等待 ring/credit 清零。
+- 增加 `ring_doorbell`、`ring_reservation`、`ring_items`、`legacy_data_submit` stats，
+  用于结构守恒检查，stats-off 时不执行计数原子操作。
+- VM 真实 NVMe 短回归（自动 reactor 拓扑、queue depth=4）通过：actor
+  `reservation=46/items=46/doorbell=46`，`spdk_submit=210/complete=210`；legacy
+  回退 `legacy_data_submit=46`，`spdk_submit=210/complete=210`。Make、CMake、POSIX
+  contract 和 fast-I/O smoke 均通过；测试后 NVMe 已恢复内核 `nvme` 驱动。
+- 本阶段不做 reactor 数量矩阵或性能结论；下一步为 67C 统一 inode dependency scheduler。
+
 ## 共享验证边界与性能观测口径
 
 - SPDK 源码必须在 VM 内通过 `git clone`、`git fetch`、`git checkout` 和 `git -C spdk submodule update --init --recursive` 获取及维护；禁止从 Windows 工作区把 `spdk/` 源码目录或其子模块传到 VM 覆盖。Windows 到 VM 的同步仅限 HFS 自身源码、脚本和文档。

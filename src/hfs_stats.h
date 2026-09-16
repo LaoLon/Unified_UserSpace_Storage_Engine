@@ -41,6 +41,10 @@ extern _Atomic uint_fast64_t hfsStatsQueueCreditWaitNs[8];
 extern _Atomic uint_fast64_t hfsStatsQueueDepthPeak[8];
 extern _Atomic uint_fast64_t hfsStatsQueueDrainBatches[8];
 extern _Atomic uint_fast64_t hfsStatsQueueDrainItems[8];
+extern _Atomic uint_fast64_t hfsStatsRingDoorbells;
+extern _Atomic uint_fast64_t hfsStatsRingReservations;
+extern _Atomic uint_fast64_t hfsStatsRingItems;
+extern _Atomic uint_fast64_t hfsStatsLegacyDataSubmits;
 extern _Atomic uint_fast64_t hfsStatsTicketAdmits;
 extern _Atomic uint_fast64_t hfsStatsTicketReadies;
 extern _Atomic uint_fast64_t hfsStatsTicketCompletes;
@@ -200,6 +204,11 @@ void hfsStatsRecordDataReactorComplete(uint32_t reactorId);
 void hfsStatsRecordQueueCreditWait(uint32_t reactorId, uint64_t waitNs);
 void hfsStatsRecordQueueDepth(uint32_t reactorId, uint64_t depth);
 void hfsStatsRecordQueueDrain(uint32_t reactorId, uint64_t batchSize);
+/* Record the actor-ring ingress and legacy fallback path. */
+void hfsStatsRecordRingDoorbell(void);
+void hfsStatsRecordRingReservation(void);
+void hfsStatsRecordRingItems(uint64_t count);
+void hfsStatsRecordLegacyDataSubmit(void);
 /* Record internal POSIX range-ticket admission and dependency progress. */
 void hfsStatsRecordTicketAdmit(uint32_t pendingDependencies,
 				       uint32_t activeTickets);
@@ -348,9 +357,29 @@ static inline void hfsStatsRecordQueueDepthFast(uint32_t reactorId,
 	}
 }
 static inline void hfsStatsRecordQueueDrainFast(uint32_t reactorId,
-								 uint64_t batchSize) {
+									 uint64_t batchSize) {
 	if (hfsStatsEnabledFast()) {
 		hfsStatsRecordQueueDrain(reactorId, batchSize);
+	}
+}
+static inline void hfsStatsRecordRingDoorbellFast(void) {
+	if (hfsStatsEnabledFast()) {
+		hfsStatsRecordRingDoorbell();
+	}
+}
+static inline void hfsStatsRecordRingReservationFast(void) {
+	if (hfsStatsEnabledFast()) {
+		hfsStatsRecordRingReservation();
+	}
+}
+static inline void hfsStatsRecordRingItemsFast(uint64_t count) {
+	if (hfsStatsEnabledFast()) {
+		hfsStatsRecordRingItems(count);
+	}
+}
+static inline void hfsStatsRecordLegacyDataSubmitFast(void) {
+	if (hfsStatsEnabledFast()) {
+		hfsStatsRecordLegacyDataSubmit();
 	}
 }
 static inline void hfsStatsRecordIoSubmitFast(void) {

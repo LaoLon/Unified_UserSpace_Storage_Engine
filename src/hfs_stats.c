@@ -69,6 +69,10 @@ _Atomic uint_fast64_t hfsStatsQueueCreditWaitNs[HFS_STATS_MAX_DATA_REACTORS];
 _Atomic uint_fast64_t hfsStatsQueueDepthPeak[HFS_STATS_MAX_DATA_REACTORS];
 _Atomic uint_fast64_t hfsStatsQueueDrainBatches[HFS_STATS_MAX_DATA_REACTORS];
 _Atomic uint_fast64_t hfsStatsQueueDrainItems[HFS_STATS_MAX_DATA_REACTORS];
+_Atomic uint_fast64_t hfsStatsRingDoorbells;
+_Atomic uint_fast64_t hfsStatsRingReservations;
+_Atomic uint_fast64_t hfsStatsRingItems;
+_Atomic uint_fast64_t hfsStatsLegacyDataSubmits;
 _Atomic uint_fast64_t hfsStatsTicketAdmits;
 _Atomic uint_fast64_t hfsStatsTicketReadies;
 _Atomic uint_fast64_t hfsStatsTicketCompletes;
@@ -453,6 +457,11 @@ static void hfsStatsReset(void) {
 		atomic_store_explicit(&hfsStatsQueueDrainItems[i], 0,
 			memory_order_relaxed);
 	}
+	atomic_store_explicit(&hfsStatsRingDoorbells, 0, memory_order_relaxed);
+	atomic_store_explicit(&hfsStatsRingReservations, 0, memory_order_relaxed);
+	atomic_store_explicit(&hfsStatsRingItems, 0, memory_order_relaxed);
+	atomic_store_explicit(&hfsStatsLegacyDataSubmits, 0,
+		memory_order_relaxed);
 	atomic_store_explicit(&hfsStatsTicketAdmits, 0, memory_order_relaxed);
 	atomic_store_explicit(&hfsStatsTicketReadies, 0, memory_order_relaxed);
 	atomic_store_explicit(&hfsStatsTicketCompletes, 0, memory_order_relaxed);
@@ -1061,6 +1070,40 @@ void hfsStatsRecordQueueDrain(uint32_t reactorId, uint64_t batchSize) {
 	atomic_fetch_add_explicit(&hfsStatsQueueDrainBatches[reactorId], 1,
 		memory_order_relaxed);
 	atomic_fetch_add_explicit(&hfsStatsQueueDrainItems[reactorId], batchSize,
+		memory_order_relaxed);
+}
+
+/* Record one actor doorbell edge rather than one notification per request. */
+void hfsStatsRecordRingDoorbell(void) {
+	if (!hfsStatsIsEnabled()) {
+		return;
+	}
+	atomic_fetch_add_explicit(&hfsStatsRingDoorbells, 1, memory_order_relaxed);
+}
+
+/* Record one successful fixed-ring reservation. */
+void hfsStatsRecordRingReservation(void) {
+	if (!hfsStatsIsEnabled()) {
+		return;
+	}
+	atomic_fetch_add_explicit(&hfsStatsRingReservations, 1,
+		memory_order_relaxed);
+}
+
+/* Record the number of operations consumed by one actor dispatch. */
+void hfsStatsRecordRingItems(uint64_t count) {
+	if (!hfsStatsIsEnabled()) {
+		return;
+	}
+	atomic_fetch_add_explicit(&hfsStatsRingItems, count, memory_order_relaxed);
+}
+
+/* Record a request that bypassed the actor ring through the legacy path. */
+void hfsStatsRecordLegacyDataSubmit(void) {
+	if (!hfsStatsIsEnabled()) {
+		return;
+	}
+	atomic_fetch_add_explicit(&hfsStatsLegacyDataSubmits, 1,
 		memory_order_relaxed);
 }
 
@@ -1708,6 +1751,14 @@ static void hfsStatsWriteSnapshot(void) {
 	HFS_STATS_APPEND("runtime_owner_ns=%"PRIu64"\n", total.runtimeOwnerNs);
 	HFS_STATS_APPEND("io_pipeline_peak=%"PRIu64"\n",
 		total.ioPipelinePeak);
+	HFS_STATS_APPEND("ring_doorbell=%"PRIuFAST64"\n",
+		atomic_load_explicit(&hfsStatsRingDoorbells, memory_order_relaxed));
+	HFS_STATS_APPEND("ring_reservation=%"PRIuFAST64"\n",
+		atomic_load_explicit(&hfsStatsRingReservations, memory_order_relaxed));
+	HFS_STATS_APPEND("ring_items=%"PRIuFAST64"\n",
+		atomic_load_explicit(&hfsStatsRingItems, memory_order_relaxed));
+	HFS_STATS_APPEND("legacy_data_submit=%"PRIuFAST64"\n",
+		atomic_load_explicit(&hfsStatsLegacyDataSubmits, memory_order_relaxed));
 	for (i = 0; i < HFS_STATS_MAX_DATA_REACTORS; i++) {
 		HFS_STATS_APPEND("data_reactor_%u_submit=%"PRIu64"\n", i,
 			atomic_load_explicit(&g_hfsStatsDataReactorSubmit[i],

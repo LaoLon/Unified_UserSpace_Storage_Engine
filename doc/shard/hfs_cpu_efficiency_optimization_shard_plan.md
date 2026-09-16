@@ -1,6 +1,6 @@
 # Shard-67：HFS 统一 I/O 执行架构重构计划
 
-> **状态**：67A operation lifetime 适配层已实现；67B～67G 待实施
+> **状态**：67A operation lifetime 与 67B data actor ring 已实现；67C～67G 待实施
 >
 > **日期**：2026-09-16
 >
@@ -174,6 +174,30 @@ data path 不再先经过 owner-side linked-list batch。每个 shard 由一个 
 **必须删除的热路径结构**：data linked-list batch、逐 item `batchLock`、逐 item queue/inflight 更新、data request 的 per-item SPDK message。
 
 **结构门禁**：submit 每 operation 最多一次 ring reservation；doorbell 按边沿发送；ring head/tail、credit、SPDK submit/complete 和 shutdown drain 守恒。
+
+#### 67B 实施记录（2026-09-16）
+
+已将 data ingress 从默认 linked-list batch 切换为 per-reactor fixed ring + SPDK actor：
+
+- `HFS_IO_EXECUTOR` 默认 `actor`，显式 `legacy` 保留旧 linked-list queue 回退；
+- producer 只在短 `ringLock` 临界区预约固定槽位，ring 满时先释放锁，再走已有 direct fallback；
+- actor 一次快照并连续消费多个槽位，backend credit 在 actor ring 内维护，completion 只做原子归还；
+- empty→non-empty 只发送一个 doorbell，满窗口时由 completion 边沿重新 arm，覆盖 shutdown drain；
+- 新增 `ring_doorbell`、`ring_reservation`、`ring_items`、`legacy_data_submit` 结构统计，默认 stats-off 不产生原子计数开销。
+
+验证脚本为 `E:\Code\test_script\run_shard67b_smoke.py`（脚本位于工作区外，不上传到 HFS 仓库），
+固定使用 VM 真实 NVMe 和自动 reactor 拓扑，未运行 reactor 数量矩阵：
+
+- VM `make -B app lib`：通过；
+- VM CMake Release（`build-cmake-shard67a`）：通过；
+- actor `POSIX CONTRACT`、`REQUEST-LOCAL FAST IO`：通过，`ring_reservation=46`、
+  `ring_items=46`、`ring_doorbell=46`、`spdk_submit=210`、`spdk_complete=210`；
+- `HFS_IO_EXECUTOR=legacy` 回退 `REQUEST-LOCAL FAST IO`：通过，
+  `legacy_data_submit=46`、`spdk_submit=210`、`spdk_complete=210`；
+- 测试结束 NVMe 已恢复内核 `nvme` 驱动，hugepages 保持 1024，无残留测试进程。
+
+本阶段只证明 actor/legacy 执行器的结构和正确性守恒，不输出吞吐或 CPU 提升结论；下一阶段进入
+67C inode dependency scheduler。
 
 ### 67C：inode dependency scheduler
 
