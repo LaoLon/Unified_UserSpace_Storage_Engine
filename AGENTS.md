@@ -2,11 +2,10 @@
 
 ## Codex && opencode 共用项目记忆
 
-- `doc/bug.md` 是当前 Bug 记录和已知限制的优先参考；发现或修复 Bug 时立即维护它。
+- `doc/bug.md` 是 HFS 2.0 当前 Bug 记录；HFS 1.x 的 Bug 历史已清理，HFS 2.0 的已知风险、停止条件和边界以 `doc/design/hfs2.0.md` §17 为准。
 - `doc/design/hfs2.0.md` 是 HFS 2.0 当前唯一的架构、边界、接口和实施计划事实源；实现、评审和验收必须以它为准。
 - `doc/review/hfs2.0_design_review_20260916.md` 是 HFS 2.0 的设计评审依据；发现设计冲突时先更新设计文档，再开始实现。
-- `doc/design/fio_baseline_notes.md` 和 `doc/performance/` 中的结果是历史性能对照数据，使用时必须标明对应版本、环境和测试口径，不能直接当作 HFS 2.0 已验收结论。
-- `doc/shard/`、`doc/项目总结.md` 以及旧 shard 提交属于 HFS 1.x 历史材料，不再是当前执行计划；不得据此恢复旧功能、旧目录结构、旧容量或旧 API，也不要把新的 shard 进度继续写回 `AGENTS.md`。
+- HFS 1.x 的旧设计、性能、review、shard、task 和 Bug 文档已从工作区清理；如需复盘只能查询 Git 历史，不得据此恢复旧功能、旧目录结构、旧容量或旧 API。
 - 需要了解当前进展时，先查看 `git log --stat` 和 `git status`，再以当前源码、测试脚本和最新文档为准。
 - SPDK 源码必须在 VM 内通过 `git clone`、`git fetch`、`git checkout` 和 `git -C spdk submodule update --init --recursive` 获取及维护；禁止从 Windows 工作区把 `spdk/` 源码目录或其子模块传到 VM 覆盖。Windows 到 VM 的同步仅限 HFS 自身源码、脚本和文档；若 VM 缺少 SPDK，应在 VM 内按锁定 commit 重新 clone/checkout。
 - HFS 2.0 的目标配置和正式验证入口使用 `.conf`，单盘 baseline 为 `config/hfs_nvme.conf`、`Nvme0n1`、PCI BDF `0000:0b:00.0`；现有 `config/*.json` 仅是旧 HFS 1.x 材料，Phase 0 前不得当作新架构输入。除非任务明确要求故障注入或对照实验，不使用 Malloc/Aio 替代正式口径；大体积测试结果默认写入 `/mnt/hfs-data`。
