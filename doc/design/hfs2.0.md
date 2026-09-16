@@ -321,6 +321,12 @@ engine 启动顺序：
 
 调用者线程不调用 `spdk_thread_poll`，不直接调用 bdev submit，不持有 SPDK channel。
 
+SPDK env 和 subsystem 是进程级一次性初始化：运行时单例在第一次 mount 时完成 env/
+subsystem 初始化并常驻，Engine 的 mount/stop 只在 EnvReady 与 Active 之间切换 descriptor、
+reactor 和 channel。配置中的 bdev 由内存生成的 `bdev_nvme_attach_controller` JSON 创建；
+调用 `spdk_subsystem_load_config` 前必须把 RPC 状态切到 `SPDK_RPC_RUNTIME`，否则 RUNTIME
+方法会被静默跳过。channel 释放经线程消息延迟执行，销毁 reactor 线程前必须 poll 排空。
+
 ### 6.2 Reactor 数量和 CPU
 
 ```text

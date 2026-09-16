@@ -14,7 +14,9 @@
 > 编号：延续 Git 历史（1.x 最后为 shard-67）；HFS 2.0 从 shard-68 开始，无兼容义务
 >
 > 进度：Shard-68 已完成（2026-09-16；Make/CMake、parser/生命周期/task 单测、
-> ASAN+UBSAN、hfsctl validate，VM 验证通过）
+> ASAN+UBSAN、hfsctl validate，VM 验证通过）；Shard-69 已完成（2026-09-16；SPDK env/
+> subsystem/reactor 所有权、R=2 自动拓扑、fork/双进程保护、doorbell、clean shutdown，
+> Make/CMake/CTest 4/4 通过）
 
 ---
 
@@ -37,6 +39,18 @@
   trace/stats off、HFS/raw ≥85%、CPU ≤500%（8 vCPU）、p99 ≤ raw×110%；
 - 故障注入和对照实验可用 Malloc/Aio，但不得据此得出正式结论；
 - 阶段顺序门禁：Phase 2/3 的结构与恢复门禁未过，不进入 Phase 4/5 的性能工作。
+
+VM 环境口径（2026-09-16 起）：
+
+- SPDK 构建树固定在 `/root/code/HFS_BASE_SPDK/spdk`（复用 HFS 1.x 的构建产物）；
+  HFS 2.0 源码同步到 `/root/code/hfs2`，VM 无 Git 凭据，使用 SFTP 增量同步；
+- NVMe `0000:0b:00.0` 绑定：`modprobe uio_pci_generic` →
+  `echo "<vendor> <device>" > /sys/bus/pci/drivers/uio_pci_generic/new_id` →
+  `echo <BDF> > /sys/bus/pci/drivers/uio_pci_generic/bind`；测试后必须 unbind 并
+  `echo <BDF> > /sys/bus/pci/drivers/nvme/bind` 恢复内核驱动；
+- 每轮 SPDK 测试前清理 `/var/run/dpdk` 与 `/run/dpdk`；
+- 构建：`make -j4 SPDK_ROOT_DIR=/root/code/HFS_BASE_SPDK/spdk`、
+  `cmake -S . -B build-cmake -DHFS_SPDK_ROOT=/root/code/HFS_BASE_SPDK/spdk`。
 
 ### 0.3 文档与变更
 
@@ -102,6 +116,11 @@
 **不做**：bdev 访问、任何持久化格式、coroutine 数据面。
 
 ### Shard-69：SPDK runtime 与 reactor 所有权
+
+> 状态：已完成（2026-09-16）。交付 `SpdkRuntime` 单例（env/subsystem 进程级初始化、
+> metadata + 2 个 data reactor、每 reactor×每 device channel、doorbell）、Engine fork
+> 保护与 mount/stop 集成；VM 上 Make/CMake/CTest 4/4 通过，`R=2`、channel 2→0、
+> fork child 返回 ForkedProcess、重启复用 env。
 
 **目标**：固定 engine 启动/停止模型和多 reactor 所有权。
 
