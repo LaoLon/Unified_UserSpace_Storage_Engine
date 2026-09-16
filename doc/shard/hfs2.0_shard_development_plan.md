@@ -1,0 +1,326 @@
+# HFS 2.0 Shard 开发计划（Phase 0-6）
+
+> 状态：HFS 2.0 当前执行计划，2026-09-16 起生效
+>
+> 事实源：`doc/design/hfs2.0.md`；评审依据：`doc/review/hfs2.0_design_review_20260916.md`
+>
+> 基线：clean-break 工作区（`src/` 为空；旧代码冻结在 `src_legacy_frozen/`；1.x 文档已清理）
+>
+> 目标：把 `hfs2.0.md` §18 的 Phase 0-6 拆成 shard-68 起的可独立验收单元
+>
+> 不包含：1.x 兼容（POSIX/preload/fd/Blobstore/旧 ABI）、MySQL/InnoDB、多进程/daemon、
+> 通用 mmap、数据面 RAID/复制
+>
+> 编号：延续 Git 历史（1.x 最后为 shard-67）；HFS 2.0 从 shard-68 开始，无兼容义务
+
+---
+
+## 0. 全局规则
+
+### 0.1 每个 shard 的完成定义
+
+1. `make` 与 CMake 均可构建；C++20 target；不引用 `src_legacy_frozen/`；
+2. 新增路径有单测或结构测试，生命周期和资源守恒测试通过；
+3. VM 真实 NVMe（`Nvme0n1`、PCI BDF `0000:0b:00.0`）上按 `.conf` 短回归通过；
+4. `spdk_submit == spdk_complete`、errors=0、无 frame/lease/ring/parent 泄漏；
+5. trace/stats off 不引入 per-request 分配；本 shard 新路径按 §16.5 补齐 tracepoint；
+6. 结构或恢复门禁失败时不得用性能数字掩盖，按 §17.3 停止并回到修复。
+
+### 0.2 固定口径
+
+- 正式功能/性能使用真实 NVMe + `.conf`（单盘 baseline `config/hfs_nvme.conf`），
+  设备 set 不允许用临时环境变量追加；
+- 性能门禁固定 §16.2：4K shared-file randrw 50/50、32 jobs、10 s、5-run median、
+  trace/stats off、HFS/raw ≥85%、CPU ≤500%（8 vCPU）、p99 ≤ raw×110%；
+- 故障注入和对照实验可用 Malloc/Aio，但不得据此得出正式结论；
+- 阶段顺序门禁：Phase 2/3 的结构与恢复门禁未过，不进入 Phase 4/5 的性能工作。
+
+### 0.3 文档与变更
+
+- 设计冲突先更新 `hfs2.0.md`，再开始实现；评审文件只作历史依据；
+- shard 进度只写本文件，不写回 `AGENTS.md`；
+- 每个 shard/sub-shard 只推进一个主要机制，必须可回滚（`.conf` key 或提交回退）；
+  打包多个机制时必须拆成 sub-shard 并分别验收；
+- 每个 shard 可派生 `doc/task/` 任务文档，结果写 `doc/task_result/`（按 AGENTS.md 规则）；
+- 新 Bug 立即记入 `doc/bug.md`。
+
+---
+
+## 1. Shard 总览
+
+| Shard | Phase | 内容 | 规模 | 依赖 | 出口门禁 |
+|---|---|---|---|---|---|
+| 68 | 0 | 工程骨架、`.conf` parser、空壳 ABI、hfsctl/stats/trace 骨架 | M | - | 双构建 + parser 单测 + 空 engine 生命周期 |
+| 69 | 0 | SPDK env、owner/metadata/data reactor、channel 所有权、进程锁 | M | 68 | 8 vCPU 拓扑、clean shutdown、双进程 Busy |
+| 70 | 1 | bdev set、superblock A/B（含 replica 格式字段）、geometry、format | M | 69 | 单/双盘 format→mount→轮换、旧 magic 拒绝、副本字段落盘 |
+| 71 | 1 | journal ring、checkpoint A/B、通用 replay 机制、多副本协议冻结 | L | 70 | torn record、journal full、模拟状态机守恒 |
+| 72 | 1 | hfsctl format/check/dump、多盘校验 | S | 71 | 工具输出、CRC/geometry 不一致 fail closed |
+| 73 | 2 | Task/frame pool、Operation、MPSC ring、doorbell | M | 69 | ASAN/TSAN、Busy 背压、drain 闭合 |
+| 74 | 2 | 唯一 inode dependency scheduler | M | 73 | 依赖场景单测 + 重叠写回归 |
+| 75 | 2 | 75A planner/parent；75B DMA arena + read/write（synthetic extent map） | L | 73/74 | 合成 fixture 数据正确、direct/bounce 计数、不构成完整文件验收 |
+| 76 | 3 | namespace、inode/目录索引、文件 API（不含 allocate） | L | 73/74 | 命名语义回归、handle generation、大目录 |
+| 77 | 3 | allocator + allocate/truncate + 真实 extent map 集成 | M | 75/76 | 分配守恒、ENOSPC、真实文件端到端读写、placement |
+| 78 | 3 | epoch、datasync/sync、group commit | L | 77 | write→sync→kill 已提交不丢、结构守恒 |
+| 79 | 3 | crash replay、fault injection、ext4 对照、多副本执行 | L | 78 | §16.4 五个断点 + 守恒 + fail closed |
+| 80 | 4 | 80A FIO engine 骨架；80B 功能矩阵 + verify | M | 77 | 矩阵正确、iomem all-or-nothing |
+| 81 | 4 | FIO 性能门禁 | M | 80 | §16.2 主 gate ≥85% |
+| 82 | 5 | RocksDB FileSystem 基础接口（buffered 过渡） | M | 78 | buffered 基础负载可跑、不宣告 direct |
+| 83 | 5 | direct 契约 + PrepareWrite/Allocate + ReadAsync/AbortIO | L | 82 | direct 下重跑基础负载、SST/WAL/flush/compact |
+| 84 | 5 | hfs_db_bench/hfs_ldb、RocksDB 恢复验收 | M | 83 | §16.3 + SIGKILL + checkconsistency |
+| 85 | 6 | 多盘完整矩阵、性能基线、支持边界与归档 | M | 81/84 | 多盘门禁 + 文档收口 |
+
+---
+
+## 2. Phase 0：新工程与 ABI
+
+### Shard-68：工程骨架、`.conf` 与 ABI
+
+**目标**：建立 C++20 编译和生命周期骨架，冻结配置与 ABI 入口。
+
+**交付物**
+
+- `src/` 新目录：`core/ runtime/ config/ io/ metadata/ storage/ common/`，
+  `include/hfs/{core,task,types,config}.hpp`；
+- Make/CMake：删除旧 `.c` source list，C++20 target，`libhfs_core.so`
+  （visibility hidden + `HFS_API`，`HFS_CORE_ABI_MAJOR=2`）；
+- `.conf` parser：`[hfs]/[spdk]/[storage]/[device.*]/[runtime]/[limits]/[metadata]/[observability]`；
+  未知 key、重复 device、缺 required device、schema 不符拒绝启动；
+- 空壳 `Engine/Client/Task/Result`：process lock、hugepage preflight、版本检查；
+- `hfsctl --config` 骨架；`common/stats`、`common/trace` 骨架（off 零开销）。
+
+**验收**：Make/CMake 均通过；parser 单测覆盖合法/未知 key/重复 device/schema 不符；
+空 engine `create → mount → stop`；trace off 无 per-request 分配；不链接旧源。
+
+**不做**：bdev 访问、任何持久化格式、coroutine 数据面。
+
+### Shard-69：SPDK runtime 与 reactor 所有权
+
+**目标**：固定 engine 启动/停止模型和多 reactor 所有权。
+
+**交付物**
+
+- `spdk_env_init`（用 `[spdk]` + `[device.*] pci_bdf` 构造 allowlist）；
+- owner jthread 打开全部 bdev descriptor；1 个 metadata reactor + R 个 data reactor
+  （`std::jthread` + `spdk_thread_poll`），每 reactor 对每 device 持有自己的
+  `spdk_io_channel`；
+- doorbell/`spdk_thread_send_msg` 规则；shutdown 顺序（关 ingress → drain callback →
+  flush metadata → 销毁 channel → join）；
+- fork child 全部 API 返回 `ForkedProcess`；第二进程/相同 bdev 返回 Busy。
+
+**验收**：8 vCPU 自动 R=2；channel 在绑定线程创建/销毁；clean shutdown；hugepages=1024
+下 preflight 通过；双进程测试 Busy。
+
+---
+
+## 3. Phase 1：raw bdev 与磁盘格式
+
+### Shard-70：bdev set、superblock 与 format
+
+**交付物**：逐盘 geometry/UUID/最小容量校验；`Hfs2Superblock` A/B（magic、版本、
+device_id、volume uuid、replica id、`metadata_replica_count` feature flag、generation、
+ranges、clean flag、CRC）；`hfsctl format --yes`；拒绝旧 Blobstore/1.x magic。
+
+**验收**：单盘和双盘 device set `format → mount → 正常读写块`；A/B 轮换写序
+（写非当前副本 → flush → 发布 generation）；容量不足/设备缺失拒绝 mount；replica
+字段在单盘 format 中已经落盘且可校验（多副本执行在 Shard-79，格式不再变更）。
+
+### Shard-71：journal ring、checkpoint 与通用 replay 机制
+
+**交付物**：`BEGIN/RECORD/COMMIT + CRC` 事务格式；record 类型枚举定义（§9.3，语义实现
+随后续 shard 落地）；50% 触发、80% 强制同步 checkpoint；checkpoint 写 inactive slot →
+flush → superblock publish → 推进 journal tail；replay 只接受完整事务；torn/未知/超长
+record 丢弃并记录 corruption evidence；**多副本协议格式冻结**：journal header 带
+replica set/generation，commit marker 语义为全部 required replica，superblock 记录
+replica id 与 `metadata_replica_count`（单盘也必须写这些字段，后续不再改格式）。
+
+**验收**：注入 torn record/journal full/checkpoint 中断；用 **test-only 模拟状态机**
+验证 replay 幂等、generation/CRC 守恒；`hfsctl check` 可定位损坏。真实
+CREATE/ALLOC/FREE/RESERVE 记录语义与 namespace/size/bitmap 守恒验收推迟到
+Shard-76/77/79。
+
+### Shard-72：hfsctl 与 device set 工具
+
+**交付物**：`format/check/dump`（`import` 骨架）；逐盘 geometry/UUID/CRC 检查；
+设备缺失、重复 bdev、volume UUID 不一致时拒绝 mount；设备故障返回可定位 `IoError`。
+
+**验收**：单盘/双盘工具输出正确；人为 CRC/geometry 不一致时 check 报错且 mount
+fail closed；不静默迁移到未声明设备。
+
+---
+
+## 4. Phase 2：coroutine 数据面
+
+### Shard-73：Task、Operation、ring 与 doorbell
+
+**交付物**：`Task/Result`（无异常）、coroutine frame pool、`OperationRef` 侵入式生命
+周期、per-shard MPSC ring、doorbell 去重、actor 批量消费、ring 满返回 Busy；
+tracepoints：`FE_SUBMIT/FE_REAP/CQ_PUSH/CQ_REAP/RING_*/ACTOR_BATCH`。
+
+**验收**：ASAN/TSAN 结构测试（无 UAF/double resume/orphan frame）；ring 满 Busy 且不
+丢请求；shutdown 后 ring/frame/operation 全部闭合；trace off 无 per-request 分配。
+
+### Shard-74：唯一 inode dependency scheduler
+
+**交付物**：intrusive interval tree + `max_end`；read/read 并行；重叠写、RMW、append、
+truncate、gap-zero、size barrier、durability epoch 统一依赖；`hash(file_id) % R` 文件
+到 shard 固定映射；tracepoints：`SCHED_WAIT/SCHED_ADMIT/SCHED_DONE`。
+
+**验收**：确定的依赖场景单测（重叠/相邻/跨越）；真实 NVMe 32 线程重叠写与短读回滚；
+dependency waits/pending peak 统计可与操作计数对上。
+
+### Shard-75：数据面（75A planner/parent，75B DMA/read-write）
+
+**75A 交付物**：parent/child 规划（child ≤1 MiB、不跨设备）；head/tail RMW；parent
+completion（first error、completed bytes、wake-all）；tracepoints：
+`EXTENT_PLAN/PARENT_COMPLETE`。
+
+**75B 交付物**：shared DMA arena（4K/16K/64K/1M、cap + backpressure）；direct
+（`spdk_vtophys` 校验）与 bounce 双路径；每 device channel 提交；read/write/append；
+tracepoints：`DMA_*/BDEV_*/COPY_*`。
+
+**验收**：使用 **test-only synthetic extent map / 预分配物理 extent fixture** 验证
+planner 拆分、RMW、parent 聚合和 direct/bounce 数据正确（含非对齐、跨 extent、稀疏读
+零）；direct/bounce 比例与 copy bytes 可见；`spdk_submit == spdk_complete`。**本 shard
+不构成完整文件验收**；真实 extent map 上的端到端读写与单/双盘 placement 验收在
+Shard-77。
+
+---
+
+## 5. Phase 3：namespace、allocator 与 durability
+
+### Shard-76：namespace 与文件 API 骨架
+
+**交付物**：inode/目录/name hash/ordered cursor；`open/remove/rename`（`allocate`/
+`truncate` 的空间语义在 Shard-77 落地）；handle generation；mtime/ctime；`GetChildren`
+不扫全表；`max_inodes`/`max_namespace_bytes` 限流；常驻内存元数据模型（§13.3）的
+namespace/inode 部分。
+
+**验收**：create/open/rename/delete/overwrite 语义回归；旧 handle 不解析到新 inode；
+rename 是单事务且无中间态；超限返回 NoMemory；RocksDB 风格文件创建/rename 压测。
+依赖 Shard-73/74，不依赖数据面 Shard-75。
+
+### Shard-77：allocator 与真实 extent map 集成
+
+**交付物**：two-level bitmap + free-run index；`FREE → RESERVED → INITIALIZED →
+COMMITTED`；单次 ≤64 extent 预分配；`File::allocate/truncate` 空间语义；NoSpace 判定；
+RESERVED replay 回收；释放异步回收；allocator bitmap 只随 checkpoint 写入；真实
+extent map snapshot 接入数据面（替换 Shard-75 的 synthetic fixture）。
+
+**验收**：分配/回收长期守恒；非 COMMITTED extent 不可见；ENOSPC 前后文件与 bitmap
+一致；**真实预分配文件上的 read/write/append 端到端正确**（非对齐、跨 extent、稀疏
+读零、覆盖写）；单盘与双盘 placement（capacity_weighted/round_robin）child 不跨设备；
+ALLOC/FREE/RESERVE 记录语义与主状态机联合回放通过。
+
+### Shard-78：epoch、sync 与 group commit
+
+**交付物**：`logical_size/durable_size` + metadata epoch；datasync 顺序
+（data drain → device flush → metadata tx → journal flush → 需要时 checkpoint/superblock
+→ publish durable epoch）；sync 额外提交时间戳/namespace/directory；group commit；
+checkpoint 不得成为每次 sync 的固定步骤（避免破坏 group commit 和写放大）；
+tracepoints：`META_TX_*/JOURNAL_*/CHKPT_*/FSYNC_*/EPOCH_PUBLISH`。
+
+**验收**：write→sync→SIGKILL 后已提交数据可见；未达到 durable epoch 的事务不得被声明
+为已提交，崩溃后 namespace/extent/size 结构守恒（原地覆盖不承诺崩溃后是旧值还是新值）；
+metadata 不指向未 durable 数据；journal bytes/op 与 group commit 批量可报告；目录
+rename 后 Fsync 语义正确。
+
+### Shard-79：crash replay、fault injection 与多盘 fail-closed
+
+**交付物**：§16.4 五个崩溃断点注入；orphan reclaim；内存 after-image 失败回滚；
+`hfsctl check` 取证；ext4 同 workload 语义对照；**多副本执行**：按 Shard-70/71 冻结的
+格式实现全副本 commit、最小已提交 txid 回滚、CRC/缺失 fail closed。
+
+**验收**：每个断点后 namespace/extent state/size/CRC 守恒并可正常 mount；损坏时
+fail closed 且现场保留；多盘掉一块 metadata device 拒绝 mount，不降级、不静默迁移。
+
+---
+
+## 6. Phase 4：FIO frontend
+
+### Shard-80：FIO external engine（80A 骨架，80B 功能矩阵）
+
+**80A 交付物**：`fio-hfs.so`（`extern "C"` 注册）；options（`hfs_config/hfs_direct/
+hfs_preallocate/hfs_client_depth`）；`open_file` 完成 create/open/allocate +
+`FIO_NOEXTEND`；`queue/getevents/event`；`queue()` 三态返回（`FIO_Q_QUEUED` /
+`FIO_Q_BUSY` / `FIO_Q_COMPLETED` + `io_u->error`）；`iomem_alloc/iomem_free` 为
+all-or-nothing：整块 arena DMA `orig_buffer` 成功，否则 FIO 初始化失败并明确报错；
+启动按 bs×iodepth×jobs 预检 arena 容量，不做半量 fallback。
+
+**80B 交付物**：完整功能矩阵跑法与 `fio --verify`。
+
+**验收**：iodepth 1/8/32/64/128 × numjobs 1/2/4/8 × read/write/randread/randwrite/
+randrw × 4K/16K/64K/1M 全部正确；`fio --verify` 通过；iomem 生效时 direct ratio ≈100%；
+arena 不足时初始化失败信息可定位；errors=0、submit/complete 闭合。
+
+### Shard-81：FIO 性能门禁
+
+**交付物**：raw comparator（同设备 SPDK bdevperf 或官方 fio SPDK plugin，同 bs/QD/jobs）；
+5-run median 报告（HFS/raw、p50/p99、CPU%、RSS、copy bytes、bounce ratio、journal
+bytes/op）。
+
+**验收**：§16.2 主 gate：4K shared-file randrw HFS/raw ≥85%、CPU ≤500%、errors=0、
+p99 ≤ raw×110%。不达标时停在上游结构修复，不扩大 reactor/arena 掩盖。
+
+---
+
+## 7. Phase 5：RocksDB frontend
+
+### Shard-82：RocksDB FileSystem 基础接口（buffered 过渡契约）
+
+**交付物**：`libhfs_rocksdb.so`；`HfsFileSystem/HfsRandomAccessFile/HfsWritableFile/
+HfsSequentialFile/HfsDirectory`；New/Get/Delete/Rename/Link/Lock/Directory/
+`GetFileModificationTime`/`GetFreeSpace`；`NewCompositeEnv` 注入；本 shard 明确
+`use_direct_io()==false`（buffered 过渡契约，不宣告 direct IO 支持）；`hfs_db_bench`
+骨架。
+
+**验收**：hfs_db_bench 注入 HFS Env 后 buffered 模式 fillseq/readrandom/overwrite/
+readwhilewriting 基础运行；WAL、MANIFEST 能创建/rename/同步；stock `db_bench` 结果
+不作为证据；不得宣称 direct IO 或性能结论。
+
+### Shard-83：async read、direct IO 与 preallocation
+
+**交付物**：切换到 `use_direct_io()==true` 并**同时**落地 `PrepareWrite/Allocate/
+PositionedAppend`（三者必须一起启用）；`ReadAsync/Poll/AbortIO`（FSReadRequest/
+io_handle 生命周期、`IOHandleDeleter`）；`MultiRead`；`RangeSync`；
+`Fsync/FsyncWithDirOptions`；错误映射（`Busy` 而非不存在的 `TryAgain`，Phase 5 验证
+RocksDB 8.9.1 对 Busy 的处置）。
+
+**验收**：direct 契约下重跑 Shard-82 的 buffered 基础负载；SST 并发读、WAL sync、
+flush/compact 正确；async 路径不回退成每请求同步；preallocation hint 生效且不产生
+RMW 放大；`AbortIO` 遵守 cancel boundary。
+
+### Shard-84：RocksDB 验收与恢复
+
+**交付物**：`hfs_db_bench`/`hfs_ldb` 完整参数；SIGKILL recovery、跨进程顺序 reopen、
+`checkconsistency`。
+
+**验收**：§16.3 全项覆盖（create/write/close/reopen、SST read、WAL sync、
+flush/compact、rename/delete、normal restart、SIGKILL、跨进程 reopen、
+checkconsistency）；错误/超时/取消映射完整。
+
+---
+
+## 8. Phase 6：收口
+
+### Shard-85：多盘完整矩阵、性能基线与归档
+
+**交付物**：
+
+- 单盘/双盘/配置全 data device 三种 device set 的功能与性能矩阵；
+- metadata replica 故障组合（掉盘、CRC 不一致、generation 落后）fail-closed 验证；
+- 正式性能基线（与 FIO/raw 同口径）写入支持边界文档；
+- `hfs2.0.md` 状态更新、支持边界与迁移说明；`src_legacy_frozen/` 归档策略确认。
+
+**验收**：多盘矩阵全部通过且每次记录 device set/placement/每盘 submit/complete；
+支持边界明确；无 1.x 代码、镜像、API 回流；HFS 2.0 才可作为正式产品线。
+
+---
+
+## 9. 风险与停止条件
+
+- 结构/恢复门禁优先于性能：出现 §17.3 任一情况立即停止性能工作（数据错误、
+  metadata corruption、资源泄漏/double resume、submit≠complete、errno 丢失、错误映射
+  不完整）。
+- 设计冲突先改 `hfs2.0.md`；实现中的临时决定必须回写设计文档或显式记录为待办。
+- 主要风险见 `hfs2.0.md` §17.2：metadata actor 瓶颈、frame 膨胀、direct IO 对齐、
+  hugepage 预算、背压、恢复错误、旧功能回流。

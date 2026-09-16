@@ -733,9 +733,13 @@ engine 直接调用 C++ `Engine/Client/File`，不通过 POSIX open/read/write�
 ### 12.2 FIO lifecycle
 
 - `queue()` 产生 coroutine operation，保存 `io_u` 引用直到 completion；
-- `iomem_alloc/iomem_free` 从 shared arena 提供整块 DMA `orig_buffer`；arena 无法容纳时
-  回退到 ≤1 MiB child bounce，并把 copy 计入统计；
-- bounded ring/operation/DMA 满时返回 `FIO_Q_BUSY`，不丢请求；
+- `iomem_alloc/iomem_free` 从 shared arena 提供整块 DMA `orig_buffer`，是 all-or-nothing
+  契约：engine 按 bs×iodepth×jobs 预检 arena 容量，无法完整提供时 FIO 初始化失败并明确
+  报错，不做半量 fallback；不使用 `iomem_alloc` 的普通 FIO buffer 按 ≤1 MiB child bounce
+  并计入 copy 统计；
+- `queue()` 三态返回：成功 `FIO_Q_QUEUED`、临时资源不足 `FIO_Q_BUSY`、参数或永久错误
+  `FIO_Q_COMPLETED` + `io_u->error`；bounded ring/operation/DMA 满时返回 `FIO_Q_BUSY`，
+  不丢请求；
 - `getevents(min,max,timeout)` 调用 `client.poll`，满足 FIO min/max 语义；
 - `event()` 写回 `io_u->error`、`resid` 和完成字节；
 - `FIO_NOEXTEND`、`fio --verify`、direct/bounce、iodepth 必须在测试中覆盖；
@@ -939,6 +943,8 @@ checkpoint_force_percent = 80
 
 [observability]
 trace = false
+trace_sample = 1
+trace_dir = /mnt/hfs-data
 stats = false
 ```
 
@@ -1056,6 +1062,110 @@ normal restart、SIGKILL recovery、跨进程顺序 reopen 和 checkconsistency�
 每个断点检查 namespace、extent bitmap/state、logical/durable size、orphan reclaim、
 generation、CRC 和 RocksDB reopen。ext4 上运行同一逻辑 workload 对照语义，不把 ext4
 性能当作 HFS 目标。
+
+### 16.5 Tracepoint 和性能归因设计
+
+trace 的目标是把“总吞吐上不去”分解到具体层级，避免再次出现“只知道掉了 40%，不知道
+时间花在 ring、scheduler、DMA 还是设备”。tracepoint 必须覆盖 frontend → client →
+ring → actor → scheduler → DMA → planner → bdev → completion → frontend 的完整链路。
+
+设计原则：
+
+- 默认 off；off 时热路径只读 per-reactor 的 cached bool，不做 per-event atomic/RMW、
+  不分配、不取锁；开启/关闭只在 control phase 切换；
+- 每个 event 写定长二进制 record，只含标量，不做格式化和字符串/指针编码；
+  格式化与聚合全部离线完成；
+- 每个 reactor/client 有独立 SPSC trace ring + 后台 writer；ring 满或 writer 落后时
+  计数 `trace_dropped` 并丢弃，绝不阻塞 I/O；
+- `trace_sample=N` 只作用于高频点（submit/complete/copy），低频点（journal/checkpoint/
+  flush/mount/recovery）必须全量；
+- trace 不得改变 I/O 顺序、资源生命周期或 `spdk_submit == spdk_complete`；trace 数据
+  不参与恢复；
+- event id 稳定，只增不改；record 带 `format_version` 和 TSC，TSC 使用同 CPU invariant
+  rdtsc，并在 session 开始写 wall-clock 校准点；
+- 正式性能数字必须 trace off；归因跑使用采样或短时全量。
+
+record（示意）：
+
+```cpp
+struct TraceRecord {
+    std::uint16_t event_id;
+    std::uint16_t format_version;
+    std::uint32_t shard;      // reactor/client id
+    std::uint64_t tsc;
+    std::uint64_t arg0;       // offset / bytes / request id ...
+    std::uint64_t arg1;
+    std::uint64_t arg2;
+    std::uint64_t arg3;       // status / errno / device id ...
+}; // 48 B
+```
+
+点位清单（按链路顺序）：
+
+| 层 | tracepoint | 记录内容 | 归因用途 |
+|---|---|---|---|
+| frontend | `FE_SUBMIT` / `FE_REAP` | file_id, op, offset, len, client | 入口吞吐、大小分布、调用方 |
+| client | `CQ_PUSH` / `CQ_REAP` | req_id, status | 完成到 reaper 的等待 |
+| ring | `RING_RESERVE` / `RING_DOORBELL` / `RING_BUSY` | slot, items, depth | 入队背压和唤醒批量 |
+| actor | `ACTOR_BATCH` | shard, dequeue 数量 | actor 消费批量和空转 |
+| scheduler | `SCHED_WAIT` / `SCHED_ADMIT` / `SCHED_DONE` | inode, range, kind, wait_tsc | 依赖等待、重叠冲突 |
+| DMA | `DMA_ACQUIRE` / `DMA_BUSY` / `DMA_RELEASE` | class, wait_tsc, arena_bytes | arena 容量与等待 |
+| planner | `EXTENT_PLAN` | children, direct/bounce, device_id | extent 拆分与 RMW 成本 |
+| bdev | `BDEV_SUBMIT` / `BDEV_COMPLETE` | device_id, len, status | 设备延迟与 QD |
+| parent | `PARENT_COMPLETE` | pending, first_error | child 聚合与错误传播 |
+| copy | `COPY_IN` / `COPY_OUT` | bytes, tsc | bounce 成本与比例 |
+| metadata | `META_TX_BEGIN` / `META_TX_COMMIT` / `JOURNAL_APPEND` / `JOURNAL_FLUSH` | tx 项数, bytes | metadata actor 吞吐与写放大 |
+| checkpoint | `CHKPT_BEGIN` / `CHKPT_END` / `CHKPT_BYTES` | generation, bytes | checkpoint 长尾停顿 |
+| durability | `FSYNC_BEGIN` / `FSYNC_END` / `EPOCH_PUBLISH` | file_id, epoch | sync 分段耗时 |
+| recovery | `RECOVERY_BEGIN` / `RECOVERY_END` | checkpoint generation, replay tx | mount 时间分解 |
+| error | `BACKEND_ERR` / `RETRY` / `BUSY_REJECT` / `TRACE_DROP` | errno, retry count | 失败与背压分布 |
+
+关键延迟链（每段独立统计 p50/p99，不允许只报总数）：
+
+```text
+T0 FE_SUBMIT → T1 RING_RESERVE → T2 ACTOR_BATCH → T3 SCHED_ADMIT
+→ T4 DMA_ACQUIRE → T5 BDEV_SUBMIT → T6 BDEV_COMPLETE → T7 PARENT_COMPLETE
+→ T8 CQ_REAP
+```
+
+派生指标：
+
+```text
+enqueue     = T1 - T0      // frontend 提交到 ring
+actor_queue = T2 - T1      // ring 等待
+sched_wait  = T3 - T2      // inode 依赖等待
+dma_wait    = T4 - T3      // arena lease 等待
+submit      = T5 - T4      // planner + bdev submit
+device      = T6 - T5      // SPDK/NVMe 延迟
+complete    = T7 - T6      // parent 聚合
+reap        = T8 - T7      // 完成到 frontend 消费
+```
+
+常驻计数（stats，trace off 也可报告）：
+
+- per-shard：outstanding、ring high watermark、actor busy/idle、busy reject；
+- per-device：submit/complete/QD/延迟、errno；
+- scheduler：active、dependency waits、pending peak；
+- DMA：arena bytes/high watermark、per-class acquire、busy；
+- metadata：tx/op、journal bytes/op、checkpoint bytes/时间、group commit 批量；
+- frontend：ReadAsync/Poll/AbortIO、FIO busy、copy bytes、bounce/direct ratio；
+- error：backend errno 分布、retry、`trace_dropped`。
+
+输出与工具：
+
+- session 目录含 `manifest.json`（build id、config、device set、runtime stats）和
+  `trace-<shard>.bin`；默认写 `trace_dir`，正式 VM 为 `/mnt/hfs-data`；
+- 离线工具解析 record、合并多 shard 时间线，输出每段延迟直方图和 per-request 分段，
+  不在线格式化；
+- 固定归因流程：`stats` 先定位层级 → `trace_sample` 拉取分段分布 → 结构修复 →
+  trace off 重跑正式门禁。
+
+门禁：
+
+- trace off 时无 per-request allocation、无 per-event atomic，`trace_enabled` 分支可被
+  branch predictor 稳定预测；
+- trace on 时不改变 `spdk_submit == spdk_complete`，不引入 UAF/double resume；
+- 采样运行必须检查 `trace_dropped`；全量短跑要求 `trace_dropped == 0`。
 
 ## 17. 非功能目标、风险和停止条件
 
