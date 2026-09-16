@@ -275,6 +275,24 @@ Shard-77。
 
 ### Shard-76：namespace 与文件 API 骨架
 
+> 状态：已完成（2026-09-17）。交付 `src/metadata/` 常驻 namespace（`Namespace`：
+> inode 表 + free-slot 复用 + generation、目录 hash/ordered 双索引、绝对路径解析、
+> create/open/remove/rename/setTimes/getChildren、`max_inodes`/`max_namespace_bytes`
+> 限流、unlink-while-open orphan 生命周期、可注入时钟）；公共 `include/hfs/file.hpp`
+> （`OpenFlags`/`FileHandle`/`FileStat`/`DirectoryEntry`/`DirectoryPage`、`File` 骨架）
+> 与 `Client::open/remove/rename/getChildren`（`ClientOptions::maxOpenFiles`、
+> Directory/Exclusive/Truncate 语义、关闭后拒绝路径操作）；设计文档 §13.1 草案同步
+> 增补这些类型与 §13.2 路径规则；`Engine::mount` 建立 namespace，`Engine::stop` 在
+> 仍有 client/open file 时返回 Busy（`MetadataLease` 计数，§14.3）。验收：
+> `namespace_test` 覆盖路径/类型检查、rename 原子替换与目录环检测、分页游标、限流
+> NoMemory、orphan + generation 复用、double-close、并发创建者+目录读者、RocksDB
+> 风格 1000 文件 create/rename/remove churn（ASAN+TSAN 干净）；`file_api_test` 在
+> 真实 `Nvme0n1` 上覆盖公共 API 语义与 handle generation、open-file 上限、Busy 停止
+> 契约。CTest 15/15。**尚未持久化**：namespace 是 mount 时重建的内存状态，
+> CREATE/LINK/UNLINK/RENAME/SET_TIMES 记录与 checkpoint snapshot 随 metadata
+> transaction path（Shard-78/79）接入；`File` 数据操作按计划返回 NotSupported，
+> 直到 Shard-77/78。
+
 **交付物**：inode/目录/name hash/ordered cursor；`open/remove/rename`（`allocate`/
 `truncate` 的空间语义在 Shard-77 落地）；handle generation；mtime/ctime；`GetChildren`
 不扫全表；`max_inodes`/`max_namespace_bytes` 限流；常驻内存元数据模型（§13.3）的

@@ -788,15 +788,54 @@ public:
     Task<Result<void>> stop();
 };
 
+struct ClientOptions {
+    std::uint32_t maxOpenFiles = 0; /* 0 = only the namespace limit applies */
+};
+
+enum class OpenFlags : std::uint32_t {
+    None      = 0,
+    Create    = 1U << 0, /* create when missing */
+    Exclusive = 1U << 1, /* AlreadyExists when present */
+    Directory = 1U << 2,
+    Truncate  = 1U << 3, /* reset logical size when present */
+};
+
+struct DirectoryEntry {
+    std::string name;
+    std::uint64_t inodeId = 0;
+    std::uint32_t generation = 0;
+    bool directory = false;
+};
+
+struct DirectoryPage {
+    std::vector<DirectoryEntry> entries;
+    std::string nextCursor; /* empty when iteration is complete */
+};
+
+struct FileStat {
+    std::uint64_t inodeId = 0;
+    std::uint32_t generation = 0;
+    bool directory = false;
+    std::uint64_t logicalSize = 0;
+    std::uint64_t mtimeNs = 0;
+    std::uint64_t ctimeNs = 0;
+};
+
 class Client {
 public:
     static Result<std::shared_ptr<Client>> create(Engine& engine,
-                                                  const ClientOptions&);
+                                                  const ClientOptions& = {});
     Task<Result<void>> close();
     Task<Result<std::shared_ptr<File>>> open(std::string_view path,
-                                             OpenFlags flags);
+                                             OpenFlags flags = OpenFlags::None);
     Task<Result<void>> remove(std::string_view path);
     Task<Result<void>> rename(std::string_view from, std::string_view to);
+    /* Bounded directory iteration: ordered by name, cursor is the last name of
+     * the previous page (empty = start); GetChildren never scans other
+     * directories. */
+    Task<Result<DirectoryPage>> getChildren(std::string_view path,
+                                            std::string_view cursor,
+                                            std::size_t maxEntries);
     PollResult poll(std::span<CompletionEvent>, std::size_t min,
                     std::size_t max, std::chrono::microseconds timeout);
 };
@@ -813,6 +852,7 @@ public:
     Task<Result<void>> truncate(std::uint64_t size);
     Task<Result<void>> datasync();
     Task<Result<void>> sync();
+    Result<FileStat> stat() const noexcept;
 };
 
 } // namespace hfs
@@ -824,6 +864,8 @@ public:
 
 ### 13.2 Namespace 规则
 
+- path 是绝对路径，按 `/` 分段；v1 不解析 `.`/`..`，不支持符号链接/硬链接
+  （`link count` 仅用于 unlink/orphan 生命周期）；
 - inode id 单调分配，handle 带 generation，旧 handle 不能解析到新 inode；
 - directory entry 由 name hash 查找、ordered cursor 遍历；
 - rename 是单一 journal transaction，源/目标不产生中间可见状态；

@@ -23,6 +23,7 @@ Bug 等级：**致命 > 严重 > 一般**。
 - 12：已修复（Shard-74，pending barrier 误挡更早提交的节点）。
 - 13：已修复（Shard-75，extent 物理偏移单位不一致导致重复叠加）。
 - 14：已修复（Shard-75，DmaArena 释放不回收预算且析构泄漏缓存块）。
+- 15：已修复（Shard-76，Engine::stop 在打开 File 时销毁 namespace 导致悬空自锁死）。
 
 ## Bug 记录
 
@@ -179,6 +180,17 @@ Bug 等级：**致命 > 严重 > 一般**。
 - **根因**：`bytes_` 统计语义未定义（在途用量还是保留预算），且缺少资源析构。
 - **修复**：明确 `bytes_` 为 arena 保留预算（背压 cap 的作用对象），`release()` 不回减；新增析构函数通过 `deallocator` 释放全部缓存块。
 - **验证结果**：测试改为 retained 语义断言后通过；ASAN 无泄漏；CTest 13/13。
+
+### 15. Engine::stop 在打开 File 时销毁 namespace 导致悬空自锁死
+
+- **状态**：已修复
+- **等级**：严重（use-after-free + 永久挂起）
+- **时间**：2026-09-17（Shard-76）
+- **现象**：`file_api_test` 在 mount 后创建 Client/File，调用 `engine->stop()` 后进程永久挂起；gdb 回溯主线程停在 `Namespace::close` 的 mutex 上（main → File::Impl::~Impl → Namespace::close），无其他线程持锁。
+- **排查过程**：locals 显示测试已执行到最后销毁 File 句柄的阶段；`Engine::stop` 已 `namespaceState.reset()`，而 `ClientState` 保存的 namespace 裸指针未失效，`close()` 实际在已释放内存的 mutex 上等待。
+- **根因**：`stop()` 未检查活跃 client/open file 就销毁 namespace；前端状态保存裸指针，违反 hfs2.0.md §14.3“活跃 client/operation 未 drain 时 stop() 返回 Busy”。
+- **修复**：引入 `MetadataLease`（Client 及其存活 File 持有）：存活期间计数 `Engine::metadataUsers`，`stop()` 计数非零返回 Busy；`file_api_test` 增加 Busy 停止契约断言。
+- **验证结果**：`file_api_test` 通过；CTest 15/15、ASAN/TSAN 干净。
 
 ## 记录模板
 
