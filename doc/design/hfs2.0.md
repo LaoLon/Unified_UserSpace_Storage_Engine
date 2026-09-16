@@ -888,6 +888,7 @@ schema_version = 1
 instance_name = hfs2
 volume_uuid = auto
 process_lock = exclusive
+process_lock_path = /var/run/hfs/hfs2.lock
 
 [spdk]
 env_driver = uio

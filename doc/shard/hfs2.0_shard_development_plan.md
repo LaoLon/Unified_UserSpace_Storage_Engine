@@ -12,6 +12,9 @@
 > 通用 mmap、数据面 RAID/复制
 >
 > 编号：延续 Git 历史（1.x 最后为 shard-67）；HFS 2.0 从 shard-68 开始，无兼容义务
+>
+> 进度：Shard-68 已完成（2026-09-16；Make/CMake、parser/生命周期/task 单测、
+> ASAN+UBSAN、hfsctl validate，VM 验证通过）
 
 ---
 
@@ -74,6 +77,11 @@
 ## 2. Phase 0：新工程与 ABI
 
 ### Shard-68：工程骨架、`.conf` 与 ABI
+
+> 状态：已完成（2026-09-16）。交付 `libhfs_core.so` 骨架、`.conf` parser
+> （schema_version 1 + 未知 key/重复 device/角色/阈值校验）、`Engine/Client/Task/Result`
+> 生命周期、`hfsctl validate`、`config/hfs_nvme.conf`、Make/CMake C++20 构建和 3 个
+> 单元测试；VM 上 Make、CMake/CTest、ASAN+UBSAN 全部通过。
 
 **目标**：建立 C++20 编译和生命周期骨架，冻结配置与 ABI 入口。
 
