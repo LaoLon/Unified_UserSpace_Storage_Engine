@@ -19,6 +19,8 @@ Bug 等级：**致命 > 严重 > 一般**。
 - 8：已修复（Shard-73，MPSC ring 满判定错误导致自旋）。
 - 9：已修复（Shard-73，publish 读取消费者专属 tail_ 数据竞争）。
 - 10：已修复（Shard-73，trace 全局计数多线程竞争）。
+- 11：已修复（Shard-74，barrier 就绪条件错误导致永远不被准入）。
+- 12：已修复（Shard-74，pending barrier 误挡更早提交的节点）。
 
 ## Bug 记录
 
@@ -131,6 +133,28 @@ Bug 等级：**致命 > 严重 > 一般**。
 - **根因**：trace 骨架计数未原子化。
 - **修复**：改为 `std::atomic<uint64_t>`（relaxed），采样判定使用取回后的序号。
 - **验证结果**：TSAN 干净，trace 事件仍正常计数。
+
+### 11. barrier 就绪条件错误导致永远不被准入（已修复）
+
+- **状态**：已修复
+- **等级**：严重（truncate/size/sync 等 barrier 会永久排队）
+- **时间**：2026-09-16（Shard-74）
+- **现象**：`scheduler_test` 场景 5 中，活跃读完成后 barrier 仍未准入，后续写也被挡住。
+- **排查过程**：`canAdmit` 对 barrier 要求 `treeRoot_ == nullptr && fifoHead_ == nullptr`，但 barrier 本身就在 FIFO 头，条件永远为假。
+- **根因**：把“没有更早的等待者”写成了“等待队列为空”。
+- **修复**：改为 `treeRoot_ == nullptr && (fifoHead_ == nullptr || fifoHead_ == &node)`。
+- **验证结果**：barrier 在树清空且位于队首时准入，场景 5/6 与压力模拟通过。
+
+### 12. pending barrier 误挡更早提交的节点（已修复）
+
+- **状态**：已修复
+- **等级**：严重（会造成调度死锁）
+- **时间**：2026-09-16（Shard-74）
+- **现象**：32 客户端压力模拟在 `active` 为空且仍有 pending 时卡住：队首节点因其后有排队 barrier 而无法准入。
+- **排查过程**：`canAdmit` 中只要存在 pendingBarrier 就拒绝所有其它节点，忽略了 barrier 之前已提交的节点语义上应优先完成。
+- **根因**：barrier 的“禁止越过”范围应只覆盖 sequence 更大的后来者。
+- **修复**：改为 `pendingBarrier_->sequence < node.sequence` 时才拒绝。
+- **验证结果**：压力模拟不再死锁，`pendingCount=0`、全部 4096 op 完成。
 
 ## 记录模板
 

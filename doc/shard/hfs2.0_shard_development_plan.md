@@ -22,7 +22,8 @@
 > Shard-72 已完成（2026-09-16；逐盘 superblock/checkpoint/journal 校验、显式 UUID 与
 > geometry 不匹配 fail closed、缺失设备拒绝、`hfsctl dump`、`import` 骨架）；
 > Shard-73 已完成（2026-09-16；FramePool、Operation 池、MPSC ring、actor、completion
-> queue，ASAN/TSAN 结构门禁通过，Make/CMake/CTest 10/10）
+> queue，ASAN/TSAN 结构门禁通过）；Shard-74 已完成（2026-09-16；inode dependency
+> scheduler、barrier 顺序、32 客户端窗口模拟、shardForFile 映射，CTest 11/11）
 
 ---
 
@@ -219,6 +220,14 @@ tracepoints：`FE_SUBMIT/FE_REAP/CQ_PUSH/CQ_REAP/RING_*/ACTOR_BATCH`。
 丢请求；shutdown 后 ring/frame/operation 全部闭合；trace off 无 per-request 分配。
 
 ### Shard-74：唯一 inode dependency scheduler
+
+> 状态：已完成（2026-09-16）。交付 `InodeDependencyScheduler`：intrusive interval tree
+> （按 start 排序、maxEnd 剪枝）、read/read 并行、重叠写/RMW 冲突、inode barrier
+> （truncate/size mutation/gap-zero/sync）、FIFO 公平唤醒（合法可并行节点可越过等待者）、
+> admit callback 批量延迟派发（避免回调重入破坏状态）、`SCHED_WAIT/SCHED_ADMIT/SCHED_DONE`
+> tracepoints、`shardForFile` 文件到 shard 映射；`scheduler_test` 覆盖依赖场景、barrier
+> 顺序、32 客户端 4096 op 窗口模拟（逐次准入做冲突不变量检查）与 ASAN/TSAN。真实 NVMe
+> 32 线程重叠写与短读回滚回归随 Shard-75 数据面落地。
 
 **交付物**：intrusive interval tree + `max_end`；read/read 并行；重叠写、RMW、append、
 truncate、gap-zero、size barrier、durability epoch 统一依赖；`hash(file_id) % R` 文件
