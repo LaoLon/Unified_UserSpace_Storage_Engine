@@ -34,6 +34,7 @@ set(HFS_CORE_SRC
   src/core/engine.cpp
   src/core/client.cpp
   src/runtime/spdk_runtime.cpp
+  src/storage/journal.cpp
   src/storage/superblock.cpp
   src/storage/volume.cpp
 )
@@ -101,9 +102,10 @@ target_link_libraries(hfsctl PRIVATE hfs_core)
 target_compile_options(hfsctl PRIVATE -fno-exceptions -fno-rtti)
 
 enable_testing()
-set(HFS_TESTS config_parser_test task_test crc_test geometry_test)
+set(HFS_TESTS config_parser_test task_test crc_test geometry_test journal_test)
 if(HFS_WITH_SPDK)
-  list(APPEND HFS_TESTS engine_lifecycle_test spdk_runtime_test format_mount_test)
+  list(APPEND HFS_TESTS engine_lifecycle_test spdk_runtime_test format_mount_test
+       journal_device_test)
 endif()
 foreach(test_name IN LISTS HFS_TESTS)
   add_executable(${test_name} tests/${test_name}.cpp)

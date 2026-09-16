@@ -4,6 +4,7 @@
 
 #include "hfs/config.hpp"
 #include "hfs/core.hpp"
+#include "hfs/journal.hpp"
 
 namespace {
 
@@ -15,6 +16,7 @@ void printUsage() {
                  "  validate          parse and validate the .conf\n"
                  "  format --yes      destructive format of the configured device set\n"
                  "  info              mount read-only metadata and print the volume layout\n"
+                 "  check             scan superblocks, checkpoints and the journal\n"
                  "\n"
                  "options:\n"
                  "  --config=PATH     HFS 2.0 .conf file (required)\n"
@@ -131,6 +133,49 @@ int runInfo(const hfs::Config &config) {
     return 0;
 }
 
+int runCheck(const hfs::Config &config) {
+    auto created = hfs::Engine::create(config);
+    if (!created.ok()) {
+        std::fprintf(stderr, "hfsctl: engine create failed: %s\n", created.message().c_str());
+        return 1;
+    }
+    auto engine = std::move(created).value();
+    auto mounted = engine->mount().wait();
+    if (!mounted.ok() || !mounted.value().ok()) {
+        std::fprintf(stderr, "hfsctl: mount failed: %s\n",
+                     mounted.ok() ? mounted.value().message().c_str() : mounted.message().c_str());
+        return 1;
+    }
+
+    auto journal = hfs::Journal::open(*engine, nullptr);
+    if (!journal.ok()) {
+        std::fprintf(stderr, "hfsctl: journal open failed: %s\n",
+                     journal.message().c_str());
+        (void)engine->stop().wait();
+        return 1;
+    }
+    auto replayed = journal.value()->replay();
+    const auto &stats = journal.value()->stats();
+
+    std::printf("checkpoint A: %s (txid %llu)\n",
+                stats.checkpointAValid ? "valid" : "empty",
+                static_cast<unsigned long long>(stats.checkpointAValid ? stats.lastCheckpointTxid : 0));
+    std::printf("checkpoint B: %s\n", stats.checkpointBValid ? "valid" : "empty");
+    std::printf("journal: head=%llu tail=%llu last_txid=%llu transactions=%u usage=%.1f%%\n",
+                static_cast<unsigned long long>(stats.head),
+                static_cast<unsigned long long>(stats.tail),
+                static_cast<unsigned long long>(stats.lastTxid), stats.validTransactions,
+                journal.value()->usageRatio() * 100.0);
+    std::printf("corruption: %s\n",
+                stats.corruption.empty() ? "none" : stats.corruption.c_str());
+
+    (void)engine->stop().wait();
+    if (!replayed.ok() || !stats.corruption.empty()) {
+        return 1;
+    }
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -193,6 +238,9 @@ int main(int argc, char **argv) {
     }
     if (command == "info") {
         return runInfo(parsed.value());
+    }
+    if (command == "check") {
+        return runCheck(parsed.value());
     }
 
     std::fprintf(stderr, "hfsctl: command '%s' is not implemented\n", command.c_str());

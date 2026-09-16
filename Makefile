@@ -28,7 +28,8 @@ TEST_SRC := $(sort $(wildcard $(PROJECT_ROOT)/tests/*_test.cpp))
 ifeq ($(HFS_WITH_SPDK),0)
 TEST_SRC := $(filter-out $(PROJECT_ROOT)/tests/engine_lifecycle_test.cpp \
                          $(PROJECT_ROOT)/tests/spdk_runtime_test.cpp \
-                         $(PROJECT_ROOT)/tests/format_mount_test.cpp,$(TEST_SRC))
+                         $(PROJECT_ROOT)/tests/format_mount_test.cpp \
+                         $(PROJECT_ROOT)/tests/journal_device_test.cpp,$(TEST_SRC))
 endif
 TEST_BIN := $(patsubst $(PROJECT_ROOT)/tests/%.cpp,$(BUILD_DIR)/bin/%,$(TEST_SRC))
 LIB_LINK := -L$(BUILD_DIR)/lib -lhfs_core -Wl,-rpath,$(BUILD_DIR)/lib -lpthread

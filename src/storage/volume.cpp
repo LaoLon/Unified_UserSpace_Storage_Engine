@@ -183,13 +183,14 @@ Result<VolumeInfo> formatVolume(SpdkRuntime &runtime, const Config &config, bool
         superblock.dataStart = layout.dataStart;
         superblock.dataBlocks = layout.dataBlocks;
         superblock.checkpointGeneration = 0;
-        superblock.journalHead = layout.journalStart;
-        superblock.journalTail = layout.journalStart;
+        superblock.journalHead = 0;
+        superblock.journalTail = 0;
         superblock.mountEpoch = 0;
         superblock.cleanShutdown = 1;
         superblockFinalize(superblock);
 
         const std::uint32_t sectorSize = runtime.deviceBlockSize(i);
+        const std::uint64_t blockFactor = config.metadataBlockSize / sectorSize;
         std::vector<std::byte> record =
             buildSuperblockRecord(superblock, config.metadataBlockSize);
         auto writeA = runtime.controlWrite(i, 0, record);
@@ -201,6 +202,22 @@ Result<VolumeInfo> formatVolume(SpdkRuntime &runtime, const Config &config, bool
         if (!writeB.ok()) {
             return makeError<VolumeInfo>(writeB.status(),
                                          "superblock B write failed: " + writeB.message());
+        }
+        /* Invalidate any older journal/checkpoint generation so a fresh image
+         * never replays stale ring content. */
+        const std::vector<std::byte> emptyBlock(config.metadataBlockSize, std::byte{0});
+        const std::uint64_t journalHeadBlock = layout.journalStart;
+        auto clearJournal = runtime.controlWrite(i, journalHeadBlock * blockFactor, emptyBlock);
+        if (!clearJournal.ok()) {
+            return makeError<VolumeInfo>(clearJournal.status(),
+                                         "journal reset failed: " + clearJournal.message());
+        }
+        for (const std::uint64_t slotStart : {layout.checkpointAStart, layout.checkpointBStart}) {
+            auto clearSlot = runtime.controlWrite(i, slotStart * blockFactor, emptyBlock);
+            if (!clearSlot.ok()) {
+                return makeError<VolumeInfo>(clearSlot.status(),
+                                             "checkpoint reset failed: " + clearSlot.message());
+            }
         }
         auto flush = runtime.controlFlush(i);
         if (!flush.ok()) {

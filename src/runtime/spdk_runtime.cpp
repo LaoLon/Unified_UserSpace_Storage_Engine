@@ -209,6 +209,22 @@ struct SpdkRuntime::Impl {
         stateChanged.notify_all();
     }
 
+    /* Process exit without an explicit stop() must not join busy-polling
+     * reactors without asking them to stop first. */
+    ~Impl() {
+        for (auto &reactor : reactors) {
+            if (reactor != nullptr) {
+                reactor->stop.store(true, std::memory_order_release);
+            }
+        }
+        for (auto &reactor : reactors) {
+            if (reactor != nullptr && reactor->thread.joinable()) {
+                reactor->thread.join();
+            }
+        }
+        reactors.clear();
+    }
+
     Reactor *reactorAt(std::size_t index) const { return reactors[index].get(); }
 
     void closeDevicesLocked() {
