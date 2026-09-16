@@ -1,196 +1,317 @@
-# HFS 2.0：SPDK-native 数据库文件存储引擎
+# HFS 2.0：C++20 coroutine-first 的 SPDK-native 存储引擎
 
-> 状态：重构目标设计，2026-09-16 起生效
+> 状态：clean-break 重构设计，2026-09-16 生效
 >
-> 本文是 HFS 2.0 的唯一目标架构。它不是当前 POSIX HFS 的增量优化说明，
-> 也不承诺兼容旧镜像、旧 ABI 或旧文件语义。
+> 评审输入：`doc/review/hfs2.0_design_review_20260916.md`
 >
-> 重构输入：`doc/review/hfs2.0_design_review_20260916.md`；当前代码事实基线：
-> `main` @ `74af418`。本文中的新模块和验收数字是目标设计，不表示已经实现。
+> 当前事实基线：`main` @ `74af418`（shard-67 架构收敛）。本文描述的是新目标，
+> 不表示新 core 已实现。
 
-## 1. 设计结论
+## 1. 设计决策
 
-HFS 2.0 是一个运行在应用进程内、直接管理 SPDK bdev/NVMe 的异步文件存储引擎。
-首批 frontend 是：
+HFS 2.0 不再是当前 HFS 的 C/Blobstore/POSIX 增量版本，而是从空的 `src/` 开始的
+全新 C++20 存储引擎：
 
 ```text
 RocksDB 8.9.1 FileSystem adapter ─┐
                                    ├─ libhfs_core.so ─ SPDK bdev ─ NVMe
-fio external ioengine ────────────┘
+FIO 3.42 external ioengine ───────┘
 ```
 
-HFS 2.0 的核心目标不是继续扩展通用 POSIX，而是把数据库和 FIO 真正需要的能力收敛
-到一条可验证的异步数据路径：
+核心运行模型：
 
 ```text
-frontend
-  → HfsClient
-  → HfsOp
-  → bounded shard ring
-  → per-shard actor
-  → inode dependency scheduler
-  → extent map
-  → SPDK bdev
-  → completion ring
-  → frontend callback/event
+Frontend
+  → hfs::Client
+  → hfs::Task / hfs::Operation
+  → bounded MPSC shard ring
+  → shard coroutine actor
+  → one inode dependency scheduler
+  → raw-bdev extent planner
+  → SPDK channel / NVMe
+  → completion event
+  → frontend callback or poll
 ```
 
-最终产品只提供：
+本次重构的硬性结论：
 
-- C 语言 async-first core API；
-- RocksDB 8.9.1 `FileSystem` adapter；
-- FIO 3.42 external ioengine；
-- `hfsctl`、format、check、dump 等管理工具。
+1. 旧 `src/` 已整体改名为 `src_legacy_frozen/`，作为本地只读参考，不进入 HFS 2.0
+   构建，也不再由 Git 跟踪；旧代码从 Git 中删除。
+2. 新 `src/` 不兼容旧 C 源码；后续实现只使用 C++20、RAII、`std::span`、concepts、
+   `std::stop_token` 和 coroutine。允许使用 coroutine，但禁止用 `std::future` 把每个
+   I/O 变成隐藏 heap allocation 或阻塞线程。
+3. 新 core 直接管理 SPDK bdev，不使用 Blobstore 文件抽象，不读取旧 Blobstore 镜像。
+4. 对外只支持 RocksDB FileSystem、FIO ioengine 和新 C++ core；不恢复通用 POSIX 兼容。
+5. 旧实现只作为冻结 A/B 和数据导出工具，不能以 compatibility flag 回流到新 core。
 
-最终产品明确不提供：
+## 2. 取代范围和冻结策略
 
-- `LD_PRELOAD`、POSIX fd/目录/cwd/权限兼容层；
-- FUSE、Linux VFS、通用 mmap、native libaio/io_uring ABI；
-- SPDK Blobstore 文件抽象；
-- 旧 `hfs_lib_async_*`、`hfsAsync*`、registered-DMA 和显式 DMA allocation ABI；
-- 多进程共享挂载、daemon、shared-memory 协议；
-- 为旧 POSIX 行为保留的 ticket/range/fd compatibility path。
+### 2.1 与旧架构的关系
 
-这些删除是产品边界，不是可选配置。
+本文取代以下文档中面向未来的冲突决策；旧文档中的 HFS 1.x 测试结果仍可作为历史
+证据，但必须标明版本：
 
-## 2. 取代关系与迁移原则
-
-### 2.1 取代的文档和决策
-
-本文在 HFS 2.0 实施阶段取代下列文档中与其冲突的目标性内容：
-
-| 文档 | HFS 2.0 的处理 |
+| 文档/内容 | HFS 2.0 处理 |
 |---|---|
-| `doc/design/hfs_product_architecture_decision.md` | 只保留为 HFS 1.x/POSIX 线的历史决策；HFS 2.0 以本文为准 |
-| `doc/design/hfs_posix_only_architecture.md` | 只保留已实施的 HFS 1.x 边界；不作为 HFS 2.0 接口设计依据 |
-| `doc/design/hfs_spdk_cpu_efficiency_optimization_design.md` | 其 operation、actor、scheduler、arena、parent completion 经验并入本文；旧实现细节不继承 |
-| `doc/shard/hfs_cpu_efficiency_optimization_shard_plan.md` | 作为 shard-67 的实施记录；后续 HFS 2.0 按本文阶段推进 |
-| `doc/design/hfs_async_model.md` | 仅抽取异步完成和资源所有权经验；旧导出 ABI 全部废弃 |
-| `doc/design/libhfs_ld_preload_design.md` | 不再适用，删除 preload 目标 |
-| 当前 Blobstore 元数据文档 | 只作为恢复/测试经验参考；HFS 2.0 不读取旧 Blobstore 镜像 |
+| POSIX-only 产品决策 | 只保留 HFS 1.x 的历史支持边界；HFS 2.0 不提供 preload |
+| `hfs_spdk_cpu_efficiency_optimization_design.md` | 只提取 operation、actor、scheduler、arena、parent、dirty epoch 的设计经验 |
+| shard-67 实现 | 只提取结构守恒和回归经验；C 模块全部重新落到 C++20 |
+| async/registered-DMA 旧 API | 异步语义可复用，旧导出符号和 registered-DMA ABI 删除 |
+| Blobstore 元数据/镜像 | 只提取 checksum、intent、recovery 经验；格式完全不兼容 |
+| `LD_PRELOAD`、fd、FUSE、mmap | 永久删除，不进入 HFS 2.0 兼容层 |
 
-同名文档中“当前已支持”的 HFS 1.x 结果必须标注版本，不能被写成 HFS 2.0 已实现。
+### 2.2 旧 src 的实际处置
 
-### 2.2 旧实现与新实现并存
+本次工作区处置如下：
 
-重构期间保留两条可运行但互不耦合的验证线：
+```text
+src/                  → src_legacy_frozen/
+Git tracked old src   → 删除
+src_legacy_frozen/    → .gitignore，保留本地冻结副本
+new src/              → 由 Phase 0/1 创建 C++20 源码
+```
+
+`src_legacy_frozen/` 只能用于代码考古、差异阅读和旧线复现；禁止从其中复制旧的
+`HfsFile`、fd 表、Blobstore handle、POSIX wrapper 或锁结构进入新实现。若旧算法可复用，
+必须先用新的类型、所有权和错误模型重写，并在提交说明中标注来源。
+
+本次转换提交只负责冻结旧源码和确定新架构，不伪造一个尚未实现的 HFS 2.0 build；因此
+旧 Make/CMake source list 在 Phase 0 完成前不可视为有效构建入口。Phase 0 必须同时移除
+旧的 `.c` 源文件引用、建立新的 `.cpp` target、固定 C++20 编译器/标准库版本，并让空壳
+`Engine`/`Client`/`Task` 先通过结构化编译和生命周期测试。
+
+迁移期间保留两条完全隔离的验证线：
 
 ```text
 HFS 1.x frozen artifact ─ 旧 Blobstore 镜像 ─ 旧 POSIX/MariaDB/RocksDB baseline
 
-HFS 2.0                ─ 新 raw-bdev 镜像 ─ 新 core/fio/RocksDB adapter
+HFS 2.0                 ─ 新 raw-bdev 镜像 ─ C++20 core/FIO/RocksDB adapter
 ```
 
-- HFS 1.x 冻结在迁移开始时的提交，用于回归对照，不再接受新功能；
-- HFS 2.0 使用新的库名、头文件、镜像 magic 和测试目录；
-- 两条线不能挂载同一 bdev，不能共享 metadata，也不能用兼容分支混合运行；
-- 在 FIO、RocksDB 和恢复门禁全部通过前，不删除 HFS 1.x 的外部 baseline artifact；
-- 门禁通过后，HFS 2.0 源码树删除旧 POSIX/Blobstore 代码，旧线只作为归档 artifact；
-- 不提供在线旧镜像转换。需要保留旧数据时，使用旧线导出到普通文件，再由 HFS 2.0
-  工具导入；导入工具不是 core 的兼容层。
+两条线不能挂载同一个 bdev。HFS 2.0 不自动升级旧镜像；数据迁移只能是旧线导出普通
+文件，再由 `hfsctl import` 写入新镜像，import 工具不属于 core compatibility path。
 
-### 2.3 反转理由和性能口径
+## 3. 产品边界
 
-反转 HFS 1.x POSIX-only 决策的原因是性能路径复杂度，而不是为了恢复旧 async 符号：
+### 3.1 支持
 
-- 当前 4K～64K POSIX HFS/raw SPDK 只有约 63.4%～70.9% 的同口径吞吐；
-- shard-67 已验证 operation lifetime、actor ring、inode scheduler、共享 DMA arena、
-  parent completion 和 dirty epoch 是更适合新核心的结构；
-- POSIX wrapper、fd、通用权限、mmap 和旧 Blobstore 层不能作为 HFS 2.0 的热路径税；
-- HFS 2.0 的性能结论固定为 8 vCPU、真实 NVMe、256 MiB、O_DIRECT、trace/stats off、
-  32 job、randrw 50/50、每项 10 秒、5 次 median，并与 raw SPDK 使用相同设备和队列口径。
+- 单进程、单 engine、单 bdev 独占；
+- C++20 coroutine-first core API；
+- RocksDB 8.9.1 `FileSystem` adapter；
+- FIO 3.42 external ioengine；
+- 直接 SPDK bdev/NVMe 访问；
+- 文件 namespace、目录、rename、delete、extent allocation、sync 和 crash recovery；
+- direct buffer 和 bounded bounce buffer 两条数据路径；
+- 当前进程内 read-after-write；明确的 `fsync`/`fdatasync` durable boundary。
 
-目标是主基线 4K shared-file randrw 的 HFS/raw ≥85%，同时报告 IOPS、p50/p99、CPU%、
-错误数和 submit/complete 守恒。没有完整口径的“快了多少”不作为设计证据。
+### 3.2 永久删除
 
-## 3. 不变的边界和新的产品边界
+- `LD_PRELOAD`、POSIX fd/dup/fcntl/stdio/cwd/dirfd/permission wrappers；
+- FUSE、Linux VFS、通用 mmap；
+- native POSIX `read/write/pread/pwrite` 作为 core API；
+- SPDK Blobstore、Blobstore cluster allocator 和 Blobstore metadata layout；
+- `hfs_lib_async_*`、`hfsAsync*`、registered-DMA、`hfsRegisterBuffer`、`hfsDmaAlloc`；
+- `HFS_POSIX_DIRECT_ASYNC`、`HFS_POSIX_QUEUE`、`HFS_POSIX_TICKET` 等旧开关；
+- 多进程同时挂载同一 bdev、daemon、shared-memory IPC、跨进程锁和故障转移；
+- 为通用 POSIX 重叠写、fd offset 或目录语义保留的 ticket/range compatibility path。
 
-### 3.1 进程模型
+fork 保护仍可作为 core 的进程安全措施，但不再模拟 POSIX preload 行为：fork child
+调用 core 直接得到 `ForkedProcess` 错误。
 
-第一版仍是 in-process library，不启动 `hfsd`：
+## 4. 总体架构
+
+### 4.1 进程内组件
 
 ```text
-RocksDB/fio
-    │
-    ├─ adapter/frontend thread
-    │
-    └─ libhfs_core.so
-           ├─ metadata actor
-           ├─ data actors
-           └─ SPDK environment/reactors
+Application process
+┌───────────────────────────────────────────────────────────┐
+│ RocksDB adapter / FIO engine                              │
+│        │                                                  │
+│        └── hfs::Engine / hfs::Client                      │
+│              ├── metadata actor coroutine                 │
+│              ├── data shard actor coroutine × R            │
+│              ├── shared DMA arena                          │
+│              ├── operation/coroutine frame pools           │
+│              └── SPDK environment and channels             │
+└───────────────────────────────────────────────────────────┘
+                              │
+                         SPDK bdev
+                              │
+                             NVMe
 ```
 
-一个 engine 独占一个 bdev；同一 bdev 的第二个进程通过进程锁收到 `EBUSY`。daemon、
-跨进程 ring、权限租约、故障转移和共享挂载另立架构，不在 HFS 2.0 偷渡。
+没有 hfsd。引入 daemon 将新增 IPC ABI、共享内存生命周期、跨进程 DMA、租约、权限、
+取消和崩溃恢复协议，这些不属于本次 clean-break。
 
-### 3.2 语义边界
-
-- 文件名、目录、rename、delete 和文件尺寸只服务于 frontend 的文件系统契约；
-- 数据 I/O 使用 opaque file handle/file id，不在 hot path 解析路径；
-- write 后本进程内立即可读；未 sync 的数据不承诺崩溃后可见；
-- `fsync`/`fdatasync` 的持久化边界由 core 明确定义，不能为吞吐跳过设备 flush；
-- sparse 区域读取为零；新 extent 在对外发布前必须已初始化或标记为未写入；
-- 不提供 mmap；RocksDB 通过 Read/ReadAsync 取得数据；
-- 不提供 HFS 1.x 的 fd、stdio、fork 兼容语义。
-
-### 3.3 已知失败经验的硬性约束
-
-HFS 2.0 必须把现有 bug 记录转成设计不变量，而不是等回归测试再次发现：
-
-| 已知问题 | HFS 2.0 约束 |
-|---|---|
-| `doc/bug.md` #48：多个异步 callback 只唤醒一个 waiter，且丢失 bserrno | completion 使用明确的发布状态和 `wake-all`；parent 保存第一个错误及原始 backend errno，所有 child 都必须 drain |
-| `doc/bug.md` #49：事务失败后内存 after-image、孤儿 Blob/占位 fd 未回滚 | raw-bdev transaction 只在 COMMIT durable 后 publish；失败恢复旧 snapshot，RESERVED extent 和未发布 handle 必须回收；HFS 2.0 不存在占位 fd |
-| `doc/bug.md` #50：metadata transaction 写入后缺少最后的设备持久化屏障 | `data flush → metadata journal/stable image → journal flush → superblock/checkpoint flush → publish` 是不可变的 sync 顺序 |
-
-任何新实现若无法证明这三条不变量，不能进入 frontend 验收。
-
-## 4. 总体架构和所有权
-
-### 4.1 组件
+### 4.2 C++20 模块布局
 
 ```text
-include/hfs_core.h        稳定 C ABI、opaque 类型、状态和配置
-src/core/                 engine、client、operation、handle
-src/runtime/              SPDK env、reactor、ring、doorbell、shutdown
-src/io/                   planner、DMA、bdev submit、completion、parent
-src/metadata/             superblock、journal、checkpoint、namespace、inode
-src/storage/              raw bdev、extent allocator、geometry
-src/common/               pool、CRC、logging、stats、trace
-adapters/rocksdb/         RocksDB 8.9.1 FileSystem adapter
-fio/                      FIO 3.42 external ioengine
-tools/                    format、check、dump、benchmark
+include/
+  hfs/core.hpp              public C++20 API，opaque ownership boundary
+  hfs/task.hpp              coroutine Task/awaitable contract
+  hfs/types.hpp             result、status、handle、iovec、config
+
+src/
+  core/engine.cpp           engine lifecycle and process lock
+  core/client.cpp           client completion sink and submit
+  core/file.cpp             file handle and metadata requests
+  core/operation.cpp        operation state and intrusive lifetime
+  core/task.cpp             coroutine frame/promise implementation
+  runtime/spdk_runtime.cpp  SPDK env and reactor threads
+  runtime/reactor.cpp       jthread + spdk_thread_poll actor
+  runtime/shard_ring.cpp    bounded MPSC ring and doorbell
+  io/io_planner.cpp         extent split、RMW、parent/child
+  io/io_operation.cpp       DMA/bdev awaitables
+  io/completion.cpp         parent completion and event dispatch
+  io/dma_arena.cpp          shared on-demand arena
+  metadata/superblock.cpp   geometry、A/B superblock
+  metadata/journal.cpp     ring journal and CRC
+  metadata/checkpoint.cpp   dual checkpoint and replay
+  metadata/namespace.cpp    inode/directory/path index
+  metadata/allocator.cpp    extent bitmap and free-run index
+  metadata/scheduler.cpp    one inode dependency scheduler
+  metadata/durability.cpp  flush、epoch、group commit
+  storage/bdev.cpp          raw SPDK bdev wrapper
+  common/crc.cpp             CRC32C
+  common/log.cpp             logging
+  common/trace.cpp           optional trace
+  common/stats.cpp           optional counters
+
+adapters/rocksdb/
+  hfs_filesystem.cpp
+  hfs_random_access_file.cpp
+  hfs_writable_file.cpp
+  hfs_sequential_file.cpp
+  hfs_directory.cpp
+  hfs_rocksdb_env.cpp
+
+fio/
+  fio_hfs.cpp               FIO C entrypoints implemented by C++20
+
+tools/
+  hfsctl.cpp
+  hfs_db_bench.cpp
+  hfs_ldb.cpp
 ```
 
-单一所有权规则：
+新 `src/` 不编译 `src_legacy_frozen/`。CMake 和 Make 只枚举新 `.cpp` 文件，并开启
+`-std=c++20`；不再维护旧 C source list。
 
-| 对象 | 唯一 owner | 其它线程的动作 |
-|---|---|---|
-| SPDK env、bdev descriptor | engine owner | 通过初始化/控制阶段访问 |
-| SPDK io channel、submit | 所属 reactor actor | 通过 ring 投递 operation |
-| shard ring head/tail | producer 短预约区 + actor consumer | 不持业务锁等待 ring |
-| inode dependency index | inode 所属 shard actor | 插入/完成/唤醒都经 actor |
-| namespace、journal、checkpoint | metadata actor | 通过 metadata request/epoch 交互 |
-| DMA free map | shared arena owner | 只持有 `HfsBufferRef`，不跨层等待 |
-| operation result/lifetime | caller ref + actor ref + parent ref | 引用计数决定释放 |
+## 5. C++20 coroutine 模型
 
-禁止以新 mutex 解决跨 owner 的问题。每个锁必须写出 owner、等待者和不会持有的资源。
+### 5.1 public type
 
-### 4.2 SPDK 线程模型
+core 对外使用 C++ 类型，不暴露 SPDK、pthread、内部结构和 allocator：
 
-HFS 不使用 `spdk_app_start` 作为应用主循环，也不让调用者线程直接驱动 SPDK。engine
-启动时：
+```cpp
+namespace hfs {
 
-1. engine owner 线程调用 `spdk_env_init`，读取配置并打开 bdev descriptor；
-2. 创建一个 metadata reactor 和 `R` 个 data reactor，每个 reactor 是一个 pthread；
-3. 每个 pthread 创建自己的 `spdk_thread`，在本线程调用 `spdk_thread_poll`；
-4. 每个 reactor 在自己的 SPDK thread 上取得并销毁自己的 `spdk_io_channel`；
-5. 实际 bdev I/O 只在拥有对应 channel 的 actor 上提交；
-6. caller 到 actor 只写固定 ring，空队列到非空队列时发一次 doorbell；
-7. `spdk_thread_send_msg` 只用于 doorbell、启动、停止和低频控制，不用于每个请求；
-8. stop 先关闭 ingress，再 drain ring/credit/operation，最后在 owner reactor 上卸载 bdev。
+using FileId = std::uint64_t;
+using RequestId = std::uint64_t;
 
-默认 CPU 规则：
+enum class Status : std::uint8_t {
+    Ok, InvalidArgument, NotFound, AlreadyExists, NoSpace, NoMemory,
+    Busy, TryAgain, IoError, Cancelled, TimedOut, ForkedProcess,
+    Corrupt, NotSupported, InvalidState
+};
+
+struct ResultInfo {
+    Status status;
+    int backend_errno;
+    std::size_t bytes;
+    std::size_t completed_bytes;
+    RequestId request_id;
+};
+
+struct IoVec {
+    std::span<std::byte> bytes;
+};
+
+template <typename T>
+class Task;                         // lazy coroutine result
+
+class Engine;
+class Client;
+class File;
+class Operation;
+
+} // namespace hfs
+```
+
+`Task<T>` 使用无异常 `Result<T>` 传播错误；core 默认 `-fno-exceptions -fno-rtti`，
+adapter 是否启用 RTTI 由 RocksDB 构建决定。C++ ABI 只在锁定的 compiler/libstdc++
+构建组合内保证，不能宣称跨发行版 binary compatibility。
+
+### 5.2 Task 和 await point
+
+每个数据 operation 是一个 coroutine frame + intrusive operation state。正常路径的
+await 点只有：
+
+```text
+co_await ring.enqueue(op)       // caller → shard
+co_await scheduler.admit(node)  // dependency ready
+co_await dma.acquire(class)     // bounded buffer lease
+co_await spdk.submit(request)   // channel-owned async request
+co_await parent.complete()      // child aggregation
+```
+
+示意：
+
+```cpp
+Task<ResultInfo> File::read(std::span<IoVec> iov,
+                            std::uint64_t offset,
+                            std::stop_token stop) {
+    auto op = co_await operationPool_.makeRead(*this, iov, offset, stop);
+    auto dependency = co_await scheduler_.admit(op.range(), OperationKind::Read);
+    auto buffer = co_await dma_.prepare(iov, op.length(), stop);
+    auto result = co_await reactor_.submitRead(op, dependency, buffer);
+    co_return result;
+}
+```
+
+这是表达模型，不要求每个 awaiter 真的产生一个独立 heap 对象。要求：
+
+- coroutine frame 从 bounded frame pool 或可审计的 custom allocator 取得；
+- awaiter 只保存 operation 引用、索引或小型状态，不保存裸指针到短命局部变量；
+- SPDK callback 只记录结果并在所属 actor 上 resume coroutine，不直接调用外部 C++；
+- `co_await` 不等于阻塞，actor 线程只 poll 和 resume ready coroutine；
+- operation 的 caller/actor/parent 引用分别释放，最后一个引用才销毁 frame；
+- `Task` 被销毁前必须显式 `detach/await`，禁止遗留未消费 coroutine。
+
+### 5.3 两种 frontend 消费方式
+
+同一 core operation 提供两种完成出口，但同一 operation 只能选一种：
+
+```cpp
+// C++ adapter: callback continuation
+client.submit(file.read(iov, offset, stop), callback);
+
+// FIO adapter: event queue
+auto handle = client.submit(file.read(iov, offset, stop));
+client.poll(events, min_events, max_events, timeout);
+```
+
+RocksDB `ReadAsync` 使用 callback；FIO `getevents()` 使用 client completion queue。
+同步 RocksDB 方法只在 frontend 线程等待 event，不阻塞 SPDK actor，也不把同步等待
+包装成 core 的 blocking worker。
+
+## 6. Runtime、reactor 和所有权
+
+### 6.1 Runtime 启停
+
+engine 启动顺序：
+
+1. `Engine` 校验配置、hugepage 预算、进程锁和 bdev 名；
+2. owner `std::jthread` 初始化 SPDK env 并打开 raw bdev descriptor；
+3. 创建一个 metadata reactor 和 `R` 个 data reactor；
+4. 每个 reactor 在自己的 `std::jthread` 中创建 `spdk_thread`，循环 `spdk_thread_poll`；
+5. 每个 reactor 在本线程获得/销毁自己的 `spdk_io_channel`；
+6. metadata actor 装载 superblock/checkpoint/journal；
+7. engine mount 完成后才允许 client attach。
+
+调用者线程不调用 `spdk_thread_poll`，不直接调用 bdev submit，不持有 SPDK channel。
+
+### 6.2 Reactor 数量和 CPU
 
 ```text
 R = 1                         nproc == 1
@@ -198,363 +319,220 @@ R = 2                         2 <= nproc <= 8
 R = min(4, max(2,nproc/4))    nproc > 8
 ```
 
-`R` 是 data reactor 数，另有一个 metadata reactor。默认 metadata/owner 使用 CPU0，
-data 使用 CPU1..R，frontend 不由 HFS 绑定。配置可以显式给出 reactor 数和 CPU 列表；
-显式配置优先，但上限仍受 `max_data_reactors` 约束。8-vCPU 默认是 2 个 data reactor，
-不因旧 shard-66 短测擅自扩大。
+`R` 是 data shard 数，另有一个 metadata actor。默认 metadata CPU0、data CPU1..R，
+frontend 不由 HFS 绑定。配置文件可显式指定 `data_reactors` 和 `data_cpus`，但上限
+不能超过 `max_data_reactors`。默认不恢复旧的 `HFS_REACTOR_PIN` 环境变量。
 
-## 5. Core API 和 operation 生命周期
+`std::jthread` 的 `stop_token` 只用于控制线程停止；停止前必须关闭 ingress、drain
+SPDK callback 和持久化 metadata，不能用 stop request 直接释放仍被 callback 使用的对象。
 
-### 5.1 C ABI 原则
+### 6.3 Doorbell 规则
 
-Core 不暴露结构体布局、pthread、SPDK 类型或 C++ 类型。所有公开类型是不透明句柄：
+data ring 是固定槽位 MPSC producer / single actor consumer：
 
-```c
-typedef struct hfs_engine hfs_engine_t;
-typedef struct hfs_client hfs_client_t;
-typedef struct hfs_file hfs_file_t;
-typedef struct hfs_op hfs_op_t;
-typedef uint64_t hfs_file_id_t;
-```
+- producer 只在短预约区分配 slot 并写入 `Operation*`；
+- empty→non-empty 只发一次 doorbell；
+- actor 批量快照 head/tail 并消费；
+- `spdk_thread_send_msg` 只用于 doorbell、初始化、停止和低频 control；
+- 不为每个 data request 发 SPDK message；
+- ring 满返回 bounded `TryAgain/Busy`，不创建无界等待队列；
+- actor 清空 ring 后再次检查 tail，再清 armed 位，避免 lost wake；
+- shutdown 关闭 producer 后等待 ring、credit、operation 和 coroutine frame 全部闭合。
 
-状态和结果：
+### 6.4 所有权矩阵
 
-```c
-typedef enum hfs_status {
-    HFS_OK = 0,
-    HFS_EINVAL,
-    HFS_ENOENT,
-    HFS_EEXIST,
-    HFS_ENOSPC,
-    HFS_ENOMEM,
-    HFS_EBUSY,
-    HFS_EAGAIN,
-    HFS_EIO,
-    HFS_ECANCELED,
-    HFS_ETIMEOUT,
-    HFS_EFORK,
-    HFS_ECORRUPT,
-    HFS_ENOTSUP,
-    HFS_ESTATE
-} hfs_status_t;
+| 对象 | owner | 跨线程规则 |
+|---|---|---|
+| SPDK env/descriptor | engine owner | 只在 control phase 访问 |
+| `spdk_io_channel`/bdev submit | reactor actor | 通过 ring 投递 |
+| ring head/tail | producer reservation + actor | 不持业务依赖等待 |
+| inode scheduler | file 所属 shard actor | 只有 actor 修改 index |
+| namespace/journal/checkpoint | metadata actor | 由 metadata request/epoch 交互 |
+| DMA arena free map | arena owner | 只传 `BufferLease` |
+| coroutine frame/operation | intrusive refs | caller/actor/parent 各持一份 |
+| frontend callback | client dispatcher | callback 时不持 core lock |
 
-typedef struct hfs_iovec {
-    void *base;
-    size_t len;
-} hfs_iovec_t;
+## 7. Operation、scheduler 和 data path
 
-typedef struct hfs_result {
-    hfs_status_t status;
-    int backend_errno;
-    size_t bytes;
-    size_t completed_bytes;
-    uint64_t request_id;
-} hfs_result_t;
-
-typedef void (*hfs_complete_fn)(hfs_op_t *, const hfs_result_t *, void *);
-```
-
-### 5.2 生命周期 API
-
-```c
-hfs_status_t hfs_engine_create(const hfs_config_t *, hfs_engine_t **);
-hfs_status_t hfs_engine_format(hfs_engine_t *, const hfs_format_options_t *);
-hfs_status_t hfs_engine_mount(hfs_engine_t *);
-hfs_status_t hfs_engine_stop(hfs_engine_t *);
-hfs_status_t hfs_engine_destroy(hfs_engine_t *);
-
-hfs_status_t hfs_client_attach(hfs_engine_t *, hfs_client_t **);
-hfs_status_t hfs_client_detach(hfs_client_t *);
-
-hfs_status_t hfs_open(hfs_client_t *, const char *path, uint32_t flags,
-                      hfs_file_t **);
-hfs_status_t hfs_create(hfs_client_t *, const char *path, uint32_t flags,
-                        hfs_file_t **);
-hfs_status_t hfs_close(hfs_file_t *);
-hfs_status_t hfs_delete(hfs_client_t *, const char *path);
-hfs_status_t hfs_rename(hfs_client_t *, const char *from, const char *to);
-hfs_status_t hfs_allocate(hfs_file_t *, uint64_t offset, uint64_t length);
-hfs_status_t hfs_truncate(hfs_file_t *, uint64_t size);
-hfs_status_t hfs_stat(hfs_file_t *, hfs_stat_t *);
-hfs_status_t hfs_sync(hfs_file_t *);
-hfs_status_t hfs_datasync(hfs_file_t *);
-```
-
-create/open/rename/delete/allocate/truncate/sync 是 metadata API；它们可以在 v1 以同步
-方式返回，但内部仍由 metadata actor 执行。数据 API 必须 async-first：
-
-```c
-hfs_status_t hfs_read_async(hfs_client_t *, hfs_file_t *,
-                            const hfs_iovec_t *, size_t iovcnt,
-                            uint64_t offset, hfs_complete_fn, void *, hfs_op_t **);
-hfs_status_t hfs_write_async(hfs_client_t *, hfs_file_t *,
-                             const hfs_iovec_t *, size_t iovcnt,
-                             uint64_t offset, hfs_complete_fn, void *, hfs_op_t **);
-hfs_status_t hfs_append_async(hfs_client_t *, hfs_file_t *,
-                              const hfs_iovec_t *, size_t iovcnt,
-                              hfs_complete_fn, void *, hfs_op_t **);
-hfs_status_t hfs_cancel(hfs_op_t *);
-hfs_status_t hfs_client_poll(hfs_client_t *, hfs_completion_event_t *,
-                             size_t min_events, size_t max_events,
-                             uint64_t timeout_us, size_t *returned);
-```
-
-callback 和 `hfs_client_poll` 二选一：一个 client 不得同时为同一个 operation 注册两种
-完成出口。RocksDB 使用 callback，FIO 使用 poll/event。callback 在不持 core 锁的完成
-dispatch 上下文执行；SPDK reactor 只发布结果，不调用外部 C++ 代码。
-
-### 5.3 Operation 状态机
+### 7.1 Operation state
 
 ```text
-NEW → READY → SUBMITTED → DONE
-  │      │          │
-  └→ WAIT_DEP ──────┘
-  └→ ABORTED
+Created → Enqueued → WaitingDependency → Ready → Submitted → Completed
+    │          │             │              │
+    └──────────┴─────────────┴──────────────┴→ Cancelled/Failed
 ```
 
-`HfsOp` 至少包含：kind、file id、`[offset,end)`、iov 引用、shard、scheduler node、
-parent 引用、结果、backend errno、caller/actor/parent 引用计数和可选诊断 sidecar。
+`Operation` 保存 file id、`[offset,end)`、读写 kind、iov 引用、shard、scheduler node、
+DMA leases、parent、first error、completed bytes、retry count 和 coroutine continuation。
+trace/profile 数据放 sidecar，不能膨胀 trace-off cache footprint。
 
-- trace/stats off 路径从固定 operation pool 取得对象，不执行每请求 `calloc`；
-- callback、poll、timeout、cancel、shutdown 都只释放自己的引用；
-- timeout 只改变 caller 看到的状态，不能释放仍可能被 SPDK callback 使用的 operation；
-- callback 错误必须保存 SPDK bdev 的原始错误，不能把所有错误折叠成 `EIO`；
-- parent 完成前 child 结果写入 parent 聚合器，caller 只等待一次；
-- fork child 不得使用继承的 engine/client/file/op，统一返回 `HFS_EFORK`。
-
-## 6. Data plane
-
-### 6.1 Shard ring 与背压
-
-按 `hash(file_id) % shard_count` 选择 shard；同一文件的 scheduler、extent lookup、
-append、resize 和 barrier 进入同一 shard。ring 为固定槽位的 MPSC producer / 单 actor
-consumer：
-
-1. producer 先取得 operation slot；
-2. 预约 ring slot 并写入 `HfsOp *`；
-3. 若从 empty 变为 non-empty，发送一次 doorbell；
-4. actor 批量快照 head/tail，检查 dependency 和 backend credit；
-5. actor 取得 DMA、提交 bdev request，callback 归还 credit 并发布完成；
-6. ring 满、operation pool 满或 DMA cap 满时返回有界背压，不无限排队。
-
-资源顺序固定为：
+资源预约顺序固定：
 
 ```text
-operation slot → DMA buffer（需要时）→ inode dependency → backend credit → submit
+operation frame → DMA lease（需要时）→ scheduler node → backend credit → SPDK submit
 ```
 
-任何状态都不能持有前一层资源等待后一层资源。ring 满时不持 inode dependency；
-backend `-ENOMEM` 时回到 READY，带有次数上限的重试，不在 callback 中递归提交。
+任意资源不足都必须释放已经取得但不再需要的资源；不能持 scheduler node 等 ring、DMA
+或 backend credit，不能在 callback 里递归提交。
 
-### 6.2 依赖调度
+### 7.2 唯一 inode dependency scheduler
 
-HFS 2.0 只保留一套 inode scheduler。它取代旧的 ticket、range stripe、range gate、
-appendLock、writeGapLock 等兼容机制：
+新 core 只维护一个 scheduler，统一表达：
 
-- scheduler 节点包含 `[start,end)`、读写类型、append/size/barrier 标志和 epoch；
-- intrusive interval tree 的节点保存 `maxEnd`，冲突查询为 `O(log A + K)`；
-- 不冲突的读可并行；重叠写、RMW、truncate、append 和 barrier 建依赖；
-- completion 只检查受影响的后继，不广播扫描整张 active list；
-- append/EOF gap 由 barrier/epoch 表达，不再新增专用锁；
-- scheduler 只由所属 actor 修改，`HFS_ORDERING`、ticket/range/none 环境变量不进入新 ABI；
-- 如需故障诊断的无序模式，只能是明确标记为不保证语义的内部测试构建，不能作为产品配置。
+- 非重叠 read/read 并行；
+- 重叠 write、RMW、append、truncate 和 size mutation 的依赖；
+- EOF gap zeroing barrier；
+- `sync`/`datasync` 的 durability epoch；
+- extent reserve/commit 的 metadata barrier。
 
-### 6.3 Read/write 和 extent planner
+实现使用 intrusive interval tree，节点维护 `max_end`：
 
-对齐请求按 extent 分段，连续且同属性的范围合并为一个 child；非对齐请求只生成必要
-的 head/middle/tail RMW child。planner 输出：
+- admission 为 `O(log A + K)`，A 是 active operation 数，K 是实际冲突数；
+- complete 只检查受影响的后继，不扫描 active 全表；
+- scheduler 只由 inode 所属 actor 修改；
+- 不保留 ticket/range/none 三套模式，不暴露 ordering 环境变量；
+- 不新增 `appendLock`、`writeGapLock`、64-stripe lock 等专用锁。
+
+RocksDB 的文件契约已经提供更强约束：SST 关闭后只读，WAL/MANIFEST 通常单 writer，
+RandomAccessFile 可并行读。新 scheduler 利用这些约束，不重新实现通用 POSIX 多 writer。
+
+### 7.3 Extent planner
+
+planner 把一次逻辑 I/O 转成 parent 和有限 child：
 
 ```text
-HfsOpBatch
-  ├─ parent completion
-  ├─ child[0..n)
-  └─ buffer references
+logical request
+  ├─ aligned contiguous child
+  ├─ head RMW child (only when needed)
+  ├─ middle direct child
+  └─ tail RMW child (only when needed)
 ```
 
-普通 read/write 不走 metadata actor；只有 cache miss 的 extent mapping 才能通过版本化
-snapshot 或异步 metadata request 补齐，不能在 data actor 内等待全局 metadata 锁。
+连续同属性 extent 合并；最大 child 默认 1 MiB。数据路径不解析路径、不进入 metadata
+actor；extent map 由 immutable/versioned snapshot 提供，cache miss 通过 metadata request
+异步回填。
 
-文件扩展要求：
+扩展写规则：
 
-- `end <= logical_size`：直接进入 scheduler/data path；
-- `end > logical_size`：由同一 inode barrier 重新读取 EOF；
-- `offset > old EOF`：先把 `[old EOF, offset)` 标记/写成零，再发布用户数据；
-- 逻辑尺寸发布和 extent 可见性由同一 metadata epoch 完成；
-- 用户数据写完但未 sync 时，当前进程可读，crash 后由 durable epoch 决定可见范围。
+1. `end <= logical_size` 直接 admission；
+2. `end > logical_size` 生成同一 inode 的 size barrier，重新确认 EOF；
+3. `offset > old EOF` 先将 gap 物化为零或明确 zero extent，再写用户数据；
+4. 数据和 extent state 完成后更新 logical epoch；
+5. sync 时才把 epoch 推进为 durable epoch。
 
-### 6.4 Parent completion
+### 7.4 Parent completion
 
-一个逻辑请求只对 caller 暴露一个 parent completion。parent 保存 pending、first error、
-completed bytes、child 状态 bitmap 和 operation 引用；child callback 不唤醒 caller。
+parent 保存 pending child count、first error、completed bytes、child bitmap 和引用：
 
-- 所有 child submit/acquire 失败都要补偿 pending；
-- read 在 parent 完成后统一 copy-out，再释放所有 buffer；
-- write 在 parent 完成后批量释放 buffer；
-- 任一 child 的 backend error 传播到 parent，但所有 child 仍完成 drain；
-- cancel/timeout 不绕过未完成 child 的 callback；
-- parent/child 在 success、error、shutdown、fork 测试中必须闭合。
+- 未提交 child 的 acquire/start 失败必须补偿 pending；
+- child callback 只更新 parent，不唤醒多个 frontend waiter；
+- 最后一个 child 通过 release store 发布 parent，并 wake-all；
+- read 统一 copy-out 后释放 lease，write 统一 release；
+- 一个 frontend operation 只能有一个 completion sink；
+- timeout/cancel 不提前销毁 SPDK callback 仍可见的 frame。
 
-## 7. DMA 和内存预算
+## 8. DMA 和资源上限
 
-### 7.1 Buffer contract
+### 8.1 Buffer lease
 
-`HfsBufferRef` 有两种来源：
+`BufferLease` 表示 caller buffer 或 shared arena slice：
 
-1. caller buffer：通过 `spdk_vtophys`、对齐和长度检查后可 direct；
-2. shared arena slice：caller 不可 direct 时用于 bounce/staging。
-
-不提供 registered buffer API，不要求 frontend 一次分配一块可 DMA 的完整
-`orig_buffer`。FIO 的大 buffer 被按最大 1 MiB child 分段；RocksDB 的异步 buffer 在
-callback 前保持有效。
-
-### 7.2 Shared arena
-
-arena 是 mount 级共享、按需增长的 bounded pool：
-
-```text
-4 KiB class   small I/O / metadata edge
-16 KiB class  common database I/O
-64 KiB class  large database I/O
-1 MiB class   extent child / fallback staging
-```
-
-默认 `dma_arena_mb=512`，配置上限不能超过 hugepage 预算；class 只有首次需求才分配。
-共享 bitmap/free map 可先作为最小实现，只有 profile 证明 central owner 是瓶颈时才加
-local magazine。arena 满时返回 `HFS_EAGAIN` 或由 frontend 看到有界 busy，不分配无界 heap。
-
-### 7.3 资源预算和预检
-
-engine 启动前计算：
-
-```text
-hugepage_required ≥ ceil((SPDK baseline + dma_cap + op_pool + reactor_state)
-                          × 1.15 / hugepage_size)
-```
-
-预检失败返回清晰错误并打印 required/available，不在运行中把系统盘或根盘当作隐式
-交换区。FIO caller memory 不计入 HFS arena cap，但必须计入 frontend 进程的外层 RSS
-预算。8-vCPU 验收默认使用 VM `vm.nr_hugepages=1024`，正式数据使用真实 NVMe。
-
-## 8. Metadata、namespace 和 allocator
-
-### 8.1 Namespace
-
-HFS 2.0 的 namespace 是持久 inode + directory entry：
-
-- inode id 64 位单调分配，handle 另带 generation，不能把旧 handle 解析到新对象；
-- directory entry 按 name hash 加速查找，同时维护排序 cursor 供 `GetChildren`；
-- 路径解析只发生在 metadata actor；数据 operation 只带 file handle/file id；
-- `rename` 是单一 journal transaction，源 entry 和目标 entry 不允许中间可见；
-- 目录 fsync 通过 directory inode 的 metadata epoch 持久化；
-- 删除先从 namespace 摘除，再延迟回收 extent；仍被打开的 file handle 可以继续完成已有 I/O，
-  但不会重新出现在路径查找中；
-- 超大目录使用分片 hash/有序迭代器，禁止每次 `GetChildren` 扫描全 namespace。
-
-mount 时加载 checkpoint，再 replay journal；内存预算按以下项目核算：
-
-```text
-inode table + directory entries + path/name bytes + extent index + allocator index
-```
-
-`max_inodes`、`max_namespace_bytes` 和 mount 时间目标必须配置并验收；超过预算时 create
-返回 `HFS_ENOMEM`，不能悄悄退回磁盘随机查找。
-
-### 8.2 Extent 和 allocator
-
-第一版固定 1 MiB data extent，metadata block 按设备 geometry 对齐。文件的 extent map
-只保存 logical extent 到 physical extent 的映射和状态：
-
-```text
-FREE → RESERVED → INITIALIZED → COMMITTED
-```
-
-- allocator 只由 metadata actor 修改；data actor 请求一个 bounded extent lease；
-- 内存中使用 two-level bitmap 加 free-run index，分配采用 next-fit，释放相邻范围合并；
-- 单次预分配默认最多 64 个 extent（64 MiB），超过则拆成多个 transaction；
-- 没有满足长度的连续 run 时可分段分配；完全没有空间返回 `HFS_ENOSPC`；
-- `RESERVED` 在 crash replay 时回收，未 `COMMITTED` 的 extent 不进入可见 map；
-- 只有 `INITIALIZED`/`COMMITTED` extent 才能读；未初始化区域按零返回或先完成初始化；
-- 物理回收可在后台执行，但不能阻塞 caller 持有的 scheduler node；
-- TRIM/unmap 不是 v1 的必需接口，不以“unmap 读零”替代实际零填充保证。
-
-### 8.3 RocksDB preallocation
-
-RocksDB 的 `PrepareWrite()`/`Allocate()` hint 只在 adapter 声明 direct I/O 时生效。HFS
-2.0 v1 选择 `use_direct_io() == true`，所以 adapter 必须正确实现：
-
-- 对齐检查和 direct/bounce 两条路径；
-- `PrepareWrite` 到 HFS `hfs_allocate` 的 64 MiB window；
-- `Allocate` 只预留空间，不改变逻辑文件尺寸；
-- `PositionedAppend` 的单 writer 顺序；
-- window 耗尽时以 metadata request 批量补充，data actor 不持锁等待；
-- 预分配失败映射为 NoSpace/IOStatus，不返回假成功。
-
-## 9. On-disk 格式和恢复
-
-### 9.1 Clean-break 镜像
-
-HFS 2.0 直接拥有整个 bdev，不使用 Linux partition，不使用 Blobstore。旧镜像一律
-不可挂载；`hfsctl format` 是破坏性命令，必须要求明确确认或使用空设备标志。
-
-布局以 device block 为单位：
-
-```text
-LBA 0..N
-┌──────────────────────────────┐
-│ Superblock A/B reserved area │ 8 MiB, two independent copies
-├──────────────────────────────┤
-│ Journal ring                 │ configurable, default 256 MiB
-├──────────────────────────────┤
-│ Checkpoint A/B region        │ configurable metadata capacity
-├──────────────────────────────┤
-│ Allocation bitmap/index      │ persistent allocator state
-├──────────────────────────────┤
-│ Data extents                 │ remaining capacity
-└──────────────────────────────┘
-```
-
-`meta_start/meta_blocks` 指 checkpoint 和 allocator 区域；journal 单独由
-`journal_start/journal_blocks` 描述；`checkpoint_a/b` 是该区域内的两个 generation
-槽位，不能把 checkpoint LBA 误写成 metadata region 起点。
-
-### 9.2 Superblock
-
-```c
-struct Hfs2Superblock {
-    uint64_t magic;
-    uint32_t format_version;
-    uint32_t feature_flags;
-    uint8_t  uuid[16];
-    uint64_t generation;
-    uint64_t device_blocks;
-    uint32_t sector_size;
-    uint32_t metadata_block_size;
-    uint64_t journal_start;
-    uint64_t journal_blocks;
-    uint64_t checkpoint_a_start;
-    uint64_t checkpoint_b_start;
-    uint64_t checkpoint_blocks;
-    uint64_t allocator_start;
-    uint64_t allocator_blocks;
-    uint64_t data_start;
-    uint64_t data_blocks;
-    uint64_t checkpoint_generation;
-    uint64_t journal_head;
-    uint64_t journal_tail;
-    uint64_t mount_epoch;
-    uint8_t  clean_shutdown;
-    uint32_t crc32c;
+```cpp
+class BufferLease {
+public:
+    BufferLease(BufferLease&&) noexcept;
+    BufferLease& operator=(BufferLease&&) noexcept;
+    ~BufferLease();
+    std::span<std::byte> span() const noexcept;
 };
 ```
 
-`format_version`、device geometry、UUID 和 CRC 必须检查。A/B superblock 写入顺序为：
-写非当前副本 → device flush → generation 发布；mount 选择 generation 最大且 CRC 正确
-的副本。设计不假设多 sector 写入原子；journal/checkpoint 每个 record 都有长度、序号、
-CRC 和 commit marker，撕裂记录自动丢弃。
+通过 `spdk_vtophys`、对齐和长度检查可以 direct 的 caller buffer 不复制；其它 buffer
+使用 arena bounce。没有 registered-DMA public API。FIO/RocksDB 的大 buffer 按 ≤1 MiB
+child 分段，不要求整块 `orig_buffer` 可 DMA。
 
-### 9.3 Journal
+### 8.2 Shared arena
 
-journal 是固定 block 对齐的环形日志。一个 transaction 为：
+mount-level shared arena 按需增长，默认 class：
+
+```text
+4 KiB   metadata edge / small I/O
+16 KiB  common database I/O
+64 KiB  large database I/O
+1 MiB   extent child / fallback staging
+```
+
+默认 `dma_arena_mb=512`，所有 class、operation frame、ring 和 SPDK baseline 都计入
+hugepage 预算。arena 达到 cap 返回 `TryAgain`/`Busy`；不在热路径执行无界 `new`，不把
+根盘或 swap 当作 fallback。central bitmap 是第一实现；只有 profile 证明需要时才加
+bounded local magazine。
+
+### 8.3 Hugepage preflight
+
+```text
+required = ceil((SPDK baseline + DMA cap + frame pool + ring + metadata reserve)
+                × 1.15 / hugepage_size)
+```
+
+启动时比较 required 与 available，失败时报告两者并拒绝 mount。正式 VM 仍按项目口径
+使用 8 vCPU、`vm.nr_hugepages=1024`、真实 NVMe `Nvme0n1`；MALLOC/AIO 只能用于确定性
+故障注入，不替代性能结论。
+
+## 9. Raw-bdev 磁盘格式
+
+### 9.1 Clean-break 镜像
+
+HFS 2.0 完整拥有 raw bdev：
+
+```text
+Superblock A/B       8 MiB reserved
+Journal ring         default 256 MiB
+Checkpoint A/B       configurable metadata region
+Allocator state      bitmap + free-run index
+Data extents         remaining capacity
+```
+
+旧 Blobstore magic、旧 metadata header 和 HFS 1.x image 都拒绝 mount。`hfsctl format`
+是破坏性命令，必须显式 `--yes` 和空设备/确认检查；不做在线转换。
+
+### 9.2 Superblock 和 geometry
+
+```cpp
+struct Hfs2Superblock {
+    std::uint64_t magic;
+    std::uint32_t format_version;
+    std::uint32_t feature_flags;
+    std::array<std::byte, 16> uuid;
+    std::uint64_t generation;
+    std::uint64_t device_blocks;
+    std::uint32_t sector_size;
+    std::uint32_t metadata_block_size;
+    std::uint64_t journal_start;
+    std::uint64_t journal_blocks;
+    std::uint64_t checkpoint_a_start;
+    std::uint64_t checkpoint_b_start;
+    std::uint64_t checkpoint_blocks;
+    std::uint64_t allocator_start;
+    std::uint64_t allocator_blocks;
+    std::uint64_t data_start;
+    std::uint64_t data_blocks;
+    std::uint64_t checkpoint_generation;
+    std::uint64_t journal_head;
+    std::uint64_t journal_tail;
+    std::uint64_t mount_epoch;
+    std::uint8_t clean_shutdown;
+    std::uint32_t crc32c;
+};
+```
+
+实际 layout 由 geometry 计算并写入 superblock；`checkpoint_a/b` 是 checkpoint region
+内的两个槽位，不与 metadata region 起点混用。A/B 写入顺序为：写非当前副本 → device
+flush → 发布 generation。设计不假设多 sector 原子写；每个 record 都有长度、序号、CRC
+和 commit marker。
+
+### 9.3 Journal 和 checkpoint
+
+journal 是固定 block 对齐 ring：
 
 ```text
 BEGIN(txid, generation, record_count, crc)
@@ -562,372 +540,338 @@ RECORD...
 COMMIT(txid, generation, tx_crc)
 ```
 
-- CRC 覆盖 header、所有 record 和 commit 之前的 payload；
-- 只有看到完整 BEGIN、records、COMMIT 且 CRC 正确才 replay；
-- `CREATE`、`LINK/UNLINK`、`RENAME`、`ALLOC/RESERVE`、`FREE`、`SET_SIZE`、`SET_TIMES`、
-  `TRUNCATE`、`CHECKPOINT` 是 metadata record 类型；
-- 普通已分配 extent 内的用户数据不写 HFS data WAL；RocksDB 自己的 WAL 是普通文件数据；
-- journal 使用率达到 50% 触发 checkpoint；超过 80% 时优先同步 checkpoint；
-- journal 没有足够连续空间时，metadata actor 先执行 checkpoint；checkpoint 无法完成时，
-  阻塞最多 `metadata_wait_timeout_ms`，然后返回 `HFS_ENOSPC`/`HFS_EBUSY`；不丢弃事务。
+只有完整 BEGIN/records/COMMIT 且 CRC 正确才 replay。record 类型至少包括：
+`CREATE`、`LINK`、`UNLINK`、`RENAME`、`ALLOC`、`RESERVE`、`FREE`、`SET_SIZE`、
+`SET_TIMES`、`TRUNCATE` 和 `CHECKPOINT`。
 
-checkpoint 为双槽：写入非活动槽的完整 inode/namespace/allocator snapshot，flush 后再
-更新 superblock generation；只有 superblock 成功 durable 才推进 journal tail。mount 失败
-不能清空旧 checkpoint，必须返回 `HFS_ECORRUPT` 并保留现场供 `hfsctl check` 读取。
+- 50% 使用率触发 checkpoint，80% 使用率优先同步 checkpoint；
+- journal 空间不足时先 checkpoint；checkpoint 失败则在 bounded timeout 后返回 NoSpace/Busy；
+- checkpoint 写 inactive slot 的完整 snapshot，flush 后更新 superblock；
+- superblock durable 后才推进 journal tail；
+- 撕裂/未知/超长 record 丢弃并记录 corruption evidence，不静默 replay。
 
-### 9.4 Sync 和 crash 顺序
+### 9.4 Extent 和 allocator
 
-`hfs_datasync(file)`：
+第一版固定 1 MiB data extent，内存 allocator 由 metadata actor 独占：
 
 ```text
-1. 拒绝新 data op 或记录目标 durable epoch
-2. drain 该文件在途 data operation
-3. device flush（确保用户 data/新 extent 初始化完成）
-4. 提交必要的 SET_SIZE/extent state transaction
+FREE → RESERVED → INITIALIZED → COMMITTED
+```
+
+- two-level bitmap + free-run index；next-fit 分配，相邻 free run 合并；
+- 单次预分配最多 64 extent（64 MiB），更多空间拆成多个 transaction；
+- 没有足够 run 时可分段，否则返回 NoSpace；
+- RESERVED 在 replay 时回收；非 COMMITTED extent 不可见；
+- new extent 暴露前必须被初始化为零或完成用户数据 durable；
+- 释放可异步回收，但不能持 frontend scheduler 等 allocator；
+- TRIM/unmap 不是 v1 必需接口，不能用“设备 unmap 读零”替代逻辑零语义。
+
+## 10. Durability 和故障恢复
+
+### 10.1 文件状态
+
+每个 inode 保存 `logical_size`、`durable_size`、extent map、mtime/ctime、link count 和
+当前 metadata epoch。logical update 对当前进程立即可见；durable epoch 只在完整 flush
+和 metadata commit 后推进。crash 后不把未 durable 的 logical tail 伪装成已提交文件。
+
+### 10.2 sync 顺序
+
+`datasync`：
+
+```text
+1. 记录目标 data epoch，阻止新的相关 barrier 越过它
+2. drain file data operations
+3. device flush，保证 user data 和 extent initialization
+4. 写 SET_SIZE/extent-state metadata transaction
 5. journal flush
-6. 必要时写并 flush superblock/checkpoint
-7. 发布 durable epoch，返回 frontend
+6. checkpoint/superblock flush（需要时）
+7. 发布 durable epoch，唤醒 waiter
 ```
 
-`hfs_sync(file)` 在上述基础上包含文件 metadata、时间戳和 namespace 关联修改。任何
-metadata commit 都不能先于其指向的数据 durable；不能出现“先 device flush、后写 journal
-但不再 flush”这种不可恢复顺序。crash 后：
+`sync` 还包括文件时间戳、namespace 和 directory metadata。不可改变的顺序是：
 
-- 完整 committed transaction replay；
-- 未提交的 after-image 丢弃并回滚内存状态；
-- RESERVED extent 回收为 FREE；
-- 已写但未被 durable metadata 指向的数据成为不可见 orphan，之后可回收；
-- 所有 waiter 收到明确的恢复/错误状态，不遗留占位 handle 或孤儿 namespace entry。
+```text
+data submit → data drain → data device flush
+  → metadata intent/commit → journal flush
+  → checkpoint/superblock flush → publish durable epoch
+```
 
-## 10. RocksDB 8.9.1 adapter
+这明确避免“metadata transaction 写完却没有最终设备屏障”的旧问题，也保证 metadata
+不会先指向未 durable 的用户数据。
 
-### 10.1 接入方式
+### 10.3 Crash replay
 
-adapter 是独立 C++ shared library，依赖 RocksDB 8.9.1，核心只依赖 C ABI。使用
-`NewCompositeEnv(std::shared_ptr<FileSystem>)` 或自定义 driver 注入 `DBOptions::env`。
-Debian 自带 `db_bench` 没有通过 CLI 注入 `DBOptions::env` 的选项，因此验收必须使用：
+- committed transaction replay；不完整 transaction 丢弃；
+- 内存 after-image 只有在 commit durable 后才 publish；失败时恢复旧 snapshot；
+- RESERVED extent 回收，unlinked-but-open file 的 extent 进入 orphan reclaim；
+- 已写但未被 durable metadata 指向的数据不可见并可回收；
+- checksum、generation、namespace、extent bitmap 和 file size 必须相互守恒；
+- mount 发现不可修复 corruption 返回 Corrupt，保留现场给 `hfsctl check`，不强行 mount。
 
-- 自编译的 `hfs_db_bench`，在创建 DB 前设置 `DBOptions.env`；或
-- 一个明确设置 `DBOptions.env = NewCompositeEnv(hfs_fs)` 的 custom driver；
-- 同理构建 `hfs_ldb` 做 `checkconsistency`，不能声称普通 stock `db_bench` 已使用 HFS。
+## 11. RocksDB 8.9.1 adapter
 
-### 10.2 FileSystem 8.9.1 契约
+### 11.1 接入原则
 
-以 VM 内 RocksDB 8.9.1 的头文件为唯一 API 依据，禁止使用不存在的名称或枚举：
+adapter 是独立 C++20 shared library，core 与 RocksDB 只通过 C++ header contract 编译
+连接；core 不包含 RocksDB header。由于 C++ ABI 依赖编译器，adapter 与 core 必须使用
+锁定的 RocksDB 8.9.1、compiler 和 libstdc++ 构建组合。
 
-| RocksDB 8.9.1 项目 | HFS 2.0 决策 |
+Debian stock `db_bench` 不提供 CLI 注入 `DBOptions::env`，所以验收使用：
+
+```cpp
+DBOptions options;
+options.env = hfs::rocksdb::NewHfsEnv(hfs_engine);
+DB::Open(options, db_options, &db);
+```
+
+实际工具为自编译 `hfs_db_bench`；`hfs_ldb` 同样显式设置 HFS Env。不能把 stock 工具
+的输出写成 HFS 已接管。
+
+### 11.2 8.9.1 必需接口
+
+严格以 VM `/usr/include/rocksdb/file_system.h` 和 `env.h` 的 8.9.1 头文件为准：
+
+| 8.9.1 契约 | HFS 2.0 实现 |
 |---|---|
-| `FSSupportedOps::kAsyncIO` | v1 声明并实现 |
+| `FSSupportedOps::kAsyncIO` | 声明并实现 |
 | `FSSupportedOps::kFSBuffer` | v1 不声明；它只适用于 non-direct MultiRead |
-| `kFSPrefetch` | 不存在，不得声明 |
-| `FSRandomAccessFile::ReadAsync(...)` | 按实际签名实现，包含 `FSReadRequest`、options、callback、`cb_arg`、`io_handle`、`IOHandleDeleter` 和 debug context |
-| `FileSystem::AbortIO()` | 必须实现，取消只对 core 仍可取消的 operation 生效 |
-| `GetFileModificationTime` | 必须实现并从 HFS inode mtime 返回 |
-| `FSDirectory::Fsync/FsyncWithDirOptions` | 必须实现，映射目录 metadata epoch |
-| `FileSystem::LockFile/UnlockFile` | 必须实现 RocksDB lock 生命周期和错误传播 |
-| `FileSystem::LinkFile` | 实现硬链接所需的 inode link-count transaction；不支持时必须返回明确的 `NotSupported`，不得伪造复制文件 |
-| `FSSequentialFile::Skip/InvalidateCache` | 必须实现；cache invalidate 在 core 为 no-op，但保留正确状态 |
-| `FSWritableFile::PrepareWrite/Allocate` | direct I/O 下必须实现为 extent preallocation |
-| `PositionedAppend` | WAL/MANIFEST 单 writer 必须实现并保持顺序 |
+| `kFSPrefetch` | 不存在，禁止声明 |
+| `FSRandomAccessFile::ReadAsync(FSReadRequest&, ..., void** io_handle, IOHandleDeleter*, IODebugContext*)` | 按完整真实签名实现 |
+| `FileSystem::AbortIO()` | 必须实现，遵守 core cancel boundary |
+| `GetFileModificationTime` | 返回 inode mtime |
+| `FSDirectory::Fsync/FsyncWithDirOptions` | 提交 directory metadata epoch |
+| `LockFile/UnlockFile` | 进程级 RocksDB lock lease |
+| `LinkFile` | link-count transaction；若版本/场景不支持则明确返回 NotSupported |
+| `FSSequentialFile::Skip/InvalidateCache` | 必须实现；invalidate 可为正确的 no-op |
+| `FSWritableFile::PrepareWrite/Allocate` | direct I/O 下映射 extent preallocation |
+| `PositionedAppend` | WAL/MANIFEST 单 writer 顺序 |
 
-`FSReadRequest`、iov 和 `io_handle` 在 ReadAsync callback 之前必须保持有效；callback
-结束后才调用 `IOHandleDeleter`。v1 不把 HFS DMA buffer 直接借给 RocksDB `fs_scratch`；
-如果将来启用，必须用 `std::unique_ptr<void, std::function<void(void*)>>` 的自定义
-deleter，并把 buffer 引用绑定到 request 生命周期。
+v1 选择 `use_direct_io() == true`，因此 RocksDB preallocation hint 生效；adapter 必须
+实现对齐检查、bounce fallback、`PrepareWrite`、`Allocate`、`PositionedAppend`、
+`RangeSync`、`Sync/FSync`、`Close` 和目录 fsync。ReadAsync 的 `FSReadRequest`、iov、
+`io_handle` 必须活到 callback 返回；之后才调用 `IOHandleDeleter`。v1 不声明 `kFSBuffer`，
+不把 HFS DMA lease 借给 `fs_scratch`。
 
-### 10.3 文件类型映射
-
-```text
-SST / immutable table  → RandomAccessFile，read/readAsync，可并行
-WAL                    → WritableFile，单 writer，PositionedAppend，Sync
-MANIFEST/CURRENT       → append/rename/lock，metadata transaction
-OPTIONS/INFO           → ordinary writable file，close 后只读
-LOCK                   → LockFile/UnlockFile 的进程级 lease
-```
-
-RocksDB `WritableFile` 通常由一个线程使用；HFS 不为它重新实现通用 POSIX 多 writer
-语义。`RandomAccessFile` 的并发 ReadAsync 是高并发主路径。
-
-## 11. FIO 3.42 external ioengine
-
-### 11.1 加载和 option
-
-支持无需安装到系统目录的方式：
+### 11.3 文件类型
 
 ```text
-fio --ioengine=external:/absolute/path/fio-hfs.so <job.fio>
+SST/table       → RandomAccessFile，可并发 Read/ReadAsync
+WAL             → WritableFile，单 writer，PositionedAppend + Sync
+MANIFEST        → append/rename，metadata epoch
+CURRENT/OPTIONS → write/close/rename
+LOCK            → LockFile/UnlockFile lease
 ```
 
-`fio-hfs.so` 在 `ioengine_ops.options` 注册全部自定义选项，并正确设置
-`option_struct_size`：
+不实现通用 POSIX 多 writer；利用 RocksDB 自身的 file role 和访问约束降低 scheduler 复杂度。
+
+## 12. FIO 3.42 adapter
+
+### 12.1 加载方式和 options
+
+FIO engine 编译为 C++20 shared library，但只在 FIO 注册入口使用 `extern "C"`：
+
+```text
+fio --ioengine=external:/absolute/path/fio-hfs.so job.fio
+```
+
+`ioengine_ops.options` 必须登记自定义 options，并设置 `option_struct_size`：
 
 ```text
 hfs_config=/path/hfs2.json
-hfs_volume=/path-or-volume-name
+hfs_volume=/volume/name
 hfs_direct=1
 hfs_preallocate=1
 hfs_client_depth=32
 ```
 
-engine 不调用 POSIX open/read/write 访问 HFS 数据，而是用 core `hfs_open/create` 取得
-handle。`setup_files()` 的默认 extend 不能绕过 allocator：`open_file` 负责 create+
-allocate，并设置 `FIO_NOEXTEND` 或完成等价的 engine-owned extend；`size=`、`offset`、
-`filename` 的映射必须写入 HFS namespace。
+engine 直接调用 C++ `Engine/Client/File`，不通过 POSIX open/read/write。`open_file`
+负责 create/open/allocate，并设置 `FIO_NOEXTEND` 或完成等价的 engine-owned extend，
+避免 `setup_files()` 用 POSIX ftruncate 绕过 HFS allocator。
 
-### 11.2 submit/getevents/event
+### 12.2 FIO lifecycle
 
-- `queue()` 创建一个 `HfsOp`，保存 `io_u` 指针直到完成；
-- `FIO_Q_BUSY` 只表示有界 ring、operation pool 或 DMA 暂满，不能丢请求；
-- `getevents(min,max,timeout)` 使用 `hfs_client_poll`，返回数满足 FIO min/max 语义；
-- `event()` 取得对应完成事件并设置 `io_u->error`、`resid`、`error`, `bytes`；
-- backend errno、`HFS_ENOSPC`、`HFS_EAGAIN` 和 `HFS_ECANCELED` 必须保留到 FIO；
-- `fio --verify` 在 HFS data path 上运行，用于确认 bounce/direct 两条路径；
-- engine close 前必须 drain 所有 io_u，再释放 file handle/client。
+- `queue()` 产生 coroutine operation，保存 `io_u` 引用直到 completion；
+- bounded ring/operation/DMA 满时返回 `FIO_Q_BUSY`，不丢请求；
+- `getevents(min,max,timeout)` 调用 `client.poll`，满足 FIO min/max 语义；
+- `event()` 写回 `io_u->error`、`resid` 和完成字节；
+- `FIO_NOEXTEND`、`fio --verify`、direct/bounce、iodepth 必须在测试中覆盖；
+- engine close 前 drain 全部 io_u、coroutine frame、File 和 Client。
 
-## 12. 错误、重试、取消和退出
+## 13. Namespace 和文件 API
 
-### 12.1 错误传播
+### 13.1 C++ API 草案
 
-一个 child 失败时：保存原始 backend errno，标记 parent first error，继续等待其它
-child，最后把映射后的 core status 送回 frontend。所有等待者必须被唤醒，不能只唤醒
-一个 waiter。
+```cpp
+namespace hfs {
 
-| Core | RocksDB `IOStatus` | FIO |
-|---|---|---|
-| `HFS_ENOSPC` | `NoSpace` | `ENOSPC` |
-| `HFS_EAGAIN`/`HFS_EBUSY` | `TryAgain`/busy error | `FIO_Q_BUSY`（submit 阶段） |
-| `HFS_ENOMEM` | `MemoryLimit` 或 IO error | `ENOMEM` |
-| `HFS_EIO` | IO error，附 backend errno | backend errno 或 `EIO` |
-| `HFS_ECANCELED` | Aborted | `ECANCELED` |
-| `HFS_ETIMEOUT` | TimedOut | `ETIMEDOUT` |
-| `HFS_ECORRUPT` | Corruption | `EIO`，同时终止 engine |
+class Engine {
+public:
+    static Result<std::unique_ptr<Engine>> create(const Config&);
+    Task<Result<void>> format(FormatOptions);
+    Task<Result<void>> mount();
+    Task<Result<void>> stop();
+};
 
-`EINVAL`、`ENOENT`、`EEXIST`、`ENOTSUP` 等语义错误不得重试。
+class Client {
+public:
+    Task<Result<std::shared_ptr<File>>> open(std::string_view path,
+                                             OpenFlags flags);
+    Task<Result<void>> remove(std::string_view path);
+    Task<Result<void>> rename(std::string_view from, std::string_view to);
+    PollResult poll(std::span<CompletionEvent>, std::size_t min,
+                    std::size_t max, std::chrono::microseconds timeout);
+};
 
-### 12.2 背压和 backend retry
+class File {
+public:
+    Task<Result<ReadResult>> read(std::span<IoVec>, std::uint64_t offset,
+                                  std::stop_token = {});
+    Task<Result<WriteResult>> write(std::span<const IoVec>, std::uint64_t offset,
+                                    std::stop_token = {});
+    Task<Result<WriteResult>> append(std::span<const IoVec>,
+                                     std::stop_token = {});
+    Task<Result<void>> allocate(std::uint64_t offset, std::uint64_t length);
+    Task<Result<void>> truncate(std::uint64_t size);
+    Task<Result<void>> datasync();
+    Task<Result<void>> sync();
+};
 
-所有队列均有上限：client depth、ring depth、backend credit、operation pool 和 DMA
-arena cap。满时：
-
-- submit 尚未取得 operation 时返回 `HFS_EAGAIN`；
-- 已取得 operation 但未入 ring 时释放引用后返回 busy；
-- backend `-ENOMEM` 只在 actor 内以最多 3 次、带界限 delay 的 READY retry 处理；
-- retry 不持 inode dependency、DMA lease 或 metadata lock；
-- 超过上限返回原始错误；绝不无限增长 retry queue。
-
-### 12.3 Teardown 和 fork
-
-正常 stop 顺序：
-
-```text
-reject new client/op
-  → close ingress rings
-  → complete/cancel pending scheduler nodes
-  → drain backend credit and callbacks
-  → flush metadata/journal/checkpoint
-  → write clean_shutdown superblock
-  → destroy channels on owning reactors
-  → join reactor threads
-  → close bdev and release process lock
+} // namespace hfs
 ```
 
-有活跃 client、operation 或未完成 durability 时，`hfs_engine_stop` 返回 `HFS_EBUSY`，
-除非调用显式的 drain-and-stop。SIGTERM 可触发 bounded drain；SIGKILL 不保证 clean flag，
-下次 mount 必须走 recovery。`pthread_atfork` 只用于把 child 标记为 fork child；子进程
-任何 core API 都返回 `HFS_EFORK`，不尝试重新使用继承的 SPDK thread/channel。
+`std::shared_ptr<File>` 只用于 frontend 的长寿命 handle，不用于每个 child；data path
+使用 intrusive `OperationRef`、pool 和 `BufferLease`。路径 API 只进 metadata actor，
+文件数据使用 file id/handle。
 
-## 13. 配置和管理工具
+### 13.2 Namespace 规则
 
-### 13.1 最小配置
+- inode id 单调分配，handle 带 generation，旧 handle 不能解析到新 inode；
+- directory entry 由 name hash 查找、ordered cursor 遍历；
+- rename 是单一 journal transaction，源/目标不产生中间可见状态；
+- delete 先摘 namespace，再延迟回收 extent；打开的 File 可完成已有 operation；
+- directory fsync 提交 directory metadata epoch；
+- `max_inodes`、`max_namespace_bytes` 超限返回 NoMemory，不退回磁盘全表扫描；
+- 大目录必须按 shard/hash 维护，`GetChildren` 不扫描全部 namespace。
+
+## 14. 错误、取消和关闭
+
+### 14.1 错误模型
+
+所有 SPDK callback 都传播原始 backend errno；parent 聚合 first error 和 completed bytes，
+但等待其它 child drain。常见 frontend 映射：
+
+| Core status | RocksDB | FIO |
+|---|---|---|
+| `NoSpace` | `IOStatus::NoSpace` | `ENOSPC` |
+| `TryAgain/Busy` | `IOStatus::TryAgain` | `FIO_Q_BUSY`（submit） |
+| `NoMemory` | memory/IO error | `ENOMEM` |
+| `IoError` | IO error + backend errno | backend errno 或 `EIO` |
+| `Cancelled` | Aborted | `ECANCELED` |
+| `TimedOut` | TimedOut | `ETIMEDOUT` |
+| `Corrupt` | Corruption，终止 engine | `EIO` |
+
+所有 waiter 都 wake；错误不能只唤醒一个等待者，也不能在 parent 处丢掉 bserrno。
+
+### 14.2 Retry/cancel
+
+- only transient `TryAgain`/backend `-ENOMEM` retry；默认最多 3 次；
+- retry 不持 scheduler、DMA 或 metadata lock；
+- ring、frame、arena 满时立即 bounded busy；
+- submit 前 cancel 从 scheduler 删除 operation；
+- submit 后 cancel 只标记状态，等待 SPDK callback 完成，不能伪造 backend abort；
+- timeout 只结束 frontend 等待，不释放 callback 仍需要的 coroutine frame；
+- coroutine cancellation 由 `std::stop_token` 传播到 awaiter，必须经过统一 state machine。
+
+### 14.3 Teardown/fork/multiprocess
+
+```text
+reject new attach/submit
+  → close producer rings
+  → cancel/remove pending scheduler nodes
+  → drain backend credit and SPDK callbacks
+  → flush journal/checkpoint/superblock
+  → write clean_shutdown
+  → destroy channels in owning jthread
+  → join reactor threads
+  → close bdev and process lock
+```
+
+活跃 client/operation 未 drain 时 `stop()` 返回 Busy，除非调用显式 drain API。SIGKILL
+不保证 clean flag，下次 mount 必须 recovery。第二进程打开相同 bdev 返回 Busy；fork child
+所有 core API 返回 ForkedProcess。
+
+## 15. 配置、ABI 和构建
+
+### 15.1 配置
 
 ```json
 {
   "bdev_name": "Nvme0n1",
-  "config_path": "config/hfs2_nvme.json",
   "metadata_block_size": 4096,
   "journal_mb": 256,
   "checkpoint_mb": 512,
   "extent_mb": 1,
   "data_reactors": 0,
+  "max_data_reactors": 4,
   "metadata_cpu": 0,
   "data_cpus": [],
   "ring_depth": 1024,
   "client_depth": 32,
   "dma_arena_mb": 512,
-  "op_pool_count": 4096,
+  "operation_pool": 4096,
+  "coroutine_frame_pool": 4096,
   "metadata_wait_timeout_ms": 5000,
   "backend_retry_limit": 3
 }
 ```
 
-`data_reactors=0` 表示使用本文件的 nproc 规则。CPU 列表长度必须与实际 reactor 数
-一致。实际 VM 验收固定 `config/hfs_nvme.json`、`Nvme0n1`、PCI BDF `0000:0b:00.0`；
-MALLOC/AIO 只用于 deterministic fault injection，不得替代正式 NVMe 结论。
+`data_reactors=0` 使用 nproc 规则；data CPU 列表必须匹配 R。正式 VM 配置仍为
+`config/hfs_nvme.json`/`Nvme0n1`/`0000:0b:00.0`。
 
-### 13.2 工具
-
-```text
-hfsctl format --config ... --yes
-hfsctl check --config ... [--repair-orphans]
-hfsctl dump-super --config ...
-hfsctl dump-journal --config ...
-hfsctl dump-tree --config ... --path ...
-```
-
-`check` 默认只读；repair 必须单独确认并记录修改的 generation。format、repair 和
-device flush 错误必须打印 bdev 名、geometry 和 generation，但不打印密码/敏感配置。
-
-## 14. 可观测性
-
-默认 trace/stats 都关闭。trace-on 只能写 `/mnt/hfs-data/<run>/` 或用户显式指定目录，
-不能把大文件默认写到根盘 `/var/tmp`。
-
-必须能够观测：
+### 15.2 C++ ABI
 
 ```text
-op_alloc/release/fallback
-ring_reservation/doorbell/items/backpressure
-scheduler_probe/conflict/dependency_wait
-dma_bytes/high_watermark/lease_wait
-extent_alloc/reserve/commit/free
-parent_children/parent_wait/first_error
-metadata_journal/checkpoint/flush/publish
-spdk_submit/complete/backend_errno
+libhfs_core.so       C++20 core
+libhfs_rocksdb.so    RocksDB 8.9.1 adapter
+fio-hfs.so           FIO external engine
+hfsctl               format/check/dump/import
 ```
 
-trace-off 热路径不能为这些计数执行额外 atomic。诊断必须首先检查：
-`trace_dropped=0`、`spdk_submit=spdk_complete`、parent/child 闭合、operation/arena 无泄漏。
+- public headers 只暴露 C++20 standard-library types 和 HFS types，不暴露 SPDK；
+- `HFS_CORE_ABI_MAJOR=2`，构建包同时记录 compiler、libstdc++ 和 RocksDB 版本；
+- default visibility hidden，version script 只导出工厂/版本符号；
+- 不承诺跨 toolchain 的 C++ binary compatibility；若未来需要其它语言，再新增薄的
+  C ABI，不把它倒灌为 core 主 API；
+- core `-std=c++20 -fno-exceptions -fno-rtti`；adapter/fio 按各自依赖单独编译；
+- Make/CMake 必须都能从新 `src/` 构建，旧 `src_legacy_frozen/` 不在 source list。
 
-## 15. 非功能目标
+### 15.3 代码处置清单
 
-以下是 HFS 2.0 的验收目标，不是当前 HFS 1.x 的已达成绩：
-
-| 项目 | 目标 |
+| 旧内容 | 处理 |
 |---|---|
-| mount | 在 8-vCPU VM、1,000,000 个 active inode、256 MiB journal 的 checkpoint 上，除 SPDK 初始化外 ≤10 s；journal replay 追加 ≤2 s |
-| metadata actor | 单 metadata actor 对 create/rename/set-size/commit 达到 ≥20,000 ops/s 的 microbenchmark，且报告 journal bytes/op |
-| memory | `inode + namespace + extent index` 按预算运行，默认不超过 1 KiB/active inode（不含 name/path 实际字节和 shared DMA arena）；超限返回 ENOMEM |
-| data latency | 主 FIO 4K 口径 p50 ≤0.5 ms、p99 ≤1.5 ms；64K p99 ≤3 ms；所有结果必须附带 CPU% |
-| resource | 默认 DMA arena ≤512 MiB，operation/ring/metadata 资源均有上限；无 swap、无无界 retry、无泄漏 |
-| recovery | 正常重启、SIGKILL 和五个 crash 注入断点都能在规定 mount 预算内恢复，且 checksum/extent/namespace 守恒 |
+| `src_legacy_frozen/` | 本地冻结、Git ignore、只读参考 |
+| `hfs_op`、actor ring、parent completion | 提取概念，C++20 重新实现 |
+| inode scheduler interval algorithm | 提取算法，合并为唯一 C++ scheduler |
+| shared DMA arena、dirty epoch、durability order | 提取设计，接到新 raw-bdev owner model |
+| stats/trace/log/CRC | 复用经过验证的观测思想，重写 C++接口 |
+| `hfs_runtime.c`、`hfs_io.c`、`hfs_meta*.c` | 不直接复用，按新 owner/extent/journal 重写 |
+| `hfs_preload.c`、`hfs_fd.*`、`hfs_lib.*` | 删除 |
+| `hfs_ticket.*`、range lock、POSIX lock/gate | 删除；只提取必要 interval 算法 |
+| Blobstore glue、blob handle、旧 metadata layout | 删除 |
+| old preload map/env/async ABI | 删除 |
 
-## 16. 构建、ABI 和源码收敛
+## 16. 测试与验收
 
-### 16.1 构建产物
+### 16.1 结构门禁
 
-```text
-libhfs_core.so       C core，默认 hidden visibility
-libhfs_rocksdb.so    RocksDB 8.9.1 C++ adapter
-fio-hfs.so           FIO 3.42 external engine
-hfsctl               format/check/dump tool
-```
+- trace/stats off 不执行 per-request unbounded allocation；
+- coroutine frame、OperationRef、BufferLease、ring slot、parent/child 全部闭合；
+- 没有持 scheduler 等 DMA/queue credit；
+- callback 不持 frontend/core lock，不直接调用外部 C++；
+- `spdk_submit == spdk_complete`；backend errno 可见；NVMe 可释放；
+- shutdown、cancel、timeout、fork child 不产生 UAF、double resume 或 orphan frame。
 
-core 用 CMake 和 Make 双构建；SPDK 版本由 VM 内 Git checkout 固定，Windows 工作区不
-同步 SPDK 源码。C core 与 C++ adapter 分开编译，core 不包含 RocksDB 头文件。
-
-ABI 规则：
-
-- `HFS_CORE_ABI_MAJOR=2`，不导出内部结构；
-- public C symbols 通过 version script 显式导出，默认 hidden；
-- `HFS_CORE_2.0` 只为新 API 服务，不提供旧 `hfs_lib_*`/async alias；
-- adapter 和 fio engine 对 core ABI 做启动时版本检查；
-- ABI 变更必须增加 major 或在新符号组中实现，不能静默改结构布局。
-
-### 16.2 复用、重写、删除清单
-
-| 当前模块/能力 | HFS 2.0 处理 | 说明 |
-|---|---|---|
-| `src/hfs_op.[ch]` | 复用后扩展 | 作为 operation lifetime 基础，改为公开 opaque core 的内部实现 |
-| `src/hfs_runtime.c` | 参考重写 | 保留自建 pthread + SPDK thread poll 经验，重写为 reactor/ring owner |
-| actor ring、parent completion | 复用设计，重写边界 | 保留 shard-67 的守恒和生命周期原则，不保留 POSIX adapter |
-| inode interval scheduler | 复用算法，重写 API | 成为唯一 scheduler；去掉 ticket/range compatibility 名称 |
-| shared DMA arena | 复用设计，重写接口 | core `HfsBufferRef`，不暴露 registered-DMA ABI |
-| dirty set/epoch、durability 顺序 | 复用设计 | 转换到 raw-bdev journal/checkpoint 实现 |
-| stats、trace、logging、CRC | 复用并瘦身 | 只保留 core 需要的事件和错误信息 |
-| `src/hfs_io.c` | 大幅重写 | 只抽取 direct/RMW/parent 的验证经验，改为 extent planner+bdev |
-| `src/hfs_meta*.c` | 大幅重写 | 只抽取 checksum、intent、epoch、恢复测试经验，不保留 Blobstore布局 |
-| `src/hfs_durability.c` | 参考重写 | 保留 group commit/flush 顺序，不保留 POSIX fd 入口 |
-| `src/hfs_file.c` | 删除后重写 | 新 `hfs_file` 是 opaque handle，不是 Blobstore file |
-| `src/hfs_preload.c` | 删除 | 不再编译、不再导出 preload 符号 |
-| `src/hfs_fd.[ch]` | 删除 | 无 fd、dup、stdio、cwd、目录句柄 |
-| `src/hfs_lib.[ch]` | 删除 | 新 API 不围绕 read/write/pread/pwrite |
-| `src/hfs_ticket.[ch]` | 删除 | 只提取 interval scheduler 可复用算法；不保留 ticket API |
-| `src/hfs_range_lock.[ch]` | 删除 | 已不属于当前主线，也不在新架构恢复 |
-| SPDK Blobstore glue | 删除 | HFS 2.0 直接调用 bdev |
-| `hfs_preload.map`、POSIX env 开关 | 删除 | 不允许旧兼容 ABI 回流 |
-| mmap/fork/POSIX permission wrappers | 删除 | fork 只保留 core 的进程保护，不保留 preload 语义 |
-
-“复用”只表示提取经过验证的算法、测试口径和故障经验；如果旧代码的数据结构、锁、
-ABI 或 Blobstore 假设与新 owner 模型冲突，直接删除后重写。
-
-## 17. 开发阶段和切换门禁
-
-### Phase 0：冻结旧线和新 ABI
-
-- 冻结 HFS 1.x commit、性能基线和数据库 baseline artifact；
-- 建立 `include/hfs_core.h`、ABI version script、Make/CMake 双构建；
-- 建立 raw-bdev `hfs2` format/mount skeleton；
-- 明确旧镜像不可用，format 必须显式确认。
-
-验收：新 core 不链接 Blobstore/preload/fd；旧线仍能运行原有回归。
-
-### Phase 1：raw bdev、superblock、journal、checkpoint
-
-- 直接打开 SPDK bdev，读取 sector geometry；
-- 实现 A/B superblock、journal record/CRC、双 checkpoint 和 clean flag；
-- 实现 crash replay、journal full、tear record fault injection。
-
-验收：format/mount/reopen/check、断电恢复和旧镜像拒绝。
-
-### Phase 2：runtime、ring、op、DMA、extent allocator
-
-- 实现 reactor pthread/`spdk_thread_poll`、per-thread channel 和 shard ring；
-- 实现 HfsOp、parent、scheduler、shared arena；
-- 实现 extent reserve/initialize/commit 和 direct/bounce read/write。
-
-验收：native API unit test、ring/scheduler/arena 守恒、4K/16K/64K raw I/O、无泄漏。
-
-### Phase 3：FIO frontend
-
-- 实现 external engine、options、setup_files/FIO_NOEXTEND、queue/getevents/event；
-- 覆盖 verify、iodepth=1/8/32/64/128、numjobs=1/2/4/8；
-- 建立 raw SPDK comparator 和固定 baseline harness。
-
-验收：读写正确、错误映射正确、FIO iodepth 真正生效，主基线达到 HFS/raw ≥85%。
-
-### Phase 4：RocksDB 8.9.1 frontend
-
-- 实现 FileSystem 全部必需接口和 ReadAsync exact signature；
-- direct IO、PrepareWrite/Allocate、PositionedAppend、Directory Fsync、LockFile；
-- 构建 `hfs_db_bench` 和 `hfs_ldb`，显式注入 `DBOptions.env`。
-
-验收：fillseq/readrandom/overwrite/readwhilewriting/flush/compact/WAL、重启和
-`ldb checkconsistency`。
-
-### Phase 5：恢复、性能和删除旧线
-
-- data flush、metadata commit、journal flush 三个 crash 边界注入；
-- ext4 同 workload 参考模型对照；
-- 5-run median、CPU/RSS、p50/p99、错误/守恒报告；
-- 所有新 frontend 通过后，从 HFS 2.0 源码树删除旧 POSIX/Blobstore 实现；
-- 更新产品文档，旧 POSIX 文档只留历史和迁移说明。
-
-## 18. 验收标准
-
-### 18.1 结构门禁
-
-- trace/stats off 无每请求 heap、pthread primitive init/destroy 或全表扫描；
-- one logical I/O 对应一个 parent、有限 child，caller 只 wait 一次；
-- ring reservation/doorbell、scheduler、DMA lease、extent、operation 引用全部闭合；
-- 没有持 dependency 等 DMA/queue credit，也没有 callback 反向取得 caller lock；
-- `spdk_submit == spdk_complete`，backend errno 可追踪，NVMe 可释放。
-
-### 18.2 FIO 固定口径
-
-正式性能：VM 真实 NVMe `0000:0b:00.0`、8 vCPU、256 MiB、O_DIRECT、trace/stats off、
-shared-file、randrw 50/50、4K/8K/16K/32K/64K、32 jobs、10 秒、5 次 median；raw 侧
-使用同设备的 SPDK bdev engine，使用等价 QD。报告 HFS/raw、IOPS、read/write p50/p99、
-CPU%、RSS、errors、submit/complete。
+### 16.2 FIO 功能和性能
 
 功能矩阵：
 
@@ -938,60 +882,142 @@ rw:      read, write, randread, randwrite, randrw
 bs:      4K, 16K, 64K, 1M
 ```
 
-每个组合至少验证错误为零和 `fio --verify`；性能门禁不以 trace-on 数字通过。
+正式性能固定：8 vCPU、真实 NVMe BDF `0000:0b:00.0`、`Nvme0n1`、O_DIRECT、256 MiB、
+shared-file、randrw 50/50、4K/8K/16K/32K/64K、32 jobs、10 秒、5-run median、
+trace/stats off。raw 对照使用同设备和等价 SPDK bdev queue。报告 HFS/raw、read/write
+p50/p99、CPU%、RSS、errors、submit/complete、journal bytes/op。
 
-### 18.3 RocksDB 和恢复
+主 gate：4K shared-file randrw 的 HFS/raw ≥85%，CPU ≤500%，errors=0，submit/complete
+闭合，p99 不超过基线 10%。如果结构/恢复门禁失败，即使 IOPS 更高也不接受。
 
-使用 custom driver：
+### 16.3 RocksDB 验收
+
+由 custom driver 注入 HFS Env：
 
 ```text
 hfs_db_bench --hfs-config=config/hfs2_nvme.json \
-  --db=/hfs2/rocksdb --benchmarks=fillseq,readrandom,overwrite,readwhilewriting \
+  --db=/hfs2/rocksdb \
+  --benchmarks=fillseq,readrandom,overwrite,readwhilewriting \
   --num=20000 --threads=8 --use_direct_io_for_flush_and_compaction=1
 
 hfs_ldb --hfs-config=config/hfs2_nvme.json \
   checkconsistency --db=/hfs2/rocksdb
 ```
 
-验收必须包含：新建、写入、close、正常重启、跨进程 reopen（一次一个进程）、flush、
-compact、delete、WAL sync、SIGKILL recovery、checkconsistency。跨进程同时 mount 同一
-bdev 仍必须被拒绝。
+必须覆盖 create/write/close/reopen、SST read、WAL sync、flush/compact、rename/delete、
+normal restart、SIGKILL recovery、跨进程顺序 reopen 和 checkconsistency。Stock db_bench
+没有注入 HFS Env 时，其结果无效。
 
-crash 注入至少覆盖：
+### 16.4 Crash 和参考模型
+
+至少在以下位置故障注入：
 
 1. data child 完成但 device flush 前；
-2. data flush 完成但 metadata transaction commit 前；
-3. journal commit 写入但 journal flush 前；
-4. checkpoint 写 inactive slot 后、superblock publish 前；
-5. clean shutdown 前的任意退出。
+2. data flush 完成但 metadata commit 前；
+3. journal COMMIT 写入但 journal flush 前；
+4. checkpoint inactive slot flush 后、superblock publish 前；
+5. clean flag 写入前。
 
-每个断点都要检查 namespace、extent 状态、logical/durable size、孤儿回收、RocksDB
-reopen 和 checksum。ext4 上相同 workload 作为语义参考，不把 ext4 性能当作 HFS 目标。
+每个断点检查 namespace、extent bitmap/state、logical/durable size、orphan reclaim、
+generation、CRC 和 RocksDB reopen。ext4 上运行同一逻辑 workload 对照语义，不把 ext4
+性能当作 HFS 目标。
 
-## 19. 风险和停止条件
+## 17. 非功能目标、风险和停止条件
+
+### 17.1 非功能目标
+
+| 项目 | 目标 |
+|---|---|
+| mount | 1,000,000 active inode、256 MiB journal 的 8-vCPU VM，除 SPDK 初始化外 ≤10 s；replay 追加 ≤2 s |
+| metadata actor | create/rename/set-size/commit microbenchmark ≥20,000 ops/s，报告 journal bytes/op |
+| metadata memory | inode/namespace/extent index 默认 ≤1 KiB/active inode，不含实际 name bytes 和 DMA arena |
+| data latency | 4K 主口径 p50 ≤0.5 ms、p99 ≤1.5 ms；64K p99 ≤3 ms |
+| resource | DMA arena ≤512 MiB，frame/ring/retry/metadata 均有界，无 swap、无泄漏 |
+| recovery | 正常重启、SIGKILL 和所有 crash 断点在 mount budget 内恢复，状态守恒 |
+
+### 17.2 风险与缓解
 
 | 风险 | 缓解 |
 |---|---|
-| metadata actor 成为瓶颈 | dirty epoch/group commit、批量 extent transaction；单独报告 metadata ops/s |
-| 全量 metadata 内存过大 | max_inodes/namespace bytes、mount time budget、create 返回 ENOMEM |
-| direct IO 对齐和 RocksDB 版本差异 | 固定 8.9.1 头文件、adapter compile test、bounce fallback |
-| journal 写放大 | data 不写 HFS WAL、metadata batch、阈值 checkpoint、报告 journal bytes/op |
-| hugepage 不足 | 启动预算检查、DMA cap、FIO 分段，不隐式扩大 arena |
-| bdev 错误/队列满 | 原始 errno、有限 retry、FIO busy、RocksDB TryAgain |
-| scheduler/parent UAF | 引用计数、fault injection、shutdown/fork sanitizer 检查 |
-| 旧功能回流 | 新库名/新镜像 magic/新 ABI，HFS 2.0 不编译旧模块 |
+| metadata actor 瓶颈 | epoch/group commit、批量 extent transaction，单独报告 metadata ops/s |
+| coroutine frame 膨胀 | frame pool、await state size audit、trace-off allocation test |
+| C++ ABI 漂移 | 锁定 compiler/libstdc++/RocksDB，启动版本检查 |
+| direct IO 对齐差异 | exact RocksDB 8.9.1 compile test、bounded bounce fallback |
+| hugepage 不足 | preflight、DMA cap、分段 FIO buffer，不隐式扩大 arena |
+| queue/backpressure | 有界 ring、FIO busy、RocksDB TryAgain、有限 retry |
+| recovery 错误 | A/B、CRC、commit marker、crash matrix、hfsctl check |
+| 旧功能回流 | 新库名、新 magic、新 source tree，不编译 frozen src |
 
-立即停止条件：任何数据错误、sparse 非零、metadata corruption、recovery 失败、
-parent/child 不闭合、operation/DMA 泄漏、submit/complete 不相等、NVMe 无法释放，或
-RocksDB/FIO 错误映射不完整。性能提升不能抵消结构或正确性门禁失败。
+### 17.3 立即停止条件
 
-## 20. 最终定位
+任何以下情况都停止性能测试并回到结构/正确性修复：
 
-> HFS 2.0 是一个面向 RocksDB 和 FIO 的 SPDK-native 用户态文件存储引擎。它在应用
-> 进程内直接管理 NVMe，使用异步 C core、raw-bdev metadata/extent layout、per-shard
-> actor、单一 inode dependency scheduler 和 bounded DMA arena，为数据库 frontend
-> 提供明确的文件、异步 I/O 和持久化契约；它不是通用 POSIX 文件系统，也不兼容 HFS 1.x
-> 的 Blobstore 镜像、fd ABI 或 preload 路径。
+- data mismatch、sparse read 非零、RMW 丢数据；
+- metadata corruption、generation/CRC 不一致、journal replay 错误；
+- parent/child、coroutine frame、DMA lease、ring slot 泄漏或 double resume；
+- `spdk_submit != spdk_complete`、backend errno 丢失、NVMe 无法释放；
+- RocksDB/FIO error mapping、cancel、AbortIO、directory fsync 不完整；
+- 旧 Blobstore、POSIX fd 或 preload 代码重新进入 HFS 2.0 build。
 
-HFS 2.0 只有在接口、磁盘格式、frontend、恢复和固定性能口径全部闭环后才切换为产品线。
-在此之前，旧 HFS 只作为冻结对照，不得把两种架构拼接成新的“兼容模式”。
+## 18. 实施顺序
+
+### Phase 0：新工程和 ABI
+
+- `src/` 使用 C++20 新目录结构；
+- 建立 `Task/Result/Engine/Client/File` 和 versioned build；
+- Make/CMake 不再引用 frozen source；
+- 实现 process lock、geometry preflight 和空 engine。
+
+验收：新 core 能独立编译；不链接 Blobstore/preload/fd；旧 artifact 仍可单独复现。
+
+### Phase 1：raw bdev 和格式
+
+- SPDK env/reactor/channel owner；
+- format、A/B superblock、geometry、journal/checkpoint；
+- `hfsctl format/check/dump/import`；
+- torn record、journal full、旧 magic rejection。
+
+### Phase 2：coroutine data plane
+
+- `Task` frame pool、OperationRef、MPSC shard ring、actor doorbell；
+- inode interval scheduler、extent planner、parent completion；
+- shared DMA arena、direct/bounce、read/write/append；
+- C++ unit/ASAN/TSAN 结构测试。
+
+### Phase 3：namespace、allocator、durability
+
+- inode/directory/name index；
+- 1 MiB extent allocator、RESERVED/INITIALIZED/COMMITTED；
+- logical/durable epoch、datasync/sync、crash replay；
+- fault injection 和 ext4 reference model。
+
+### Phase 4：FIO frontend
+
+- FIO options、setup_files/FIO_NOEXTEND、queue/getevents/event；
+- verify、direct/bounce、iodepth/numjobs 功能矩阵；
+- raw SPDK comparator 和 5-run performance gate。
+
+### Phase 5：RocksDB frontend
+
+- 8.9.1 FileSystem exact contract；
+- ReadAsync/AbortIO、direct IO、preallocation、PositionedAppend；
+- custom `hfs_db_bench`/`hfs_ldb`、WAL/flush/compact/recovery。
+
+### Phase 6：收口和归档
+
+- 所有 gate 通过后删除新树中最后的旧兼容残留；
+- `src_legacy_frozen/` 保持本地忽略或单独归档，不回到 product build；
+- 更新架构索引、性能基线、支持边界和迁移说明；
+- HFS 2.0 才能作为正式产品线，旧 HFS 1.x 只保留归档 artifact。
+
+## 19. 最终定位
+
+> HFS 2.0 是一个 C++20 coroutine-first、运行在应用进程内、直接管理 SPDK bdev/NVMe
+> 的数据库文件存储引擎。它以 per-shard actor、单一 inode dependency scheduler、
+> bounded DMA arena、extent allocator 和可恢复 raw-bdev metadata 为核心，为 RocksDB
+> 8.9.1 和 FIO 3.42 提供明确的异步文件契约。它不是通用 POSIX 文件系统，不使用
+> Blobstore，也不兼容 HFS 1.x 的 src、镜像、fd ABI 或 preload 路径。
+
+HFS 2.0 的第一条实现原则是：旧代码可以冻结，但不能以兼容性名义继续污染新架构；
+第二条原则是：coroutine 只用于表达非阻塞状态机，所有资源、错误、恢复和完成边界都
+必须可计数、可回放、可验证。
