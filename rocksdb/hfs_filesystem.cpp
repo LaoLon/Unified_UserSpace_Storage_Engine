@@ -184,29 +184,51 @@ struct AsyncReadState {
 
 /* Runs the HFS read off the caller thread and publishes one completion. */
 void executeAsyncRead(AsyncReadState *state) {
-    hfs::IoVec buffer{reinterpret_cast<std::byte *>(state->request->scratch),
-                      state->request->len};
-    auto read = state->file->read(std::span<hfs::IoVec>(&buffer, 1),
-                                  state->request->offset).wait();
-
-    std::unique_lock<std::mutex> lock(state->mutex);
-    if (!state->aborted) {
+    rocksdb::IOStatus status = rocksdb::IOStatus::IOError("async read failed");
+    try {
+        hfs::IoVec buffer{reinterpret_cast<std::byte *>(state->request->scratch),
+                          state->request->len};
+        auto read = state->file->read(std::span<hfs::IoVec>(&buffer, 1),
+                                      state->request->offset).wait();
         if (!read.ok()) {
-            state->request->status = toIoStatus(read);
+            status = toIoStatus(read);
         } else {
             auto value = std::move(read).value();
             if (!value.ok()) {
-                state->request->status = toIoStatus(value);
+                status = toIoStatus(value);
             } else {
                 state->request->result = rocksdb::Slice(
                     state->request->scratch, value.value().bytes);
-                state->request->status = rocksdb::IOStatus::OK();
+                status = rocksdb::IOStatus::OK();
             }
         }
-        state->callback(*state->request, state->callbackArg);
+    } catch (const std::exception &error) {
+        status = rocksdb::IOStatus::IOError(
+            std::string("async read worker failed: ") + error.what());
+    } catch (...) {
+        status = rocksdb::IOStatus::IOError("async read worker failed");
     }
-    state->completed = true;
-    lock.unlock();
+
+    bool invokeCallback = false;
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        if (!state->aborted) {
+            state->request->status = status;
+            invokeCallback = true;
+        }
+    }
+    /* Invoke user code outside the state lock so callbacks may re-enter Poll/AbortIO. */
+    if (invokeCallback) {
+        try {
+            state->callback(*state->request, state->callbackArg);
+        } catch (...) {
+            /* RocksDB callbacks must not escape the worker thread. */
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->completed = true;
+    }
     state->condition.notify_all();
 }
 
