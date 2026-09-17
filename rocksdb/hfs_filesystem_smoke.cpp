@@ -2,6 +2,7 @@
 
 #include <cstdlib>
 #include <cstdint>
+#include <atomic>
 #include <memory>
 #include <string>
 #include <vector>
@@ -17,10 +18,10 @@ int main(int argc, char **argv) {
     if (fileSystem == nullptr) {
         return 3;
     }
-    /* Buffered Shard-82 intentionally exposes no unimplemented async capability. */
+    /* Shard-83 exposes the complete async read handle contract. */
     int64_t supportedOps = -1;
     fileSystem->SupportedOps(supportedOps);
-    if (supportedOps != 0) {
+    if ((supportedOps & (1LL << rocksdb::FSSupportedOps::kAsyncIO)) == 0) {
         return 4;
     }
     rocksdb::FileOptions options;
@@ -64,30 +65,52 @@ int main(int argc, char **argv) {
     if (!status.ok() || result.compare(payload) != 0) {
         return 11;
     }
+    std::atomic<bool> callbackCalled = false;
+    rocksdb::FSReadRequest request;
+    request.offset = 0;
+    request.len = sizeof(scratch);
+    request.scratch = scratch;
+    void *ioHandle = nullptr;
+    rocksdb::IOHandleDeleter deleter;
+    status = random->ReadAsync(
+        request, options.io_options,
+        [&callbackCalled](const rocksdb::FSReadRequest &, void *) {
+            callbackCalled.store(true);
+        }, nullptr, &ioHandle, &deleter, &debug);
+    if (!status.ok() || ioHandle == nullptr || !deleter) {
+        return 12;
+    }
+    std::vector<void *> asyncHandles{ioHandle};
+    status = fileSystem->Poll(asyncHandles, 1);
+    if (!status.ok() || !callbackCalled.load() || request.result.compare(payload) != 0) {
+        deleter(ioHandle);
+        return 12;
+    }
+    deleter(ioHandle);
     std::vector<std::string> children;
     status = fileSystem->GetChildren("/", options.io_options, &children, &debug);
     if (!status.ok()) {
-        return 12;
+        return 13;
     }
     /* Check idempotent directory creation and the resident directory handle. */
     status = fileSystem->CreateDirIfMissing("/rocksdb-dir", options.io_options, &debug);
     if (!status.ok() ||
         !fileSystem->CreateDirIfMissing("/rocksdb-dir", options.io_options, &debug).ok()) {
-        return 13;
+        return 14;
     }
     std::unique_ptr<rocksdb::FSDirectory> directory;
     status = fileSystem->NewDirectory("/rocksdb-dir", options.io_options, &directory, &debug);
     if (!status.ok()) {
-        return 14;
+        return 15;
     }
     directory.reset();
     status = fileSystem->DeleteFile("/rocksdb-smoke", options.io_options, &debug);
     if (!status.ok()) {
-        return 15;
+        return 16;
     }
     status = fileSystem->DeleteFile("/rocksdb-link", options.io_options, &debug);
     if (!status.ok() || !fileSystem->DeleteDir("/rocksdb-dir", options.io_options, &debug).ok()) {
-        return 15;
+        return 16;
     }
     return 0;
 }

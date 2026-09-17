@@ -2,12 +2,17 @@
 
 #include "rocksdb/hfs_filesystem.hpp"
 
+#include <algorithm>
 #include <cerrno>
+#include <condition_variable>
 #include <cstdint>
+#include <exception>
 #include <fcntl.h>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <sys/file.h>
 #include <unistd.h>
 #include <utility>
@@ -34,6 +39,7 @@ rocksdb::IOStatus toIoStatus(const hfs::Result<T> &result) {
     case hfs::Status::AlreadyExists:
         return rocksdb::IOStatus::IOError(result.message());
     case hfs::Status::Busy:
+        return rocksdb::IOStatus::Busy(result.message());
     case hfs::Status::TryAgain:
         return rocksdb::IOStatus::IOError(result.message());
     case hfs::Status::InvalidArgument:
@@ -127,10 +133,87 @@ public:
         return rocksdb::IOStatus::OK();
     }
 
+    /* Implements RocksDB's direct positioned-read entry point. */
+    rocksdb::IOStatus PositionedRead(uint64_t offset, size_t n,
+                                     const rocksdb::IOOptions &options,
+                                     rocksdb::Slice *result, char *scratch,
+                                     rocksdb::IODebugContext *debug) override {
+        if (scratch == nullptr && n != 0) {
+            return rocksdb::IOStatus::InvalidArgument("null positioned read buffer");
+        }
+        hfs::IoVec buffer{reinterpret_cast<std::byte *>(scratch), n};
+        auto read = file_->read(std::span<hfs::IoVec>(&buffer, 1), offset).wait();
+        if (!read.ok()) return toIoStatus(read);
+        auto value = std::move(read).value();
+        if (!value.ok()) return toIoStatus(value);
+        *result = rocksdb::Slice(scratch, value.value().bytes);
+        return rocksdb::IOStatus::OK();
+    }
+
+    /* HFS exposes aligned SPDK buffers for direct sequential reads. */
+    bool use_direct_io() const override { return true; }
+
+    /* Matches the SPDK DMA alignment used by the HFS data path. */
+    size_t GetRequiredBufferAlignment() const override { return 4096; }
+
 private:
     std::shared_ptr<hfs::File> file_;
     std::uint64_t offset_ = 0;
 };
+
+/* Owns one submitted async read until RocksDB releases its opaque handle. */
+struct AsyncReadState {
+    std::shared_ptr<hfs::File> file;
+    rocksdb::FSReadRequest *request = nullptr;
+    rocksdb::IOOptions options;
+    std::function<void(const rocksdb::FSReadRequest &, void *)> callback;
+    void *callbackArg = nullptr;
+    std::mutex mutex;
+    std::condition_variable condition;
+    bool completed = false;
+    bool aborted = false;
+    std::thread worker;
+
+    /* Joins the worker before the opaque handle is reclaimed. */
+    ~AsyncReadState() {
+        if (worker.joinable()) {
+            worker.join();
+        }
+    }
+};
+
+/* Runs the HFS read off the caller thread and publishes one completion. */
+void executeAsyncRead(AsyncReadState *state) {
+    hfs::IoVec buffer{reinterpret_cast<std::byte *>(state->request->scratch),
+                      state->request->len};
+    auto read = state->file->read(std::span<hfs::IoVec>(&buffer, 1),
+                                  state->request->offset).wait();
+
+    std::unique_lock<std::mutex> lock(state->mutex);
+    if (!state->aborted) {
+        if (!read.ok()) {
+            state->request->status = toIoStatus(read);
+        } else {
+            auto value = std::move(read).value();
+            if (!value.ok()) {
+                state->request->status = toIoStatus(value);
+            } else {
+                state->request->result = rocksdb::Slice(
+                    state->request->scratch, value.value().bytes);
+                state->request->status = rocksdb::IOStatus::OK();
+            }
+        }
+        state->callback(*state->request, state->callbackArg);
+    }
+    state->completed = true;
+    lock.unlock();
+    state->condition.notify_all();
+}
+
+/* Deletes a submitted async request only after its worker has stopped. */
+void deleteAsyncReadHandle(void *handle) {
+    delete static_cast<AsyncReadState *>(handle);
+}
 
 class HfsRandomAccessFile final : public rocksdb::FSRandomAccessFile {
 public:
@@ -154,6 +237,60 @@ public:
         }
         *result = rocksdb::Slice(scratch, value.value().bytes);
         return rocksdb::IOStatus::OK();
+    }
+
+    /* Processes a batch of non-overlapping reads while preserving per-request status. */
+    rocksdb::IOStatus MultiRead(rocksdb::FSReadRequest *requests, size_t count,
+                                const rocksdb::IOOptions &options,
+                                rocksdb::IODebugContext *debug) override {
+        if (requests == nullptr && count != 0) {
+            return rocksdb::IOStatus::InvalidArgument("null multi-read requests");
+        }
+        for (size_t index = 0; index < count; ++index) {
+            auto &request = requests[index];
+            request.status = Read(request.offset, request.len, options,
+                                  &request.result, request.scratch, debug);
+        }
+        return rocksdb::IOStatus::OK();
+    }
+
+    /* HFS requires aligned offsets, lengths, and scratch buffers for direct I/O. */
+    bool use_direct_io() const override { return true; }
+
+    /* Matches the SPDK DMA alignment used by the HFS data path. */
+    size_t GetRequiredBufferAlignment() const override { return 4096; }
+
+    /* Submits a real background read and returns before the HFS coroutine completes. */
+    rocksdb::IOStatus ReadAsync(
+        rocksdb::FSReadRequest &request, const rocksdb::IOOptions &options,
+        std::function<void(const rocksdb::FSReadRequest &, void *)> callback,
+        void *callbackArg, void **ioHandle, rocksdb::IOHandleDeleter *deleter,
+        rocksdb::IODebugContext *) override {
+        if (ioHandle == nullptr || deleter == nullptr || callback == nullptr) {
+            return rocksdb::IOStatus::InvalidArgument("invalid async read handle");
+        }
+        if (request.scratch == nullptr && request.len != 0) {
+            return rocksdb::IOStatus::InvalidArgument("null async read buffer");
+        }
+        *ioHandle = nullptr;
+        *deleter = {};
+        try {
+            auto state = std::make_unique<AsyncReadState>();
+            state->file = file_;
+            state->request = &request;
+            state->options = options;
+            state->callback = std::move(callback);
+            state->callbackArg = callbackArg;
+            state->worker = std::thread(executeAsyncRead, state.get());
+            *ioHandle = state.release();
+            *deleter = deleteAsyncReadHandle;
+            return rocksdb::IOStatus::OK();
+        } catch (const std::exception &error) {
+            return rocksdb::IOStatus::IOError(
+                std::string("async read submission failed: ") + error.what());
+        } catch (...) {
+            return rocksdb::IOStatus::IOError("async read submission failed");
+        }
     }
 
 private:
@@ -260,8 +397,49 @@ public:
     /* Identifies this implementation to RocksDB's Customizable registry. */
     const char *Name() const override { return "HfsFileSystem"; }
 
-    /* Do not advertise async I/O until the core reactor ownership contract is complete. */
-    void SupportedOps(int64_t &supported_ops) override { supported_ops = 0; }
+    /* Advertises the implemented callback, poll, and abort async contract. */
+    void SupportedOps(int64_t &supported_ops) override {
+        supported_ops = (1LL << rocksdb::FSSupportedOps::kAsyncIO);
+    }
+
+    /* Waits until the requested number of submitted reads have completed. */
+    rocksdb::IOStatus Poll(std::vector<void *> &ioHandles,
+                           size_t minCompletions) override {
+        const size_t required = std::min(minCompletions, ioHandles.size());
+        if (required == 0) return rocksdb::IOStatus::OK();
+        while (true) {
+            size_t completed = 0;
+            AsyncReadState *waitState = nullptr;
+            for (void *handle : ioHandles) {
+                if (handle == nullptr) continue;
+                auto *state = static_cast<AsyncReadState *>(handle);
+                std::lock_guard<std::mutex> lock(state->mutex);
+                if (state->completed) {
+                    ++completed;
+                } else if (waitState == nullptr) {
+                    waitState = state;
+                }
+            }
+            if (completed >= required) return rocksdb::IOStatus::OK();
+            if (waitState == nullptr) return rocksdb::IOStatus::IOError(
+                "async read completion handle is invalid");
+            std::unique_lock<std::mutex> lock(waitState->mutex);
+            waitState->condition.wait(lock, [waitState] {
+                return waitState->completed;
+            });
+        }
+    }
+
+    /* Cancels pending reads and suppresses callbacks for reads not yet completed. */
+    rocksdb::IOStatus AbortIO(std::vector<void *> &ioHandles) override {
+        for (void *handle : ioHandles) {
+            if (handle == nullptr) continue;
+            auto *state = static_cast<AsyncReadState *>(handle);
+            std::lock_guard<std::mutex> lock(state->mutex);
+            if (!state->completed) state->aborted = true;
+        }
+        return rocksdb::IOStatus::OK();
+    }
 
     /* Opens an existing HFS regular file for sequential reads. */
     rocksdb::IOStatus NewSequentialFile(const std::string &fname,
