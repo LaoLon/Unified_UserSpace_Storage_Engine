@@ -184,6 +184,7 @@ struct AsyncReadState {
     std::condition_variable condition;
     bool completed = false;
     bool aborted = false;
+    bool callbackStarted = false;
     std::thread worker;
 
     /* Joins the worker before the opaque handle is reclaimed. */
@@ -226,6 +227,9 @@ void executeAsyncRead(AsyncReadState *state) {
         std::lock_guard<std::mutex> lock(state->mutex);
         if (!state->aborted) {
             state->request->status = status;
+            /* Establish the cancellation boundary before releasing the lock;
+             * AbortIO after this point cannot rewrite callback-visible state. */
+            state->callbackStarted = true;
             invokeCallback = true;
         }
     }
@@ -482,7 +486,7 @@ public:
             if (handle == nullptr) continue;
             auto *state = static_cast<AsyncReadState *>(handle);
             std::lock_guard<std::mutex> lock(state->mutex);
-            if (!state->completed) {
+            if (!state->completed && !state->callbackStarted) {
                 state->aborted = true;
                 state->request->status = rocksdb::IOStatus::IOError(
                     "async read aborted");

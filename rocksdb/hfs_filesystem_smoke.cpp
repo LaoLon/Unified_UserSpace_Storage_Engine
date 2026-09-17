@@ -208,6 +208,52 @@ int main(int argc, char **argv) {
         return 12;
     }
     deleter(ioHandle);
+    /* Abort after callback entry must not rewrite callback-visible status. */
+    char boundaryScratch[12]{};
+    rocksdb::FSReadRequest boundaryRequest;
+    boundaryRequest.offset = 0;
+    boundaryRequest.len = sizeof(boundaryScratch);
+    boundaryRequest.scratch = boundaryScratch;
+    std::atomic<bool> boundaryEntered = false;
+    std::atomic<bool> boundaryRelease = false;
+    std::atomic<bool> boundaryCallback = false;
+    void *boundaryHandle = nullptr;
+    rocksdb::IOHandleDeleter boundaryDeleter;
+    status = random->ReadAsync(
+        boundaryRequest, options.io_options,
+        [&](const rocksdb::FSReadRequest &, void *) {
+            boundaryEntered.store(true);
+            while (!boundaryRelease.load()) {
+                std::this_thread::yield();
+            }
+            boundaryCallback.store(true);
+        }, nullptr, &boundaryHandle, &boundaryDeleter, &debug);
+    if (!status.ok() || boundaryHandle == nullptr || !boundaryDeleter) {
+        boundaryRelease.store(true);
+        if (boundaryHandle != nullptr && boundaryDeleter) boundaryDeleter(boundaryHandle);
+        return 12;
+    }
+    for (std::size_t spin = 0; spin < 100000 && !boundaryEntered.load(); ++spin) {
+        std::this_thread::yield();
+    }
+    if (!boundaryEntered.load()) {
+        boundaryRelease.store(true);
+        boundaryDeleter(boundaryHandle);
+        return 12;
+    }
+    std::vector<void *> boundaryHandles{boundaryHandle};
+    if (!fileSystem->AbortIO(boundaryHandles).ok()) {
+        boundaryRelease.store(true);
+        boundaryDeleter(boundaryHandle);
+        return 12;
+    }
+    boundaryRelease.store(true);
+    if (!fileSystem->Poll(boundaryHandles, 1).ok() || !boundaryCallback.load() ||
+        !boundaryRequest.status.ok() || boundaryRequest.result.compare(payload) != 0) {
+        boundaryDeleter(boundaryHandle);
+        return 12;
+    }
+    boundaryDeleter(boundaryHandle);
     rocksdb::FSReadRequest invalidRequest;
     invalidRequest.offset = 0;
     invalidRequest.len = 1;
