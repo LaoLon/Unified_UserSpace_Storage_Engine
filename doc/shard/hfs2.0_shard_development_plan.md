@@ -405,6 +405,10 @@ p99 ≤ raw×110%。不达标时停在上游结构修复，不扩大 reactor/are
 
 ### Shard-82：RocksDB FileSystem 基础接口（buffered 过渡契约）
 
+> 状态：基础接口已实现并随 Shard-83/84 在单盘真实 NVMe 回归；当前实现已切换到
+> direct IO 契约，故本 shard 的历史 buffered-only 验收不再单独作为最终支持边界。
+> 完整 stock RocksDB 兼容性仍不宣称。
+
 **交付物**：`libhfs_rocksdb.so`；`HfsFileSystem/HfsRandomAccessFile/HfsWritableFile/
 HfsSequentialFile/HfsDirectory`；New/Get/Delete/Rename/Link/Lock/Directory/
 `GetFileModificationTime`/`GetFreeSpace`；`NewCompositeEnv` 注入；本 shard 明确
@@ -416,6 +420,11 @@ readwhilewriting 基础运行；WAL、MANIFEST 能创建/rename/同步；stock `
 不作为证据；不得宣称 direct IO 或性能结论。
 
 ### Shard-83：async read、direct IO 与 preallocation
+
+> 状态：接口实现完成，单盘真实 NVMe 已验证 direct read/write、ReadAsync/Poll/AbortIO
+> 生命周期、MultiRead、Allocate、PositionedAppend、RangeSync、Fsync 和错误映射；
+> RocksDB smoke 覆盖了 async 与 MultiRead。当前仍缺完整 SST 并发读、性能放大和
+> 独立 Abort 竞态矩阵证据，不能据此宣称全部 direct IO 性能目标。
 
 **交付物**：切换到 `use_direct_io()==true` 并**同时**落地 `PrepareWrite/Allocate/
 PositionedAppend`（三者必须一起启用）；`ReadAsync/Poll/AbortIO`（FSReadRequest/
@@ -429,6 +438,11 @@ RMW 放大；`AbortIO` 遵守 cancel boundary。
 
 ### Shard-84：RocksDB 验收与恢复
 
+> 状态：核心验收工具和单盘真实 NVMe 最小闭环已完成；已验证 fillseq/readrandom/
+> overwrite/readwhilewriting、direct/async、正常 reopen、SIGKILL recovery、
+> `hfs_ldb checkconsistency`、`hfsctl check` 和 MultiRead。完整 §16.3 组合（含完整
+> flush/compact、跨进程矩阵及所有错误/取消路径）仍保留为未完成证据项。
+
 **交付物**：`hfs_db_bench`/`hfs_ldb` 完整参数；SIGKILL recovery、跨进程顺序 reopen、
 `checkconsistency`。
 
@@ -441,6 +455,11 @@ checkconsistency）；错误/超时/取消映射完整。
 ## 8. Phase 6：收口
 
 ### Shard-85：多盘完整矩阵、性能基线与归档
+
+> 状态：单盘真实 NVMe 功能/FIO workload 矩阵和 `--verify=crc32c` loader smoke 已
+> 通过；当前 VM 只有 `Nvme0n1`（`0000:0b:00.0`），双盘、全 data device、metadata
+> replica 掉盘/CRC/generation 故障组合以及 raw 对照/5-run 性能门禁仍未完成，不能用
+> 重复 BDF、SATA 或 Malloc/Aio 替代。
 
 **交付物**：
 
