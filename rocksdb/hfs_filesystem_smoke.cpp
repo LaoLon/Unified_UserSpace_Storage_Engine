@@ -26,6 +26,33 @@ int main(int argc, char **argv) {
     }
     rocksdb::FileOptions options;
     rocksdb::IODebugContext debug;
+    /* The database identity lock must reject a concurrent opener and recover
+     * after the first process releases its lock. */
+    rocksdb::FileLock *firstLock = nullptr;
+    if (!fileSystem->LockFile("/rocksdb-lock-db", options.io_options, &firstLock, &debug).ok() ||
+        firstLock == nullptr) {
+        return 5;
+    }
+    rocksdb::FileLock *secondLock = nullptr;
+    if (fileSystem->LockFile("/rocksdb-lock-db", options.io_options, &secondLock, &debug).ok() ||
+        secondLock != nullptr ||
+        !fileSystem->UnlockFile(firstLock, options.io_options, &debug).ok()) {
+        if (secondLock != nullptr) {
+            fileSystem->UnlockFile(secondLock, options.io_options, &debug);
+        }
+        if (firstLock != nullptr) {
+            fileSystem->UnlockFile(firstLock, options.io_options, &debug);
+        }
+        return 5;
+    }
+    firstLock = nullptr;
+    if (!fileSystem->LockFile("/rocksdb-lock-db", options.io_options, &firstLock, &debug).ok() ||
+        firstLock == nullptr || !fileSystem->UnlockFile(firstLock, options.io_options, &debug).ok()) {
+        if (firstLock != nullptr) {
+            fileSystem->UnlockFile(firstLock, options.io_options, &debug);
+        }
+        return 5;
+    }
     uint64_t freeSpace = 0;
     auto status = fileSystem->GetFreeSpace("/", options.io_options, &freeSpace, &debug);
     if (!status.ok() || freeSpace == 0) {
