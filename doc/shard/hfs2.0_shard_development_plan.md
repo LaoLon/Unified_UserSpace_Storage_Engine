@@ -487,7 +487,8 @@ checkconsistency）；错误/超时/取消映射完整。
 2026-09-17 双盘验收还发现 clean/dirty 生命周期逐盘递增会使副本 generation 漂移，
 已改为先读取全部副本、计算一次共享版本后逐盘发布；修复后双盘 `hfsctl check` 连续
 通过。RocksDB smoke 仍在 free-space 立即减少的 extent 粒度断言处返回 7，需单独修订
-测试口径，不能记录为 smoke 全通过。
+测试口径，不能记录为 smoke 全通过。随后对真实双盘完成缺失第二 BDF、合法落后
+generation、双槽 CRC 损坏三类 fail-closed 探针，三项均返回非零并保留明确错误。
 
 **交付物**：
 

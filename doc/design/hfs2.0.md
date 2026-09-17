@@ -1338,6 +1338,8 @@ checkpoint region 必须容纳 namespace/inode/extent map/各 device allocator b
   硬门禁，不以 Malloc/Aio 或重复 BDF 代替。真实双盘验收还暴露并修复了生命周期
   superblock generation 逐盘递增导致的副本漂移；RocksDB smoke 中“12 字节写入后
   free space 必须立即减少”断言与 extent 粒度统计不一致，暂不作为双盘通过证据。
+  缺失 BDF、合法但落后 generation、双槽 CRC 损坏三类双盘 fail-closed 探针也已通过；
+  双盘完整 workload 矩阵和性能 gate 仍未完成。
 - 所有 gate 通过后删除新树中最后的旧兼容残留；
 - `src_legacy_frozen/` 保持本地忽略或单独归档，不回到 product build；
 - 更新架构索引、性能基线、支持边界和迁移说明；

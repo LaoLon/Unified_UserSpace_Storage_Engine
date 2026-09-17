@@ -103,3 +103,13 @@ replica check，以及 2 jobs/4 KiB/16 MiB 的 `randrw` CRC verify，返回 `err
 clean/dirty 标志会造成 superblock generation 漂移，已修复为共享版本发布；修复后
 双盘 `hfsctl check` 连续通过。RocksDB smoke 仍因“12 字节写入后 free space 必须
 立即减少”这一与 extent 粒度统计不一致的断言返回 7，需另行修订测试口径。
+
+真实双盘 fail-closed 探针结果：
+
+| 故障 | 结果 |
+| --- | --- |
+| 只接管 `0000:0b:00.0`，缺失 required `0000:13:00.0` | `hfsctl info` 非零，SPDK 报 `No such device` |
+| `Nvme1n1` 两个合法 superblock 都回退一个 generation | mount 非零，报告 metadata replica 不一致 |
+| `Nvme1n1` 两个 superblock CRC 损坏 | mount 非零，报告设备未格式化 |
+
+每项探针后均重新 format 双盘并恢复两个 BDF 到 kernel `nvme`，未留下损坏测试状态。
