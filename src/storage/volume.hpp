@@ -28,4 +28,7 @@ Result<VolumeInfo> formatVolume(SpdkRuntime &runtime, const Config &config, bool
 /* Read and validate superblock A/B on every configured device. */
 Result<VolumeInfo> mountVolume(SpdkRuntime &runtime, const Config &config);
 
+/* Publish the clean-shutdown state to every configured device. */
+Result<void> updateCleanShutdown(SpdkRuntime &runtime, const Config &config, bool clean);
+
 } // namespace hfs

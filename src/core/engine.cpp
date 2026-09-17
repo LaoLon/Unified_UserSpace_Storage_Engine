@@ -263,6 +263,12 @@ Task<Result<void>> Engine::mount() {
         runtime.stop();
         co_return makeError(volume.status(), volume.message());
     }
+    /* Mark the volume dirty before exposing any mounted handles. */
+    auto markedDirty = updateCleanShutdown(runtime, impl.config, false);
+    if (!markedDirty.ok()) {
+        runtime.stop();
+        co_return markedDirty;
+    }
     impl.geometries = volume.value().devices;
 
     /* Build the resident namespace before replay so checkpoints can restore it. */
@@ -395,6 +401,12 @@ Task<Result<void>> Engine::stop() {
         co_return Result<void>(Status::Busy, "clients or open files are still active");
     }
     if (impl.mounted) {
+        /* No active clients remain here, so publish a clean lifecycle state
+         * before releasing the runtime that owns the control path. */
+        auto markedClean = updateCleanShutdown(SpdkRuntime::instance(), impl.config, true);
+        if (!markedClean.ok()) {
+            co_return markedClean;
+        }
         impl.journal.reset();
         impl.metadataTarget.reset();
         auto stopped = SpdkRuntime::instance().stop();

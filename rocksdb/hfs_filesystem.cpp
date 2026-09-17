@@ -79,6 +79,18 @@ std::string hostLockPath(const std::string &path) {
 struct HfsContext {
     std::shared_ptr<hfs::Engine> engine;
     std::shared_ptr<hfs::Client> client;
+
+    /* Release the frontend lease before cleanly stopping the owned engine. */
+    ~HfsContext() {
+        if (client != nullptr) {
+            client->close().wait();
+            client.reset();
+        }
+        if (engine != nullptr) {
+            engine->stop().wait();
+            engine.reset();
+        }
+    }
 };
 
 /* Opens one HFS file and returns the nested coroutine result consistently. */

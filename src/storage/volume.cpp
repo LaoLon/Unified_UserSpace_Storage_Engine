@@ -5,6 +5,7 @@
 #include <cerrno>
 #include <cstring>
 #include <fcntl.h>
+#include <limits>
 #include <string>
 #include <unistd.h>
 
@@ -369,6 +370,44 @@ Result<VolumeInfo> mountVolume(SpdkRuntime &runtime, const Config &config) {
               static_cast<unsigned long long>(volume.generation), volume.devices.size(),
               volume.cleanShutdown ? 1 : 0);
     return volume;
+}
+
+Result<void> updateCleanShutdown(SpdkRuntime &runtime, const Config &config, bool clean) {
+    for (std::size_t deviceIndex = 0; deviceIndex < config.devices.size(); ++deviceIndex) {
+        const std::uint32_t sectorSize = runtime.deviceBlockSize(deviceIndex);
+        if (sectorSize == 0 || config.metadataBlockSize == 0) {
+            return makeError(Status::IoError, "device geometry is not available");
+        }
+        Hfs2Superblock slotA{};
+        Hfs2Superblock slotB{};
+        auto readA = readSuperblock(runtime, deviceIndex, 0, config.metadataBlockSize,
+                                    sectorSize, &slotA);
+        if (!readA.ok()) return makeError(readA.status(), readA.message());
+        auto readB = readSuperblock(runtime, deviceIndex, kSuperblockSlotOffsetBytes,
+                                    config.metadataBlockSize, sectorSize, &slotB);
+        if (!readB.ok()) return makeError(readB.status(), readB.message());
+        if (!readA.value() && !readB.value()) {
+            return makeError(Status::NotFound, "no valid superblock while updating clean flag");
+        }
+        const bool useB = readB.value() && (!readA.value() || slotB.generation > slotA.generation);
+        Hfs2Superblock updated = useB ? slotB : slotA;
+        if (updated.generation == std::numeric_limits<std::uint64_t>::max() ||
+            updated.mountEpoch == std::numeric_limits<std::uint64_t>::max()) {
+            return makeError(Status::Corrupt, "superblock lifecycle counter overflow");
+        }
+        updated.generation += 1;
+        updated.mountEpoch += 1;
+        updated.cleanShutdown = clean ? 1 : 0;
+        superblockFinalize(updated);
+        const std::uint64_t targetOffset = useB ? 0 : kSuperblockSlotOffsetBytes;
+        auto written = runtime.controlWrite(deviceIndex, targetOffset / sectorSize,
+                                            buildSuperblockRecord(updated,
+                                                                   config.metadataBlockSize));
+        if (!written.ok()) return written;
+        auto flushed = runtime.controlFlush(deviceIndex);
+        if (!flushed.ok()) return flushed;
+    }
+    return Result<void>(Status::Ok);
 }
 
 } // namespace hfs

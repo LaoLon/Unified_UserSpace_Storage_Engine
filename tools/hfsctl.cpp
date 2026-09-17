@@ -214,12 +214,14 @@ int runCheck(const hfs::Config &config) {
             ok = false;
             continue;
         }
-        std::printf("device %zu (%s): SB A=%s B=%s generation=%llu replica=%u/%u\n", i,
+        std::printf("device %zu (%s): SB A=%s B=%s generation=%llu replica=%u/%u "
+                    "clean=%u mount_epoch=%llu\n", i,
                     config.devices[i].bdevName.c_str(),
                     slots.value().validA ? "valid" : "invalid",
                     slots.value().validB ? "valid" : "invalid",
                     static_cast<unsigned long long>(sb->generation), sb->replicaId,
-                    sb->replicaCount);
+                    sb->replicaCount, static_cast<unsigned int>(sb->cleanShutdown),
+                    static_cast<unsigned long long>(sb->mountEpoch));
         if (!haveUuid) {
             uuid = sb->uuid;
             haveUuid = true;
