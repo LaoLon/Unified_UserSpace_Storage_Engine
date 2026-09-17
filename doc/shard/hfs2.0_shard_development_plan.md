@@ -508,6 +508,10 @@ RMW 放大；`AbortIO` 遵守 cancel boundary。
 > RocksDB smoke 中验证缺失路径不会退化为通用 I/O 错误。
 > 另补齐 `LockFile` 空输出参数保护、锁竞争与其他 host 错误的区分，以及 `NoSpace`
 > 到 RocksDB 子码的映射；真实 NVMe smoke 覆盖空输出、锁竞争和缺失路径断言。
+> 随后按 RocksDB 8.9.1 的 exact `IOStatus` 接口收口：`TryAgain` 统一映射为设置
+> `retryable` 的 `Busy`（该版本没有 `IOStatus::TryAgain`），`Cancelled` 映射为
+> `Aborted`，`TimedOut` 映射为 `TimedOut`，`Corrupt` 映射为 `Corruption`；构建、
+> 内部测试及真实 NVMe smoke 均通过。
 > `file_api_test` 还明确检查 checkpoint flush 与 metadata commit 注入期间
 > `logicalSize/durableSize` 不变量，清除注入后重试才推进 durable size。
 > 另以两个独立 `hfs_db_bench` 进程执行 `fillseq`→`readrandom`，再由独立
