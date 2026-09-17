@@ -314,15 +314,23 @@ public:
         return value.ok() ? rocksdb::IOStatus::OK() : toIoStatus(value);
     }
 
-    /* Closes the HFS handle; there is no host descriptor to flush. */
+    /* Flushes the final RocksDB metadata before releasing the HFS handle. */
     rocksdb::IOStatus Close(const rocksdb::IOOptions &, rocksdb::IODebugContext *) override {
+        if (file_ != nullptr) {
+            auto synced = file_->sync().wait();
+            if (!synced.ok()) return toIoStatus(synced);
+            auto value = std::move(synced).value();
+            if (!value.ok()) return toIoStatus(value);
+        }
         file_.reset();
         return rocksdb::IOStatus::OK();
     }
 
-    /* Buffered writes are immediately submitted by the current core API. */
+    /* Makes buffered RocksDB metadata visible across process reopen. */
     rocksdb::IOStatus Flush(const rocksdb::IOOptions &, rocksdb::IODebugContext *) override {
-        return rocksdb::IOStatus::OK();
+        auto synced = file_->sync().wait();
+        if (!synced.ok()) return toIoStatus(synced);
+        return toIoStatus(std::move(synced).value());
     }
 
     /* Writes at an explicit offset for RocksDB preallocation and manifests. */
@@ -581,7 +589,16 @@ public:
     rocksdb::IOStatus RenameFile(const std::string &src, const std::string &target,
                                  const rocksdb::IOOptions &, rocksdb::IODebugContext *) override {
         auto renamed = context_->client->rename(hfsPath(src), hfsPath(target)).wait();
-        return renamed.ok() ? toIoStatus(std::move(renamed).value()) : toIoStatus(renamed);
+        if (!renamed.ok()) return toIoStatus(renamed);
+        auto renameStatus = std::move(renamed).value();
+        if (!renameStatus.ok()) return toIoStatus(renameStatus);
+        /* RocksDB uses rename for CURRENT and MANIFEST publication. */
+        std::shared_ptr<hfs::File> file;
+        auto opened = openFile(context_, target, hfs::OpenFlags::None, &file);
+        if (!opened.ok()) return opened;
+        auto synced = file->sync().wait();
+        if (!synced.ok()) return toIoStatus(synced);
+        return toIoStatus(std::move(synced).value());
     }
 
     /* Creates a native HFS hard link without duplicating file contents. */

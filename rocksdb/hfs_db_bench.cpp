@@ -112,6 +112,16 @@ int runBenchmark(const BenchOptions &options) {
             }
         }
     }
+    /* Close RocksDB before checking publication of CURRENT and MANIFEST. */
+    db.reset();
+    /* Verify the RocksDB CURRENT publication before this process exits. */
+    rocksdb::FileOptions fileOptions;
+    rocksdb::IODebugContext debug;
+    if (!env->GetFileSystem()->FileExists(options.dbPath + "/CURRENT",
+                                          fileOptions.io_options, &debug).ok()) {
+        std::cerr << "CURRENT was not published in HFS namespace\n";
+        return 6;
+    }
     std::cout << options.benchmark << " completed " << options.num << " operations\n";
     return 0;
 }

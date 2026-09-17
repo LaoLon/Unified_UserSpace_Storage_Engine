@@ -445,22 +445,18 @@ Task<Result<void>> File::datasync() {
     if (impl_->state->engine == nullptr || !impl_->state->engine->processValid()) {
         co_return Result<void>(Status::ForkedProcess, "engine belongs to another process");
     }
-    auto statResult = stat();
-    if (!statResult.ok()) {
-        co_return makeError(statResult.status(), statResult.message());
-    }
-    co_return impl_->state->engine->syncMetadata(statResult.value().logicalEpoch);
+    /* Durability is a namespace-wide barrier; an inode epoch may be stale. */
+    co_return impl_->state->engine->syncMetadata(
+        impl_->state->namespaceState->logicalEpoch());
 }
 
 Task<Result<void>> File::sync() {
     if (impl_->state->engine == nullptr || !impl_->state->engine->processValid()) {
         co_return Result<void>(Status::ForkedProcess, "engine belongs to another process");
     }
-    auto statResult = stat();
-    if (!statResult.ok()) {
-        co_return makeError(statResult.status(), statResult.message());
-    }
-    co_return impl_->state->engine->syncMetadata(statResult.value().logicalEpoch);
+    /* Durability is a namespace-wide barrier; an inode epoch may be stale. */
+    co_return impl_->state->engine->syncMetadata(
+        impl_->state->namespaceState->logicalEpoch());
 }
 
 } // namespace hfs
