@@ -19,7 +19,8 @@
 | 结果 | 20/20 运行 `err=0`，submit/complete 闭合 |
 
 此前已完成同一正式设备上的 RocksDB direct/async、正常 reopen、SIGKILL recovery、
-`hfs_ldb checkconsistency` 和 `hfsctl check`。
+`hfs_ldb checkconsistency` 和 `hfsctl check`；FIO 4K loader smoke 加 `--verify=crc32c`
+也通过且 `err=0`。
 
 ## 当前硬门禁
 
