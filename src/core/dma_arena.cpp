@@ -1,12 +1,34 @@
 #include "core/dma_arena.hpp"
 
 #include <chrono>
+#include <limits>
 
 #include "common/trace.hpp"
 
 namespace hfs {
 
+namespace {
+
+/* Checks a non-empty range without forming an overflowing pointer value. */
+bool containsRange(std::uintptr_t allocationStart, std::size_t allocationBytes,
+                   std::uintptr_t rangeStart, std::size_t rangeBytes) noexcept {
+    const auto maxAddress = std::numeric_limits<std::uintptr_t>::max();
+    if (rangeBytes == 0 || allocationBytes == 0 ||
+        rangeStart > maxAddress - rangeBytes ||
+        allocationStart > maxAddress - allocationBytes) {
+        return false;
+    }
+    const auto rangeEnd = rangeStart + rangeBytes;
+    const auto allocationEnd = allocationStart + allocationBytes;
+    return rangeStart >= allocationStart && rangeEnd <= allocationEnd;
+}
+
+} // namespace
+
 std::size_t DmaArena::classSizeFor(std::size_t size) noexcept {
+    if (size == 0) {
+        return 0;
+    }
     for (const std::size_t classSize : kClassSizes) {
         if (size <= classSize) {
             return classSize;
@@ -28,6 +50,10 @@ void DmaArena::configure(std::size_t capacityBytes, Allocator alloc, Deallocator
 }
 
 Result<std::span<std::byte>> DmaArena::acquire(std::size_t size, std::uint32_t timeoutMs) {
+    if (size == 0) {
+        return makeError<std::span<std::byte>>(Status::InvalidArgument,
+                                               "empty DMA request");
+    }
     const std::size_t classSize = classSizeFor(size);
     std::unique_lock<std::mutex> lock(mutex_);
     if (allocator_ == nullptr) {
@@ -85,7 +111,7 @@ Result<std::span<std::byte>> DmaArena::acquire(std::size_t size, std::uint32_t t
             void *buffer = sizeClass.free.back();
             sizeClass.free.pop_back();
             ++acquires_;
-            live_.insert(buffer);
+            live_.emplace(buffer, classSize);
             trace::event(trace::EventId::DmaAcquire, classSize, bytes_);
             return std::span<std::byte>(static_cast<std::byte *>(buffer), classSize);
         }
@@ -109,7 +135,7 @@ Result<std::span<std::byte>> DmaArena::acquire(std::size_t size, std::uint32_t t
                                                        "DMA allocation failed");
             }
             lock.lock();
-            live_.insert(buffer);
+            live_.emplace(buffer, classSize);
             lock.unlock();
             return std::span<std::byte>(static_cast<std::byte *>(buffer), classSize);
         }
@@ -138,7 +164,7 @@ void DmaArena::release(std::span<std::byte> buffer) noexcept {
         {
             std::lock_guard<std::mutex> lock(mutex_);
             auto found = largeLive_.find(buffer.data());
-            if (found == largeLive_.end()) return;
+            if (found == largeLive_.end() || found->second != buffer.size()) return;
             bytes_ -= found->second;
             largeLive_.erase(found);
             ++releases_;
@@ -151,8 +177,10 @@ void DmaArena::release(std::span<std::byte> buffer) noexcept {
     }
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        auto found = live_.find(buffer.data());
+        if (found == live_.end() || found->second != buffer.size()) return;
         classes_[classIndex].free.push_back(buffer.data());
-        live_.erase(buffer.data());
+        live_.erase(found);
         ++releases_;
     }
     trace::event(trace::EventId::DmaRelease, buffer.size());
@@ -161,7 +189,60 @@ void DmaArena::release(std::span<std::byte> buffer) noexcept {
 
 bool DmaArena::owns(const void *buffer) const {
     std::lock_guard<std::mutex> lock(mutex_);
-    return live_.count(buffer) != 0 || largeLive_.count(const_cast<void *>(buffer)) != 0;
+    void *address = const_cast<void *>(buffer);
+    return live_.count(address) != 0 || largeLive_.count(address) != 0;
+}
+
+bool DmaArena::ownsRange(const void *ptr, std::size_t bytes) const {
+    if (ptr == nullptr || bytes == 0) {
+        return false;
+    }
+    const auto rangeStart = reinterpret_cast<std::uintptr_t>(ptr);
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (const auto &[allocation, allocationBytes] : live_) {
+        if (containsRange(reinterpret_cast<std::uintptr_t>(allocation), allocationBytes,
+                          rangeStart, bytes)) {
+            return true;
+        }
+    }
+    for (const auto &[allocation, allocationBytes] : largeLive_) {
+        if (containsRange(reinterpret_cast<std::uintptr_t>(allocation), allocationBytes,
+                          rangeStart, bytes)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+Result<void> DmaArena::tryAcquireBatch(std::span<const std::size_t> sizes,
+                                       std::span<BufferLease> leases) {
+    if (sizes.empty() || sizes.size() != leases.size()) {
+        return makeError(Status::InvalidArgument, "invalid DMA batch shape");
+    }
+    for (const BufferLease &lease : leases) {
+        if (!lease.span().empty()) {
+            return makeError(Status::InvalidArgument, "DMA batch output is not empty");
+        }
+    }
+    for (const std::size_t size : sizes) {
+        if (size == 0) {
+            return makeError(Status::InvalidArgument, "empty DMA batch request");
+        }
+    }
+
+    std::size_t acquired = 0;
+    for (; acquired < sizes.size(); ++acquired) {
+        auto result = acquire(sizes[acquired], 0);
+        if (!result.ok()) {
+            for (std::size_t i = 0; i < acquired; ++i) {
+                leases[i].reset();
+            }
+            return makeError(result.status(), result.message());
+        }
+        leases[acquired].arena_ = this;
+        leases[acquired].bytes_ = result.value();
+    }
+    return Result<void>(Status::Ok);
 }
 
 DmaArena::~DmaArena() {

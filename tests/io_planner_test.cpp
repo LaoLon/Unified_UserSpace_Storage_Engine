@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <thread>
 #include <vector>
 
@@ -179,6 +180,22 @@ int main() {
         HFS_TEST_CHECK(first.ok() && first.value().size() == 4096);
         auto second = arena.acquire(4096, 0);
         HFS_TEST_CHECK(second.ok());
+
+        const auto firstPointer = first.value().data();
+        const auto firstBytes = first.value().size();
+        HFS_TEST_CHECK(arena.ownsRange(firstPointer, 1));
+        HFS_TEST_CHECK(arena.ownsRange(firstPointer, firstBytes));
+        HFS_TEST_CHECK(arena.ownsRange(firstPointer + 1, firstBytes - 1));
+        HFS_TEST_CHECK(arena.ownsRange(firstPointer + firstBytes - 1, 1));
+        HFS_TEST_CHECK(!arena.ownsRange(firstPointer + firstBytes, 1));
+        HFS_TEST_CHECK(!arena.ownsRange(firstPointer + firstBytes - 1, 2));
+        HFS_TEST_CHECK(!arena.ownsRange(firstPointer, 0));
+        HFS_TEST_CHECK(!arena.ownsRange(
+            reinterpret_cast<const void *>(std::numeric_limits<std::uintptr_t>::max() - 1),
+            2));
+        std::array<std::byte, 1> foreign{};
+        HFS_TEST_CHECK(!arena.ownsRange(foreign.data(), foreign.size()));
+
         auto exhausted = arena.acquire(4096, 0);
         HFS_TEST_CHECK(!exhausted.ok() && exhausted.status() == Status::Busy);
         {
@@ -186,6 +203,7 @@ int main() {
             HFS_TEST_CHECK(!lease.ok() && lease.status() == Status::Busy);
         }
         arena.release(second.value());
+        HFS_TEST_CHECK(!arena.ownsRange(second.value().data(), 1));
         auto reused = arena.acquire(4096, 0);
         HFS_TEST_CHECK(reused.ok());
         arena.release(first.value());
@@ -218,7 +236,43 @@ int main() {
         HFS_TEST_CHECK(arena.stats().releases == 1);
     }
 
-    /* 9. parent completion aggregates concurrently issued children */
+    /* 9. fixed-span DMA batches succeed without partial output leases */
+    {
+        DmaArena arena;
+        arena.configure(8192, memAlloc, memFree, nullptr);
+        const std::array<std::size_t, 2> sizes = {100, 4096};
+        std::array<BufferLease, 2> leases{};
+        auto batch = arena.tryAcquireBatch(sizes, leases);
+        HFS_TEST_CHECK(batch.ok());
+        HFS_TEST_CHECK(leases[0].fromArena() && leases[1].fromArena());
+        HFS_TEST_CHECK(leases[0].span().size() == 4096 &&
+                       leases[1].span().size() == 4096);
+        HFS_TEST_CHECK(arena.ownsRange(leases[0].span().data() + 1, 64));
+        leases[0].reset();
+        leases[1].reset();
+        HFS_TEST_CHECK(arena.stats().acquires == 2 && arena.stats().releases == 2);
+    }
+
+    /* 10. a nonblocking DMA batch rolls back every earlier lease on failure */
+    {
+        DmaArena arena;
+        arena.configure(8192, memAlloc, memFree, nullptr);
+        const std::array<std::size_t, 3> sizes = {4096, 4096, 4096};
+        std::array<BufferLease, 3> leases{};
+        auto batch = arena.tryAcquireBatch(sizes, leases);
+        HFS_TEST_CHECK(!batch.ok() && batch.status() == Status::Busy);
+        for (const auto &lease : leases) {
+            HFS_TEST_CHECK(lease.span().empty());
+        }
+        const auto rolledBack = arena.stats();
+        HFS_TEST_CHECK(rolledBack.acquires == 2 && rolledBack.releases == 2);
+
+        auto retry = arena.acquire(4096, 0);
+        HFS_TEST_CHECK(retry.ok());
+        arena.release(retry.value());
+    }
+
+    /* 11. parent completion aggregates concurrently issued children */
     {
         ParentCompletion parent;
         ParentProbe probe;

@@ -7,7 +7,6 @@
 #include <mutex>
 #include <span>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 #include "hfs/types.hpp"
@@ -35,6 +34,8 @@ public:
     void reset() noexcept;
 
 private:
+    friend class DmaArena;
+
     DmaArena *arena_ = nullptr;
     std::span<std::byte> bytes_;
 };
@@ -71,9 +72,17 @@ public:
     Result<std::span<std::byte>> acquire(std::size_t size, std::uint32_t timeoutMs);
     void release(std::span<std::byte> buffer) noexcept;
 
+    /* Acquires every requested lease without waiting; outputs must be empty.
+     * On failure, the output span remains empty and no lease stays acquired. */
+    Result<void> tryAcquireBatch(std::span<const std::size_t> sizes,
+                                 std::span<BufferLease> leases);
+
     /* True when the pointer is a live slice handed out by this arena; only
      * such slices are safe for direct (non-bounce) device DMA. */
     bool owns(const void *buffer) const;
+
+    /* True when the complete non-empty range lies within one live allocation. */
+    bool ownsRange(const void *ptr, std::size_t bytes) const;
 
     Stats stats() const;
     static std::size_t classSizeFor(std::size_t size) noexcept; /* 0 = no class */
@@ -90,7 +99,7 @@ private:
     std::size_t highWatermark_ = 0;
     std::array<SizeClass, kClassCount> classes_;
     std::unordered_map<void *, std::size_t> largeLive_;
-    std::unordered_set<const void *> live_;
+    std::unordered_map<void *, std::size_t> live_;
     Allocator allocator_ = nullptr;
     Deallocator deallocator_ = nullptr;
     void *allocatorCtx_ = nullptr;
