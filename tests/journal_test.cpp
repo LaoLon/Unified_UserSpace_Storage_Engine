@@ -392,6 +392,43 @@ int main() {
         HFS_TEST_CHECK(target.values.empty());
     }
 
+    /* 7. Checkpoint slot and superblock publication failures are retryable. */
+    for (std::size_t failAt : {0U, 1U}) {
+        Fixture fixture;
+        HFS_TEST_CHECK(fixture.valid());
+        HFS_TEST_CHECK(fixture.format() == 0);
+        MemoryTarget target;
+        auto journal = fixture.open(&target);
+        HFS_TEST_CHECK(journal != nullptr);
+        HFS_TEST_CHECK(journal->append({setSize(31, 99)}, true).ok());
+        fixture.device->failWriteAt(failAt);
+        HFS_TEST_CHECK(!journal->checkpoint().ok());
+        HFS_TEST_CHECK(target.values[31] == 99);
+        fixture.device->failWriteAt(std::numeric_limits<std::size_t>::max());
+        HFS_TEST_CHECK(journal->checkpoint().ok());
+        MemoryTarget reader;
+        auto reopened = fixture.open(&reader);
+        HFS_TEST_CHECK(reopened != nullptr);
+        HFS_TEST_CHECK(reopened->replay().ok());
+        HFS_TEST_CHECK(reader.values[31] == 99);
+    }
+
+    /* 8. A checkpoint flush failure does not mutate the target. */
+    {
+        Fixture fixture;
+        HFS_TEST_CHECK(fixture.valid());
+        HFS_TEST_CHECK(fixture.format() == 0);
+        MemoryTarget target;
+        auto journal = fixture.open(&target);
+        HFS_TEST_CHECK(journal != nullptr);
+        HFS_TEST_CHECK(journal->append({setSize(32, 101)}, true).ok());
+        fixture.device->failFlush(true);
+        HFS_TEST_CHECK(!journal->checkpoint().ok());
+        HFS_TEST_CHECK(target.values[32] == 101);
+        fixture.device->failFlush(false);
+        HFS_TEST_CHECK(journal->checkpoint().ok());
+    }
+
     std::printf("journal_test: ok\n");
     return 0;
 }
