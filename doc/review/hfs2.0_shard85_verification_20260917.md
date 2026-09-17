@@ -186,3 +186,6 @@ RocksDB `GetFileSize` 与 `GetFileModificationTime` 的底层 stat 失败现统�
 
 `ReadAsync/AbortIO` 现以 callback-started 作为取消边界：callback 已开始后，`AbortIO`
 不再覆盖其可见状态；真实 NVMe smoke 以阻塞 callback 的确定性竞态回归通过。
+
+锁接口还覆盖了空输出参数保护、非竞争 host 错误保留为 `IOError`，以及 HFS
+`NoSpace` 映射为 RocksDB `NoSpace` 子码；相关构建和真实 NVMe smoke 均通过。

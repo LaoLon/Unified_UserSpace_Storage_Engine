@@ -506,6 +506,8 @@ RMW 放大；`AbortIO` 遵守 cancel boundary。
 > logical range，确保 checkpoint/metadata commit 断点不会被幂等 sync 短路。
 > 随后统一 `GetFileSize`/`GetFileModificationTime` 的 stat 错误映射，并在真实 NVMe
 > RocksDB smoke 中验证缺失路径不会退化为通用 I/O 错误。
+> 另补齐 `LockFile` 空输出参数保护、锁竞争与其他 host 错误的区分，以及 `NoSpace`
+> 到 RocksDB 子码的映射；真实 NVMe smoke 覆盖空输出、锁竞争和缺失路径断言。
 
 **交付物**：`hfs_db_bench`/`hfs_ldb` 完整参数；SIGKILL recovery、跨进程顺序 reopen、
 `checkconsistency`。
