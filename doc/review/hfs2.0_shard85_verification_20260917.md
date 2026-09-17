@@ -183,3 +183,6 @@ Shard-84 的 RocksDB lock 回归现要求第二个同名 `LockFile` 返回 `Busy
 
 RocksDB `GetFileSize` 与 `GetFileModificationTime` 的底层 stat 失败现统一保留 HFS
 错误类别；缺失路径回归已随真实 NVMe RocksDB smoke 通过。
+
+`ReadAsync/AbortIO` 现以 callback-started 作为取消边界：callback 已开始后，`AbortIO`
+不再覆盖其可见状态；真实 NVMe smoke 以阻塞 callback 的确定性竞态回归通过。
