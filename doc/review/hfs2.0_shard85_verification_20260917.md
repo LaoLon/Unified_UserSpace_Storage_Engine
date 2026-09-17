@@ -125,3 +125,7 @@ readwhilewriting`（32 keys、2 threads）通过，首次 `checkconsistency` 报
 最后双盘 `hfsctl check` 返回 0，两盘 generation=393、mount_epoch=8、journal
 transaction/corruption 状态一致。该结果补强 Shard-84 的双盘恢复证据，但不替代
 完整跨进程错误/取消矩阵或 Shard-81 性能 gate。
+
+双盘 FIO 完整矩阵随后执行 400/400 组合：320 项 `PASS`、80 项
+`RESOURCE_BOUNDARY`、0 项功能性 `FAIL`。资源边界集中于 64K/1M 与高 QD×jobs，最大
+QD=128、numjobs=8、1M；持久化结果为 `/mnt/hfs-data/hfs-fio-matrix-dual-20260917.log`。

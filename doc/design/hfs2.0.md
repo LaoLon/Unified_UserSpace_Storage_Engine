@@ -1345,6 +1345,8 @@ checkpoint region 必须容纳 namespace/inode/extent map/各 device allocator b
   双盘 RocksDB smoke 与 `hfsctl check` 均通过。
   双盘 `hfs_db_bench` 的 fillseq/readrandom/overwrite/readwhilewriting、SIGKILL 后
   checkconsistency 与 `hfsctl check` 也已通过；完整错误/取消矩阵和性能 gate 仍未闭合。
+  双盘 FIO 完整 workload 矩阵已收集到 320 项 PASS、80 项 RESOURCE_BOUNDARY、0 项
+  功能失败；结果归档在 `/mnt/hfs-data/hfs-fio-matrix-dual-20260917.log`。
 - 所有 gate 通过后删除新树中最后的旧兼容残留；
 - `src_legacy_frozen/` 保持本地忽略或单独归档，不回到 product build；
 - 更新架构索引、性能基线、支持边界和迁移说明；

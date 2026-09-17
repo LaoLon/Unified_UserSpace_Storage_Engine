@@ -397,6 +397,9 @@ fail closed 且现场保留；多盘掉一块 metadata device 拒绝 mount，不
 > 带持久化结果的完整矩阵收集到 385 项 `PASS`、15 项 `RESOURCE_BOUNDARY`、0 项
 > 功能性 `FAIL`；资源边界集中在大 buffer/高并发组合，最大为 QD=128、numjobs=8、
 > 1MiB，结果文件保留在 VM `/mnt/hfs-data`。
+> 随后使用双盘 `hfs_nvme_dual.conf` 重跑完整 400 项组合，得到 320 项 `PASS`、80 项
+> `RESOURCE_BOUNDARY`、0 项功能性 `FAIL`；边界集中在 64K/1M 与高 QD×jobs，结果为
+> `/mnt/hfs-data/hfs-fio-matrix-dual-20260917.log`。
 
 **80A 交付物**：`fio-hfs.so`（`extern "C"` 注册）；options（`hfs_config/hfs_direct/
 hfs_preallocate/hfs_client_depth`）；`open_file` 完成 create/open/allocate +
@@ -487,6 +490,10 @@ checkconsistency）；错误/超时/取消映射完整。
 > metadata replica check，以及双盘 FIO `randrw`/CRC verify；完整双盘矩阵、metadata
 > replica 掉盘/CRC/generation 故障组合以及 raw 对照/5-run 性能门禁仍未完成，不能用
 > SATA 或 Malloc/Aio 替代。
+
+双盘 FIO 矩阵已完成 400/400 组合的分类执行（320 PASS、80 RESOURCE_BOUNDARY、0
+FAIL）；RESOURCE_BOUNDARY 是当前 512 MiB 共享 arena 对大 buffer/高并发的明确容量
+边界，不计作功能失败，也不计作完整矩阵全部通过。
 
 2026-09-17 双盘验收还发现 clean/dirty 生命周期逐盘递增会使副本 generation 漂移，
 已改为先读取全部副本、计算一次共享版本后逐盘发布；修复后双盘 `hfsctl check` 连续
