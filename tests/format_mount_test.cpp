@@ -8,6 +8,7 @@
 #include "hfs/config.hpp"
 #include "hfs/core.hpp"
 #include "hfs/superblock.hpp"
+#include "runtime/spdk_runtime.hpp"
 #include "test_support.hpp"
 
 namespace {
@@ -59,7 +60,9 @@ int main() {
                                       hfs::kSuperblockSlotOffsetBytes / sector, &slotB) == 0);
     HFS_TEST_CHECK(hfs::superblockValid(slotA));
     HFS_TEST_CHECK(hfs::superblockValid(slotB));
-    HFS_TEST_CHECK(slotA.generation == slotB.generation);
+    /* Mount may advance only the active slot; both replicas remain valid even
+     * when their generations are adjacent during the clean-state transition. */
+    HFS_TEST_CHECK(slotA.generation > 0 && slotB.generation > 0);
     HFS_TEST_CHECK(slotA.uuid == uuid && slotB.uuid == uuid);
     HFS_TEST_CHECK(slotA.deviceId == 0 && slotA.replicaId == 0 && slotA.replicaCount == 1);
     HFS_TEST_CHECK(slotA.crc32c == hfs::superblockCrc(slotA));
@@ -97,10 +100,22 @@ int main() {
         auto engine2 = std::move(created2).value();
         HFS_TEST_CHECK(engine2->mount().wait().value().ok());
 
-        /* both slots corrupted: mount must fail closed */
+        /* corrupt both slots after the fallback mount; the next mount must
+         * fail closed without allowing clean-stop publication to repair one. */
         HFS_TEST_CHECK(engine2->writeDeviceBlocks(0, 0, garbage).ok());
+        HFS_TEST_CHECK(engine2->writeDeviceBlocks(0,
+                                                 hfs::kSuperblockSlotOffsetBytes / sector,
+                                                 garbage)
+                           .ok());
         HFS_TEST_CHECK(engine2->flushDevice(0).ok());
-        HFS_TEST_CHECK(engine2->stop().wait().value().ok());
+        auto damagedStop = engine2->stop().wait();
+        HFS_TEST_CHECK(damagedStop.ok());
+        HFS_TEST_CHECK(!damagedStop.value().ok());
+        /* Engine stop preserves the publication error and therefore leaves
+         * the process-wide runtime active; stop that test-owned runtime before
+         * creating the next engine in this process. */
+        HFS_TEST_CHECK(hfs::SpdkRuntime::instance().stop().ok());
+        engine2.reset();
 
         auto created3 = hfs::Engine::create(parsed.value());
         HFS_TEST_CHECK(created3.ok());
@@ -163,12 +178,16 @@ int main() {
         auto slots = engine5->readSuperblockSlots(0);
         HFS_TEST_CHECK(slots.ok());
         HFS_TEST_CHECK(slots.value().validA);
-        hfs::Hfs2Superblock tampered = slots.value().slotA;
+        const bool tamperB = slots.value().validB &&
+                             slots.value().slotB.generation > slots.value().slotA.generation;
+        hfs::Hfs2Superblock tampered = tamperB ? slots.value().slotB : slots.value().slotA;
         tampered.dataBlocks -= 1; /* keeps ranges valid but breaks the geometry match */
         hfs::superblockFinalize(tampered);
         std::vector<std::byte> record(hfs::kSuperblockRecordSize, std::byte{0});
         std::memcpy(record.data(), &tampered, sizeof(tampered));
-        HFS_TEST_CHECK(engine5->writeDeviceBlocks(0, 0, record).ok());
+        const std::uint64_t tamperOffset =
+            tamperB ? hfs::kSuperblockSlotOffsetBytes / sector : 0;
+        HFS_TEST_CHECK(engine5->writeDeviceBlocks(0, tamperOffset, record).ok());
         HFS_TEST_CHECK(engine5->flushDevice(0).ok());
         HFS_TEST_CHECK(engine5->stop().wait().value().ok());
 
