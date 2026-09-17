@@ -351,6 +351,10 @@ int main(int argc, char **argv) {
         !fileSystem->CreateDirIfMissing("/rocksdb-dir", options.io_options, &debug).ok()) {
         return 14;
     }
+    status = fileSystem->CreateDir("/rocksdb-dir-direct", options.io_options, &debug);
+    if (!status.ok()) {
+        return 14;
+    }
     bool isDirectory = false;
     auto directoryStatus =
         fileSystem->IsDirectory("/rocksdb-dir", options.io_options, &isDirectory, &debug);
@@ -389,7 +393,9 @@ int main(int argc, char **argv) {
         return 16;
     }
     status = fileSystem->DeleteFile("/rocksdb-link", options.io_options, &debug);
-    if (!status.ok() || !fileSystem->DeleteDir("/rocksdb-dir", options.io_options, &debug).ok()) {
+    if (!status.ok() ||
+        !fileSystem->DeleteDir("/rocksdb-dir", options.io_options, &debug).ok() ||
+        !fileSystem->DeleteDir("/rocksdb-dir-direct", options.io_options, &debug).ok()) {
         return 16;
     }
     status = fileSystem->GetFreeSpace("/", options.io_options, &freeSpace, &debug);

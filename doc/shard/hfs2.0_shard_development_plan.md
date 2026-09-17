@@ -532,6 +532,8 @@ RMW 放大；`AbortIO` 遵守 cancel boundary。
 > 随后将 `fillseq`、`readrandom`、`overwrite`、`readwhilewriting` 分别放入四个独立
 > 进程顺序执行（各 64 项），独立 `hfs_ldb checkconsistency` 仍报告 `entries=64`；
 > 正式 `.conf`/真实 NVMe 通过，完整错误与取消矩阵仍待补齐。
+> 另补充 FileSystem smoke 的直接 `CreateDir`/`DeleteDir` 生命周期，单盘真实 NVMe
+> 全 smoke 已通过；Shard-84 的完整错误与取消矩阵仍待补齐。
 
 **交付物**：`hfs_db_bench`/`hfs_ldb` 完整参数；SIGKILL recovery、跨进程顺序 reopen、
 `checkconsistency`。
