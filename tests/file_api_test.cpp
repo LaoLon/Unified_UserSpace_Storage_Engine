@@ -156,8 +156,17 @@ int main() {
                 auto failedCheckpoint = first.value()->datasync().wait().value();
                 HFS_TEST_CHECK(!failedCheckpoint.ok() &&
                                failedCheckpoint.status() == Status::IoError);
+                auto checkpointFailureStat = first.value()->stat();
+                HFS_TEST_CHECK(checkpointFailureStat.ok() &&
+                               checkpointFailureStat.value().logicalSize == 12288 &&
+                               checkpointFailureStat.value().durableSize <
+                                   checkpointFailureStat.value().logicalSize);
                 HFS_TEST_CHECK(::unsetenv("HFS_TEST_FAIL_CHECKPOINT_FLUSH") == 0);
                 HFS_TEST_CHECK(first.value()->datasync().wait().value().ok());
+                auto checkpointRetryStat = first.value()->stat();
+                HFS_TEST_CHECK(checkpointRetryStat.ok() &&
+                               checkpointRetryStat.value().durableSize ==
+                                   checkpointRetryStat.value().logicalSize);
                 HFS_TEST_CHECK(first.value()->sync().wait().value().ok());
                 /* Data is durable, but the metadata commit boundary must still
                  * reject publication and allow a later retry. */
@@ -173,8 +182,17 @@ int main() {
                 auto failedMetadata = first.value()->datasync().wait().value();
                 HFS_TEST_CHECK(!failedMetadata.ok() &&
                                failedMetadata.status() == Status::IoError);
+                auto metadataFailureStat = first.value()->stat();
+                HFS_TEST_CHECK(metadataFailureStat.ok() &&
+                               metadataFailureStat.value().logicalSize == 16384 &&
+                               metadataFailureStat.value().durableSize <
+                                   metadataFailureStat.value().logicalSize);
                 HFS_TEST_CHECK(::unsetenv("HFS_TEST_FAIL_METADATA_COMMIT") == 0);
                 HFS_TEST_CHECK(first.value()->datasync().wait().value().ok());
+                auto metadataRetryStat = first.value()->stat();
+                HFS_TEST_CHECK(metadataRetryStat.ok() &&
+                               metadataRetryStat.value().durableSize ==
+                                   metadataRetryStat.value().logicalSize);
             }
 
             /* 6. client open-file limit */
