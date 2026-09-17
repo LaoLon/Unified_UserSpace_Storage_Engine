@@ -280,12 +280,16 @@ public:
         if (requests == nullptr && count != 0) {
             return rocksdb::IOStatus::InvalidArgument("null multi-read requests");
         }
+        rocksdb::IOStatus firstError = rocksdb::IOStatus::OK();
         for (size_t index = 0; index < count; ++index) {
             auto &request = requests[index];
             request.status = Read(request.offset, request.len, options,
                                   &request.result, request.scratch, debug);
+            if (!request.status.ok() && firstError.ok()) {
+                firstError = request.status;
+            }
         }
-        return rocksdb::IOStatus::OK();
+        return firstError;
     }
 
     /* HFS requires aligned offsets, lengths, and scratch buffers for direct I/O. */

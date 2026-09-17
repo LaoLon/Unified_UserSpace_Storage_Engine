@@ -123,6 +123,19 @@ int main(int argc, char **argv) {
         multiRequests[1].result.compare(payload) != 0) {
         return 11;
     }
+    /* A batch reports the first per-request failure while preserving each
+     * request's individual status for callers that inspect the array. */
+    rocksdb::FSReadRequest mixedRequests[2];
+    mixedRequests[0].offset = 0;
+    mixedRequests[0].len = sizeof(multiScratchA);
+    mixedRequests[0].scratch = multiScratchA;
+    mixedRequests[1].offset = 0;
+    mixedRequests[1].len = 1;
+    mixedRequests[1].scratch = nullptr;
+    status = random->MultiRead(mixedRequests, 2, options.io_options, &debug);
+    if (status.ok() || !mixedRequests[0].status.ok() || mixedRequests[1].status.ok()) {
+        return 11;
+    }
     std::atomic<bool> callbackCalled = false;
     rocksdb::FSReadRequest request;
     request.offset = 0;
