@@ -288,7 +288,49 @@ int main(int argc, char **argv) {
         timeoutDeleter(timeoutHandle);
         return 12;
     }
+    /* Abort after a timed-out callback must preserve TimedOut and never
+     * rewrite the already published request status. */
+    if (!fileSystem->AbortIO(timeoutHandles).ok() ||
+        !timeoutRequest.status.IsTimedOut()) {
+        ::unsetenv("HFS_TEST_ASYNC_READ_DELAY_MS");
+        timeoutDeleter(timeoutHandle);
+        return 12;
+    }
     timeoutDeleter(timeoutHandle);
+    if (::unsetenv("HFS_TEST_ASYNC_READ_DELAY_MS") != 0) {
+        return 12;
+    }
+    /* Abort wins when it reaches the request before the timeout callback
+     * boundary, even when the request also carries a short timeout. */
+    rocksdb::IOOptions cancelTimeoutOptions;
+    cancelTimeoutOptions.timeout = std::chrono::milliseconds(1);
+    rocksdb::FSReadRequest cancelTimeoutRequest;
+    cancelTimeoutRequest.offset = 0;
+    cancelTimeoutRequest.len = sizeof(scratch);
+    cancelTimeoutRequest.scratch = scratch;
+    std::atomic<bool> cancelTimeoutCallback = false;
+    void *cancelTimeoutHandle = nullptr;
+    rocksdb::IOHandleDeleter cancelTimeoutDeleter;
+    if (::setenv("HFS_TEST_ASYNC_READ_DELAY_MS", "50", 1) != 0) {
+        return 12;
+    }
+    status = random->ReadAsync(
+        cancelTimeoutRequest, cancelTimeoutOptions,
+        [&cancelTimeoutCallback](const rocksdb::FSReadRequest &, void *) {
+            cancelTimeoutCallback.store(true);
+        }, nullptr, &cancelTimeoutHandle, &cancelTimeoutDeleter, &debug);
+    std::vector<void *> cancelTimeoutHandles{cancelTimeoutHandle};
+    if (!status.ok() || cancelTimeoutHandle == nullptr || !cancelTimeoutDeleter ||
+        !fileSystem->AbortIO(cancelTimeoutHandles).ok() ||
+        !fileSystem->Poll(cancelTimeoutHandles, 1).ok() ||
+        cancelTimeoutCallback.load() || !cancelTimeoutRequest.status.IsAborted()) {
+        ::unsetenv("HFS_TEST_ASYNC_READ_DELAY_MS");
+        if (cancelTimeoutHandle != nullptr && cancelTimeoutDeleter) {
+            cancelTimeoutDeleter(cancelTimeoutHandle);
+        }
+        return 12;
+    }
+    cancelTimeoutDeleter(cancelTimeoutHandle);
     if (::unsetenv("HFS_TEST_ASYNC_READ_DELAY_MS") != 0) {
         return 12;
     }
@@ -402,6 +444,30 @@ int main(int argc, char **argv) {
             return 12;
         }
         cancelDeleters[index](cancelHandles[index]);
+    }
+    /* A backend flush error must cross the RocksDB adapter as IOError and
+     * become retryable after the injected failure is removed. */
+    std::unique_ptr<rocksdb::FSWritableFile> errorWritable;
+    status = fileSystem->NewWritableFile("/rocksdb-error", options, &errorWritable, &debug);
+    if (!status.ok()) {
+        return 12;
+    }
+    status = errorWritable->Append(payload, options.io_options, &debug);
+    if (!status.ok() || ::setenv("HFS_TEST_FAIL_FLUSH_DEVICE", "0", 1) != 0) {
+        return 12;
+    }
+    auto injectedFlush = errorWritable->Sync(options.io_options, &debug);
+    if (injectedFlush.ok() || !injectedFlush.IsIOError()) {
+        ::unsetenv("HFS_TEST_FAIL_FLUSH_DEVICE");
+        return 12;
+    }
+    if (::unsetenv("HFS_TEST_FAIL_FLUSH_DEVICE") != 0 ||
+        !errorWritable->Sync(options.io_options, &debug).ok() ||
+        !errorWritable->Close(options.io_options, &debug).ok()) {
+        return 12;
+    }
+    if (!fileSystem->DeleteFile("/rocksdb-error", options.io_options, &debug).ok()) {
+        return 12;
     }
     /* RocksDB publishes CURRENT and MANIFEST through atomic namespace rename;
      * verify both the new name and the absence of the old name. */

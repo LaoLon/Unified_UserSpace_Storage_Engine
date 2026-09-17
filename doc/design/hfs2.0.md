@@ -1361,7 +1361,11 @@ checkpoint region 必须容纳 namespace/inode/extent map/各 device allocator b
   在 callback 后写回 request result。DataPath 的 `-ETIMEDOUT`、`-ECANCELED`、
   `-EAGAIN` 和 `-ENOSPC` 也分别映射为 core 的 TimedOut、Cancelled、Busy 和 NoSpace；
   RocksDB FileSystem 输出参数空指针统一返回 InvalidArgument。上述边界已由真实
-  `Nvme0n1` 回归覆盖，但完整错误/取消组合矩阵仍未闭合。
+  `Nvme0n1` 回归覆盖。2026-09-18 的联合回归已闭合 Shard-79/83/84 的可重复
+  错误、超时、取消组合矩阵，包括超时后 AbortIO、取消抢先于超时、callback-started
+  边界、8 句柄批量取消及 RocksDB flush 错误映射；证据见
+  `doc/review/hfs2_error_timeout_cancel_matrix_20260918.md`。真实掉电等价、性能
+  gate 和完整 stock RocksDB 兼容性仍保持未完成边界。
 - 所有 gate 通过后删除新树中最后的旧兼容残留；
 - `src_legacy_frozen/` 保持本地忽略或单独归档，不回到 product build；
 - 更新架构索引、性能基线、支持边界和迁移说明；

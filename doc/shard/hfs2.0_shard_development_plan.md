@@ -378,6 +378,9 @@ rename 后 Fsync 语义正确。
 > 以及 clean-flag publish 前的 `HFS_TEST_FAIL_CLEAN_FLAG`；三者均在真实 NVMe
 > `file_api_test` 中验证失败后重试。journal commit/flush 与 checkpoint publish
 > 断点已有单元证据；真正掉电等价验证和断点后的完整 namespace/extent/size 守恒仍未闭合。
+> 2026-09-18：Shard-79 的可重复错误/超时/取消组合矩阵已与 Shard-83/84 联合闭合，
+> 覆盖 data/checkpoint/metadata/clean flush 失败、journal/副本 fail-closed、DataPath
+> 超时和取消边界；真实掉电等价及每个断点后的全量结构守恒仍是独立未完成项。
 
 **交付物**：§16.4 五个崩溃断点注入；orphan reclaim；内存 after-image 失败回滚；
 `hfsctl check` 取证；ext4 同 workload 语义对照；**多副本执行**：按 Shard-70/71 冻结的
@@ -494,10 +497,14 @@ readwhilewriting 基础运行；WAL、MANIFEST 能创建/rename/同步；stock `
 > `TimedOut`，后端 I/O 继续排空并由句柄析构回收。真实 NVMe smoke 已验证超时
 > callback/status，DataPath 也将 `-ETIMEDOUT` 映射为 `TimedOut` 并验证 submit/complete
 > 闭合；超时后的 request result 保持不变，避免后台完成越过 callback 边界写回；完整
-> 组合矩阵仍需继续扩展。
+> 组合矩阵已在 2026-09-18 的联合真实 NVMe 回归中闭合，详见
+> `doc/review/hfs2_error_timeout_cancel_matrix_20260918.md`。
 > 随后统一 RocksDB FileSystem 各输出参数的空指针保护，所有对应 API 返回
 > `InvalidArgument` 而不解引用空指针；真实 NVMe smoke 已覆盖这些永久错误路径，
 > 并保持原有取消/超时回归通过。
+> 2026-09-18：已补齐并在真实 NVMe 执行 Shard-79/83/84 联合错误、超时、取消组合矩阵，
+> 包括超时后 AbortIO、取消抢先于超时、callback-started 边界、8 句柄批量取消以及
+> RocksDB flush 错误映射；性能放大和 SST 专项规模矩阵仍不在本次闭合范围。
 
 **交付物**：切换到 `use_direct_io()==true` 并**同时**落地 `PrepareWrite/Allocate/
 PositionedAppend`（三者必须一起启用）；`ReadAsync/Poll/AbortIO`（FSReadRequest/
@@ -542,9 +549,11 @@ RMW 放大；`AbortIO` 遵守 cancel boundary。
 > `entries=64`，补齐顺序跨进程 reopen 的直接证据。
 > 随后将 `fillseq`、`readrandom`、`overwrite`、`readwhilewriting` 分别放入四个独立
 > 进程顺序执行（各 64 项），独立 `hfs_ldb checkconsistency` 仍报告 `entries=64`；
-> 正式 `.conf`/真实 NVMe 通过，完整错误与取消矩阵仍待补齐。
+> 正式 `.conf`/真实 NVMe 通过；错误、超时、取消组合矩阵已由联合回归闭合。
 > 另补充 FileSystem smoke 的直接 `CreateDir`/`DeleteDir` 生命周期，单盘真实 NVMe
-> 全 smoke 已通过；Shard-84 的完整错误与取消矩阵仍待补齐。
+> 全 smoke 已通过；Shard-84 的错误、超时、取消组合矩阵已由联合回归闭合。
+> 2026-09-18：联合矩阵已在单盘真实 NVMe 通过；跨进程 workload、SIGKILL/replay
+> 和 checkconsistency 既有证据保持有效，stock RocksDB 全兼容性仍不宣称。
 > 同时固定 `IsDirectory` 的 RocksDB 谓词语义：对缺失路径返回 `OK + false`，并由
 > 真实 NVMe smoke 回归验证，避免将其误判为 `NotFound`。
 
