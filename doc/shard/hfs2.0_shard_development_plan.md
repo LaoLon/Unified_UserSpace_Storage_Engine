@@ -511,6 +511,9 @@ RMW 放大；`AbortIO` 遵守 cancel boundary。
 > 另以两个独立 `hfs_db_bench` 进程执行 `fillseq`→`readrandom`，再由独立
 > `hfs_ldb` 进程执行 `checkconsistency`；真实 NVMe 结果为 64/64 读写与
 > `entries=64`，补齐顺序跨进程 reopen 的直接证据。
+> 随后将 `fillseq`、`readrandom`、`overwrite`、`readwhilewriting` 分别放入四个独立
+> 进程顺序执行（各 64 项），独立 `hfs_ldb checkconsistency` 仍报告 `entries=64`；
+> 正式 `.conf`/真实 NVMe 通过，完整错误与取消矩阵仍待补齐。
 
 **交付物**：`hfs_db_bench`/`hfs_ldb` 完整参数；SIGKILL recovery、跨进程顺序 reopen、
 `checkconsistency`。

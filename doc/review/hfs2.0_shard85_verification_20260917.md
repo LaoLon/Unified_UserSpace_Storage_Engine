@@ -193,3 +193,7 @@ RocksDB `GetFileSize` 与 `GetFileModificationTime` 的底层 stat 失败现统�
 跨进程顺序 reopen 复测使用两个独立 `hfs_db_bench` 进程：第一个 `fillseq` 64 项，
 第二个 `readrandom` 64 项，随后独立 `hfs_ldb checkconsistency` 报告 `entries=64`；
 正式 `.conf` 与真实 NVMe 均通过。
+
+进一步的跨进程顺序 workload 复测将 `fillseq`、`readrandom`、`overwrite`、
+`readwhilewriting` 分别在四个独立进程中执行，各 64 项；随后独立一致性检查仍为
+`entries=64`，正式 `.conf` 与真实 NVMe 通过。
