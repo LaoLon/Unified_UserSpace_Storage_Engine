@@ -126,6 +126,7 @@ public:
                                              OpenFlags flags = OpenFlags::None);
     Task<Result<void>> remove(std::string_view path);
     Task<Result<void>> rename(std::string_view from, std::string_view to);
+    Task<Result<void>> link(std::string_view from, std::string_view to);
     Task<Result<DirectoryPage>> getChildren(std::string_view path,
                                             std::string_view cursor,
                                             std::size_t maxEntries);

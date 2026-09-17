@@ -75,6 +75,8 @@ public:
     Result<void> remove(std::string_view path);
     /* POSIX-like atomic replace; never exposes an intermediate state. */
     Result<void> rename(std::string_view from, std::string_view to);
+    /* Adds a second name for a regular inode without copying its data. */
+    Result<void> link(std::string_view from, std::string_view to);
     Result<void> setTimes(FileHandle handle, std::uint64_t mtimeNs, std::uint64_t ctimeNs);
     Result<DirectoryPage> getChildren(std::string_view path, std::string_view cursor,
                                       std::size_t maxEntries) const;

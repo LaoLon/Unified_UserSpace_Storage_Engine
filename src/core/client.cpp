@@ -181,6 +181,16 @@ Task<Result<void>> Client::rename(std::string_view from, std::string_view to) {
     co_return state.namespaceState->rename(from, to);
 }
 
+/* Creates a namespace hard link while preserving one shared inode and extent map. */
+Task<Result<void>> Client::link(std::string_view from, std::string_view to) {
+    auto &state = *impl_->state;
+    auto valid = validateClient(state);
+    if (!valid.ok()) {
+        co_return Result<void>(valid.status(), valid.message());
+    }
+    co_return state.namespaceState->link(from, to);
+}
+
 Task<Result<DirectoryPage>> Client::getChildren(std::string_view path,
                                                 std::string_view cursor,
                                                 std::size_t maxEntries) {

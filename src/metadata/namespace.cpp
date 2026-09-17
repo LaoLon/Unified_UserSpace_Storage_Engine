@@ -511,6 +511,40 @@ Result<void> Namespace::rename(std::string_view from, std::string_view to) {
     return Result<void>(Status::Ok);
 }
 
+/* Adds one directory entry to an existing regular inode atomically. */
+Result<void> Namespace::link(std::string_view from, std::string_view to) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto source = resolveEntry(from);
+    if (!source.ok()) {
+        return makeError(source.status(), source.message());
+    }
+    Inode &inode = inodes_[source.value().inode];
+    if (inode.directory) {
+        return makeError(Status::InvalidArgument, "cannot hard-link a directory");
+    }
+    auto target = resolveParent(to);
+    if (!target.ok()) {
+        return makeError(target.status(), target.message());
+    }
+    Inode &parent = inodes_[target.value().inode];
+    const std::string_view name = target.value().name;
+    if (parent.index->byName.find(name) != parent.index->byName.end()) {
+        return makeError(Status::AlreadyExists, "link target already exists");
+    }
+    const std::uint64_t entryCost = entryBytes(name);
+    if (namespaceBytes_ + entryCost > config_.maxNamespaceBytes) {
+        ++stats_.limitRejects;
+        return makeError(Status::NoMemory, "max_namespace_bytes exceeded");
+    }
+    const std::uint64_t now = nowNs();
+    linkEntry(parent, name, inode.id);
+    namespaceBytes_ += entryCost;
+    ++inode.linkCount;
+    touch(parent, now, true);
+    touch(inode, now, false);
+    return Result<void>(Status::Ok);
+}
+
 Result<void> Namespace::setTimes(FileHandle handle, std::uint64_t mtimeNs,
                                  std::uint64_t ctimeNs) {
     std::lock_guard<std::mutex> lock(mutex_);

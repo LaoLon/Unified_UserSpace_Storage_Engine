@@ -339,6 +339,13 @@ public:
         return renamed.ok() ? toIoStatus(std::move(renamed).value()) : toIoStatus(renamed);
     }
 
+    /* Creates a native HFS hard link without duplicating file contents. */
+    rocksdb::IOStatus LinkFile(const std::string &src, const std::string &target,
+                               const rocksdb::IOOptions &, rocksdb::IODebugContext *) override {
+        auto linked = context_->client->link(hfsPath(src), hfsPath(target)).wait();
+        return linked.ok() ? toIoStatus(std::move(linked).value()) : toIoStatus(linked);
+    }
+
     /* Acquires a process lock for RocksDB's DB identity. */
     rocksdb::IOStatus LockFile(const std::string &fname, const rocksdb::IOOptions &,
                                rocksdb::FileLock **lock, rocksdb::IODebugContext *) override {
