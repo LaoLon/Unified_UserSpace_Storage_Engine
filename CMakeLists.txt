@@ -32,6 +32,9 @@ set(HFS_CORE_SRC
   src/common/trace.cpp
   src/config/parser.cpp
   src/core/actor.cpp
+  src/core/async.cpp
+  src/core/async_completion_queue.cpp
+  src/core/async_data_service.cpp
   src/core/client.cpp
   src/core/data_path.cpp
   src/core/data_plane.cpp
@@ -73,8 +76,15 @@ target_link_libraries(hfs_core PRIVATE Threads::Threads)
 
 set(FIO_SOURCE_DIR "" CACHE PATH "fio source tree for the optional HFS external engine")
 if(EXISTS ${FIO_SOURCE_DIR}/fio.h)
-  add_library(fio-hfs MODULE fio/fio_hfs.cpp)
-  target_include_directories(fio-hfs PRIVATE ${FIO_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  add_library(fio-hfs MODULE
+    fio/fio_hfs.cpp
+    fio/preallocation_single_flight.cpp
+  )
+  target_include_directories(fio-hfs PRIVATE
+    ${FIO_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+  )
   target_compile_options(fio-hfs PRIVATE -include ${FIO_SOURCE_DIR}/config-host.h)
   target_compile_options(fio-hfs PRIVATE -O0 -g)
   target_link_libraries(fio-hfs PRIVATE hfs_core)
@@ -250,6 +260,61 @@ target_include_directories(io_planner_test PRIVATE
 target_compile_options(io_planner_test PRIVATE -fno-exceptions -fno-rtti)
 target_link_libraries(io_planner_test PRIVATE Threads::Threads)
 add_test(NAME io_planner_test COMMAND io_planner_test)
+
+# Async completion value queue and intrusive handle lifecycle test.
+add_executable(async_completion_queue_test
+  tests/async_completion_queue_test.cpp
+  src/core/async.cpp
+  src/core/async_completion_queue.cpp
+  src/core/operation.cpp
+)
+target_include_directories(async_completion_queue_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests
+)
+target_compile_options(async_completion_queue_test PRIVATE -fno-exceptions -fno-rtti)
+target_link_libraries(async_completion_queue_test PRIVATE Threads::Threads)
+add_test(NAME async_completion_queue_test COMMAND async_completion_queue_test)
+
+# Actor/scheduler async data-service test with a fake backend.
+add_executable(async_data_service_test
+  tests/async_data_service_test.cpp
+  src/common/log.cpp
+  src/common/stats.cpp
+  src/common/trace.cpp
+  src/core/actor.cpp
+  src/core/async_data_service.cpp
+  src/core/dma_arena.cpp
+  src/core/extent_map.cpp
+  src/core/io_planner.cpp
+  src/core/operation.cpp
+  src/core/parent_completion.cpp
+  src/core/scheduler.cpp
+  src/core/shard_ring.cpp
+)
+target_include_directories(async_data_service_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests
+)
+target_compile_options(async_data_service_test PRIVATE -fno-exceptions -fno-rtti)
+target_link_libraries(async_data_service_test PRIVATE Threads::Threads)
+add_test(NAME async_data_service_test COMMAND async_data_service_test)
+
+# FIO shared-file preallocation single-flight helper test.
+add_executable(preallocation_single_flight_test
+  tests/preallocation_single_flight_test.cpp
+  fio/preallocation_single_flight.cpp
+)
+target_include_directories(preallocation_single_flight_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests
+)
+target_compile_options(preallocation_single_flight_test PRIVATE -fno-exceptions -fno-rtti)
+target_link_libraries(preallocation_single_flight_test PRIVATE Threads::Threads)
+add_test(NAME preallocation_single_flight_test COMMAND preallocation_single_flight_test)
 
 # Device-backed data-path test: real NVMe read/write through the async data
 # reactor path (compiles the core sources directly and links SPDK).
