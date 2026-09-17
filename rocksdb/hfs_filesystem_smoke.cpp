@@ -179,6 +179,12 @@ int main(int argc, char **argv) {
     if (!status.ok()) {
         return 15;
     }
+    status = directory->Fsync(options.io_options, &debug);
+    if (!status.ok() ||
+        !directory->FsyncWithDirOptions(options.io_options, &debug,
+                                        rocksdb::DirFsyncOptions{}).ok()) {
+        return 15;
+    }
     directory.reset();
     /* Release the last open inode reference before checking extent reclaim. */
     random.reset();
