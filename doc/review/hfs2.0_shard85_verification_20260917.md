@@ -44,6 +44,10 @@ RocksDB FileSystem smoke 还验证了 allocator-backed `GetFreeSpace`：真实 N
 `another engine already holds '/tmp/hfs2.lock'`；该结果直接证明跨进程独占锁边界，
 但不替代跨进程 RocksDB workload 的顺序 reopen 矩阵。
 
+RocksDB smoke 另加入 8 个线程共享单个 `FSRandomAccessFile` 的 32 次 positioned-read
+回归，全部读取结果与原始 payload 一致；该证据覆盖并发 SST 风格读取，但不替代完整
+stock RocksDB SST/compact 压力矩阵。
+
 Shard-80 的 FIO loader 仍以共享 DMA arena 提供整块 `orig_buffer`；arena 结构测试覆盖
 了 2 MiB 连续分配、3 MiB cap 下第二次分配返回 `Busy`，以及释放后 bytes 归零。真实
 NVMe `--verify=crc32c` loader smoke 继续通过。另执行了 QD=128、numjobs=8、1MiB 的

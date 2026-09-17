@@ -466,7 +466,8 @@ readwhilewriting 基础运行；WAL、MANIFEST 能创建/rename/同步；stock `
 
 > 状态：接口实现完成，单盘真实 NVMe 已验证 direct read/write、ReadAsync/Poll/AbortIO
 > 生命周期、MultiRead、Allocate、PositionedAppend、RangeSync、Fsync 和错误映射；
-> RocksDB smoke 已覆盖 async、MultiRead，以及 8 个句柄立即 AbortIO 的并发竞态。
+> RocksDB smoke 已覆盖 async、MultiRead、8 个句柄立即 AbortIO 的并发竞态，以及
+> 8 个线程共享一个 `FSRandomAccessFile` 的 positioned-read 回归。
 > 当前仍缺完整 SST 并发读、性能放大和更广泛 cancel/timeout 矩阵证据，不能据此宣称
 > 全部 direct IO 性能目标。
 
