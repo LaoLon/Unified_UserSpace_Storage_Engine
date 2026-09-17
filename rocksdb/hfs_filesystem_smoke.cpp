@@ -54,10 +54,25 @@ int main(int argc, char **argv) {
     if (!status.ok()) {
         return 10;
     }
-    status = fileSystem->DeleteFile("/rocksdb-smoke", options.io_options, &debug);
-    if (!status.ok()) {
+    /* Check idempotent directory creation and the resident directory handle. */
+    status = fileSystem->CreateDirIfMissing("/rocksdb-dir", options.io_options, &debug);
+    if (!status.ok() ||
+        !fileSystem->CreateDirIfMissing("/rocksdb-dir", options.io_options, &debug).ok()) {
         return 11;
     }
+    std::unique_ptr<rocksdb::FSDirectory> directory;
+    status = fileSystem->NewDirectory("/rocksdb-dir", options.io_options, &directory, &debug);
+    if (!status.ok()) {
+        return 12;
+    }
+    directory.reset();
+    status = fileSystem->DeleteFile("/rocksdb-smoke", options.io_options, &debug);
+    if (!status.ok()) {
+        return 13;
+    }
     status = fileSystem->DeleteFile("/rocksdb-link", options.io_options, &debug);
-    return status.ok() ? 0 : 12;
+    if (!status.ok() || !fileSystem->DeleteDir("/rocksdb-dir", options.io_options, &debug).ok()) {
+        return 14;
+    }
+    return 0;
 }

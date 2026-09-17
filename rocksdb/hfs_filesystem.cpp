@@ -283,21 +283,29 @@ public:
         return removed.ok() ? toIoStatus(std::move(removed).value()) : toIoStatus(removed);
     }
 
-    /* Creates one HFS directory entry. */
+    /* Creates one HFS directory entry and rejects an existing name. */
     rocksdb::IOStatus CreateDir(const std::string &dirname, const rocksdb::IOOptions &,
                                 rocksdb::IODebugContext *) override {
         std::shared_ptr<hfs::File> file;
-        return openFile(context_, dirname, hfs::OpenFlags::Create | hfs::OpenFlags::Directory,
+        return openFile(context_, dirname,
+                        hfs::OpenFlags::Create | hfs::OpenFlags::Exclusive |
+                            hfs::OpenFlags::Directory,
                         &file);
     }
 
-    /* Creates a directory or accepts an already existing directory. */
+    /* Creates a directory or accepts an already existing directory only. */
     rocksdb::IOStatus CreateDirIfMissing(const std::string &dirname,
                                          const rocksdb::IOOptions &options,
                                          rocksdb::IODebugContext *dbg) override {
-        auto status = CreateDir(dirname, options, dbg);
-        if (status.ok() || status.IsIOError()) return status;
-        return status;
+        std::shared_ptr<hfs::File> existing;
+        auto status = openFile(context_, dirname, hfs::OpenFlags::Directory, &existing);
+        if (status.ok()) {
+            return rocksdb::IOStatus::OK();
+        }
+        if (!status.IsNotFound()) {
+            return status;
+        }
+        return CreateDir(dirname, options, dbg);
     }
 
     /* Removes an empty HFS directory entry. */
