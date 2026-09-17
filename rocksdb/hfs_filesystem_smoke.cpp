@@ -305,6 +305,21 @@ int main(int argc, char **argv) {
     for (std::size_t index = 0; index < cancelCount; ++index) {
         cancelDeleters[index](cancelHandles[index]);
     }
+    /* RocksDB publishes CURRENT and MANIFEST through atomic namespace rename;
+     * verify both the new name and the absence of the old name. */
+    status = fileSystem->RenameFile("/rocksdb-smoke", "/rocksdb-renamed",
+                                    options.io_options, &debug);
+    if (!status.ok()) {
+        return 13;
+    }
+    if (!fileSystem->FileExists("/rocksdb-renamed", options.io_options, &debug).ok()) {
+        return 13;
+    }
+    auto oldNameStatus =
+        fileSystem->FileExists("/rocksdb-smoke", options.io_options, &debug);
+    if (oldNameStatus.ok() || !oldNameStatus.IsNotFound()) {
+        return 13;
+    }
     std::vector<std::string> children;
     status = fileSystem->GetChildren("/", options.io_options, &children, &debug);
     if (!status.ok()) {
@@ -349,7 +364,7 @@ int main(int argc, char **argv) {
     directory.reset();
     /* Release the last open inode reference before checking extent reclaim. */
     random.reset();
-    status = fileSystem->DeleteFile("/rocksdb-smoke", options.io_options, &debug);
+    status = fileSystem->DeleteFile("/rocksdb-renamed", options.io_options, &debug);
     if (!status.ok()) {
         return 16;
     }

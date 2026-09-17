@@ -517,6 +517,8 @@ RMW 放大；`AbortIO` 遵守 cancel boundary。
 > `retryable` 的 `Busy`（该版本没有 `IOStatus::TryAgain`），`Cancelled` 映射为
 > `Aborted`，`TimedOut` 映射为 `TimedOut`，`Corrupt` 映射为 `Corruption`；构建、
 > 内部测试及真实 NVMe smoke 均通过。
+> 另补充真实 FileSystem smoke 的 atomic rename：新路径可见、旧路径返回 `NotFound`，
+> 并在后续删除中验证 extent reclaim 不受 rename 影响。
 > `file_api_test` 还明确检查 checkpoint flush 与 metadata commit 注入期间
 > `logicalSize/durableSize` 不变量，清除注入后重试才推进 durable size。
 > 另以两个独立 `hfs_db_bench` 进程执行 `fillseq`→`readrandom`，再由独立
