@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <string>
 #include <vector>
@@ -37,11 +38,16 @@ struct FioHfsFile {
 };
 
 struct FioHfsThread {
-    std::unique_ptr<hfs::Engine> engine;
+    std::shared_ptr<hfs::Engine> engine;
     std::shared_ptr<hfs::Client> client;
     std::vector<io_u *> completed;
     std::vector<io_u *> ready;
 };
+
+/* FIO numjobs share one process lock while retaining one Client per worker. */
+std::mutex processMutex;
+std::shared_ptr<hfs::Engine> processEngine;
+std::size_t processUsers = 0;
 
 int fioError(hfs::Status status) {
     switch (status) {
@@ -146,24 +152,43 @@ int fioHfsInit(struct thread_data *td) {
         fioLog("fio-hfs: config parse failed\n");
         return 1;
     }
-    auto engine = hfs::Engine::create(config.value());
-    if (!engine.ok()) {
-        fioLog("fio-hfs: engine create failed\n");
-        return 1;
-    }
-    auto mountedTask = engine.value()->mount().wait();
-    if (!mountedTask.ok() || !mountedTask.value().ok()) {
-        fioLog("fio-hfs: engine mount failed\n");
-        return 1;
+    std::shared_ptr<hfs::Engine> engine;
+    {
+        std::lock_guard<std::mutex> lock(processMutex);
+        if (processEngine == nullptr) {
+            auto created = hfs::Engine::create(config.value());
+            if (!created.ok()) {
+                fioLog("fio-hfs: engine create failed\n");
+                return 1;
+            }
+            engine = std::shared_ptr<hfs::Engine>(std::move(created).value());
+            auto mountedTask = engine->mount().wait();
+            if (!mountedTask.ok() || !mountedTask.value().ok()) {
+                fioLog("fio-hfs: engine mount failed\n");
+                return 1;
+            }
+            processEngine = engine;
+        } else {
+            engine = processEngine;
+        }
+        ++processUsers;
     }
     const std::uint32_t clientDepth = options == nullptr ? 32 : options->clientDepth;
-    auto client = hfs::Client::create(*engine.value(), hfs::ClientOptions{clientDepth});
+    auto client = hfs::Client::create(*engine, hfs::ClientOptions{clientDepth});
     if (!client.ok()) {
         fioLog("fio-hfs: client create failed\n");
+        std::lock_guard<std::mutex> lock(processMutex);
+        if (processUsers != 0) {
+            --processUsers;
+        }
+        if (processUsers == 0) {
+            processEngine->stop().wait();
+            processEngine.reset();
+        }
         return 1;
     }
     auto *state = new FioHfsThread;
-    state->engine = std::move(engine).value();
+    state->engine = std::move(engine);
     state->client = std::move(client).value();
     td->io_ops_data = state;
     return 0;
@@ -180,8 +205,15 @@ void fioHfsCleanup(struct thread_data *td) {
         state->client->close().wait();
     }
     state->client.reset();
-    if (state->engine != nullptr) {
-        state->engine->stop().wait();
+    {
+        std::lock_guard<std::mutex> lock(processMutex);
+        if (processUsers != 0) {
+            --processUsers;
+        }
+        if (processUsers == 0 && processEngine != nullptr) {
+            processEngine->stop().wait();
+            processEngine.reset();
+        }
     }
     delete state;
     td->io_ops_data = nullptr;
