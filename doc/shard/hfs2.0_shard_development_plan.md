@@ -448,6 +448,9 @@ p99 ≤ raw×110%。不达标时停在上游结构修复，不扩大 reactor/are
 > raw p99 并统一 reactor/core 拓扑后再收口。已补采 raw histogram：中位 p99 为
 > 1825.646 us；现有 HFS write p99 中位约 2056.192 us，高于 raw×110% 的
 > 2008.211 us，故性能门禁仍未通过。
+> 2026-09-17：新增可复用的原生 SPDK 5-run 基线文档
+> `doc/performance/hfs2_spdk_raw_baseline_20260917.md`，覆盖 4K/8K/16K/32K/64K
+> `randrw` 吞吐和平均延迟；该批结果不替代尚需统一拓扑采集的 p99 gate。
 
 ---
 
