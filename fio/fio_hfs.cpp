@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <condition_variable>
+#include <chrono>
 #include <deque>
 #include <memory>
 #include <limits>
@@ -148,7 +149,7 @@ int fioHfsIomemAlloc(struct thread_data *td, size_t totalMem) {
                               depth > std::numeric_limits<std::uint64_t>::max() / bytes;
         const std::uint64_t cap =
             static_cast<std::uint64_t>(engine->config().dmaArenaMb) << 20;
-        if (cap != 0 && (overflow || depth * bytes >= cap)) {
+        if (cap != 0 && (overflow || depth * bytes > cap)) {
             fioLog("fio-hfs: requested fio DMA arena exceeds mount cap\n");
             return 1;
         }
@@ -548,7 +549,7 @@ enum fio_q_status fioHfsQueue(struct thread_data *td, struct io_u *io) {
 }
 
 int fioHfsGetevents(struct thread_data *td, unsigned int min, unsigned int max,
-                    const struct timespec *) {
+                    const struct timespec *timeout) {
     auto *state = static_cast<FioHfsThread *>(td->io_ops_data);
     if (state == nullptr || max == 0) {
         return 0;
@@ -556,9 +557,16 @@ int fioHfsGetevents(struct thread_data *td, unsigned int min, unsigned int max,
     std::vector<std::unique_ptr<FioHfsPending>> finished;
     {
         std::unique_lock<std::mutex> lock(state->mutex);
-        state->condition.wait(lock, [state, min] {
-            return state->completed.size() >= min;
-        });
+        const auto ready = [state, min] { return state->completed.size() >= min; };
+        if (timeout == nullptr) {
+            state->condition.wait(lock, ready);
+        } else {
+            const auto timeoutNs = std::chrono::seconds(timeout->tv_sec) +
+                                   std::chrono::nanoseconds(timeout->tv_nsec);
+            if (!state->condition.wait_for(lock, timeoutNs, ready)) {
+                return 0;
+            }
+        }
         const unsigned int take = static_cast<unsigned int>(
             std::min<std::size_t>(max, state->completed.size()));
         state->ready.assign(state->completed.begin(), state->completed.begin() + take);
