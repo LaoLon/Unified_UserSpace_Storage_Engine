@@ -31,6 +31,7 @@ int main(int argc, char **argv) {
     if (!status.ok() || freeSpace == 0) {
         return 5;
     }
+    const uint64_t initialFreeSpace = freeSpace;
     std::unique_ptr<rocksdb::FSWritableFile> writable;
     status = fileSystem->NewWritableFile("/rocksdb-smoke", options, &writable, &debug);
     if (!status.ok()) {
@@ -43,6 +44,10 @@ int main(int argc, char **argv) {
     }
     status = writable->Close(options.io_options, &debug);
     if (!status.ok()) {
+        return 7;
+    }
+    status = fileSystem->GetFreeSpace("/", options.io_options, &freeSpace, &debug);
+    if (!status.ok() || freeSpace >= initialFreeSpace) {
         return 7;
     }
     /* Verify LinkFile preserves the same inode before deleting both names. */
@@ -159,12 +164,18 @@ int main(int argc, char **argv) {
         return 15;
     }
     directory.reset();
+    /* Release the last open inode reference before checking extent reclaim. */
+    random.reset();
     status = fileSystem->DeleteFile("/rocksdb-smoke", options.io_options, &debug);
     if (!status.ok()) {
         return 16;
     }
     status = fileSystem->DeleteFile("/rocksdb-link", options.io_options, &debug);
     if (!status.ok() || !fileSystem->DeleteDir("/rocksdb-dir", options.io_options, &debug).ok()) {
+        return 16;
+    }
+    status = fileSystem->GetFreeSpace("/", options.io_options, &freeSpace, &debug);
+    if (!status.ok() || freeSpace != initialFreeSpace) {
         return 16;
     }
     return 0;
