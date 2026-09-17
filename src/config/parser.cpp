@@ -545,7 +545,11 @@ Result<void> validateConfig(const Config &config) {
 
     auto checkDeviceList = [&](const std::vector<std::string> &list,
                                const std::string &label) -> Result<void> {
+        std::set<std::string> ids;
         for (const auto &id : list) {
+            if (!ids.insert(id).second) {
+                return invalid(label + " contains duplicate device '" + id + "'");
+            }
             const DeviceConfig *device = config.findDevice(id);
             if (device == nullptr) {
                 return invalid(label + " references unknown device '" + id + "'");
@@ -560,6 +564,16 @@ Result<void> validateConfig(const Config &config) {
     auto dataCheck = checkDeviceList(config.dataDevices, "data_devices");
     if (!dataCheck.ok()) {
         return dataCheck;
+    }
+    std::size_t metadataRoleCount = 0;
+    for (const auto &device : config.devices) {
+        if (device.metadata) {
+            ++metadataRoleCount;
+        }
+    }
+    if (metadataRoleCount != config.metadataDevices.size() ||
+        config.metadataReplication != metadataRoleCount) {
+        return invalid("metadata_replication must match the complete metadata device set");
     }
     for (const auto &id : config.metadataDevices) {
         if (!config.findDevice(id)->metadata) {

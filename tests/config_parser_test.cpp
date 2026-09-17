@@ -137,6 +137,14 @@ int main() {
         HFS_TEST_CHECK(expectInvalid(text, "malformed-line") == 0);
     }
 
+    /* 15. metadata replica list must be complete and duplicate-free */
+    {
+        std::string text = base;
+        HFS_TEST_CHECK(replaceAll(text, "metadata_devices = nvme0",
+                                  "metadata_devices = nvme0,nvme0"));
+        HFS_TEST_CHECK(expectInvalid(text, "duplicate-metadata") == 0);
+    }
+
     std::printf("config_parser_test: ok\n");
     return 0;
 }
