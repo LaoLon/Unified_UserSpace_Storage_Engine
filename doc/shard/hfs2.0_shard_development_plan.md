@@ -385,6 +385,8 @@ fail closed 且现场保留；多盘掉一块 metadata device 拒绝 mount，不
 > 2026-09-17 已补真实 NVMe 超限探针（QD=128、numjobs=8、1MiB）：返回非零并输出
 > `requested fio DMA arena exceeds mount cap`；FIO 外层仍会打印已创建 job 的统计，
 > 因而这里只记录为 cap 拒绝证据，不宣称“零 worker 启动”或完整容量矩阵通过。
+> 随后补跑 QD=128 的 80 项高深度功能矩阵（numjobs=1/2/4/8、4 种 block size、5 种
+> workload），脚本逐项检查 `err=0` 并全部通过；这仍不等价于完整 QD×jobs 矩阵。
 
 **80A 交付物**：`fio-hfs.so`（`extern "C"` 注册）；options（`hfs_config/hfs_direct/
 hfs_preallocate/hfs_client_depth`）；`open_file` 完成 create/open/allocate +

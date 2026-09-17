@@ -46,6 +46,10 @@ NVMe `--verify=crc32c` loader smoke 继续通过。另执行了 QD=128、numjobs
 由于 FIO 外层仍打印已创建 job 的统计，该结果只证明 cap 拒绝路径，不证明完整高负载
 容量矩阵，也不宣称零 worker 启动。
 
+随后在同一真实 NVMe 上完成 QD=128 的 80 项高深度功能矩阵：numjobs=1/2/4/8、
+4K/16K/64K/1M、write/read/randwrite/randread/randrw；脚本逐项检查 `err=0`，
+80/80 通过。该结果补强了高深度功能正确性，但不替代完整 QD×jobs 矩阵和性能 gate。
+
 ## Shard-81 raw 对照结果
 
 按 §16.2 口径在同一 `0000:0b:00.0` 上完成 raw SPDK `bdevperf` 与 HFS FIO
