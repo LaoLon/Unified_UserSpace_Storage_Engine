@@ -26,8 +26,13 @@ int main(int argc, char **argv) {
     }
     rocksdb::FileOptions options;
     rocksdb::IODebugContext debug;
+    uint64_t freeSpace = 0;
+    auto status = fileSystem->GetFreeSpace("/", options.io_options, &freeSpace, &debug);
+    if (!status.ok() || freeSpace == 0) {
+        return 5;
+    }
     std::unique_ptr<rocksdb::FSWritableFile> writable;
-    auto status = fileSystem->NewWritableFile("/rocksdb-smoke", options, &writable, &debug);
+    status = fileSystem->NewWritableFile("/rocksdb-smoke", options, &writable, &debug);
     if (!status.ok()) {
         return 5;
     }
