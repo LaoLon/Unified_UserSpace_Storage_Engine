@@ -31,6 +31,9 @@ readwhilewriting、`checkconsistency`、SIGKILL 后 reopen/check、`hfsctl check
 `file_api_test` 均通过；SIGKILL 后 superblock 显示 `clean=0`，随后 mount 与一致性
 检查成功完成。该复测仍不替代双盘和完整错误/取消矩阵。
 
+RocksDB FileSystem smoke 现已额外覆盖 DB identity 锁竞争：首个 `LockFile` 成功，
+第二个同名锁请求被拒绝，释放后可再次获取；该检查在同一真实 NVMe 回归中通过。
+
 RocksDB FileSystem smoke 还验证了 allocator-backed `GetFreeSpace`：真实 NVMe 单盘
 上初始可分配空间为 `31,398,559,744` 字节，写入一个 extent 后为 `31,397,511,168`
 字节，释放最后一个硬链接并关闭读句柄后恢复为 `31,398,559,744` 字节。该结果只
