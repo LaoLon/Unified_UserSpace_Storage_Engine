@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <span>
 #include <vector>
@@ -54,6 +55,8 @@ private:
     IoPlanner planner_;
     IoPlanner::Config plannerConfig_;
     Config config_;
+    /* Round-robin requests across the engine-owned data reactors. */
+    std::atomic<std::uint32_t> nextReactor_{0};
     Stats stats_;
     std::vector<std::uint32_t> deviceBlockBytes_;   /* per-device sector size */
     std::vector<std::uint32_t> deviceBlocksPerMeta_; /* sectors per metadata block */

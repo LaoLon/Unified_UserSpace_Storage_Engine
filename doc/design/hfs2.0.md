@@ -1354,6 +1354,8 @@ checkpoint region 必须容纳 namespace/inode/extent map/各 device allocator b
   或其余四个 crash 断点。
   File API 的同步 `read/write` 也已尊重 pre-cancelled `stop_token`，在提交数据面前
   返回 `Cancelled`；in-flight 取消仍只由 RocksDB async `AbortIO` 契约负责。
+  DataPath 已修正为按请求轮询已启动的 data reactors，不再把所有数据 I/O 固定到
+  reactor 0；真实 NVMe FIO smoke 回归通过，性能 gate 仍以正式 raw 对照为准。
 - 所有 gate 通过后删除新树中最后的旧兼容残留；
 - `src_legacy_frozen/` 保持本地忽略或单独归档，不回到 product build；
 - 更新架构索引、性能基线、支持边界和迁移说明；

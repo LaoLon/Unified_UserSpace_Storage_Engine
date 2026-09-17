@@ -86,6 +86,11 @@ Result<void> DataPath::execute(const ExtentMap &map, std::span<std::byte> readBu
         return makeError(planResult.status(), planResult.message());
     }
     const auto &plan = planResult.value();
+    const std::uint32_t reactorCount = runtime_.dataReactorCount();
+    const std::uint32_t reactorIndex =
+        reactorCount == 0
+            ? config_.reactorIndex
+            : nextReactor_.fetch_add(1, std::memory_order_relaxed) % reactorCount;
 
     ParentCompletion parent;
     parent.init(plan.count, nullptr, nullptr);
@@ -165,7 +170,7 @@ Result<void> DataPath::execute(const ExtentMap &map, std::span<std::byte> readBu
             /* RMW: refresh the full block, merge the user bytes, then write. */
             WaitState readState;
             auto submit =
-                runtime_.submitDataRead(config_.reactorIndex, child.deviceId,
+                runtime_.submitDataRead(reactorIndex, child.deviceId,
                                         span.data(), deviceOffset, deviceBlocks,
                                         childCallback, &readState);
             if (!submit.ok()) {
@@ -194,10 +199,10 @@ Result<void> DataPath::execute(const ExtentMap &map, std::span<std::byte> readBu
 
         WaitState state;
         Result<void> submit =
-            write ? runtime_.submitDataWrite(config_.reactorIndex, child.deviceId,
+            write ? runtime_.submitDataWrite(reactorIndex, child.deviceId,
                                              span.data(), deviceOffset, deviceBlocks,
                                              childCallback, &state)
-                  : runtime_.submitDataRead(config_.reactorIndex, child.deviceId,
+                  : runtime_.submitDataRead(reactorIndex, child.deviceId,
                                             span.data(), deviceOffset, deviceBlocks,
                                             childCallback, &state);
         if (!submit.ok()) {

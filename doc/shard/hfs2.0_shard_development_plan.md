@@ -429,6 +429,11 @@ bytes/op）。
 **验收**：§16.2 主 gate：4K shared-file randrw HFS/raw ≥85%、CPU ≤500%、errors=0、
 p99 ≤ raw×110%。不达标时停在上游结构修复，不扩大 reactor/arena 掩盖。
 
+> 2026-09-17：发现 `DataPath` 原先将所有请求固定投递到 data reactor 0；现已按请求
+> 在已启动的 data reactors 间轮询，真实 NVMe FIO smoke 通过。该修复尚未改变既有
+> raw 对照的失败结论，正式 5-run gate 仍需用正确加载 external engine 的 FIO 配置
+> 重跑并取得 p99。
+
 ---
 
 ## 7. Phase 5：RocksDB frontend
