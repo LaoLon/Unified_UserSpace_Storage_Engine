@@ -33,7 +33,10 @@ RocksDB FileSystem smoke 还验证了 allocator-backed `GetFreeSpace`：真实 N
 
 Shard-80 的 FIO loader 仍以共享 DMA arena 提供整块 `orig_buffer`；arena 结构测试覆盖
 了 2 MiB 连续分配、3 MiB cap 下第二次分配返回 `Busy`，以及释放后 bytes 归零。真实
-NVMe `--verify=crc32c` loader smoke 继续通过；高负载 arena 容量矩阵尚未宣称完成。
+NVMe `--verify=crc32c` loader smoke 继续通过。另执行了 QD=128、numjobs=8、1MiB 的
+真实 NVMe 超限探针：FIO 返回非零并记录 `requested fio DMA arena exceeds mount cap`；
+由于 FIO 外层仍打印已创建 job 的统计，该结果只证明 cap 拒绝路径，不证明完整高负载
+容量矩阵，也不宣称零 worker 启动。
 
 ## Shard-81 raw 对照结果
 

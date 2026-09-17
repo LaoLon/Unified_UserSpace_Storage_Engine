@@ -382,6 +382,9 @@ fail closed 且现场保留；多盘掉一块 metadata device 拒绝 mount，不
 > 已接入 Engine-owned 共享 DMA arena，并覆盖大块连续分配、容量耗尽和释放统计单测；
 > 正式高负载 arena 容量矩阵仍待补齐；在 VM 上显式加入 FIO `iomem=malloc` 会被 FIO
 > 报告为与 external engine 冲突并拒绝分配，不能把该路径误记为 arena 通过证据。
+> 2026-09-17 已补真实 NVMe 超限探针（QD=128、numjobs=8、1MiB）：返回非零并输出
+> `requested fio DMA arena exceeds mount cap`；FIO 外层仍会打印已创建 job 的统计，
+> 因而这里只记录为 cap 拒绝证据，不宣称“零 worker 启动”或完整容量矩阵通过。
 
 **80A 交付物**：`fio-hfs.so`（`extern "C"` 注册）；options（`hfs_config/hfs_direct/
 hfs_preallocate/hfs_client_depth`）；`open_file` 完成 create/open/allocate +
