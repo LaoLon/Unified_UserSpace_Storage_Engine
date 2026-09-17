@@ -134,6 +134,9 @@ public:
     /* Reads from the current sequential offset into RocksDB scratch storage. */
     rocksdb::IOStatus Read(size_t n, const rocksdb::IOOptions &, rocksdb::Slice *result,
                            char *scratch, rocksdb::IODebugContext *) override {
+        if (result == nullptr) {
+            return rocksdb::IOStatus::InvalidArgument("null sequential read result");
+        }
         if (scratch == nullptr && n != 0) {
             return rocksdb::IOStatus::InvalidArgument("null sequential read buffer");
         }
@@ -165,6 +168,9 @@ public:
                                      const rocksdb::IOOptions &options,
                                      rocksdb::Slice *result, char *scratch,
                                      rocksdb::IODebugContext *debug) override {
+        if (result == nullptr) {
+            return rocksdb::IOStatus::InvalidArgument("null positioned read result");
+        }
         if (scratch == nullptr && n != 0) {
             return rocksdb::IOStatus::InvalidArgument("null positioned read buffer");
         }
@@ -325,6 +331,9 @@ public:
     rocksdb::IOStatus Read(uint64_t offset, size_t n, const rocksdb::IOOptions &,
                            rocksdb::Slice *result, char *scratch,
                            rocksdb::IODebugContext *) const override {
+        if (result == nullptr) {
+            return rocksdb::IOStatus::InvalidArgument("null random read result");
+        }
         if (scratch == nullptr && n != 0) {
             return rocksdb::IOStatus::InvalidArgument("null random read buffer");
         }
@@ -564,6 +573,9 @@ public:
                                          const rocksdb::FileOptions &,
                                          std::unique_ptr<rocksdb::FSSequentialFile> *result,
                                          rocksdb::IODebugContext *) override {
+        if (result == nullptr) {
+            return rocksdb::IOStatus::InvalidArgument("null sequential file output");
+        }
         std::shared_ptr<hfs::File> file;
         auto status = openFile(context_, fname, hfs::OpenFlags::None, &file);
         if (!status.ok()) return status;
@@ -576,6 +588,9 @@ public:
         const std::string &fname, const rocksdb::FileOptions &,
         std::unique_ptr<rocksdb::FSRandomAccessFile> *result,
         rocksdb::IODebugContext *) override {
+        if (result == nullptr) {
+            return rocksdb::IOStatus::InvalidArgument("null random file output");
+        }
         std::shared_ptr<hfs::File> file;
         auto status = openFile(context_, fname, hfs::OpenFlags::None, &file);
         if (!status.ok()) return status;
@@ -588,6 +603,9 @@ public:
         const std::string &fname, const rocksdb::FileOptions &,
         std::unique_ptr<rocksdb::FSWritableFile> *result,
         rocksdb::IODebugContext *) override {
+        if (result == nullptr) {
+            return rocksdb::IOStatus::InvalidArgument("null writable file output");
+        }
         std::shared_ptr<hfs::File> file;
         auto status = openFile(context_, fname,
                                hfs::OpenFlags::Create | hfs::OpenFlags::Truncate, &file);
@@ -600,6 +618,9 @@ public:
     rocksdb::IOStatus NewDirectory(const std::string &name, const rocksdb::IOOptions &,
                                     std::unique_ptr<rocksdb::FSDirectory> *result,
                                     rocksdb::IODebugContext *) override {
+        if (result == nullptr) {
+            return rocksdb::IOStatus::InvalidArgument("null directory output");
+        }
         std::shared_ptr<hfs::File> file;
         auto status = openFile(context_, name, hfs::OpenFlags::Directory, &file);
         if (!status.ok()) return status;
@@ -618,6 +639,9 @@ public:
     rocksdb::IOStatus GetChildren(const std::string &dir, const rocksdb::IOOptions &,
                                   std::vector<std::string> *result,
                                   rocksdb::IODebugContext *) override {
+        if (result == nullptr) {
+            return rocksdb::IOStatus::InvalidArgument("null children output");
+        }
         result->clear();
         std::string cursor;
         do {
@@ -673,6 +697,9 @@ public:
     /* Returns the logical HFS size, not a host-file size. */
     rocksdb::IOStatus GetFileSize(const std::string &fname, const rocksdb::IOOptions &,
                                   uint64_t *fileSize, rocksdb::IODebugContext *) override {
+        if (fileSize == nullptr) {
+            return rocksdb::IOStatus::InvalidArgument("null file size output");
+        }
         std::shared_ptr<hfs::File> file;
         auto status = openFile(context_, fname, hfs::OpenFlags::None, &file);
         if (!status.ok()) return status;
@@ -686,6 +713,9 @@ public:
     rocksdb::IOStatus GetFileModificationTime(const std::string &fname,
                                                const rocksdb::IOOptions &, uint64_t *mtime,
                                                rocksdb::IODebugContext *) override {
+        if (mtime == nullptr) {
+            return rocksdb::IOStatus::InvalidArgument("null file time output");
+        }
         std::shared_ptr<hfs::File> file;
         auto status = openFile(context_, fname, hfs::OpenFlags::None, &file);
         if (!status.ok()) return status;
@@ -721,6 +751,9 @@ public:
     /* Reports the shared inode link count for a regular HFS file. */
     rocksdb::IOStatus NumFileLinks(const std::string &fname, const rocksdb::IOOptions &,
                                    uint64_t *count, rocksdb::IODebugContext *) override {
+        if (count == nullptr) {
+            return rocksdb::IOStatus::InvalidArgument("null link count output");
+        }
         std::shared_ptr<hfs::File> file;
         auto status = openFile(context_, fname, hfs::OpenFlags::None, &file);
         if (!status.ok()) return status;
@@ -734,6 +767,9 @@ public:
     rocksdb::IOStatus AreFilesSame(const std::string &first, const std::string &second,
                                    const rocksdb::IOOptions &, bool *same,
                                    rocksdb::IODebugContext *) override {
+        if (same == nullptr) {
+            return rocksdb::IOStatus::InvalidArgument("null file identity output");
+        }
         std::shared_ptr<hfs::File> left;
         std::shared_ptr<hfs::File> right;
         auto leftStatus = openFile(context_, first, hfs::OpenFlags::None, &left);
@@ -789,6 +825,9 @@ public:
     /* Exposes a stable HFS test namespace path. */
     rocksdb::IOStatus GetTestDirectory(const rocksdb::IOOptions &, std::string *path,
                                        rocksdb::IODebugContext *) override {
+        if (path == nullptr) {
+            return rocksdb::IOStatus::InvalidArgument("null test directory output");
+        }
         *path = "/rocksdb-test";
         return rocksdb::IOStatus::OK();
     }
@@ -796,6 +835,9 @@ public:
     /* HFS paths are already canonical absolute namespace paths. */
     rocksdb::IOStatus GetAbsolutePath(const std::string &dbPath, const rocksdb::IOOptions &,
                                       std::string *output, rocksdb::IODebugContext *) override {
+        if (output == nullptr) {
+            return rocksdb::IOStatus::InvalidArgument("null absolute path output");
+        }
         *output = hfsPath(dbPath);
         return rocksdb::IOStatus::OK();
     }
@@ -810,6 +852,9 @@ public:
     /* Distinguishes HFS directory handles from regular file handles. */
     rocksdb::IOStatus IsDirectory(const std::string &path, const rocksdb::IOOptions &,
                                    bool *isDirectory, rocksdb::IODebugContext *) override {
+        if (isDirectory == nullptr) {
+            return rocksdb::IOStatus::InvalidArgument("null directory predicate output");
+        }
         std::shared_ptr<hfs::File> file;
         auto status = openFile(context_, path, hfs::OpenFlags::Directory, &file);
         if (status.ok()) {

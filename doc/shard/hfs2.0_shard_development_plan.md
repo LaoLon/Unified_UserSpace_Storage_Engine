@@ -495,6 +495,9 @@ readwhilewriting 基础运行；WAL、MANIFEST 能创建/rename/同步；stock `
 > callback/status，DataPath 也将 `-ETIMEDOUT` 映射为 `TimedOut` 并验证 submit/complete
 > 闭合；超时后的 request result 保持不变，避免后台完成越过 callback 边界写回；完整
 > 组合矩阵仍需继续扩展。
+> 随后统一 RocksDB FileSystem 各输出参数的空指针保护，所有对应 API 返回
+> `InvalidArgument` 而不解引用空指针；真实 NVMe smoke 已覆盖这些永久错误路径，
+> 并保持原有取消/超时回归通过。
 
 **交付物**：切换到 `use_direct_io()==true` 并**同时**落地 `PrepareWrite/Allocate/
 PositionedAppend`（三者必须一起启用）；`ReadAsync/Poll/AbortIO`（FSReadRequest/

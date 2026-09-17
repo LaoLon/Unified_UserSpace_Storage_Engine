@@ -67,6 +67,29 @@ int main(int argc, char **argv) {
         return 5;
     }
     const uint64_t initialFreeSpace = freeSpace;
+    /* Every output-bearing FileSystem API must fail closed on a null output. */
+    if (!fileSystem->NewSequentialFile("/rocksdb-missing", options, nullptr, &debug)
+             .IsInvalidArgument() ||
+        !fileSystem->NewRandomAccessFile("/rocksdb-missing", options, nullptr, &debug)
+             .IsInvalidArgument() ||
+        !fileSystem->NewWritableFile("/rocksdb-missing", options, nullptr, &debug)
+             .IsInvalidArgument() ||
+        !fileSystem->NewDirectory("/", options.io_options, nullptr, &debug)
+             .IsInvalidArgument() ||
+        !fileSystem->GetChildren("/", options.io_options, nullptr, &debug)
+             .IsInvalidArgument() ||
+        !fileSystem->GetFileSize("/rocksdb-missing", options.io_options, nullptr, &debug)
+             .IsInvalidArgument() ||
+        !fileSystem->GetFileModificationTime("/rocksdb-missing", options.io_options, nullptr,
+                                             &debug)
+             .IsInvalidArgument() ||
+        !fileSystem->GetTestDirectory(options.io_options, nullptr, &debug).IsInvalidArgument() ||
+        !fileSystem->GetAbsolutePath("rocksdb", options.io_options, nullptr, &debug)
+             .IsInvalidArgument() ||
+        !fileSystem->IsDirectory("/rocksdb-missing", options.io_options, nullptr, &debug)
+             .IsInvalidArgument()) {
+        return 5;
+    }
     std::unique_ptr<rocksdb::FSWritableFile> writable;
     status = fileSystem->NewWritableFile("/rocksdb-smoke", options, &writable, &debug);
     if (!status.ok()) {
@@ -104,6 +127,13 @@ int main(int argc, char **argv) {
     if (!status.ok()) {
         return 8;
     }
+    if (!fileSystem->NumFileLinks("/rocksdb-smoke", options.io_options, nullptr, &debug)
+             .IsInvalidArgument() ||
+        !fileSystem->AreFilesSame("/rocksdb-smoke", "/rocksdb-link", options.io_options,
+                                   nullptr, &debug)
+             .IsInvalidArgument()) {
+        return 9;
+    }
     uint64_t linkCount = 0;
     bool sameFile = false;
     if (!fileSystem->NumFileLinks("/rocksdb-smoke", options.io_options, &linkCount, &debug).ok() ||
@@ -117,6 +147,18 @@ int main(int argc, char **argv) {
     if (!status.ok()) {
         return 10;
     }
+    if (!random->Read(0, 0, options.io_options, nullptr, nullptr, &debug).IsInvalidArgument()) {
+        return 11;
+    }
+    std::unique_ptr<rocksdb::FSSequentialFile> sequential;
+    status = fileSystem->NewSequentialFile("/rocksdb-link", options, &sequential, &debug);
+    if (!status.ok() || !sequential->Read(0, options.io_options, nullptr, nullptr, &debug)
+                              .IsInvalidArgument() ||
+        !sequential->PositionedRead(0, 0, options.io_options, nullptr, nullptr, &debug)
+             .IsInvalidArgument()) {
+        return 11;
+    }
+    sequential.reset();
     char scratch[12]{};
     rocksdb::Slice result;
     status = random->Read(0, sizeof(scratch), options.io_options, &result, scratch, &debug);
