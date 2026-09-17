@@ -176,3 +176,7 @@ data child 已完成、device flush 尚未提交时，`datasync` 返回 `IoError
 Shard-83 的真实 NVMe `file_data_test` 还覆盖了 pre-cancelled synchronous read/write：
 两者均在提交数据面前返回 `Cancelled`，且取消写不会改变文件 logical size；in-flight
 取消仍由已验证的 RocksDB `AbortIO` 路径负责。
+
+Shard-84 的 RocksDB lock 回归现要求第二个同名 `LockFile` 返回 `Busy`；真实 NVMe
+`file_api_test` 通过。该测试同时将 checkpoint/metadata fault-injection 写入扩展到
+新的 logical range，避免已 durable epoch 的幂等 sync 绕过注入点。

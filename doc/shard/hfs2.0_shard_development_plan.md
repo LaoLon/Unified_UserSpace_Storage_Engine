@@ -499,6 +499,9 @@ RMW 放大；`AbortIO` 遵守 cancel boundary。
 > `hfs_lock_probe`，真实 VM 上第一进程持锁、第二进程返回 `Busy` 并报告锁路径，
 > 跨进程独占边界已得到直接证据；完整跨进程 workload 顺序矩阵及所有错误/取消
 > 路径仍保留为未完成证据项。
+> 2026-09-17：修正 RocksDB `LockFile` 将竞争映射为 `Busy`（而非通用 `IOError`），并
+> 在真实 NVMe `file_api_test` 中验证；同时修正 durable fault-injection 测试先扩展
+> logical range，确保 checkpoint/metadata commit 断点不会被幂等 sync 短路。
 
 **交付物**：`hfs_db_bench`/`hfs_ldb` 完整参数；SIGKILL recovery、跨进程顺序 reopen、
 `checkconsistency`。
