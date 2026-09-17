@@ -30,6 +30,10 @@ int main(int argc, char **argv) {
     /* The database identity lock must reject a concurrent opener and recover
      * after the first process releases its lock. */
     rocksdb::FileLock *firstLock = nullptr;
+    if (!fileSystem->LockFile("/rocksdb-lock-db", options.io_options, nullptr, &debug)
+             .IsInvalidArgument()) {
+        return 5;
+    }
     if (!fileSystem->LockFile("/rocksdb-lock-db", options.io_options, &firstLock, &debug).ok() ||
         firstLock == nullptr) {
         return 5;

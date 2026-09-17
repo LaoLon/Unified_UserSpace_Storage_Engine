@@ -688,6 +688,9 @@ public:
     /* Acquires a process lock for RocksDB's DB identity. */
     rocksdb::IOStatus LockFile(const std::string &fname, const rocksdb::IOOptions &,
                                rocksdb::FileLock **lock, rocksdb::IODebugContext *) override {
+        if (lock == nullptr) {
+            return rocksdb::IOStatus::InvalidArgument("null RocksDB lock output");
+        }
         auto *value = new HfsFileLock;
         value->fd = ::open(hostLockPath(fname).c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0644);
         if (value->fd < 0) {
