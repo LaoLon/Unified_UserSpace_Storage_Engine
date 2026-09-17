@@ -23,6 +23,10 @@
 #include "hfs/core.hpp"
 #include "hfs/file.hpp"
 
+#if defined(HFS_WITH_SPDK)
+#include <spdk/env.h>
+#endif
+
 namespace {
 
 struct FioHfsOptions {
@@ -91,6 +95,40 @@ int fioError(hfs::Status status) {
 /* Keep diagnostics inside the module so C++ name mangling cannot affect fio symbols. */
 void fioLog(const char *message) {
     std::fputs(message, stderr);
+}
+
+/* Allocate fio's complete requested buffer from the SPDK DMA heap. */
+int fioHfsIomemAlloc(struct thread_data *td, size_t totalMem) {
+    if (td == nullptr || totalMem == 0) {
+        if (td != nullptr) td->orig_buffer = nullptr;
+        return totalMem == 0 ? 0 : 1;
+    }
+#if defined(HFS_WITH_SPDK)
+    td->orig_buffer = static_cast<char *>(spdk_dma_zmalloc(totalMem, 4096, nullptr));
+    if (td->orig_buffer == nullptr) {
+        fioLog("fio-hfs: complete DMA arena allocation failed\n");
+        return 1;
+    }
+    td->orig_buffer_size = totalMem;
+    return 0;
+#else
+    (void)totalMem;
+    td->orig_buffer = nullptr;
+    fioLog("fio-hfs: DMA arena requires an SPDK-enabled build\n");
+    return 1;
+#endif
+}
+
+/* Release only the single arena owned by fio for this worker. */
+void fioHfsIomemFree(struct thread_data *td) {
+    if (td == nullptr || td->orig_buffer == nullptr) {
+        return;
+    }
+#if defined(HFS_WITH_SPDK)
+    spdk_dma_free(td->orig_buffer);
+#endif
+    td->orig_buffer = nullptr;
+    td->orig_buffer_size = 0;
 }
 
 std::string fioPath(const char *name) {
@@ -377,6 +415,8 @@ extern "C" struct ioengine_ops ioengine = {
     .close_file = fioHfsClose,
     .invalidate = fioHfsInvalidate,
     .get_file_size = fioHfsGetFileSize,
+    .iomem_alloc = fioHfsIomemAlloc,
+    .iomem_free = fioHfsIomemFree,
     .option_struct_size = sizeof(FioHfsOptions),
     .options = options,
 };
