@@ -689,7 +689,9 @@ public:
         if (value->fd < 0 || ::flock(value->fd, LOCK_EX | LOCK_NB) != 0) {
             if (value->fd >= 0) ::close(value->fd);
             delete value;
-            return rocksdb::IOStatus::IOError("RocksDB lock is already held");
+            /* RocksDB treats an existing process lock as a retryable busy
+             * condition, not as filesystem corruption or I/O failure. */
+            return rocksdb::IOStatus::Busy("RocksDB lock is already held");
         }
         *lock = value;
         return rocksdb::IOStatus::OK();

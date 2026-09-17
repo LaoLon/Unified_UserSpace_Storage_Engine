@@ -35,7 +35,9 @@ int main(int argc, char **argv) {
         return 5;
     }
     rocksdb::FileLock *secondLock = nullptr;
-    if (fileSystem->LockFile("/rocksdb-lock-db", options.io_options, &secondLock, &debug).ok() ||
+    auto secondLockStatus =
+        fileSystem->LockFile("/rocksdb-lock-db", options.io_options, &secondLock, &debug);
+    if (secondLockStatus.ok() || !secondLockStatus.IsBusy() ||
         secondLock != nullptr ||
         !fileSystem->UnlockFile(firstLock, options.io_options, &debug).ok()) {
         if (secondLock != nullptr) {
