@@ -550,6 +550,9 @@ FAIL）；RESOURCE_BOUNDARY 是当前 512 MiB 共享 arena 对大 buffer/高并�
 通过。此前 free-space 立即减少断言与 extent 粒度不一致的问题已修正，当前双盘
 RocksDB smoke 的 free-space reclaim 与 `hfsctl check` 均通过。随后对真实双盘完成缺失第二 BDF、合法落后
 generation、双槽 CRC 损坏三类 fail-closed 探针，三项均返回非零并保留明确错误。
+另以两块真实 NVMe 完成 required metadata device 掉盘探针：双盘 format 后仅将
+`0000:0b:00.0` 绑定给 SPDK、让 `0000:13:00.0` 保持内核 `nvme` 驱动，dual
+`hfsctl info` 返回非零并报告缺失控制器；测试结束后两块设备均恢复到内核驱动。
 
 **交付物**：
 
