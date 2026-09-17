@@ -4,6 +4,8 @@
 #include <iostream>
 #include <memory>
 #include <string>
+#include <sstream>
+#include <vector>
 
 #include "rocksdb/db.h"
 #include "rocksdb/hfs_filesystem.hpp"
@@ -11,44 +13,82 @@
 
 namespace {
 
-/* Parses a small stable argument surface shared by the Shard-82 smoke. */
+/* Parses both the canonical Shard-84 flags and the legacy smoke form. */
 struct BenchOptions {
     std::string configPath;
     std::string dbPath;
     std::string benchmark = "fillseq";
+    std::vector<std::string> benchmarks;
     std::uint64_t num = 100;
+    std::uint32_t threads = 1;
+    bool directIoForFlush = false;
 };
 
+/* Splits the comma-separated benchmark list while rejecting empty entries. */
+std::vector<std::string> splitBenchmarks(const std::string &value) {
+    std::vector<std::string> result;
+    std::stringstream stream(value);
+    std::string benchmark;
+    while (std::getline(stream, benchmark, ',')) {
+        if (benchmark.empty()) return {};
+        result.push_back(benchmark);
+    }
+    return result;
+}
+
 bool parseArguments(int argc, char **argv, BenchOptions *options) {
-    if (argc < 3 || options == nullptr) {
+    if (argc < 2 || options == nullptr) {
         return false;
     }
-    options->configPath = argv[1];
-    options->dbPath = argv[2];
-    for (int i = 3; i < argc; ++i) {
+    for (int i = 1; i < argc; ++i) {
         const std::string argument = argv[i];
-        if (argument.rfind("--bench=", 0) == 0) {
+        if (argument.rfind("--hfs-config=", 0) == 0) {
+            options->configPath = argument.substr(13);
+        } else if (argument.rfind("--db=", 0) == 0) {
+            options->dbPath = argument.substr(5);
+        } else if (argument.rfind("--benchmarks=", 0) == 0) {
+            options->benchmarks = splitBenchmarks(argument.substr(13));
+        } else if (argument.rfind("--threads=", 0) == 0) {
+            options->threads = static_cast<std::uint32_t>(std::stoul(argument.substr(10)));
+        } else if (argument.rfind("--use_direct_io_for_flush_and_compaction=", 0) == 0) {
+            options->directIoForFlush = argument.substr(argument.find('=') + 1) == "1";
+        } else if (argument.rfind("--bench=", 0) == 0) {
             options->benchmark = argument.substr(8);
         } else if (argument.rfind("--num=", 0) == 0) {
             options->num = std::stoull(argument.substr(6));
+        } else if (argument.front() != '-' && options->configPath.empty()) {
+            options->configPath = argument;
+        } else if (argument.front() != '-' && options->dbPath.empty()) {
+            options->dbPath = argument;
         } else {
             return false;
         }
     }
-    return options->benchmark == "fillseq" || options->benchmark == "overwrite" ||
-           options->benchmark == "readrandom" || options->benchmark == "readwhilewriting";
+    if (options->benchmarks.empty()) options->benchmarks.push_back(options->benchmark);
+    if (options->configPath.empty() || options->dbPath.empty() || options->threads == 0) {
+        return false;
+    }
+    for (const auto &benchmark : options->benchmarks) {
+        if (benchmark != "fillseq" && benchmark != "overwrite" &&
+            benchmark != "readrandom" && benchmark != "readwhilewriting") return false;
+    }
+    return true;
 }
 
 /* Executes one deterministic key/value operation against the composite Env. */
-int runBenchmark(const BenchOptions &options) {
-    auto env = hfs::rocksdb_adapter::createCompositeEnv(options.configPath);
+int runBenchmark(const BenchOptions &options, rocksdb::Env *sharedEnv = nullptr) {
+    std::unique_ptr<rocksdb::Env> ownedEnv;
+    if (sharedEnv == nullptr) ownedEnv = hfs::rocksdb_adapter::createCompositeEnv(options.configPath);
+    rocksdb::Env *env = sharedEnv != nullptr ? sharedEnv : ownedEnv.get();
     if (env == nullptr) {
         std::cerr << "cannot create HFS RocksDB Env\n";
         return 2;
     }
     rocksdb::Options dbOptions;
     dbOptions.create_if_missing = true;
-    dbOptions.env = env.get();
+    dbOptions.env = env;
+    dbOptions.max_background_jobs = static_cast<int>(options.threads);
+    dbOptions.use_direct_io_for_flush_and_compaction = options.directIoForFlush;
     rocksdb::DB *database = nullptr;
     rocksdb::Status opened = rocksdb::DB::Open(dbOptions, options.dbPath, &database);
     if (!opened.ok()) {
@@ -131,8 +171,22 @@ int runBenchmark(const BenchOptions &options) {
 int main(int argc, char **argv) {
     BenchOptions options;
     if (!parseArguments(argc, argv, &options)) {
-        std::cerr << "usage: hfs_db_bench CONFIG DB_PATH [--bench=fillseq|overwrite|readrandom|readwhilewriting] [--num=N]\n";
+        std::cerr << "usage: hfs_db_bench --hfs-config=CONFIG --db=PATH "
+                     "--benchmarks=fillseq,readrandom,overwrite,readwhilewriting "
+                     "[--num=N] [--threads=N] "
+                     "[--use_direct_io_for_flush_and_compaction=1]\n";
         return 1;
     }
-    return runBenchmark(options);
+    auto sharedEnv = hfs::rocksdb_adapter::createCompositeEnv(options.configPath);
+    if (sharedEnv == nullptr) {
+        std::cerr << "cannot create HFS RocksDB Env\n";
+        return 2;
+    }
+    for (const auto &benchmark : options.benchmarks) {
+        BenchOptions run = options;
+        run.benchmark = benchmark;
+        const int result = runBenchmark(run, sharedEnv.get());
+        if (result != 0) return result;
+    }
+    return 0;
 }
