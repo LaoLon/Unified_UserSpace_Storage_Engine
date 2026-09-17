@@ -1337,7 +1337,8 @@ checkpoint region 必须容纳 namespace/inode/extent map/各 device allocator b
   检查及双盘 FIO verify 已通过。双盘完整矩阵、metadata 故障组合和性能 gate 仍是
   硬门禁，不以 Malloc/Aio 或重复 BDF 代替。真实双盘验收还暴露并修复了生命周期
   superblock generation 逐盘递增导致的副本漂移；RocksDB smoke 中“12 字节写入后
-  free space 必须立即减少”断言与 extent 粒度统计不一致，暂不作为双盘通过证据。
+  free space 必须立即减少”断言与 extent 粒度统计不一致的问题已修正，当前 free-space
+  reclaim 与双盘 `hfsctl check` 均通过。
   缺失 BDF、合法但落后 generation、双槽 CRC 损坏三类双盘 fail-closed 探针也已通过；
   双盘完整 workload 矩阵和性能 gate 仍未完成。
   双盘回归期间还修复了控制 flush 的块/字节单位错误、镜像 superblock 未应用目标盘

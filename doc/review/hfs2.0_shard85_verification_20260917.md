@@ -101,8 +101,9 @@ replica check，以及 2 jobs/4 KiB/16 MiB 的 `randrw` CRC verify，返回 `err
 此前缺盘环境下的重复 BDF 探针仍保留为边界证据；当前双盘测试使用两个独立 BDF，且
 已确认 `vm.nr_hugepages=1024`、`HugePages_Free=1024`。生命周期验收中发现逐盘更新
 clean/dirty 标志会造成 superblock generation 漂移，已修复为共享版本发布；修复后
-双盘 `hfsctl check` 连续通过。RocksDB smoke 仍因“12 字节写入后 free space 必须
-立即减少”这一与 extent 粒度统计不一致的断言返回 7，需另行修订测试口径。
+双盘 `hfsctl check` 连续通过。此前“12 字节写入后 free space 必须立即减少”这一
+与 extent 粒度统计不一致的断言已修正；当前双盘 RocksDB smoke 的 free-space reclaim
+与 `hfsctl check` 均通过。
 
 真实双盘 fail-closed 探针结果：
 

@@ -497,8 +497,8 @@ checkconsistency）；错误/超时/取消映射完整。
 > 状态：单盘真实 NVMe 功能/FIO workload 矩阵和 `--verify=crc32c` loader smoke 已
 > 通过；VM 现有两块独立 NVMe：`Nvme0n1`（`0000:0b:00.0`）和 `Nvme1n1`
 > （`0000:13:00.0`）。新增 `config/hfs_nvme_dual.conf` 已通过双盘 format、mount、
-> metadata replica check，以及双盘 FIO `randrw`/CRC verify；完整双盘矩阵、metadata
-> replica 掉盘/CRC/generation 故障组合以及 raw 对照/5-run 性能门禁仍未完成，不能用
+> metadata replica check，以及双盘 FIO `randrw`/CRC verify；metadata replica 掉盘/
+> CRC/generation 故障组合以及 raw 对照/5-run 性能门禁仍未完成，不能用
 > SATA 或 Malloc/Aio 替代。
 
 双盘 FIO 矩阵已完成 400/400 组合的分类执行（320 PASS、80 RESOURCE_BOUNDARY、0
@@ -507,8 +507,8 @@ FAIL）；RESOURCE_BOUNDARY 是当前 512 MiB 共享 arena 对大 buffer/高并�
 
 2026-09-17 双盘验收还发现 clean/dirty 生命周期逐盘递增会使副本 generation 漂移，
 已改为先读取全部副本、计算一次共享版本后逐盘发布；修复后双盘 `hfsctl check` 连续
-通过。RocksDB smoke 仍在 free-space 立即减少的 extent 粒度断言处返回 7，需单独修订
-测试口径，不能记录为 smoke 全通过。随后对真实双盘完成缺失第二 BDF、合法落后
+通过。此前 free-space 立即减少断言与 extent 粒度不一致的问题已修正，当前双盘
+RocksDB smoke 的 free-space reclaim 与 `hfsctl check` 均通过。随后对真实双盘完成缺失第二 BDF、合法落后
 generation、双槽 CRC 损坏三类 fail-closed 探针，三项均返回非零并保留明确错误。
 
 **交付物**：
