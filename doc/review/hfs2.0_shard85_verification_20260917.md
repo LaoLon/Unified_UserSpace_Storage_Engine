@@ -98,6 +98,9 @@ device set。因此以下项目没有伪造通过：
 补充第二块真实 NVMe 后，应以同一 `.conf` 声明完整 device set，重新执行上述缺失
 矩阵，并记录每盘 placement、submit/complete 和故障恢复结果。
 
-2026-09-17 复核 VM 设备状态：仅存在 `/dev/nvme0n1`，PCI 盘为 VMware NVMe
-`0000:0b:00.0`，当前绑定 `/sys/bus/pci/drivers/nvme`；其余设备为 SATA/块设备，
-因此本记录没有将它们替代为第二块 NVMe。
+2026-09-17 复核 VM 设备状态：出现 `/dev/nvme0n1`（30G）和 `/dev/nvme0n2`（25G），
+但二者均指向同一 VMware NVMe 控制器 `0000:0b:00.0` 和同一 serial，当前绑定
+`/sys/bus/pci/drivers/nvme`；其余设备为 SATA/块设备。临时配置将 `Nvme0n2` 作为
+第二 device 声明时，被正式 parser 以 duplicate PCI BDF 拒绝，因此没有将同一控制器
+的 namespace 冒充独立第二盘。VM 重启后的 hugepage 值曾为 0，已恢复并确认
+`vm.nr_hugepages=1024`、`HugePages_Free=1024`。
