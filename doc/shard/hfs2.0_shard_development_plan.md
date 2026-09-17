@@ -491,7 +491,10 @@ RMW 放大；`AbortIO` 遵守 cancel boundary。
 > SIGKILL recovery、clean-flag 取证、`hfs_ldb checkconsistency`、`hfsctl check` 和 MultiRead。完整
 > §16.3 组合（含跨进程矩阵及所有错误/取消路径）仍保留为未完成证据项。双盘
 > `hfs_nvme_dual.conf` 上已补跑四类 db_bench workload、SIGKILL 后 checkconsistency
-> 和 `hfsctl check`，均通过且两副本状态一致。
+> 和 `hfsctl check`，均通过且两副本状态一致。随后新增不启动 SPDK 的
+> `hfs_lock_probe`，真实 VM 上第一进程持锁、第二进程返回 `Busy` 并报告锁路径，
+> 跨进程独占边界已得到直接证据；完整跨进程 workload 顺序矩阵及所有错误/取消
+> 路径仍保留为未完成证据项。
 
 **交付物**：`hfs_db_bench`/`hfs_ldb` 完整参数；SIGKILL recovery、跨进程顺序 reopen、
 `checkconsistency`。
