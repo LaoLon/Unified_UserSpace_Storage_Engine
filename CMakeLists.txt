@@ -71,6 +71,16 @@ target_include_directories(hfs_core
 )
 target_link_libraries(hfs_core PRIVATE Threads::Threads)
 
+set(FIO_SOURCE_DIR "" CACHE PATH "fio source tree for the optional HFS external engine")
+if(EXISTS ${FIO_SOURCE_DIR}/fio.h)
+  add_library(fio-hfs MODULE fio/fio_hfs.cpp)
+  target_include_directories(fio-hfs PRIVATE ${FIO_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_compile_options(fio-hfs PRIVATE -include ${FIO_SOURCE_DIR}/config-host.h)
+    target_compile_options(fio-hfs PRIVATE -O0 -g)
+  target_link_libraries(fio-hfs PRIVATE hfs_core)
+  set_target_properties(fio-hfs PROPERTIES PREFIX "" OUTPUT_NAME "fio-hfs")
+endif()
+
 if(HFS_WITH_SPDK)
   # Mirror of the legacy SPDK static link set; bdev/nvme/env/thread/init are
   # the modules the runtime uses, the rest keep subsystem registration intact.

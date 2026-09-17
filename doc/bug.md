@@ -230,6 +230,17 @@ Bug 等级：**致命 > 严重 > 一般**。
   truncate 同样避免加法回绕。
 - **验证结果**：新增极大范围 reservation 回归；Linux/CMake 结构测试通过。
 
+### 19. FIO 外部引擎文件布局未形成实际 I/O（处理中）
+
+- **状态**：处理中
+- **等级**：严重
+- **时间**：2026-09-17（Shard-80A）
+- **现象**：真实 NVMe 上 FIO 引擎可加载、HFS 可 format/mount/stop，但最小 job 未产生 I/O 统计。
+- **排查过程**：初版因缺少 invalidate 回调报 Bad file descriptor；补齐后生命周期正常，仍需继续闭合 FIO `get_file_size`、open/layout 与请求调度契约。
+- **根因**：FIO 虚拟文件引擎不能依赖 host fd 的默认文件布局路径，当前 size/open 回调组合尚未满足 FIO 的实际请求准入条件。
+- **修复**：已补齐无 fd invalidate、get_file_size 和 open 时 preallocate 的骨架；功能矩阵前保持 Shard-80 未完成。
+- **验证结果**：编译通过；真实 NVMe bind→format→mount→engine cleanup 通过；实际 I/O 门禁仍未通过。
+
 ## 记录模板
 
 ### N. 简短标题

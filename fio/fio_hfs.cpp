@@ -1,0 +1,330 @@
+/* HFS 2.0 fio external engine. The first adapter keeps fio's completion
+ * contract synchronous while the core grows its reactor-backed polling path. */
+
+#include <cerrno>
+#include <cstddef>
+#include <cstdint>
+#include <cstdlib>
+#include <cstdio>
+#include <memory>
+#include <span>
+#include <string>
+#include <vector>
+
+#include "fio.h"
+#include "optgroup.h"
+
+/* fio's C helpers define min/max macros that must not leak into C++ headers. */
+#undef min
+#undef max
+
+#include "hfs/config.hpp"
+#include "hfs/core.hpp"
+#include "hfs/file.hpp"
+
+namespace {
+
+struct FioHfsOptions {
+    void *padding = nullptr; /* fio requires the first option offset to be non-zero. */
+    char *config = nullptr;
+    unsigned int direct = 1;
+    unsigned int preallocate = 1;
+    unsigned int clientDepth = 32;
+};
+
+struct FioHfsFile {
+    std::shared_ptr<hfs::File> file;
+};
+
+struct FioHfsThread {
+    std::unique_ptr<hfs::Engine> engine;
+    std::shared_ptr<hfs::Client> client;
+    std::vector<io_u *> completed;
+    std::vector<io_u *> ready;
+};
+
+int fioError(hfs::Status status) {
+    switch (status) {
+    case hfs::Status::Busy:
+    case hfs::Status::TryAgain:
+        return EAGAIN;
+    case hfs::Status::NoMemory:
+        return ENOMEM;
+    case hfs::Status::NoSpace:
+        return ENOSPC;
+    case hfs::Status::NotFound:
+        return ENOENT;
+    case hfs::Status::AlreadyExists:
+        return EEXIST;
+    case hfs::Status::InvalidArgument:
+        return EINVAL;
+    case hfs::Status::NotSupported:
+        return ENOTSUP;
+    case hfs::Status::Cancelled:
+        return ECANCELED;
+    case hfs::Status::TimedOut:
+        return ETIMEDOUT;
+    case hfs::Status::IoError:
+        return EIO;
+    default:
+        return EIO;
+    }
+}
+
+/* Keep diagnostics inside the module so C++ name mangling cannot affect fio symbols. */
+void fioLog(const char *message) {
+    std::fputs(message, stderr);
+}
+
+std::string fioPath(const char *name) {
+    if (name == nullptr || name[0] == '\0') {
+        return {};
+    }
+    std::string path(name);
+    if (path.front() != '/') {
+        path.insert(path.begin(), '/');
+    }
+    return path;
+}
+
+static struct fio_option options[5]{};
+
+/* C++ cannot use C's out-of-order designated initializers for fio options. */
+struct FioHfsOptionInitializer {
+    FioHfsOptionInitializer() {
+        options[0].name = const_cast<char *>("hfs_config");
+        options[0].lname = const_cast<char *>("HFS .conf path");
+        options[0].type = FIO_OPT_STR_STORE;
+        options[0].off1 = offsetof(FioHfsOptions, config);
+        options[0].help = const_cast<char *>("HFS 2.0 .conf configuration path");
+        options[0].category = FIO_OPT_C_ENGINE;
+        options[0].group = FIO_OPT_G_INVALID;
+
+        options[1].name = const_cast<char *>("hfs_direct");
+        options[1].lname = const_cast<char *>("HFS direct mode");
+        options[1].type = FIO_OPT_BOOL;
+        options[1].off1 = offsetof(FioHfsOptions, direct);
+        options[1].def = const_cast<char *>("1");
+        options[1].help = const_cast<char *>("Use HFS direct data path");
+        options[1].category = FIO_OPT_C_ENGINE;
+        options[1].group = FIO_OPT_G_INVALID;
+
+        options[2].name = const_cast<char *>("hfs_preallocate");
+        options[2].lname = const_cast<char *>("HFS preallocation");
+        options[2].type = FIO_OPT_BOOL;
+        options[2].off1 = offsetof(FioHfsOptions, preallocate);
+        options[2].def = const_cast<char *>("1");
+        options[2].help = const_cast<char *>("Allocate HFS extents during open_file");
+        options[2].category = FIO_OPT_C_ENGINE;
+        options[2].group = FIO_OPT_G_INVALID;
+
+        options[3].name = const_cast<char *>("hfs_client_depth");
+        options[3].lname = const_cast<char *>("HFS client depth");
+        options[3].type = FIO_OPT_INT;
+        options[3].off1 = offsetof(FioHfsOptions, clientDepth);
+        options[3].def = const_cast<char *>("32");
+        options[3].help = const_cast<char *>("HFS client queue depth");
+        options[3].category = FIO_OPT_C_ENGINE;
+        options[3].group = FIO_OPT_G_INVALID;
+    }
+};
+
+static FioHfsOptionInitializer optionInitializer;
+
+int fioHfsInit(struct thread_data *td) {
+    auto *options = static_cast<FioHfsOptions *>(td->eo);
+    const char *configPath = options == nullptr ? nullptr : options->config;
+    if (configPath == nullptr || configPath[0] == '\0') {
+        configPath = std::getenv("HFS_CONFIG");
+    }
+    if (configPath == nullptr || configPath[0] == '\0') {
+        fioLog("fio-hfs: hfs_config is required\n");
+        return 1;
+    }
+    auto config = hfs::parseConfigFile(configPath);
+    if (!config.ok()) {
+        fioLog("fio-hfs: config parse failed\n");
+        return 1;
+    }
+    auto engine = hfs::Engine::create(config.value());
+    if (!engine.ok()) {
+        fioLog("fio-hfs: engine create failed\n");
+        return 1;
+    }
+    auto mountedTask = engine.value()->mount().wait();
+    if (!mountedTask.ok() || !mountedTask.value().ok()) {
+        fioLog("fio-hfs: engine mount failed\n");
+        return 1;
+    }
+    const std::uint32_t clientDepth = options == nullptr ? 32 : options->clientDepth;
+    auto client = hfs::Client::create(*engine.value(), hfs::ClientOptions{clientDepth});
+    if (!client.ok()) {
+        fioLog("fio-hfs: client create failed\n");
+        return 1;
+    }
+    auto *state = new FioHfsThread;
+    state->engine = std::move(engine).value();
+    state->client = std::move(client).value();
+    td->io_ops_data = state;
+    return 0;
+}
+
+void fioHfsCleanup(struct thread_data *td) {
+    auto *state = static_cast<FioHfsThread *>(td->io_ops_data);
+    if (state == nullptr) {
+        return;
+    }
+    state->ready.clear();
+    state->completed.clear();
+    if (state->client != nullptr) {
+        state->client->close().wait();
+    }
+    state->client.reset();
+    if (state->engine != nullptr) {
+        state->engine->stop().wait();
+    }
+    delete state;
+    td->io_ops_data = nullptr;
+}
+
+int fioHfsOpen(struct thread_data *td, struct fio_file *fioFile) {
+    auto *state = static_cast<FioHfsThread *>(td->io_ops_data);
+    if (state == nullptr || state->client == nullptr) {
+        return EINVAL;
+    }
+    auto opened = state->client->open(fioPath(fioFile->file_name), hfs::OpenFlags::Create).wait();
+    if (!opened.ok()) {
+        return fioError(opened.status());
+    }
+    auto *file = new FioHfsFile;
+    auto openedResult = std::move(opened).value();
+    if (!openedResult.ok()) {
+        delete file;
+        return fioError(openedResult.status());
+    }
+    file->file = std::move(openedResult).value();
+    auto stat = file->file->stat();
+    if (!stat.ok()) {
+        delete file;
+        return fioError(stat.status());
+    }
+    auto *options = static_cast<FioHfsOptions *>(td->eo);
+    const std::uint64_t requestedSize = static_cast<std::uint64_t>(td->o.size);
+    if (options != nullptr && options->preallocate != 0 && requestedSize != 0) {
+        auto allocated = file->file->allocate(0, requestedSize).wait();
+        if (!allocated.ok() || !allocated.value().ok()) {
+            delete file;
+            return allocated.ok() ? fioError(allocated.value().status()) : EIO;
+        }
+        stat = file->file->stat();
+        if (!stat.ok()) {
+            delete file;
+            return fioError(stat.status());
+        }
+    }
+    fioFile->engine_data = file;
+    fioFile->real_file_size = stat.value().logicalSize;
+    fio_file_set_size_known(fioFile);
+    return 0;
+}
+
+int fioHfsClose(struct thread_data *, struct fio_file *fioFile) {
+    auto *file = static_cast<FioHfsFile *>(fioFile->engine_data);
+    delete file;
+    fioFile->engine_data = nullptr;
+    return 0;
+}
+
+/* HFS owns cache coherency; fio has no host file descriptor to invalidate. */
+int fioHfsInvalidate(struct thread_data *, struct fio_file *) { return 0; }
+
+/* Fio needs a logical extent before it schedules the first request. */
+int fioHfsGetFileSize(struct thread_data *td, struct fio_file *fioFile) {
+    const std::uint64_t size = static_cast<std::uint64_t>(td->o.size);
+    fioFile->real_file_size = size == 0 ? 4096 : size;
+    return 0;
+}
+
+enum fio_q_status fioHfsQueue(struct thread_data *td, struct io_u *io) {
+    auto *state = static_cast<FioHfsThread *>(td->io_ops_data);
+    auto *file = io->file == nullptr ? nullptr
+                                     : static_cast<FioHfsFile *>(io->file->engine_data);
+    if (state == nullptr || file == nullptr || file->file == nullptr) {
+        io->error = EINVAL;
+        if (state != nullptr) {
+            state->completed.push_back(io);
+        }
+        return FIO_Q_COMPLETED;
+    }
+    hfs::IoVec buffer{static_cast<std::byte *>(io->xfer_buf), io->xfer_buflen};
+    if (io->ddir == DDIR_READ) {
+        auto taskResult = file->file->read(std::span<hfs::IoVec>(&buffer, 1), io->offset).wait();
+        if (!taskResult.ok() || !taskResult.value().ok()) {
+            io->error = taskResult.ok() ? fioError(taskResult.value().status()) : EIO;
+            io->resid = io->xfer_buflen;
+        } else {
+            io->error = 0;
+            io->resid = io->xfer_buflen - taskResult.value().value().bytes;
+        }
+    } else if (io->ddir == DDIR_WRITE) {
+        auto taskResult =
+            file->file->write(std::span<const hfs::IoVec>(&buffer, 1), io->offset).wait();
+        if (!taskResult.ok() || !taskResult.value().ok()) {
+            io->error = taskResult.ok() ? fioError(taskResult.value().status()) : EIO;
+            io->resid = io->xfer_buflen;
+        } else {
+            io->error = 0;
+            io->resid = io->xfer_buflen - taskResult.value().value().bytes;
+        }
+    } else {
+        io->error = EOPNOTSUPP;
+        io->resid = io->xfer_buflen;
+    }
+    state->completed.push_back(io);
+    return FIO_Q_COMPLETED;
+}
+
+int fioHfsGetevents(struct thread_data *td, unsigned int min, unsigned int max,
+                    const struct timespec *) {
+    auto *state = static_cast<FioHfsThread *>(td->io_ops_data);
+    if (state == nullptr || max == 0) {
+        return 0;
+    }
+    state->ready.clear();
+    const unsigned int count = static_cast<unsigned int>(state->completed.size());
+    if (count < min) {
+        return 0;
+    }
+    const unsigned int take = count < max ? count : max;
+    state->ready.insert(state->ready.end(), state->completed.begin(),
+                        state->completed.begin() + take);
+    state->completed.erase(state->completed.begin(), state->completed.begin() + take);
+    return static_cast<int>(take);
+}
+
+struct io_u *fioHfsEvent(struct thread_data *td, int event) {
+    auto *state = static_cast<FioHfsThread *>(td->io_ops_data);
+    if (state == nullptr || event < 0 || static_cast<std::size_t>(event) >= state->ready.size()) {
+        return nullptr;
+    }
+    return state->ready[static_cast<std::size_t>(event)];
+}
+
+} // namespace
+
+extern "C" struct ioengine_ops ioengine = {
+    .name = "hfs",
+    .version = FIO_IOOPS_VERSION,
+    .flags = FIO_NOEXTEND | FIO_MEMALIGN,
+    .init = fioHfsInit,
+    .queue = fioHfsQueue,
+    .getevents = fioHfsGetevents,
+    .event = fioHfsEvent,
+    .cleanup = fioHfsCleanup,
+    .open_file = fioHfsOpen,
+    .close_file = fioHfsClose,
+    .invalidate = fioHfsInvalidate,
+    .get_file_size = fioHfsGetFileSize,
+    .option_struct_size = sizeof(FioHfsOptions),
+    .options = options,
+};
