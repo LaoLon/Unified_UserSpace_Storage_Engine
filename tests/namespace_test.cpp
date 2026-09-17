@@ -331,6 +331,35 @@ int main() {
                     static_cast<unsigned long long>(stats.renames));
     }
 
+    /* Logical and durable epochs are monotonic and publish atomically. */
+    {
+        auto created = Namespace::create(testConfig(64, 1ULL << 20), fakeClock, nullptr);
+        HFS_TEST_CHECK(created.ok());
+        Namespace &ns = *created.value();
+        auto handle = ns.create("/epoch", true, false, false);
+        HFS_TEST_CHECK(handle.ok());
+        const auto logical = ns.logicalEpoch();
+        HFS_TEST_CHECK(logical > 0 && ns.durableEpoch() == 0);
+        HFS_TEST_CHECK(!ns.publishDurableEpoch(logical + 1).ok());
+        HFS_TEST_CHECK(ns.publishDurableEpoch(logical).ok());
+        HFS_TEST_CHECK(ns.durableEpoch() == logical);
+        auto stat = ns.stat(handle.value());
+        HFS_TEST_CHECK(stat.ok() && stat.value().logicalSize == stat.value().durableSize);
+        HFS_TEST_CHECK(ns.setSize(handle.value(), 4096).ok());
+        const auto future = ns.logicalEpoch();
+        HFS_TEST_CHECK(future > logical);
+        stat = ns.stat(handle.value());
+        HFS_TEST_CHECK(stat.ok() && stat.value().logicalSize == 4096 &&
+                       stat.value().durableSize == 0);
+        HFS_TEST_CHECK(ns.publishDurableEpoch(logical).ok());
+        stat = ns.stat(handle.value());
+        HFS_TEST_CHECK(stat.ok() && stat.value().durableSize == 0);
+        HFS_TEST_CHECK(ns.publishDurableEpoch(future).ok());
+        stat = ns.stat(handle.value());
+        HFS_TEST_CHECK(stat.ok() && stat.value().durableSize == 4096);
+        HFS_TEST_CHECK(!ns.publishDurableEpoch(logical - 1).ok());
+    }
+
     std::printf("namespace_test: ok\n");
     return 0;
 }

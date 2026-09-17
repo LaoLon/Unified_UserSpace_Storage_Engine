@@ -7,6 +7,7 @@
 
 #include "hfs/journal.hpp"
 #include "hfs/superblock.hpp"
+#include "metadata/group_commit.hpp"
 #include "test_support.hpp"
 
 namespace {
@@ -172,6 +173,26 @@ hfs::JournalRecord setSize(std::uint64_t objectId, std::uint64_t size) {
 } // namespace
 
 int main() {
+    /* 0. Multiple metadata requests share one journal transaction and flush. */
+    {
+        Fixture fixture;
+        HFS_TEST_CHECK(fixture.valid());
+        HFS_TEST_CHECK(fixture.format() == 0);
+        MemoryTarget target;
+        auto journal = fixture.open(&target);
+        HFS_TEST_CHECK(journal != nullptr);
+        hfs::metadata::GroupCommitCoordinator coordinator(*journal);
+        HFS_TEST_CHECK(coordinator.enqueue({setSize(1, 100)}, 1).ok());
+        HFS_TEST_CHECK(coordinator.enqueue({setSize(1, 200)}, 2).ok());
+        HFS_TEST_CHECK(coordinator.sync(2).ok());
+        HFS_TEST_CHECK(coordinator.durableEpoch() == 2);
+        HFS_TEST_CHECK(coordinator.stats().transactions == 1);
+        HFS_TEST_CHECK(coordinator.stats().flushes == 1);
+        HFS_TEST_CHECK(coordinator.stats().lastBatchRequests == 2);
+        HFS_TEST_CHECK(coordinator.stats().lastBatchRecords == 2);
+        HFS_TEST_CHECK(target.values[1] == 200);
+    }
+
     /* 1. append, replay into a fresh target, checkpoint resume */
     {
         Fixture fixture;

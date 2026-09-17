@@ -3,6 +3,7 @@
 #include <cstring>
 #include <map>
 #include <memory>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -377,6 +378,21 @@ int main() {
         HFS_TEST_CHECK(retry.ok());
         HFS_TEST_CHECK(ns.releaseExtents(handle.value(), retry.value()).ok());
         HFS_TEST_CHECK(ns.extents(handle.value()).value().size() == 1);
+
+        /* A stale overlapping reservation must not leak committed allocator space. */
+        auto firstPending = ns.reserveExtents(handle.value(), 16 * 4096, 4096);
+        auto secondPending = ns.reserveExtents(handle.value(), 16 * 4096, 4096);
+        HFS_TEST_CHECK(firstPending.ok() && secondPending.ok());
+        const auto freeBeforeCommit = ns.stats().allocatedExtents;
+        HFS_TEST_CHECK(ns.commitExtents(handle.value(), firstPending.value()).ok());
+        HFS_TEST_CHECK(!ns.commitExtents(handle.value(), secondPending.value()).ok());
+        HFS_TEST_CHECK(ns.stats().allocatedExtents == freeBeforeCommit + 1);
+        HFS_TEST_CHECK(ns.extents(handle.value()).value().back().logicalExtent == 16);
+
+        /* Range arithmetic must fail closed instead of wrapping. */
+        auto overflow = ns.reserveExtents(
+            handle.value(), std::numeric_limits<std::uint64_t>::max() - 1, 8);
+        HFS_TEST_CHECK(!overflow.ok() && overflow.status() == Status::InvalidArgument);
     }
 
     /* 10. multi-device placement keeps every run device-local */

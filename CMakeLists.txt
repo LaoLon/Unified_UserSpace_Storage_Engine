@@ -45,6 +45,7 @@ set(HFS_CORE_SRC
   src/core/scheduler.cpp
   src/core/shard_ring.cpp
   src/metadata/allocator.cpp
+  src/metadata/group_commit.cpp
   src/metadata/inode_map.cpp
   src/metadata/namespace.cpp
   src/runtime/spdk_runtime.cpp
@@ -130,7 +131,10 @@ foreach(test_name IN LISTS HFS_TESTS)
   add_executable(${test_name} tests/${test_name}.cpp)
   target_link_libraries(${test_name} PRIVATE hfs_core)
   target_compile_options(${test_name} PRIVATE -fno-exceptions -fno-rtti)
-  target_include_directories(${test_name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+  target_include_directories(${test_name} PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests
+  )
   target_compile_definitions(${test_name} PRIVATE
     HFS_DEFAULT_CONF_PATH="${CMAKE_CURRENT_SOURCE_DIR}/config/hfs_nvme.conf")
   add_test(NAME ${test_name} COMMAND ${test_name})

@@ -222,7 +222,7 @@ tracepoints：`FE_SUBMIT/FE_REAP/CQ_PUSH/CQ_REAP/RING_*/ACTOR_BATCH`。
 
 ### Shard-74：唯一 inode dependency scheduler
 
-> 状态：已完成（2026-09-16）。交付 `InodeDependencyScheduler`：intrusive interval tree
+> 状态：机制完成，真实 NVMe 集成回归延期（2026-09-16）。交付 `InodeDependencyScheduler`：intrusive interval tree
 > （按 start 排序、maxEnd 剪枝）、read/read 并行、重叠写/RMW 冲突、inode barrier
 > （truncate/size mutation/gap-zero/sync）、FIFO 公平唤醒（合法可并行节点可越过等待者）、
 > admit callback 批量延迟派发（避免回调重入破坏状态）、`SCHED_WAIT/SCHED_ADMIT/SCHED_DONE`
@@ -304,7 +304,8 @@ rename 是单事务且无中间态；超限返回 NoMemory；RocksDB 风格文�
 
 ### Shard-77：allocator 与真实 extent map 集成
 
-> 状态：已完成（2026-09-17；持久化部分按计划留待 Shard-78/79）。交付：
+> 状态：成功路径完成，一致性边界已补强（2026-09-17；持久化部分按计划留待
+> Shard-78/79）。交付：
 > `Allocator`（两级 bitmap + free-run index、next-fit、相邻 run 合并、
 > FREE→RESERVED→INITIALIZED→COMMITTED、单次 ≤64 extent、capacity/ENOSPC、
 > CRC 快照 serialize/deserialize、RESERVED replay 回收、`verify()` 不变量）；
@@ -336,6 +337,11 @@ extent map snapshot 接入数据面（替换 Shard-75 的 synthetic fixture）�
 ALLOC/FREE/RESERVE 记录语义与主状态机联合回放通过。
 
 ### Shard-78：epoch、sync 与 group commit
+
+> 状态：进行中（78A/78B，2026-09-17）。已加入 namespace 的 logical/durable epoch、
+> per-inode logical/durable size、单调 durable publish 校验，以及基于 Journal 的
+> 有序 group commit 协调器和批量 flush 验证；data flush、metadata transaction 与
+> File sync 接线尚未完成，当前不宣称 sync 崩溃恢复能力。
 
 **交付物**：`logical_size/durable_size` + metadata epoch；datasync 顺序
 （data drain → device flush → metadata tx → journal flush → 需要时 checkpoint/superblock

@@ -1,4 +1,5 @@
 #include <cstdio>
+#include <limits>
 #include <memory>
 #include <string>
 #include <unistd.h>
@@ -43,6 +44,14 @@ int main() {
             HFS_TEST_CHECK(firstStat.ok() && !firstStat.value().directory);
             HFS_TEST_CHECK(firstStat.value().logicalSize == 0);
             HFS_TEST_CHECK(first.value()->handle().valid());
+
+            /* Reject arithmetic overflow before reserving or mutating metadata. */
+            auto overflowAllocate =
+                first.value()->allocate(std::numeric_limits<std::uint64_t>::max(), 1)
+                    .wait()
+                    .value();
+            HFS_TEST_CHECK(!overflowAllocate.ok() &&
+                           overflowAllocate.status() == Status::InvalidArgument);
 
             auto exclusive = client->open("/db/FILE-000001",
                                           OpenFlags::Create | OpenFlags::Exclusive)

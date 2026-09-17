@@ -99,6 +99,12 @@ public:
     /* Grows the logical size (never shrinks). */
     Result<void> setSize(FileHandle handle, std::uint64_t size);
 
+    /* Epoch state is published only after data flush and metadata transaction
+     * work complete (Shard-78). */
+    std::uint64_t logicalEpoch() const;
+    std::uint64_t durableEpoch() const;
+    Result<void> publishDurableEpoch(std::uint64_t epoch);
+
     std::uint64_t extentBytes() const noexcept { return config_.extentBytes; }
     std::uint64_t deviceStartExtent(std::uint32_t deviceId) const noexcept;
 
@@ -142,6 +148,8 @@ private:
     std::vector<Inode> inodes_; /* slot 0 unused, slot 1 is the root directory */
     std::vector<std::uint64_t> freeSlots_;
     std::uint64_t namespaceBytes_ = 0;
+    std::uint64_t logicalEpoch_ = 0;
+    std::uint64_t durableEpoch_ = 0;
     Stats stats_;
     std::vector<std::unique_ptr<Allocator>> allocators_;
     PlacementPicker picker_;

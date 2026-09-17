@@ -25,6 +25,8 @@ Bug 等级：**致命 > 严重 > 一般**。
 - 14：已修复（Shard-75，DmaArena 释放不回收预算且析构泄漏缓存块）。
 - 15：已修复（Shard-76，Engine::stop 在打开 File 时销毁 namespace 导致悬空自锁死）。
 - 16：已修复（Shard-77，DataPlane 零初始化合成映射逻辑偏移全部叠加在 0）。
+- 17：已修复（Shard-77 边界收口，extent commit 失败可泄漏 allocator 状态）。
+- 18：已修复（Shard-77 边界收口，extent/range 计算整数溢出未拒绝）。
 
 ## Bug 记录
 
@@ -203,6 +205,30 @@ Bug 等级：**致命 > 严重 > 一般**。
 - **根因**：合成 extent map 的逻辑偏移没有按 `i * extentBytes` 展开。
 - **修复**：逻辑偏移改为 `i * extentBytes`，写入偏移同步对应。
 - **验证结果**：`file_data_test` 全部场景通过；CTest 17/17、ASAN/TSAN 干净。
+
+### 17. extent commit 失败后 allocator 与 inode map 不一致
+
+- **状态**：已修复
+- **等级**：严重
+- **时间**：2026-09-17（Shard-77 边界收口）
+- **现象**：同一 inode 存在重叠的 outstanding reservation 时，后一个 commit
+  可能在 extent map 发布失败，但其 allocator extent 已进入 COMMITTED，形成空间泄漏。
+- **根因**：`commitExtents` 逐个修改 allocator，最后才更新 inode map，缺少完整预校验和补偿。
+- **修复**：先在候选 extent map 上验证全集合与所有 reservation 状态，再修改 allocator；
+  中途失败释放已经提交的 runs，map 仅在全部成功后发布；`releaseExtents` 只接受 RESERVED runs。
+- **验证结果**：新增重叠 reservation 回归；`allocator_test`、`namespace_test` 通过。
+
+### 18. extent/range 算术溢出未 fail closed
+
+- **状态**：已修复
+- **等级**：严重
+- **时间**：2026-09-17（Shard-77 边界收口）
+- **现象**：极大 offset/length 在 namespace reservation、extent lookup 或 planner 中相加回绕，
+  可能产生错误逻辑范围。
+- **根因**：直接使用 `offset + length` 与 `size + extentBytes - 1`，没有统一溢出检查。
+- **修复**：reservation、lookup、planner 入口拒绝溢出；extent 向上取整改用除法和余数，
+  truncate 同样避免加法回绕。
+- **验证结果**：新增极大范围 reservation 回归；Linux/CMake 结构测试通过。
 
 ## 记录模板
 

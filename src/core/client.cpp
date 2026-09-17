@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <vector>
 
@@ -279,10 +280,18 @@ Task<Result<WriteResult>> File::write(std::span<const IoVec> buffers, std::uint6
         if (vec.size != 0 && vec.data == nullptr) {
             co_return makeError<WriteResult>(Status::InvalidArgument, "null iovec buffer");
         }
+        if (vec.size > std::numeric_limits<std::size_t>::max() - total) {
+            co_return makeError<WriteResult>(Status::InvalidArgument,
+                                             "iovec byte count overflows");
+        }
         total += vec.size;
     }
     if (total == 0) {
         co_return WriteResult{0};
+    }
+    if (offset > std::numeric_limits<std::uint64_t>::max() - total) {
+        co_return makeError<WriteResult>(Status::InvalidArgument,
+                                         "write range overflows");
     }
 
     /* Allocate missing extents, zero-initialize them, then commit. Extents are
@@ -373,6 +382,9 @@ Task<Result<void>> File::allocate(std::uint64_t offset, std::uint64_t length) {
     }
     if (length == 0) {
         co_return Result<void>(Status::Ok);
+    }
+    if (offset > std::numeric_limits<std::uint64_t>::max() - length) {
+        co_return Result<void>(Status::InvalidArgument, "allocation range overflows");
     }
     auto reservations = state.namespaceState->reserveExtents(impl_->handle, offset, length);
     if (!reservations.ok()) {

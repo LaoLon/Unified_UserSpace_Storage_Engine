@@ -42,6 +42,8 @@ struct Inode {
     std::uint32_t linkCount = 0; /* visible directory entries */
     std::uint32_t openCount = 0; /* live File handles */
     std::uint64_t logicalSize = 0;
+    std::uint64_t durableSize = 0;
+    std::uint64_t logicalEpoch = 0;
     std::uint64_t mtimeNs = 0;
     std::uint64_t ctimeNs = 0;
     std::uint64_t parent = 0;     /* parent directory (root points to itself) */

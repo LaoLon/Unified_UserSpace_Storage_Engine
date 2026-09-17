@@ -1,6 +1,7 @@
 #include "core/io_planner.hpp"
 
 #include <algorithm>
+#include <limits>
 
 #include "common/trace.hpp"
 
@@ -14,6 +15,9 @@ Result<IoPlanner::Plan> IoPlanner::plan(const ExtentMap &map, std::uint64_t offs
     (void)write;
     if (length == 0) {
         return makeError<Plan>(Status::InvalidArgument, "zero-length I/O");
+    }
+    if (offset > std::numeric_limits<std::uint64_t>::max() - length) {
+        return makeError<Plan>(Status::InvalidArgument, "I/O range overflows");
     }
     if (config_.blockSize == 0 || config_.maxChildBytes < config_.blockSize ||
         config_.maxChildren == 0 || config_.maxChildren > Plan::kMaxChildren) {

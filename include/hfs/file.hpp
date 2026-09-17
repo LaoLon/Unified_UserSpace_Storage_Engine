@@ -63,6 +63,7 @@ struct FileStat {
     std::uint32_t linkCount = 0;
     std::uint32_t openCount = 0;
     std::uint64_t logicalSize = 0;
+    std::uint64_t durableSize = 0;
     std::uint64_t mtimeNs = 0;
     std::uint64_t ctimeNs = 0;
 };

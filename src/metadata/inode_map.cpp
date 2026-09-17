@@ -1,6 +1,7 @@
 #include "metadata/inode_map.hpp"
 
 #include <algorithm>
+#include <limits>
 
 namespace hfs::metadata {
 
@@ -87,6 +88,9 @@ Result<void> InodeExtentMap::restore(std::span<const ExtentDescriptor> descripto
 
 Result<std::size_t> InodeExtentMap::lookup(std::uint64_t offset, std::uint64_t length,
                                            std::span<ExtentView> out) const {
+    if (length == 0 || offset > std::numeric_limits<std::uint64_t>::max() - length) {
+        return makeError<std::size_t>(Status::InvalidArgument, "extent lookup range overflows");
+    }
     const std::uint64_t end = offset + length;
     std::size_t count = 0;
     for (const ExtentDescriptor &descriptor : extents_) {
