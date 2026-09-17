@@ -180,3 +180,6 @@ Shard-83 的真实 NVMe `file_data_test` 还覆盖了 pre-cancelled synchronous 
 Shard-84 的 RocksDB lock 回归现要求第二个同名 `LockFile` 返回 `Busy`；真实 NVMe
 `file_api_test` 通过。该测试同时将 checkpoint/metadata fault-injection 写入扩展到
 新的 logical range，避免已 durable epoch 的幂等 sync 绕过注入点。
+
+RocksDB `GetFileSize` 与 `GetFileModificationTime` 的底层 stat 失败现统一保留 HFS
+错误类别；缺失路径回归已随真实 NVMe RocksDB smoke 通过。

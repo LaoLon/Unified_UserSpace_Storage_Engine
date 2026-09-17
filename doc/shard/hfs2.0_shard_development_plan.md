@@ -502,6 +502,8 @@ RMW 放大；`AbortIO` 遵守 cancel boundary。
 > 2026-09-17：修正 RocksDB `LockFile` 将竞争映射为 `Busy`（而非通用 `IOError`），并
 > 在真实 NVMe `file_api_test` 中验证；同时修正 durable fault-injection 测试先扩展
 > logical range，确保 checkpoint/metadata commit 断点不会被幂等 sync 短路。
+> 随后统一 `GetFileSize`/`GetFileModificationTime` 的 stat 错误映射，并在真实 NVMe
+> RocksDB smoke 中验证缺失路径不会退化为通用 I/O 错误。
 
 **交付物**：`hfs_db_bench`/`hfs_ldb` 完整参数；SIGKILL recovery、跨进程顺序 reopen、
 `checkconsistency`。
