@@ -33,6 +33,11 @@ rocksdb::IOStatus toIoStatus(const hfs::Result<T> &result) {
     if (result.ok()) {
         return rocksdb::IOStatus::OK();
     }
+    auto retryableBusy = [&result]() {
+        auto status = rocksdb::IOStatus::Busy(result.message());
+        status.SetRetryable(true);
+        return status;
+    };
     switch (result.status()) {
     case hfs::Status::NotFound:
         return rocksdb::IOStatus::NotFound(result.message());
@@ -41,18 +46,20 @@ rocksdb::IOStatus toIoStatus(const hfs::Result<T> &result) {
     case hfs::Status::AlreadyExists:
         return rocksdb::IOStatus::IOError(result.message());
     case hfs::Status::Busy:
-        return rocksdb::IOStatus::Busy(result.message());
+        return retryableBusy();
     case hfs::Status::Cancelled:
         return rocksdb::IOStatus::Aborted(result.message());
     case hfs::Status::TimedOut:
         return rocksdb::IOStatus::TimedOut(result.message());
     case hfs::Status::TryAgain:
-        /* RocksDB IOStatus has no TryAgain factory; preserve retryability as I/O. */
-        return rocksdb::IOStatus::IOError(result.message());
+        /* RocksDB IOStatus has no TryAgain factory; preserve retryability as Busy. */
+        return retryableBusy();
     case hfs::Status::InvalidArgument:
         return rocksdb::IOStatus::InvalidArgument(result.message());
     case hfs::Status::NotSupported:
         return rocksdb::IOStatus::NotSupported(result.message());
+    case hfs::Status::Corrupt:
+        return rocksdb::IOStatus::Corruption(result.message());
     default:
         return rocksdb::IOStatus::IOError(result.message());
     }
