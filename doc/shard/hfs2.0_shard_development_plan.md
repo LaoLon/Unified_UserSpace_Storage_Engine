@@ -534,6 +534,8 @@ RMW 放大；`AbortIO` 遵守 cancel boundary。
 > 正式 `.conf`/真实 NVMe 通过，完整错误与取消矩阵仍待补齐。
 > 另补充 FileSystem smoke 的直接 `CreateDir`/`DeleteDir` 生命周期，单盘真实 NVMe
 > 全 smoke 已通过；Shard-84 的完整错误与取消矩阵仍待补齐。
+> 同时固定 `IsDirectory` 的 RocksDB 谓词语义：对缺失路径返回 `OK + false`，并由
+> 真实 NVMe smoke 回归验证，避免将其误判为 `NotFound`。
 
 **交付物**：`hfs_db_bench`/`hfs_ldb` 完整参数；SIGKILL recovery、跨进程顺序 reopen、
 `checkconsistency`。

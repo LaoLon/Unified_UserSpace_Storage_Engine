@@ -370,6 +370,7 @@ int main(int argc, char **argv) {
     }
     auto missingStatus =
         fileSystem->IsDirectory("/rocksdb-missing", options.io_options, &isDirectory, &debug);
+    /* RocksDB's predicate reports a missing path as OK with false. */
     if (!missingStatus.ok() || isDirectory) {
         std::fprintf(stderr, "IsDirectory missing failed: %s\n", missingStatus.ToString().c_str());
         return 14;
