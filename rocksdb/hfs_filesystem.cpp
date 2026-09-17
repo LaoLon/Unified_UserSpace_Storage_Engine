@@ -202,6 +202,7 @@ struct AsyncReadState {
     bool callbackStarted = false;
     bool ioCompleted = false;
     rocksdb::IOStatus ioStatus = rocksdb::IOStatus::IOError("async read failed");
+    rocksdb::Slice ioResult;
     std::thread worker;
     std::thread ioWorker;
 
@@ -240,8 +241,8 @@ void executeAsyncReadIo(AsyncReadState *state) {
             if (!value.ok()) {
                 status = toIoStatus(value);
             } else {
-                state->request->result = rocksdb::Slice(
-                    state->request->scratch, value.value().bytes);
+                state->ioResult = rocksdb::Slice(state->request->scratch,
+                                                 value.value().bytes);
                 status = rocksdb::IOStatus::OK();
             }
         }
@@ -286,6 +287,9 @@ void executeAsyncRead(AsyncReadState *state) {
     {
         std::lock_guard<std::mutex> lock(state->mutex);
         if (!state->aborted) {
+            if (status.ok()) {
+                state->request->result = state->ioResult;
+            }
             state->request->status = status;
             /* Establish the cancellation boundary before releasing the lock;
              * AbortIO after this point cannot rewrite callback-visible state. */

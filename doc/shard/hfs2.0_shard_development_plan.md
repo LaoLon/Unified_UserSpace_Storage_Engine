@@ -493,7 +493,8 @@ readwhilewriting 基础运行；WAL、MANIFEST 能创建/rename/同步；stock `
 > 2026-09-18：async 读现在尊重 RocksDB `IOOptions::timeout`；前端等待超时返回
 > `TimedOut`，后端 I/O 继续排空并由句柄析构回收。真实 NVMe smoke 已验证超时
 > callback/status，DataPath 也将 `-ETIMEDOUT` 映射为 `TimedOut` 并验证 submit/complete
-> 闭合；完整组合矩阵仍需继续扩展。
+> 闭合；超时后的 request result 保持不变，避免后台完成越过 callback 边界写回；完整
+> 组合矩阵仍需继续扩展。
 
 **交付物**：切换到 `use_direct_io()==true` 并**同时**落地 `PrepareWrite/Allocate/
 PositionedAppend`（三者必须一起启用）；`ReadAsync/Poll/AbortIO`（FSReadRequest/

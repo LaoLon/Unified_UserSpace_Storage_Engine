@@ -240,7 +240,8 @@ int main(int argc, char **argv) {
     }
     std::vector<void *> timeoutHandles{timeoutHandle};
     status = fileSystem->Poll(timeoutHandles, 1);
-    if (!status.ok() || !timeoutCallback.load() || !timeoutRequest.status.IsTimedOut()) {
+    if (!status.ok() || !timeoutCallback.load() || !timeoutRequest.status.IsTimedOut() ||
+        timeoutRequest.result.size() != 0) {
         ::unsetenv("HFS_TEST_ASYNC_READ_DELAY_MS");
         timeoutDeleter(timeoutHandle);
         return 12;
