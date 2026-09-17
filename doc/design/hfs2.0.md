@@ -1329,6 +1329,10 @@ checkpoint region 必须容纳 namespace/inode/extent map/各 device allocator b
 
 ### Phase 6：收口和归档
 
+- 2026-09-17：Shard-79 至 Shard-84 已实现并完成对应单盘真实 NVMe 回归；Shard-85
+  已完成单盘 workload 矩阵。当前验收 VM 仅提供 `Nvme0n1`（`0000:0b:00.0`），
+  因此双盘、全 data device 及 metadata replica 故障组合仍是待在双 NVMe 环境执行的
+  硬门禁，不以 Malloc/Aio 或重复 BDF 代替。
 - 所有 gate 通过后删除新树中最后的旧兼容残留；
 - `src_legacy_frozen/` 保持本地忽略或单独归档，不回到 product build；
 - 更新架构索引、性能基线、支持边界和迁移说明；
