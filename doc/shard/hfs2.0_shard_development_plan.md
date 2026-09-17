@@ -434,7 +434,9 @@ p99 ≤ raw×110%。不达标时停在上游结构修复，不扩大 reactor/are
 > raw 对照的历史失败结论；随后按正确 external-engine 配置完成新的 5-run 复测，
 > HFS/raw 中位 IOPS 比为 86.56%，但 raw bdevperf 结果没有 p99，且本轮 raw 使用
 > 单 core、HFS 使用两个 data reactor，故仍不能宣称 §16.2 通过。后续需取得同口径
-> raw p99 并统一 reactor/core 拓扑后再收口。
+> raw p99 并统一 reactor/core 拓扑后再收口。已补采 raw histogram：中位 p99 为
+> 1825.646 us；现有 HFS write p99 中位约 2056.192 us，高于 raw×110% 的
+> 2008.211 us，故性能门禁仍未通过。
 
 ---
 

@@ -97,6 +97,16 @@ write p99 为 `1957.89--2113.54 us`，5 次均 `err=0`。raw SPDK bdevperf 结�
 `/mnt/hfs-data/hfs2-shard81-r2-20260917-134845` 和
 `/mnt/hfs-data/hfs2-shard81-raw-20260917-135017`。
 
+为补齐尾延迟证据，随后在同一设备、同一 QD=32 和单个 SPDK core 上启用 bdevperf
+latency histogram 重新执行 5 次。raw IOPS 为 `47736.68, 51027.24, 51113.11,
+53942.88, 55152.98`，中位数 `51027.24 IOPS`；raw p99 为 `2012.891, 1825.646,
+1863.095, 1750.747, 1722.661 us`，中位数 `1825.646 us`，5 次均
+`Fail=0/TO=0`。按现有 HFS 5-run 结果，read p99 中位数约 `2007.04 us`、write
+p99 中位数约 `2056.192 us`；raw×110% 为 `2008.211 us`，write p99 超出门限。
+本轮 raw 仍为单 core、HFS 为两个 data reactor，且采集批次不同，故该结果只补充
+了门禁所需的 raw 尾延迟证据，不能把 Shard-81 标记为通过。原始日志保留在 VM
+`/mnt/hfs-data/hfs2-shard81-raw-p99-20260917-1355`。
+
 ## 当前硬门禁
 
 VM 现有两块独立 NVMe 控制器：`Nvme0n1`（`0000:0b:00.0`，30 GiB）和 `Nvme1n1`
