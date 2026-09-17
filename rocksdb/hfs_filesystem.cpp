@@ -224,6 +224,9 @@ public:
     /* Identifies this implementation to RocksDB's Customizable registry. */
     const char *Name() const override { return "HfsFileSystem"; }
 
+    /* Do not advertise async I/O until the core reactor ownership contract is complete. */
+    void SupportedOps(int64_t &supported_ops) override { supported_ops = 0; }
+
     /* Opens an existing HFS regular file for sequential reads. */
     rocksdb::IOStatus NewSequentialFile(const std::string &fname,
                                          const rocksdb::FileOptions &,
