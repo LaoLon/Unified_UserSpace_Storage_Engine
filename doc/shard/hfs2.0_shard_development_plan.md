@@ -409,6 +409,9 @@ fail closed 且现场保留；多盘掉一块 metadata device 拒绝 mount，不
 > 随后使用双盘 `hfs_nvme_dual.conf` 重跑完整 400 项组合，得到 320 项 `PASS`、80 项
 > `RESOURCE_BOUNDARY`、0 项功能性 `FAIL`；边界集中在 64K/1M 与高 QD×jobs，结果为
 > `/mnt/hfs-data/hfs-fio-matrix-dual-20260917.log`。
+> 复跑时脚本另要求 FIO `issued rwts` 至少包含一个完成的读写，结果仍为 320/80/0；
+> 该次结果保存在 `/mnt/hfs-data/hfs-fio-matrix-20260917.log`，结束后两块 BDF
+> 均恢复内核 `nvme`，`vm.nr_hugepages=1024`。
 
 **80A 交付物**：`fio-hfs.so`（`extern "C"` 注册）；options（`hfs_config/hfs_direct/
 hfs_preallocate/hfs_client_depth`）；`open_file` 完成 create/open/allocate +
