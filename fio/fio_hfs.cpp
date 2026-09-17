@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <condition_variable>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -47,7 +48,6 @@ struct FioHfsFile {
 struct FioHfsPending {
     io_u *io = nullptr;
     std::shared_ptr<hfs::File> file;
-    std::thread worker;
 };
 
 struct FioHfsThread {
@@ -57,9 +57,15 @@ struct FioHfsThread {
     std::mutex mutex;
     std::condition_variable condition;
     std::vector<std::unique_ptr<FioHfsPending>> pending;
+    std::deque<FioHfsPending *> workQueue;
+    std::vector<std::thread> workers;
+    bool stopping = false;
     std::vector<io_u *> completed;
     std::vector<io_u *> ready;
 };
+
+/* Runs a bounded worker for one FIO thread instead of creating one thread per I/O. */
+void fioHfsWorker(FioHfsThread *state);
 
 /* FIO numjobs share one process lock while retaining one Client per worker. */
 std::mutex processMutex;
@@ -262,6 +268,40 @@ int fioHfsInit(struct thread_data *td) {
     state->engine = std::move(engine);
     state->client = std::move(client).value();
     state->maxOutstanding = clientDepth == 0 ? 1 : clientDepth;
+    try {
+        /* Keep a small fixed pool per fio worker to bound host-thread fanout. */
+        const std::size_t workerCount = std::min<std::size_t>(4, state->maxOutstanding);
+        state->workers.reserve(workerCount);
+        for (std::size_t index = 0; index < workerCount; ++index) {
+            state->workers.emplace_back(fioHfsWorker, state);
+        }
+    } catch (...) {
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            state->stopping = true;
+        }
+        state->condition.notify_all();
+        for (auto &worker : state->workers) {
+            if (worker.joinable()) {
+                worker.join();
+            }
+        }
+        state->client->close().wait();
+        state->client.reset();
+        {
+            std::lock_guard<std::mutex> lock(processMutex);
+            if (processUsers != 0) {
+                --processUsers;
+            }
+            if (processUsers == 0 && processEngine != nullptr) {
+                processEngine->stop().wait();
+                processEngine.reset();
+            }
+        }
+        delete state;
+        fioLog("fio-hfs: worker pool create failed\n");
+        return 1;
+    }
     td->io_ops_data = state;
     return 0;
 }
@@ -271,19 +311,22 @@ void fioHfsCleanup(struct thread_data *td) {
     if (state == nullptr) {
         return;
     }
-    /* Join every worker before releasing the client and its engine. */
-    std::vector<std::unique_ptr<FioHfsPending>> pending;
+    /* Stop and join the bounded worker pool before releasing the engine. */
     {
         std::lock_guard<std::mutex> lock(state->mutex);
-        pending = std::move(state->pending);
+        state->stopping = true;
         state->ready.clear();
         state->completed.clear();
     }
-    for (auto &request : pending) {
-        if (request->worker.joinable()) {
-            request->worker.join();
+    state->condition.notify_all();
+    for (auto &worker : state->workers) {
+        if (worker.joinable()) {
+            worker.join();
         }
     }
+    state->workers.clear();
+    state->pending.clear();
+    state->workQueue.clear();
     if (state->client != nullptr) {
         state->client->close().wait();
     }
@@ -393,6 +436,30 @@ void executeFioIo(io_u *io, const std::shared_ptr<hfs::File> &file) {
     }
 }
 
+/* Drains queued requests using the bounded pool and publishes completions. */
+void fioHfsWorker(FioHfsThread *state) {
+    while (true) {
+        FioHfsPending *request = nullptr;
+        {
+            std::unique_lock<std::mutex> lock(state->mutex);
+            state->condition.wait(lock, [state] {
+                return state->stopping || !state->workQueue.empty();
+            });
+            if (state->stopping && state->workQueue.empty()) {
+                return;
+            }
+            request = state->workQueue.front();
+            state->workQueue.pop_front();
+        }
+        executeFioIo(request->io, request->file);
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            state->completed.push_back(request->io);
+        }
+        state->condition.notify_all();
+    }
+}
+
 enum fio_q_status fioHfsQueue(struct thread_data *td, struct io_u *io) {
     auto *state = static_cast<FioHfsThread *>(td->io_ops_data);
     auto *file = io->file == nullptr ? nullptr
@@ -411,25 +478,9 @@ enum fio_q_status fioHfsQueue(struct thread_data *td, struct io_u *io) {
             return FIO_Q_BUSY;
         }
         state->pending.push_back(std::move(request));
+        state->workQueue.push_back(requestPtr);
     }
-    try {
-        requestPtr->worker = std::thread([state, requestPtr] {
-            executeFioIo(requestPtr->io, requestPtr->file);
-            {
-                std::lock_guard<std::mutex> lock(state->mutex);
-                state->completed.push_back(requestPtr->io);
-            }
-            state->condition.notify_all();
-        });
-    } catch (...) {
-        std::lock_guard<std::mutex> lock(state->mutex);
-        state->pending.erase(
-            std::remove_if(state->pending.begin(), state->pending.end(),
-                           [requestPtr](const auto &entry) { return entry.get() == requestPtr; }),
-            state->pending.end());
-        io->error = EAGAIN;
-        return FIO_Q_COMPLETED;
-    }
+    state->condition.notify_one();
     return FIO_Q_QUEUED;
 }
 
@@ -457,11 +508,6 @@ int fioHfsGetevents(struct thread_data *td, unsigned int min, unsigned int max,
                 finished.push_back(std::move(*found));
                 state->pending.erase(found);
             }
-        }
-    }
-    for (auto &request : finished) {
-        if (request->worker.joinable()) {
-            request->worker.join();
         }
     }
     return static_cast<int>(state->ready.size());
