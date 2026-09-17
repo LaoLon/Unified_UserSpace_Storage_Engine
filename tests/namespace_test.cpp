@@ -231,7 +231,37 @@ int main() {
         HFS_TEST_CHECK(ns.create("/abcde", false, false, false).ok());
     }
 
-    /* 8. concurrent creators with a directory reader (TSAN target) */
+    /* 8. checkpoint snapshot round-trip and corruption rejection */
+    {
+        NamespaceConfig config = testConfig(1024, 8ULL << 20);
+        config.extentBytes = 4096;
+        config.deviceExtents = {16};
+        config.deviceStartExtents = {0};
+        auto source = Namespace::create(config, fakeClock, nullptr);
+        HFS_TEST_CHECK(source.ok());
+        Namespace &sourceNs = *source.value();
+        auto file = sourceNs.create("/snapshot", false, false, false);
+        HFS_TEST_CHECK(file.ok());
+        HFS_TEST_CHECK(sourceNs.link("/snapshot", "/snapshot-link").ok());
+        std::vector<std::byte> snapshot;
+        HFS_TEST_CHECK(sourceNs.saveSnapshot(17, snapshot).ok());
+        HFS_TEST_CHECK(sourceNs.snapshotTxid() == 17);
+
+        auto restored = Namespace::create(config, fakeClock, nullptr);
+        HFS_TEST_CHECK(restored.ok());
+        Namespace &restoredNs = *restored.value();
+        HFS_TEST_CHECK(restoredNs.loadSnapshot(snapshot).ok());
+        auto first = restoredNs.stat("/snapshot");
+        auto second = restoredNs.stat("/snapshot-link");
+        HFS_TEST_CHECK(first.ok() && second.ok());
+        HFS_TEST_CHECK(first.value().inodeId == second.value().inodeId);
+        HFS_TEST_CHECK(first.value().linkCount == 2);
+        HFS_TEST_CHECK(restoredNs.snapshotTxid() == 17);
+        snapshot.back() ^= std::byte{0x01};
+        HFS_TEST_CHECK(restoredNs.loadSnapshot(snapshot).status() == Status::Corrupt);
+    }
+
+    /* 9. concurrent creators with a directory reader (TSAN target) */
     {
         auto created = Namespace::create(testConfig(8192, 8ULL << 20), fakeClock, nullptr);
         HFS_TEST_CHECK(created.ok());
