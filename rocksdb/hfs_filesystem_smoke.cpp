@@ -50,6 +50,7 @@ int main(int argc, char **argv) {
     if (!status.ok() || freeSpace >= initialFreeSpace) {
         return 7;
     }
+    const uint64_t allocatedFreeSpace = freeSpace;
     /* Verify LinkFile preserves the same inode before deleting both names. */
     status = fileSystem->LinkFile("/rocksdb-smoke", "/rocksdb-link", options.io_options,
                                   &debug);
@@ -178,5 +179,9 @@ int main(int argc, char **argv) {
     if (!status.ok() || freeSpace != initialFreeSpace) {
         return 16;
     }
+    std::printf("free-space reclaim: initial=%llu allocated=%llu final=%llu\n",
+                static_cast<unsigned long long>(initialFreeSpace),
+                static_cast<unsigned long long>(allocatedFreeSpace),
+                static_cast<unsigned long long>(freeSpace));
     return 0;
 }
