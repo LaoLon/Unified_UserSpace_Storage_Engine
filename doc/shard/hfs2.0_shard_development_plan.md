@@ -365,6 +365,11 @@ rename 后 Fsync 语义正确。
 > generation 和双槽 CRC，且修复了控制 flush 单位、目标盘 geometry 镜像及 mirrored
 > journal geometry 生命周期问题。
 
+> 2026-09-17：修正 `format_mount_test` 的单盘损坏边界：generation 断言不再要求
+> 两个 superblock 槽位始终相等；geometry tamper 选择当前最高 generation 槽位；
+> fallback mount 后同时损坏 A/B，并验证下一次 mount 返回 `NotFound` fail-closed。
+> 该真实 NVMe 测试已通过，仍不替代真正掉电等价验证。
+
 > 2026-09-17：新增显式 `HFS_TEST_FAIL_FLUSH_DEVICE` 测试钩子，并在真实 NVMe
 > `file_api_test` 中验证 data child 完成后、device flush 提交前的失败边界：
 > `datasync` 返回 `IoError`，清除注入后同一数据可正常完成 datasync/sync。该钩子
