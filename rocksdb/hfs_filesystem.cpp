@@ -42,7 +42,12 @@ rocksdb::IOStatus toIoStatus(const hfs::Result<T> &result) {
         return rocksdb::IOStatus::IOError(result.message());
     case hfs::Status::Busy:
         return rocksdb::IOStatus::Busy(result.message());
+    case hfs::Status::Cancelled:
+        return rocksdb::IOStatus::Aborted(result.message());
+    case hfs::Status::TimedOut:
+        return rocksdb::IOStatus::TimedOut(result.message());
     case hfs::Status::TryAgain:
+        /* RocksDB IOStatus has no TryAgain factory; preserve retryability as I/O. */
         return rocksdb::IOStatus::IOError(result.message());
     case hfs::Status::InvalidArgument:
         return rocksdb::IOStatus::InvalidArgument(result.message());
