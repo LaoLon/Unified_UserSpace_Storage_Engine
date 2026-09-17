@@ -29,6 +29,7 @@ public:
         writeCount_ = 0;
         failWriteAt_ = writeIndex;
     }
+    void failFlush(bool enabled) noexcept { failFlush_ = enabled; }
     std::byte *slot(std::uint64_t sequence, std::uint64_t journalStart,
                     std::uint64_t journalBlocks) noexcept {
         return data_.data() + (journalStart + (sequence % journalBlocks)) * kMeta;
@@ -58,7 +59,12 @@ public:
         return hfs::Result<void>(hfs::Status::Ok);
     }
 
-    hfs::Result<void> flush() override { return hfs::Result<void>(hfs::Status::Ok); }
+    hfs::Result<void> flush() override {
+        if (failFlush_) {
+            return hfs::makeError(hfs::Status::IoError, "injected journal flush failure");
+        }
+        return hfs::Result<void>(hfs::Status::Ok);
+    }
 
 private:
     hfs::Result<void> fail() {
@@ -67,6 +73,7 @@ private:
     std::vector<std::byte> data_;
     std::size_t writeCount_ = 0;
     std::size_t failWriteAt_ = std::numeric_limits<std::size_t>::max();
+    bool failFlush_ = false;
 };
 
 class MemoryTarget final : public hfs::JournalTarget {
@@ -369,6 +376,20 @@ int main() {
         HFS_TEST_CHECK(reader.values.empty());
         HFS_TEST_CHECK(reopened->stats().lastTxid == 0);
         HFS_TEST_CHECK(reopened->stats().corruption.empty());
+    }
+
+    /* 6. A COMMIT write followed by flush failure is not published in memory. */
+    {
+        Fixture fixture;
+        HFS_TEST_CHECK(fixture.valid());
+        HFS_TEST_CHECK(fixture.format() == 0);
+        MemoryTarget target;
+        auto journal = fixture.open(&target);
+        HFS_TEST_CHECK(journal != nullptr);
+        fixture.device->failFlush(true);
+        auto appended = journal->append({setSize(22, 84)}, true);
+        HFS_TEST_CHECK(appended.status() == hfs::Status::IoError);
+        HFS_TEST_CHECK(target.values.empty());
     }
 
     std::printf("journal_test: ok\n");
