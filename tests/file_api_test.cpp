@@ -159,6 +159,22 @@ int main() {
                 HFS_TEST_CHECK(::unsetenv("HFS_TEST_FAIL_CHECKPOINT_FLUSH") == 0);
                 HFS_TEST_CHECK(first.value()->datasync().wait().value().ok());
                 HFS_TEST_CHECK(first.value()->sync().wait().value().ok());
+                /* Data is durable, but the metadata commit boundary must still
+                 * reject publication and allow a later retry. */
+                std::vector<std::byte> metadataPattern(4096, std::byte{0x4D});
+                IoVec metadataVec{metadataPattern.data(), metadataPattern.size()};
+                HFS_TEST_CHECK(first.value()
+                                   ->write(std::span<const IoVec>(&metadataVec, 1), 0,
+                                           std::stop_token{})
+                                   .wait()
+                                   .value()
+                                   .ok());
+                HFS_TEST_CHECK(::setenv("HFS_TEST_FAIL_METADATA_COMMIT", "1", 1) == 0);
+                auto failedMetadata = first.value()->datasync().wait().value();
+                HFS_TEST_CHECK(!failedMetadata.ok() &&
+                               failedMetadata.status() == Status::IoError);
+                HFS_TEST_CHECK(::unsetenv("HFS_TEST_FAIL_METADATA_COMMIT") == 0);
+                HFS_TEST_CHECK(first.value()->datasync().wait().value().ok());
             }
 
             /* 6. client open-file limit */
@@ -192,9 +208,15 @@ int main() {
         HFS_TEST_CHECK(busyFile.ok());
         auto busyStop = engine->stop().wait().value();
         HFS_TEST_CHECK(busyStop.status() == Status::Busy);
-        busyFile.value().reset();
-        busyClient.value().reset();
-        HFS_TEST_CHECK(engine->stop().wait().value().ok());
+            busyFile.value().reset();
+            busyClient.value().reset();
+            /* Clean shutdown publication is itself a fail-closed boundary. */
+            HFS_TEST_CHECK(::setenv("HFS_TEST_FAIL_CLEAN_FLAG", "1", 1) == 0);
+            auto failedCleanStop = engine->stop().wait().value();
+            HFS_TEST_CHECK(!failedCleanStop.ok() &&
+                           failedCleanStop.status() == Status::IoError);
+            HFS_TEST_CHECK(::unsetenv("HFS_TEST_FAIL_CLEAN_FLAG") == 0);
+            HFS_TEST_CHECK(engine->stop().wait().value().ok());
     }
 
     /* restore a clean formatted image for the other device tests */

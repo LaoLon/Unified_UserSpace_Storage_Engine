@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <fstream>
@@ -80,6 +81,12 @@ HugepageInfo readHugepageInfo() {
 #else
 HugepageInfo readHugepageInfo() { return {}; }
 #endif
+
+/* Test-only boundary between durable data and metadata publication. */
+bool testMetadataCommitFailureRequested() {
+    const char *value = std::getenv("HFS_TEST_FAIL_METADATA_COMMIT");
+    return value != nullptr && std::string(value) == "1";
+}
 
 /* Adapts the resident namespace snapshot to the journal checkpoint contract. */
 class NamespaceJournalTarget final : public JournalTarget {
@@ -455,6 +462,10 @@ Result<void> Engine::syncMetadata(std::uint64_t epoch) {
         if (!flushed.ok()) {
             return flushed;
         }
+    }
+    if (testMetadataCommitFailureRequested()) {
+        return makeError(Status::IoError,
+                         "test-injected metadata commit boundary failure");
     }
     auto prepared = impl_->namespaceState->prepareDurableEpoch(epoch);
     if (!prepared.ok()) {

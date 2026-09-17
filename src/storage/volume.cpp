@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <limits>
@@ -15,6 +16,12 @@
 namespace hfs {
 
 namespace {
+
+/* Test-only boundary before publishing a clean or dirty superblock flag. */
+bool testCleanFlagFailureRequested() {
+    const char *value = std::getenv("HFS_TEST_FAIL_CLEAN_FLAG");
+    return value != nullptr && std::string(value) == "1";
+}
 
 /* "auto" generates a random volume UUID; otherwise parse 32 hex digits with
  * optional dashes. */
@@ -405,6 +412,10 @@ Result<void> updateCleanShutdown(SpdkRuntime &runtime, const Config &config, boo
     }
     const std::uint64_t nextGeneration = reference.generation + 1;
     const std::uint64_t nextMountEpoch = reference.mountEpoch + 1;
+    if (testCleanFlagFailureRequested()) {
+        return makeError(Status::IoError,
+                         "test-injected clean-flag publish failure");
+    }
     /* Publish identical generation and epoch values to all configured devices. */
     for (std::size_t deviceIndex = 0; deviceIndex < config.devices.size(); ++deviceIndex) {
         Hfs2Superblock updated = current[deviceIndex];

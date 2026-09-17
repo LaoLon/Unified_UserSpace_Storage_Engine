@@ -368,8 +368,11 @@ rename 后 Fsync 语义正确。
 > 2026-09-17：新增显式 `HFS_TEST_FAIL_FLUSH_DEVICE` 测试钩子，并在真实 NVMe
 > `file_api_test` 中验证 data child 完成后、device flush 提交前的失败边界：
 > `datasync` 返回 `IoError`，清除注入后同一数据可正常完成 datasync/sync。该钩子
-> 只在测试环境变量指定设备时生效，属于可重复的顺序边界证据，不等价于掉电模拟；
-> 其余四个崩溃断点和断点后的完整 namespace/extent/size 守恒仍未闭合。
+> 只在测试环境变量指定设备时生效，属于可重复的顺序边界证据，不等价于掉电模拟。
+> 随后补齐 data flush 后、metadata commit 前的 `HFS_TEST_FAIL_METADATA_COMMIT`，
+> 以及 clean-flag publish 前的 `HFS_TEST_FAIL_CLEAN_FLAG`；三者均在真实 NVMe
+> `file_api_test` 中验证失败后重试。journal commit/flush 与 checkpoint publish
+> 断点已有单元证据；真正掉电等价验证和断点后的完整 namespace/extent/size 守恒仍未闭合。
 
 **交付物**：§16.4 五个崩溃断点注入；orphan reclaim；内存 after-image 失败回滚；
 `hfsctl check` 取证；ext4 同 workload 语义对照；**多副本执行**：按 Shard-70/71 冻结的
