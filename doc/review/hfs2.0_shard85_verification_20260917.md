@@ -31,6 +31,10 @@ RocksDB FileSystem smoke 还验证了 allocator-backed `GetFreeSpace`：真实 N
 字节，释放最后一个硬链接并关闭读句柄后恢复为 `31,398,559,744` 字节。该结果只
 证明单盘 data extent 统计和 open-handle 回收语义，不替代多盘容量矩阵。
 
+Shard-80 的 FIO loader 仍以共享 DMA arena 提供整块 `orig_buffer`；arena 结构测试覆盖
+了 2 MiB 连续分配、3 MiB cap 下第二次分配返回 `Busy`，以及释放后 bytes 归零。真实
+NVMe `--verify=crc32c` loader smoke 继续通过；高负载 arena 容量矩阵尚未宣称完成。
+
 ## Shard-81 raw 对照结果
 
 按 §16.2 口径在同一 `0000:0b:00.0` 上完成 raw SPDK `bdevperf` 与 HFS FIO
