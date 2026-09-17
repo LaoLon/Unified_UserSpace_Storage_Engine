@@ -63,6 +63,10 @@ DmaArena 单元回归还覆盖了共享 cap 满载时的背压：释放在 200ms
 其中最大组合为 QD=128、numjobs=8、1MiB；结果文件为 VM 上的
 `/mnt/hfs-data/hfs-fio-matrix-20260917.log`。
 
+随后修正了 FIO 对 arena `Busy` 的诊断：共享 cap 耗尽现在输出
+`requested fio DMA arena exceeds mount cap`，而非与真实 allocator `NoMemory` 混淆；
+低深度真实 NVMe `--verify=crc32c` smoke 在该修正后继续通过。
+
 ## Shard-81 raw 对照结果
 
 按 §16.2 口径在同一 `0000:0b:00.0` 上完成 raw SPDK `bdevperf` 与 HFS FIO
