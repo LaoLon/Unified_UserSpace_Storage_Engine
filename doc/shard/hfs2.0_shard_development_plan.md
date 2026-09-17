@@ -567,6 +567,8 @@ generation、双槽 CRC 损坏三类 fail-closed 探针，三项均返回非零�
 另以两块真实 NVMe 完成 required metadata device 掉盘探针：双盘 format 后仅将
 `0000:0b:00.0` 绑定给 SPDK、让 `0000:13:00.0` 保持内核 `nvme` 驱动，dual
 `hfsctl info` 返回非零并报告缺失控制器；测试结束后两块设备均恢复到内核驱动。
+随后重新执行双盘 generation 回退与双槽 CRC 损坏探针：两项均返回非零，分别报告
+metadata replica 不一致和设备未格式化；测试结束后两块设备仍恢复到内核驱动。
 
 **交付物**：
 
