@@ -10,6 +10,10 @@
 #include <mutex>
 #include <span>
 #include <string>
+#include <condition_variable>
+#include <thread>
+#include <chrono>
+#include <utility>
 #include <vector>
 
 #include "fio.h"
@@ -42,6 +46,11 @@ struct FioHfsThread {
     std::shared_ptr<hfs::Client> client;
     std::vector<io_u *> completed;
     std::vector<io_u *> ready;
+    std::vector<std::jthread> workers;
+    std::mutex completionMutex;
+    std::condition_variable completionCv;
+    std::size_t pending = 0;
+    std::uint32_t clientDepth = 32;
 };
 
 /* FIO numjobs share one process lock while retaining one Client per worker. */
@@ -210,6 +219,7 @@ int fioHfsInit(struct thread_data *td) {
     auto *state = new FioHfsThread;
     state->engine = std::move(engine);
     state->client = std::move(client).value();
+    state->clientDepth = clientDepth == 0 ? 1 : clientDepth;
     td->io_ops_data = state;
     return 0;
 }
@@ -219,8 +229,13 @@ void fioHfsCleanup(struct thread_data *td) {
     if (state == nullptr) {
         return;
     }
+    /* Join request workers before releasing files, clients, or the shared engine. */
+    state->workers.clear();
     state->ready.clear();
-    state->completed.clear();
+    {
+        std::lock_guard<std::mutex> lock(state->completionMutex);
+        state->completed.clear();
+    }
     if (state->client != nullptr) {
         state->client->close().wait();
     }
@@ -297,6 +312,20 @@ int fioHfsGetFileSize(struct thread_data *td, struct fio_file *fioFile) {
     return 0;
 }
 
+/* Complete one fio request and wake getevents without exposing a half result. */
+void fioHfsComplete(FioHfsThread &state, io_u *io, int error, std::size_t resid) {
+    io->error = error;
+    io->resid = resid;
+    {
+        std::lock_guard<std::mutex> lock(state.completionMutex);
+        if (state.pending != 0) {
+            --state.pending;
+        }
+        state.completed.push_back(io);
+    }
+    state.completionCv.notify_one();
+}
+
 enum fio_q_status fioHfsQueue(struct thread_data *td, struct io_u *io) {
     auto *state = static_cast<FioHfsThread *>(td->io_ops_data);
     auto *file = io->file == nullptr ? nullptr
@@ -304,45 +333,64 @@ enum fio_q_status fioHfsQueue(struct thread_data *td, struct io_u *io) {
     if (state == nullptr || file == nullptr || file->file == nullptr) {
         io->error = EINVAL;
         if (state != nullptr) {
-            state->completed.push_back(io);
+            fioHfsComplete(*state, io, EINVAL, io->xfer_buflen);
         }
         return FIO_Q_COMPLETED;
     }
-    hfs::IoVec buffer{static_cast<std::byte *>(io->xfer_buf), io->xfer_buflen};
-    if (io->ddir == DDIR_READ) {
-        auto taskResult = file->file->read(std::span<hfs::IoVec>(&buffer, 1), io->offset).wait();
-        if (!taskResult.ok() || !taskResult.value().ok()) {
-            io->error = taskResult.ok() ? fioError(taskResult.value().status()) : EIO;
-            io->resid = io->xfer_buflen;
-        } else {
-            io->error = 0;
-            io->resid = io->xfer_buflen - taskResult.value().value().bytes;
+    {
+        std::lock_guard<std::mutex> lock(state->completionMutex);
+        if (state->pending >= state->clientDepth) {
+            return FIO_Q_BUSY;
         }
-    } else if (io->ddir == DDIR_WRITE) {
-        auto taskResult =
-            file->file->write(std::span<const hfs::IoVec>(&buffer, 1), io->offset).wait();
-        if (!taskResult.ok() || !taskResult.value().ok()) {
-            io->error = taskResult.ok() ? fioError(taskResult.value().status()) : EIO;
-            io->resid = io->xfer_buflen;
-        } else {
-            io->error = 0;
-            io->resid = io->xfer_buflen - taskResult.value().value().bytes;
-        }
-    } else {
-        io->error = EOPNOTSUPP;
-        io->resid = io->xfer_buflen;
+        ++state->pending;
     }
-    state->completed.push_back(io);
-    return FIO_Q_COMPLETED;
+    /* Keep the file alive until the coroutine-backed request has completed. */
+    const std::size_t length = io->xfer_buflen;
+    const std::uint64_t offset = io->offset;
+    const enum fio_ddir direction = io->ddir;
+    state->workers.emplace_back([state, fileHandle = file->file, io, length, offset,
+                                 direction](std::stop_token) {
+        hfs::IoVec buffer{static_cast<std::byte *>(io->xfer_buf), length};
+        if (direction == DDIR_READ) {
+            auto result = fileHandle->read(std::span<hfs::IoVec>(&buffer, 1), offset).wait();
+            if (!result.ok() || !result.value().ok()) {
+                fioHfsComplete(*state, io, result.ok() ? fioError(result.value().status()) : EIO,
+                               length);
+            } else {
+                fioHfsComplete(*state, io, 0, length - result.value().value().bytes);
+            }
+        } else if (direction == DDIR_WRITE) {
+            auto result = fileHandle->write(std::span<const hfs::IoVec>(&buffer, 1), offset).wait();
+            if (!result.ok() || !result.value().ok()) {
+                fioHfsComplete(*state, io, result.ok() ? fioError(result.value().status()) : EIO,
+                               length);
+            } else {
+                fioHfsComplete(*state, io, 0, length - result.value().value().bytes);
+            }
+        } else {
+            fioHfsComplete(*state, io, EOPNOTSUPP, length);
+        }
+    });
+    return FIO_Q_QUEUED;
 }
 
 int fioHfsGetevents(struct thread_data *td, unsigned int min, unsigned int max,
-                    const struct timespec *) {
+                    const struct timespec *timeout) {
     auto *state = static_cast<FioHfsThread *>(td->io_ops_data);
     if (state == nullptr || max == 0) {
         return 0;
     }
     state->ready.clear();
+    std::unique_lock<std::mutex> lock(state->completionMutex);
+    if (state->completed.size() < min && min != 0) {
+        if (timeout != nullptr) {
+            const auto duration = std::chrono::seconds(timeout->tv_sec) +
+                                  std::chrono::nanoseconds(timeout->tv_nsec);
+            state->completionCv.wait_for(lock, duration, [&state, min] {
+                return state->completed.size() >= min;
+            });
+        }
+    }
     const unsigned int count = static_cast<unsigned int>(state->completed.size());
     if (count < min) {
         return 0;
