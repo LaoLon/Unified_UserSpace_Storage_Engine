@@ -377,6 +377,37 @@ public:
         return linked.ok() ? toIoStatus(std::move(linked).value()) : toIoStatus(linked);
     }
 
+    /* Reports the shared inode link count for a regular HFS file. */
+    rocksdb::IOStatus NumFileLinks(const std::string &fname, const rocksdb::IOOptions &,
+                                   uint64_t *count, rocksdb::IODebugContext *) override {
+        std::shared_ptr<hfs::File> file;
+        auto status = openFile(context_, fname, hfs::OpenFlags::None, &file);
+        if (!status.ok()) return status;
+        auto stat = file->stat();
+        if (!stat.ok()) return toIoStatus(stat);
+        *count = stat.value().linkCount;
+        return rocksdb::IOStatus::OK();
+    }
+
+    /* Compares stable inode identity rather than path strings. */
+    rocksdb::IOStatus AreFilesSame(const std::string &first, const std::string &second,
+                                   const rocksdb::IOOptions &, bool *same,
+                                   rocksdb::IODebugContext *) override {
+        std::shared_ptr<hfs::File> left;
+        std::shared_ptr<hfs::File> right;
+        auto leftStatus = openFile(context_, first, hfs::OpenFlags::None, &left);
+        if (!leftStatus.ok()) return leftStatus;
+        auto rightStatus = openFile(context_, second, hfs::OpenFlags::None, &right);
+        if (!rightStatus.ok()) return rightStatus;
+        auto leftStat = left->stat();
+        auto rightStat = right->stat();
+        if (!leftStat.ok()) return toIoStatus(leftStat);
+        if (!rightStat.ok()) return toIoStatus(rightStat);
+        *same = leftStat.value().inodeId == rightStat.value().inodeId &&
+                leftStat.value().generation == rightStat.value().generation;
+        return rocksdb::IOStatus::OK();
+    }
+
     /* Acquires a process lock for RocksDB's DB identity. */
     rocksdb::IOStatus LockFile(const std::string &fname, const rocksdb::IOOptions &,
                                rocksdb::FileLock **lock, rocksdb::IODebugContext *) override {

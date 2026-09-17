@@ -45,37 +45,45 @@ int main(int argc, char **argv) {
     if (!status.ok()) {
         return 8;
     }
+    uint64_t linkCount = 0;
+    bool sameFile = false;
+    if (!fileSystem->NumFileLinks("/rocksdb-smoke", options.io_options, &linkCount, &debug).ok() ||
+        !fileSystem->AreFilesSame("/rocksdb-smoke", "/rocksdb-link", options.io_options,
+                                  &sameFile, &debug).ok() ||
+        linkCount != 2 || !sameFile) {
+        return 9;
+    }
     std::unique_ptr<rocksdb::FSRandomAccessFile> random;
     status = fileSystem->NewRandomAccessFile("/rocksdb-link", options, &random, &debug);
     if (!status.ok()) {
-        return 9;
+        return 10;
     }
     char scratch[12]{};
     rocksdb::Slice result;
     status = random->Read(0, sizeof(scratch), options.io_options, &result, scratch, &debug);
     if (!status.ok() || result.compare(payload) != 0) {
-        return 10;
+        return 11;
     }
     std::vector<std::string> children;
     status = fileSystem->GetChildren("/", options.io_options, &children, &debug);
     if (!status.ok()) {
-        return 11;
+        return 12;
     }
     /* Check idempotent directory creation and the resident directory handle. */
     status = fileSystem->CreateDirIfMissing("/rocksdb-dir", options.io_options, &debug);
     if (!status.ok() ||
         !fileSystem->CreateDirIfMissing("/rocksdb-dir", options.io_options, &debug).ok()) {
-        return 12;
+        return 13;
     }
     std::unique_ptr<rocksdb::FSDirectory> directory;
     status = fileSystem->NewDirectory("/rocksdb-dir", options.io_options, &directory, &debug);
     if (!status.ok()) {
-        return 13;
+        return 14;
     }
     directory.reset();
     status = fileSystem->DeleteFile("/rocksdb-smoke", options.io_options, &debug);
     if (!status.ok()) {
-        return 14;
+        return 15;
     }
     status = fileSystem->DeleteFile("/rocksdb-link", options.io_options, &debug);
     if (!status.ok() || !fileSystem->DeleteDir("/rocksdb-dir", options.io_options, &debug).ok()) {
