@@ -188,6 +188,35 @@ public:
         return rocksdb::IOStatus::OK();
     }
 
+    /* Writes at an explicit offset for RocksDB preallocation and manifests. */
+    rocksdb::IOStatus PositionedAppend(const rocksdb::Slice &data, uint64_t offset,
+                                        const rocksdb::IOOptions &,
+                                        rocksdb::IODebugContext *) override {
+        hfs::IoVec buffer{reinterpret_cast<std::byte *>(const_cast<char *>(data.data())),
+                          data.size()};
+        auto written = file_->write(std::span<const hfs::IoVec>(&buffer, 1), offset).wait();
+        if (!written.ok()) return toIoStatus(written);
+        auto value = std::move(written).value();
+        return value.ok() ? rocksdb::IOStatus::OK() : toIoStatus(value);
+    }
+
+    /* Reserves and zero-initializes the requested HFS logical range. */
+    rocksdb::IOStatus Allocate(uint64_t offset, uint64_t length,
+                               const rocksdb::IOOptions &, rocksdb::IODebugContext *) override {
+        auto allocated = file_->allocate(offset, length).wait();
+        return allocated.ok() ? toIoStatus(std::move(allocated).value()) : toIoStatus(allocated);
+    }
+
+    /* Buffered HFS writes have no separate range cache; sync the file safely. */
+    rocksdb::IOStatus RangeSync(uint64_t, uint64_t, const rocksdb::IOOptions &options,
+                                rocksdb::IODebugContext *dbg) override {
+        return Sync(options, dbg);
+    }
+
+    /* The core allocator performs all reservation work during Append/Allocate. */
+    void PrepareWrite(size_t, size_t, const rocksdb::IOOptions &,
+                      rocksdb::IODebugContext *) override {}
+
     /* Persists user data and file metadata through the HFS durable epoch path. */
     rocksdb::IOStatus Sync(const rocksdb::IOOptions &, rocksdb::IODebugContext *) override {
         auto synced = file_->sync().wait();
@@ -206,6 +235,13 @@ public:
     rocksdb::IOStatus Fsync(const rocksdb::IOOptions &, rocksdb::IODebugContext *) override {
         auto synced = file_->sync().wait();
         return synced.ok() ? toIoStatus(std::move(synced).value()) : toIoStatus(synced);
+    }
+
+    /* Directory-specific options do not change HFS's single durable barrier. */
+    rocksdb::IOStatus FsyncWithDirOptions(const rocksdb::IOOptions &options,
+                                          rocksdb::IODebugContext *dbg,
+                                          const rocksdb::DirFsyncOptions &) override {
+        return Fsync(options, dbg);
     }
 
 private:
