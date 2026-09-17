@@ -147,7 +147,7 @@ int main() {
                 std::vector<std::byte> checkpointPattern(4096, std::byte{0x3C});
                 IoVec checkpointVec{checkpointPattern.data(), checkpointPattern.size()};
                 HFS_TEST_CHECK(first.value()
-                                   ->write(std::span<const IoVec>(&checkpointVec, 1), 0,
+                                   ->write(std::span<const IoVec>(&checkpointVec, 1), 8192,
                                            std::stop_token{})
                                    .wait()
                                    .value()
@@ -164,7 +164,7 @@ int main() {
                 std::vector<std::byte> metadataPattern(4096, std::byte{0x4D});
                 IoVec metadataVec{metadataPattern.data(), metadataPattern.size()};
                 HFS_TEST_CHECK(first.value()
-                                   ->write(std::span<const IoVec>(&metadataVec, 1), 0,
+                                   ->write(std::span<const IoVec>(&metadataVec, 1), 12288,
                                            std::stop_token{})
                                    .wait()
                                    .value()
