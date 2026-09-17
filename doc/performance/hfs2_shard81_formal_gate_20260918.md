@@ -6,7 +6,7 @@
 
 ## 结论
 
-本轮完成了 raw 与 HFS 各五次采集，但 gate **未通过，且不能作为有效的性能通过证据**。HFS external FIO 引擎每次只完成 8 KiB（读 4 KiB、写 4 KiB），没有兑现 §16.2 要求的 32 jobs/有效并发 32；因此 HFS 吞吐中位数只有 `0.098 IOPS`，与 raw 的 `5151.390 IOPS` 比值为 `0.000019`。这属于上游 FIO 请求生命周期/并发提交边界未闭合，不是可接受的性能差距。
+本轮完成了 raw 与 HFS 各五次采集，但 gate **未通过，且不能作为有效的性能通过证据**。HFS external FIO 引擎每次只完成 8 KiB（读 4 KiB、写 4 KiB），总请求量远未达到 §16.2 要求的 32 jobs/有效并发 32；因此 HFS 吞吐中位数只有 `0.098 IOPS`，与 raw 的 `5151.390 IOPS` 比值为 `0.000019`。这属于上游 FIO 请求生命周期/并发提交边界未闭合，不是可接受的性能差距。注意：`group_reporting=1` 会把多个 job 汇总到 JSON 的 `jobs[0]`，本报告不以该字段推断实际 job 数。
 
 ## 固定口径
 
@@ -42,7 +42,7 @@
 | CPU ≤ 500% | 不能据此收口 | HFS JSON 仅反映退化的单请求路径，raw CPU/RSS 未由 bdevperf 导出 |
 | errors = 0 | PASS（表面） | 不足以抵消请求数量未闭合 |
 | read/write p99 ≤ raw×110% | INCOMPLETE | raw 只有 aggregate p99，HFS 读写样本也不完整 |
-| submit/complete 闭合 | FAIL | 32 jobs 目标未兑现；FIO JSON 每次只反映极少量 I/O |
+| submit/complete 闭合 | FAIL | 总请求量极低，无法证明 32 jobs 的有效 workload 已闭合 |
 
 因此 Shard-81 保持未完成。下一步必须先完成 core 内前端提交/完成生命周期、`io_handle` 保活和停止顺序，恢复真实 `queue/getevents/event` 并发后，再以同一拓扑重跑五次 raw/HFS gate。
 

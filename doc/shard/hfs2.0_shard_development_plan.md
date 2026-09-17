@@ -456,7 +456,8 @@ p99 ≤ raw×110%。不达标时停在上游结构修复，不扩大 reactor/are
 > `randrw` 吞吐和平均延迟；该批结果不替代尚需统一拓扑采集的 p99 gate。
 > 2026-09-18：按统一 CPU 2-3、真实 `Nvme0n1`、4K/randrw/50%/有效并发 32/10 秒
 > 口径完成 raw 与 HFS 各五次采集。raw 中位 IOPS 为 5151.390；HFS external
-> engine 每次仅完成 8 KiB，未兑现 32 jobs 并发，HFS/raw 为 0.000019，故 gate
+> engine 每次仅完成 8 KiB，总请求量未形成可证明的 32 jobs 有效并发，HFS/raw 为
+> 0.000019，故 gate
 > 结构性失败；raw 仅有 aggregate p99，读写分离 p99 和 submit/complete 也不能收口。
 > 证据见 `doc/performance/hfs2_shard81_formal_gate_20260918.md`；必须先修复 FIO
 > 前端提交/完成生命周期，再重跑正式 gate。
@@ -466,7 +467,7 @@ p99 ≤ raw×110%。不达标时停在上游结构修复，不扩大 reactor/are
 > 重跑，Shard-81 仍不标记完成。
 > 随后按正式口径重跑：raw 中位 5108.72 IOPS，修复后的 HFS 中位 0.89991 IOPS，
 > HFS/raw=0.00017615；五次 errors 均为 0，但每次只完成 20-430 KiB，仍未兑现
-> 32-job 请求量，故性能 gate 继续结构性失败。当前需继续定位高并发 FIO job 与
+> 32-job 有效请求量，故性能 gate 继续结构性失败。当前需继续定位高并发 FIO job 与
 > HFS data reactor/Client 的阻塞关系。
 
 ---
