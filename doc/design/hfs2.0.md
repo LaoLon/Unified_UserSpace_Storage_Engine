@@ -1356,6 +1356,11 @@ checkpoint region 必须容纳 namespace/inode/extent map/各 device allocator b
   返回 `Cancelled`；in-flight 取消仍只由 RocksDB async `AbortIO` 契约负责。
   DataPath 已修正为按请求轮询已启动的 data reactors，不再把所有数据 I/O 固定到
   reactor 0；真实 NVMe FIO smoke 回归通过，性能 gate 仍以正式 raw 对照为准。
+  2026-09-18 按统一 CPU 2-3 和真实 `Nvme0n1` 完成 Shard-81 raw/HFS 各五次采集；
+  raw 中位 5151.390 IOPS，但 HFS external engine 每次仅完成 8 KiB，32 jobs
+  并发未兑现，HFS/raw=0.000019，性能 gate 结构性失败。raw 仅有 aggregate p99，
+  读写分离 p99 与 submit/complete 尚未闭合；不得据此宣称性能 gate 通过。证据见
+  `doc/performance/hfs2_shard81_formal_gate_20260918.md`。
   2026-09-18：RocksDB `ReadAsync` 已实现 `IOOptions::timeout` 的前端等待语义；超时
   返回 `TimedOut` 后，后台 I/O 继续排空，句柄析构时才回收 worker 和 buffer，且不会
   在 callback 后写回 request result。DataPath 的 `-ETIMEDOUT`、`-ECANCELED`、

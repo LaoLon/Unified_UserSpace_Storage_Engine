@@ -454,6 +454,12 @@ p99 ≤ raw×110%。不达标时停在上游结构修复，不扩大 reactor/are
 > 2026-09-17：新增可复用的原生 SPDK 5-run 基线文档
 > `doc/performance/hfs2_spdk_raw_baseline_20260917.md`，覆盖 4K/8K/16K/32K/64K
 > `randrw` 吞吐和平均延迟；该批结果不替代尚需统一拓扑采集的 p99 gate。
+> 2026-09-18：按统一 CPU 2-3、真实 `Nvme0n1`、4K/randrw/50%/有效并发 32/10 秒
+> 口径完成 raw 与 HFS 各五次采集。raw 中位 IOPS 为 5151.390；HFS external
+> engine 每次仅完成 8 KiB，未兑现 32 jobs 并发，HFS/raw 为 0.000019，故 gate
+> 结构性失败；raw 仅有 aggregate p99，读写分离 p99 和 submit/complete 也不能收口。
+> 证据见 `doc/performance/hfs2_shard81_formal_gate_20260918.md`；必须先修复 FIO
+> 前端提交/完成生命周期，再重跑正式 gate。
 
 ---
 
