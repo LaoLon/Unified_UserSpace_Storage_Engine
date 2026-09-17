@@ -26,6 +26,11 @@ numjobs=1/2/4/8、4K/16K/64K/1M、write/read/randwrite/randread/randrw 子矩阵
 `hfs_ldb checkconsistency` 和 `hfsctl check`；FIO 4K loader smoke 加 `--verify=crc32c`
 也通过且 `err=0`。
 
+在 FIO arena admission 修正后再次执行单盘组合回归：fillseq/readrandom/overwrite/
+readwhilewriting、`checkconsistency`、SIGKILL 后 reopen/check、`hfsctl check` 与
+`file_api_test` 均通过；SIGKILL 后 superblock 显示 `clean=0`，随后 mount 与一致性
+检查成功完成。该复测仍不替代双盘和完整错误/取消矩阵。
+
 RocksDB FileSystem smoke 还验证了 allocator-backed `GetFreeSpace`：真实 NVMe 单盘
 上初始可分配空间为 `31,398,559,744` 字节，写入一个 extent 后为 `31,397,511,168`
 字节，释放最后一个硬链接并关闭读句柄后恢复为 `31,398,559,744` 字节。该结果只
