@@ -543,8 +543,10 @@ Result<std::unique_ptr<Journal>> Journal::open(Engine &engine, JournalTarget *ta
     }
     auto device = std::make_unique<RuntimeJournalDevice>(runtime, deviceIndex,
                                                          config.metadataBlockSize, sectorSize);
+    /* Capture the raw pointer before transferring ownership to Journal. */
+    JournalDevice *devicePtr = device.get();
     const auto &geometry = geometries[deviceIndex];
-    return Journal::create(std::move(device), device.get(), geometry.journalStart,
+    return Journal::create(std::move(device), devicePtr, geometry.journalStart,
                            geometry.journalBlocks, geometry.checkpointAStart,
                            geometry.checkpointBStart, geometry.checkpointBlocks,
                            config.checkpointTriggerPercent,

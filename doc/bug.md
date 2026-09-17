@@ -29,6 +29,7 @@ Bug 等级：**致命 > 严重 > 一般**。
 - 18：已修复（Shard-77 边界收口，extent/range 计算整数溢出未拒绝）。
 - 21：已修复（Shard-82，RocksDB LockFile 将 HFS 路径误当宿主机路径）。
 - 22：已修复（Shard-82，RocksDB DB 路径尾斜杠未规范化）。
+- 23：已修复（Shard-79，Journal::open ownership transfer 求值顺序不安全）。
 
 ## Bug 记录
 
@@ -59,6 +60,18 @@ Bug 等级：**致命 > 严重 > 一般**。
   路径外不带尾斜杠。
 - **修复**：adapter 的统一路径转换去除尾斜杠，并保留 `/`。
 - **验证结果**：真实 NVMe `hfs_db_bench fillseq` 和跨进程 `readrandom` 均通过。
+
+### 23. Journal::open ownership transfer 求值顺序不安全
+
+- **状态**：已修复
+- **等级**：严重（可能得到悬空或空的 journal device 指针）
+- **时间**：2026-09-17（Shard-79）
+- **现象**：`Journal::open(Engine&)` 在一个调用表达式中同时执行
+  `std::move(device)` 与 `device.get()`。
+- **根因**：C++ 函数实参求值顺序未定义，裸指针获取可能发生在 ownership move 之后。
+- **修复**：在 move 前保存 `JournalDevice*`，再把 ownership 传入 `Journal::create`。
+- **验证结果**：VM clean build、namespace/journal 回归和真实 NVMe RocksDB 多进程
+  fillseq/readrandom/overwrite/readwhilewriting 均通过。
 
 ### 1. `.conf` schema 表使用 `std::initializer_list` 导致静态存储悬空
 
