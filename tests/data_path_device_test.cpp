@@ -1,4 +1,5 @@
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <span>
@@ -175,6 +176,18 @@ int main() {
         std::vector<std::byte> largeBack(large.size(), std::byte{0});
         HFS_TEST_CHECK(path.read(map, largeBack, 0, largeBack.size()).ok());
         HFS_TEST_CHECK(checksum(largeBack) == checksum(large));
+
+        /* A late child completion must become TimedOut at the parent boundary
+         * while still draining before the buffers are released. */
+        DataPath::Config timeoutConfig = pathConfig;
+        timeoutConfig.timeoutMs = 1;
+        DataPath timeoutPath(runtime, arena, plannerConfig, timeoutConfig);
+        std::vector<std::byte> timeoutRead(metaBlock, std::byte{0});
+        HFS_TEST_CHECK(::setenv("HFS_TEST_DATA_IO_DELAY_MS", "25", 1) == 0);
+        auto timeoutResult = timeoutPath.read(map, timeoutRead, 0, timeoutRead.size());
+        HFS_TEST_CHECK(::unsetenv("HFS_TEST_DATA_IO_DELAY_MS") == 0);
+        HFS_TEST_CHECK(!timeoutResult.ok() && timeoutResult.status() == Status::TimedOut);
+        HFS_TEST_CHECK(timeoutPath.stats().submits == timeoutPath.stats().completes);
 
         /* 6. child accounting and error-free completion */
         const auto stats = path.stats();

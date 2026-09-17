@@ -3,9 +3,11 @@
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <thread>
 
 #include "common/trace.hpp"
 #include "core/parent_completion.hpp"
@@ -25,6 +27,15 @@ struct WaitState {
 void childCallback(void *ctx, int status) {
     auto *state = static_cast<WaitState *>(ctx);
     trace::event(trace::EventId::BdevComplete, static_cast<std::uint64_t>(status));
+    /* Test-only delay makes the frontend timeout boundary deterministic. */
+    const char *delayText = std::getenv("HFS_TEST_DATA_IO_DELAY_MS");
+    if (delayText != nullptr && *delayText != '\0') {
+        char *end = nullptr;
+        const unsigned long delay = std::strtoul(delayText, &end, 10);
+        if (end != delayText && *end == '\0' && delay <= 60000) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+        }
+    }
     {
         std::lock_guard<std::mutex> lock(state->mutex);
         state->done = true;
@@ -47,6 +58,18 @@ int waitForChild(WaitState &state, std::uint32_t timeoutMs) {
 
 /* Preserve the first child status and backend errno at the parent boundary. */
 Result<void> childFailureResult(int error) {
+    if (error == -ETIMEDOUT) {
+        return makeError(Status::TimedOut, "data path child timed out");
+    }
+    if (error == -ECANCELED) {
+        return makeError(Status::Cancelled, "data path child cancelled");
+    }
+    if (error == -EAGAIN) {
+        return makeError(Status::Busy, "data path child temporarily unavailable");
+    }
+    if (error == -ENOSPC) {
+        return makeError(Status::NoSpace, "data path child has no space");
+    }
     if (error > 0 && error <= static_cast<int>(Status::InvalidState)) {
         const auto status = static_cast<Status>(error);
         return makeError(status, std::string("data path child failed: ") +
