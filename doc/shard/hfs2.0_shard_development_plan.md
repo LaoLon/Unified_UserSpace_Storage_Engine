@@ -412,7 +412,8 @@ p99 ≤ raw×110%。不达标时停在上游结构修复，不扩大 reactor/are
 
 > 状态：基础接口已实现并随 Shard-83/84 在单盘真实 NVMe 回归；当前实现已切换到
 > direct IO 契约，故本 shard 的历史 buffered-only 验收不再单独作为最终支持边界。
-> 完整 stock RocksDB 兼容性仍不宣称。
+> `GetFreeSpace` 已改为返回 allocator-backed data capacity（排除元数据区和已分配
+> extent），并由 namespace/真实 smoke 回归覆盖；完整 stock RocksDB 兼容性仍不宣称。
 
 **交付物**：`libhfs_rocksdb.so`；`HfsFileSystem/HfsRandomAccessFile/HfsWritableFile/
 HfsSequentialFile/HfsDirectory`；New/Get/Delete/Rename/Link/Lock/Directory/
