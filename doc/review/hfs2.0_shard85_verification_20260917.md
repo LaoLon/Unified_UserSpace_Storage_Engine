@@ -58,6 +58,11 @@ failure。该项是可定位的资源边界，不是数据错误；矩阵因此�
 DmaArena 单元回归还覆盖了共享 cap 满载时的背压：释放在 200ms 等待窗口内唤醒
 成功，无释放时 10ms 后返回 `Busy`；该路径未引入无界等待。
 
+带持久化结果的完整 FIO 矩阵最终收集到 385 项 `PASS`、15 项 `RESOURCE_BOUNDARY`、
+0 项功能性 `FAIL`。资源边界来自正式 512 MiB arena cap 下的大 buffer/高并发组合，
+其中最大组合为 QD=128、numjobs=8、1MiB；结果文件为 VM 上的
+`/mnt/hfs-data/hfs-fio-matrix-20260917.log`。
+
 ## Shard-81 raw 对照结果
 
 按 §16.2 口径在同一 `0000:0b:00.0` 上完成 raw SPDK `bdevperf` 与 HFS FIO
