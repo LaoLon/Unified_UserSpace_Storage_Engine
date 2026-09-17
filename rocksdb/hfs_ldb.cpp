@@ -13,13 +13,23 @@ namespace {
 
 /* Parses the stable checkconsistency command surface. */
 bool parseArguments(int argc, char **argv, std::string *config, std::string *dbPath) {
-    if (argc != 4 || config == nullptr || dbPath == nullptr ||
-        std::string(argv[2]) != "checkconsistency") return false;
-    const std::string dbArgument = argv[3];
-    if (dbArgument.rfind("--db=", 0) != 0 || dbArgument.size() == 5) return false;
-    *config = argv[1];
-    *dbPath = dbArgument.substr(5);
-    return true;
+    if (argc < 2 || config == nullptr || dbPath == nullptr) return false;
+    bool commandSeen = false;
+    for (int index = 1; index < argc; ++index) {
+        const std::string argument = argv[index];
+        if (argument == "checkconsistency") {
+            commandSeen = true;
+        } else if (argument.rfind("--hfs-config=", 0) == 0) {
+            *config = argument.substr(13);
+        } else if (argument.rfind("--db=", 0) == 0) {
+            *dbPath = argument.substr(5);
+        } else if (index == 1 && config->empty()) {
+            *config = argument;
+        } else {
+            return false;
+        }
+    }
+    return commandSeen && !config->empty() && !dbPath->empty();
 }
 
 /* Opens the HFS database without writes and scans every visible key/value entry. */
@@ -58,7 +68,7 @@ int main(int argc, char **argv) {
     std::string config;
     std::string dbPath;
     if (!parseArguments(argc, argv, &config, &dbPath)) {
-        std::cerr << "usage: hfs_ldb CONFIG checkconsistency --db=PATH\n";
+        std::cerr << "usage: hfs_ldb --hfs-config=CONFIG checkconsistency --db=PATH\n";
         return 1;
     }
     return checkConsistency(config, dbPath);
