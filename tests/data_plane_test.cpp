@@ -27,6 +27,21 @@ void onOpComplete(hfs::Operation *operation) {
     ++gCompletions;
 }
 
+/* Counts value completions without retaining an Operation or frontend object. */
+void onCompletionPublished(void *raw, const hfs::CompletionEvent &event) {
+    auto *count = static_cast<int *>(raw);
+    ++(*count);
+    if (event.requestId == 0) {
+        *count = -1;
+    }
+}
+
+/* Resets externally owned bounded sidecar storage when its Operation is reaped. */
+void resetSidecarProbe(void *raw) {
+    auto *value = static_cast<std::uint32_t *>(raw);
+    *value = 0;
+}
+
 void *testDmaAlloc(std::size_t size, void *) noexcept {
     return ::operator new(size, std::nothrow);
 }
@@ -126,6 +141,157 @@ int main() {
         HFS_TEST_CHECK(!operation->complete(0));
         HFS_TEST_CHECK(gCompletions == 1);
         operation->release();
+        HFS_TEST_CHECK(hfs::Operation::liveCount() == 0);
+
+        /* Role references close independently while sharing one underlying count. */
+        auto *roleOperation = hfs::Operation::create(12);
+        HFS_TEST_CHECK(roleOperation != nullptr);
+        HFS_TEST_CHECK(roleOperation->refCount() == 1);
+        HFS_TEST_CHECK(roleOperation->refCount(hfs::OperationRefRole::Legacy) == 1);
+        HFS_TEST_CHECK(roleOperation->tryAcquireRef(hfs::OperationRefRole::Actor));
+        roleOperation->acquireRef(hfs::OperationRefRole::Scheduler);
+        roleOperation->acquireRef(hfs::OperationRefRole::Backend);
+        roleOperation->acquireRef(hfs::OperationRefRole::Parent);
+        HFS_TEST_CHECK(roleOperation->refCount() == 5);
+        HFS_TEST_CHECK(roleOperation->refCount(hfs::OperationRefRole::Actor) == 1);
+        HFS_TEST_CHECK(roleOperation->releaseRef(hfs::OperationRefRole::Parent));
+        HFS_TEST_CHECK(roleOperation->releaseRef(hfs::OperationRefRole::Backend));
+        HFS_TEST_CHECK(roleOperation->releaseRef(hfs::OperationRefRole::Scheduler));
+        HFS_TEST_CHECK(roleOperation->releaseRef(hfs::OperationRefRole::Actor));
+        HFS_TEST_CHECK(!roleOperation->releaseRef(hfs::OperationRefRole::Actor));
+        HFS_TEST_CHECK(roleOperation->refCount() == 1);
+        roleOperation->release();
+        HFS_TEST_CHECK(hfs::Operation::liveCount() == 0);
+
+        /* A frontend handle keeps a fast-completed operation alive until return. */
+        int published = 0;
+        auto *fast = hfs::Operation::create(13);
+        HFS_TEST_CHECK(fast != nullptr);
+        fast->setCompletionSink({&published, onCompletionPublished});
+        auto handle = fast->acquireFrontendHandle({7, 1});
+        HFS_TEST_CHECK(handle.valid());
+        HFS_TEST_CHECK(handle.requestId() == 13);
+        HFS_TEST_CHECK(handle.token().slot == 7);
+        HFS_TEST_CHECK(fast->refCount(hfs::OperationRefRole::FrontendHandle) == 1);
+        fast->release(); /* Drop the creator reference before the frontend returns. */
+        HFS_TEST_CHECK(fast->completeTerminal(0));
+        HFS_TEST_CHECK(fast->isTerminal());
+        HFS_TEST_CHECK(!fast->isCompletionPublished());
+        HFS_TEST_CHECK(fast->publishCompletion());
+        HFS_TEST_CHECK(fast->state.load() == hfs::OperationState::CompletionPublished);
+        HFS_TEST_CHECK(published == 1);
+        HFS_TEST_CHECK(!fast->publishCompletion());
+        HFS_TEST_CHECK(handle.valid());
+        handle.reset();
+        HFS_TEST_CHECK(hfs::Operation::liveCount() == 0);
+
+        /* New preparation and drain states remain on the existing lifecycle object. */
+        auto *lifecycle = hfs::Operation::create(14);
+        HFS_TEST_CHECK(lifecycle != nullptr);
+        HFS_TEST_CHECK(lifecycle->transition(hfs::OperationState::Created,
+                                             hfs::OperationState::Enqueued));
+        HFS_TEST_CHECK(lifecycle->beginPreparing());
+        HFS_TEST_CHECK(lifecycle->state.load() == hfs::OperationState::Preparing);
+        HFS_TEST_CHECK(lifecycle->beginDraining());
+        HFS_TEST_CHECK(lifecycle->state.load() == hfs::OperationState::Draining);
+        HFS_TEST_CHECK(lifecycle->completeTerminal(0));
+        HFS_TEST_CHECK(lifecycle->state.load() == hfs::OperationState::Completed);
+        HFS_TEST_CHECK(lifecycle->publishCompletion());
+        lifecycle->release();
+        HFS_TEST_CHECK(hfs::Operation::liveCount() == 0);
+
+        /* Terminal transition and publication each reject a second caller. */
+        auto *split = hfs::Operation::create(15);
+        HFS_TEST_CHECK(split != nullptr);
+        HFS_TEST_CHECK(split->completeTerminal(hfs::Status::TimedOut, -110, 128));
+        HFS_TEST_CHECK(!split->completeTerminal(hfs::Status::Ok));
+        HFS_TEST_CHECK(!split->isCompletionPublished());
+        HFS_TEST_CHECK(split->publishCompletion());
+        HFS_TEST_CHECK(!split->publishCompletion());
+        split->release();
+        HFS_TEST_CHECK(hfs::Operation::liveCount() == 0);
+
+        /* Pool reuse clears public state, sidecar state, hooks and role counters. */
+        std::uint32_t sidecarProbe = 99;
+        auto *dirty = hfs::Operation::create(16);
+        HFS_TEST_CHECK(dirty != nullptr);
+        dirty->kind = hfs::OperationKind::Write;
+        dirty->state.store(hfs::OperationState::Draining);
+        dirty->fileId = 44;
+        dirty->offset = 55;
+        dirty->length = 66;
+        dirty->shard = 3;
+        dirty->userCtx = &sidecarProbe;
+        dirty->onComplete = onOpComplete;
+        dirty->status = -5;
+        dirty->resultStatus = hfs::Status::IoError;
+        dirty->backendErrno = -5;
+        dirty->completedBytes = 77;
+        dirty->retryCount = 8;
+        dirty->schedulerNode = &sidecarProbe;
+        dirty->dmaLease = &sidecarProbe;
+        dirty->parent = &sidecarProbe;
+        dirty->setCompletionToken({8, 9});
+        dirty->setCompletionSink({&published, onCompletionPublished});
+        dirty->asyncState().schedulerNode = &sidecarProbe;
+        dirty->asyncState().parent = &sidecarProbe;
+        dirty->asyncState().backendState = &sidecarProbe;
+        dirty->asyncState().status = hfs::Status::IoError;
+        dirty->asyncState().backendErrno = -6;
+        dirty->asyncState().childCount = 2;
+        dirty->asyncState().submittedChildren = 2;
+        dirty->asyncState().drainedChildren = 1;
+        dirty->asyncState().completionPublished = true;
+        dirty->asyncState().children[0].backendIo = &sidecarProbe;
+        dirty->asyncState().children[0].buffer = &sidecarProbe;
+        dirty->asyncState().children[0].dmaLease = &sidecarProbe;
+        dirty->asyncState().children[0].offset = 99;
+        dirty->asyncState().children[0].physicalBlock = 100;
+        dirty->asyncState().children[0].deviceId = 2;
+        dirty->asyncState().children[0].bufferOffset = 3;
+        dirty->asyncState().children[0].bufferLength = 4;
+        HFS_TEST_CHECK(dirty->attachAsyncStorage(&sidecarProbe, sizeof(sidecarProbe),
+                                                  resetSidecarProbe));
+        dirty->release();
+        HFS_TEST_CHECK(sidecarProbe == 0);
+
+        auto *reused = hfs::Operation::create(17);
+        HFS_TEST_CHECK(reused != nullptr);
+        HFS_TEST_CHECK(reused->requestId == 17);
+        HFS_TEST_CHECK(reused->kind == hfs::OperationKind::Other);
+        HFS_TEST_CHECK(reused->state.load() == hfs::OperationState::Created);
+        HFS_TEST_CHECK(!reused->isTerminal());
+        HFS_TEST_CHECK(!reused->isCompletionPublished());
+        HFS_TEST_CHECK(reused->fileId == 0 && reused->offset == 0 && reused->length == 0);
+        HFS_TEST_CHECK(reused->shard == 0 && reused->userCtx == nullptr);
+        HFS_TEST_CHECK(reused->onComplete == nullptr);
+        HFS_TEST_CHECK(reused->status == 0 && reused->resultStatus == hfs::Status::Ok);
+        HFS_TEST_CHECK(reused->backendErrno == 0 && reused->completedBytes == 0);
+        HFS_TEST_CHECK(reused->retryCount == 0 && reused->schedulerNode == nullptr);
+        HFS_TEST_CHECK(reused->dmaLease == nullptr && reused->parent == nullptr);
+        HFS_TEST_CHECK(!reused->completionToken().valid());
+        HFS_TEST_CHECK(reused->completionSink().context == nullptr);
+        HFS_TEST_CHECK(reused->completionSink().publish == nullptr);
+        HFS_TEST_CHECK(reused->asyncStorage().storage == nullptr);
+        HFS_TEST_CHECK(reused->asyncState().schedulerNode == nullptr);
+        HFS_TEST_CHECK(reused->asyncState().parent == nullptr);
+        HFS_TEST_CHECK(reused->asyncState().backendState == nullptr);
+        HFS_TEST_CHECK(reused->asyncState().childCount == 0);
+        HFS_TEST_CHECK(reused->asyncState().submittedChildren == 0);
+        HFS_TEST_CHECK(reused->asyncState().drainedChildren == 0);
+        HFS_TEST_CHECK(!reused->asyncState().completionPublished);
+        HFS_TEST_CHECK(reused->asyncState().children[0].backendIo == nullptr);
+        HFS_TEST_CHECK(reused->asyncState().children[0].buffer == nullptr);
+        HFS_TEST_CHECK(reused->asyncState().children[0].dmaLease == nullptr);
+        HFS_TEST_CHECK(reused->asyncState().children[0].offset == 0);
+        HFS_TEST_CHECK(reused->asyncState().children[0].physicalBlock == 0);
+        HFS_TEST_CHECK(reused->asyncState().children[0].deviceId == 0);
+        HFS_TEST_CHECK(reused->asyncState().children[0].bufferOffset == 0);
+        HFS_TEST_CHECK(reused->asyncState().children[0].bufferLength == 0);
+        HFS_TEST_CHECK(reused->refCount() == 1);
+        HFS_TEST_CHECK(reused->refCount(hfs::OperationRefRole::Legacy) == 1);
+        HFS_TEST_CHECK(reused->refCount(hfs::OperationRefRole::Actor) == 0);
+        reused->release();
         HFS_TEST_CHECK(hfs::Operation::liveCount() == 0);
 
         const std::size_t overflowBefore = hfs::Operation::poolOverflow();
