@@ -460,6 +460,10 @@ p99 ≤ raw×110%。不达标时停在上游结构修复，不扩大 reactor/are
 > 结构性失败；raw 仅有 aggregate p99，读写分离 p99 和 submit/complete 也不能收口。
 > 证据见 `doc/performance/hfs2_shard81_formal_gate_20260918.md`；必须先修复 FIO
 > 前端提交/完成生命周期，再重跑正式 gate。
+> 2026-09-18 修复已落地：移除 external worker pool，FIO `queue()` 在提交线程同步
+> 完成 HFS core I/O 并返回 `FIO_Q_COMPLETED`；真实 NVMe 4-job/4K/randrw/3 秒
+> smoke 完成约 19 MiB、errors=0，4 个 client 正常关闭。32-job 正式 gate 尚未
+> 重跑，Shard-81 仍不标记完成。
 
 ---
 

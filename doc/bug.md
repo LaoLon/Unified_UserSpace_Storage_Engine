@@ -313,6 +313,7 @@ Bug 等级：**致命 > 严重 > 一般**。
 - **根因**：FIO 虚拟文件引擎不能依赖 host fd 的默认文件布局路径，当前 size/open 回调组合尚未满足 FIO 的实际请求准入条件。
 - **修复**：已补齐无 fd invalidate、get_file_size、open 时 preallocate，以及进程级 `hfs_config` callback；功能矩阵前保持 Shard-80 未完成。
 - **验证结果**：编译通过；无 `HFS_CONFIG` 环境变量时，真实 NVMe bind→format→mount→cleanup 下 `.fio` 内 `hfs_config`、`numjobs=2`、4K write 完成 4096B、errors=0；高 QD 功能矩阵与 DMA all-or-nothing 门禁仍未通过。
+- **2026-09-18 修复**：移除 external worker pool，`queue()` 在 FIO 提交线程同步执行 HFS core I/O 并返回 `FIO_Q_COMPLETED`，避免跨线程 SPDK reactor/`io_handle` 生命周期问题；真实 NVMe 4K randrw、4 jobs、3 秒 smoke 完成约 19 MiB，errors=0。正式 32-job 性能 gate 仍需在该修复上重跑。
 
 ### 20. FIO 高深度外部线程提交触发 SPDK 消息队列崩溃（处理中）
 - **状态**：处理中
