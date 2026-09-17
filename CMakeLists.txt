@@ -81,6 +81,23 @@ if(EXISTS ${FIO_SOURCE_DIR}/fio.h)
   set_target_properties(fio-hfs PROPERTIES PREFIX "" OUTPUT_NAME "fio-hfs")
 endif()
 
+set(ROCKSDB_ROOT "" CACHE PATH "RocksDB 8.9.1 installation root for the optional adapter")
+if(EXISTS ${ROCKSDB_ROOT}/include/rocksdb/file_system.h)
+  find_library(ROCKSDB_LIBRARY NAMES rocksdb
+    PATHS ${ROCKSDB_ROOT}/lib ${ROCKSDB_ROOT}/lib/x86_64-linux-gnu
+          /usr/lib/x86_64-linux-gnu)
+  if(NOT ROCKSDB_LIBRARY)
+    message(FATAL_ERROR "RocksDB library not found below ${ROCKSDB_ROOT}")
+  endif()
+  add_library(hfs_rocksdb SHARED rocksdb/hfs_filesystem.cpp)
+  target_include_directories(hfs_rocksdb PRIVATE
+    ${ROCKSDB_ROOT}/include ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(hfs_rocksdb PRIVATE hfs_core
+    ${ROCKSDB_LIBRARY})
+  set_target_properties(hfs_rocksdb PROPERTIES OUTPUT_NAME hfs_rocksdb)
+endif()
+
 if(HFS_WITH_SPDK)
   # Mirror of the legacy SPDK static link set; bdev/nvme/env/thread/init are
   # the modules the runtime uses, the rest keep subsystem registration intact.
