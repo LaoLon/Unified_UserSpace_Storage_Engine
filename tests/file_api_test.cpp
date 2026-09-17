@@ -1,4 +1,5 @@
 #include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <string>
@@ -134,6 +135,12 @@ int main() {
                                 .value();
                 HFS_TEST_CHECK(read.ok() && read.value().bytes == pattern.size());
                 HFS_TEST_CHECK(readBack == pattern);
+                /* A data flush failure must stop before the metadata checkpoint. */
+                HFS_TEST_CHECK(::setenv("HFS_TEST_FAIL_FLUSH_DEVICE", "0", 1) == 0);
+                auto failedDatasync = first.value()->datasync().wait().value();
+                HFS_TEST_CHECK(!failedDatasync.ok() &&
+                               failedDatasync.status() == Status::IoError);
+                HFS_TEST_CHECK(::unsetenv("HFS_TEST_FAIL_FLUSH_DEVICE") == 0);
                 /* Both barriers now flush data and checkpoint metadata. */
                 HFS_TEST_CHECK(first.value()->datasync().wait().value().ok());
                 HFS_TEST_CHECK(first.value()->sync().wait().value().ok());

@@ -133,6 +133,18 @@ struct ControlIo {
     int rc = 0;
 };
 
+/* Returns whether an explicitly requested test flush fault targets this device.
+ * The hook is inert unless the caller sets HFS_TEST_FAIL_FLUSH_DEVICE. */
+bool testFlushFailureRequested(std::size_t deviceIndex) {
+    const char *value = std::getenv("HFS_TEST_FAIL_FLUSH_DEVICE");
+    if (value == nullptr || *value == '\0') {
+        return false;
+    }
+    char *end = nullptr;
+    const unsigned long parsed = std::strtoul(value, &end, 10);
+    return end != value && *end == '\0' && parsed == deviceIndex;
+}
+
 int failControlIo(const std::shared_ptr<ControlIo> &io, int rc) {
     if (io->dma != nullptr) {
         spdk_dma_free(io->dma);
@@ -693,6 +705,11 @@ struct SpdkRuntime::Impl {
         if (index >= devices.size() || devices[index].desc == nullptr || reactors.empty() ||
             reactors[0]->spdk == nullptr) {
             return makeError(Status::InvalidArgument, "device index out of range");
+        }
+        if (op == ControlIo::Op::Flush && testFlushFailureRequested(index)) {
+            return makeError(Status::IoError,
+                             "test-injected data/control flush failure on device " +
+                                 std::to_string(index));
         }
 
         auto io = std::make_shared<ControlIo>();

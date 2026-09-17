@@ -129,3 +129,8 @@ transaction/corruption 状态一致。该结果补强 Shard-84 的双盘恢复�
 双盘 FIO 完整矩阵随后执行 400/400 组合：320 项 `PASS`、80 项
 `RESOURCE_BOUNDARY`、0 项功能性 `FAIL`。资源边界集中于 64K/1M 与高 QD×jobs，最大
 QD=128、numjobs=8、1M；持久化结果为 `/mnt/hfs-data/hfs-fio-matrix-dual-20260917.log`。
+
+Shard-79 的真实 NVMe `file_api_test` 还验证了 `HFS_TEST_FAIL_FLUSH_DEVICE=0`：在
+data child 已完成、device flush 尚未提交时，`datasync` 返回 `IoError`；清除变量后
+同一数据可继续完成 datasync/sync。该钩子默认关闭且只提供顺序边界证据，不替代掉电
+模拟，也不表示其余四个 §16.4 crash 断点已经完成。

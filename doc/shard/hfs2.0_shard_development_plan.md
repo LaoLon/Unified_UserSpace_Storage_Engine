@@ -365,6 +365,12 @@ rename 后 Fsync 语义正确。
 > generation 和双槽 CRC，且修复了控制 flush 单位、目标盘 geometry 镜像及 mirrored
 > journal geometry 生命周期问题。
 
+> 2026-09-17：新增显式 `HFS_TEST_FAIL_FLUSH_DEVICE` 测试钩子，并在真实 NVMe
+> `file_api_test` 中验证 data child 完成后、device flush 提交前的失败边界：
+> `datasync` 返回 `IoError`，清除注入后同一数据可正常完成 datasync/sync。该钩子
+> 只在测试环境变量指定设备时生效，属于可重复的顺序边界证据，不等价于掉电模拟；
+> 其余四个崩溃断点和断点后的完整 namespace/extent/size 守恒仍未闭合。
+
 **交付物**：§16.4 五个崩溃断点注入；orphan reclaim；内存 after-image 失败回滚；
 `hfsctl check` 取证；ext4 同 workload 语义对照；**多副本执行**：按 Shard-70/71 冻结的
 格式实现全副本 commit、最小已提交 txid 回滚、CRC/缺失 fail closed。

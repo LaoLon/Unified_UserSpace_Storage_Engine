@@ -1347,6 +1347,10 @@ checkpoint region 必须容纳 namespace/inode/extent map/各 device allocator b
   checkconsistency 与 `hfsctl check` 也已通过；完整错误/取消矩阵和性能 gate 仍未闭合。
   双盘 FIO 完整 workload 矩阵已收集到 320 项 PASS、80 项 RESOURCE_BOUNDARY、0 项
   功能失败；结果归档在 `/mnt/hfs-data/hfs-fio-matrix-dual-20260917.log`。
+  Shard-79 另以 `HFS_TEST_FAIL_FLUSH_DEVICE` 在真实 NVMe 的 `file_api_test` 中覆盖
+  data child 完成后、device flush 提交前的 `datasync` 失败边界；注入仅在显式测试
+  环境变量下生效，清除后同一数据可完成 datasync/sync，不把该顺序注入等同于掉电
+  或其余四个 crash 断点。
 - 所有 gate 通过后删除新树中最后的旧兼容残留；
 - `src_legacy_frozen/` 保持本地忽略或单独归档，不回到 product build；
 - 更新架构索引、性能基线、支持边界和迁移说明；
