@@ -49,6 +49,30 @@ int main() {
         HFS_TEST_CHECK(arena.stats().bytes == 0);
     }
 
+    /* 0b. bounded arena wait wakes on release and times out otherwise. */
+    {
+        hfs::DmaArena arena;
+        arena.configure(4096, testDmaAlloc, testDmaFree, nullptr);
+        auto held = arena.acquire(4096, 0);
+        HFS_TEST_CHECK(held.ok());
+        std::atomic<bool> waiterOk = false;
+        std::thread waiter([&] {
+            auto acquired = arena.acquire(4096, 200);
+            waiterOk.store(acquired.ok());
+            if (acquired.ok()) arena.release(acquired.value());
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        arena.release(held.value());
+        waiter.join();
+        HFS_TEST_CHECK(waiterOk.load());
+
+        auto heldAgain = arena.acquire(4096, 0);
+        HFS_TEST_CHECK(heldAgain.ok());
+        auto timedOut = arena.acquire(4096, 10);
+        HFS_TEST_CHECK(!timedOut.ok() && timedOut.status() == hfs::Status::Busy);
+        arena.release(heldAgain.value());
+    }
+
     /* 1. frame pool: bounded classes, reuse, overflow accounting */
     {
         auto &pool = hfs::FramePool::instance();
