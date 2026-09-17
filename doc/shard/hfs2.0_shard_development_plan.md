@@ -464,6 +464,10 @@ p99 ≤ raw×110%。不达标时停在上游结构修复，不扩大 reactor/are
 > 完成 HFS core I/O 并返回 `FIO_Q_COMPLETED`；真实 NVMe 4-job/4K/randrw/3 秒
 > smoke 完成约 19 MiB、errors=0，4 个 client 正常关闭。32-job 正式 gate 尚未
 > 重跑，Shard-81 仍不标记完成。
+> 随后按正式口径重跑：raw 中位 5108.72 IOPS，修复后的 HFS 中位 0.89991 IOPS，
+> HFS/raw=0.00017615；五次 errors 均为 0，但每次只完成 20-430 KiB，仍未兑现
+> 32-job 请求量，故性能 gate 继续结构性失败。当前需继续定位高并发 FIO job 与
+> HFS data reactor/Client 的阻塞关系。
 
 ---
 

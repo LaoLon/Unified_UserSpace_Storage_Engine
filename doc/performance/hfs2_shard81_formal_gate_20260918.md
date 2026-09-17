@@ -45,3 +45,17 @@
 | submit/complete 闭合 | FAIL | 32 jobs 目标未兑现；FIO JSON 每次只反映极少量 I/O |
 
 因此 Shard-81 保持未完成。下一步必须先完成 core 内前端提交/完成生命周期、`io_handle` 保活和停止顺序，恢复真实 `queue/getevents/event` 并发后，再以同一拓扑重跑五次 raw/HFS gate。
+
+## 2026-09-18 修复后重跑
+
+修复 external worker pool 后，先完成真实 NVMe 4-job smoke；随后按本报告固定口径
+重跑。raw 五次 IOPS 为 `5241.33 / 5004.26 / 5334.68 / 5108.72 / 4175.39`，
+中位数 `5108.72 IOPS`。HFS 五次总 IOPS（read+iops 与 write+iops）为
+`0.89991 / 1.098791 / 0.199601 / 0.89982 / 10.496851`，中位数
+`0.89991 IOPS`，HFS/raw=`0.00017615`，相当于 raw 的 `0.0176%`，性能差距
+约 `99.9824%`。
+
+五次 HFS 均返回 `error=0`，但每次仅完成 20 KiB 至 430 KiB 左右，远未达到
+32 jobs/10 秒应有的请求量；设备最终恢复为内核 `nvme` 驱动。因此这次重跑仍是
+结构性失败，说明同步提交路径能通过低并发 smoke，但不能满足正式 32-job gate。
+后续需定位 32 个 FIO job 与 HFS data reactor/Client 的并发阻塞，再重跑正式 gate。
