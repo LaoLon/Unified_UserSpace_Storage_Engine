@@ -237,6 +237,10 @@ Result<VolumeInfo> mountVolume(SpdkRuntime &runtime, const Config &config) {
     volume.metadataBlockSize = config.metadataBlockSize;
     volume.replicaCount = config.metadataReplication;
     volume.cleanShutdown = true;
+    /* Track every configured metadata replica so missing or duplicated roles
+     * fail closed before any journal or namespace state is opened. */
+    std::vector<bool> metadataReplicasSeen(config.metadataReplication, false);
+    std::size_t metadataReplicaCount = 0;
 
     for (std::size_t i = 0; i < config.devices.size(); ++i) {
         const std::uint64_t deviceBytes = runtime.deviceCapacityBytes(i);
@@ -278,6 +282,27 @@ Result<VolumeInfo> mountVolume(SpdkRuntime &runtime, const Config &config) {
                                          "metadata_replication mismatch on device '" +
                                              config.devices[i].bdevName + "'");
         }
+        const bool isMetadataDevice = config.devices[i].metadata;
+        if (isMetadataDevice) {
+            if (chosen.replicaId >= metadataReplicasSeen.size()) {
+                return makeError<VolumeInfo>(
+                    Status::Corrupt, "metadata replica_id is outside the configured set on device '" +
+                                         config.devices[i].bdevName + "'");
+            }
+            if (metadataReplicasSeen[chosen.replicaId]) {
+                return makeError<VolumeInfo>(
+                    Status::Corrupt, "duplicate metadata replica_id on device '" +
+                                         config.devices[i].bdevName + "'");
+            }
+            metadataReplicasSeen[chosen.replicaId] = true;
+            ++metadataReplicaCount;
+            const bool mirrored = (chosen.featureFlags & kFeatureMetadataMirror) != 0;
+            if (mirrored != (config.metadataReplication > 1)) {
+                return makeError<VolumeInfo>(
+                    Status::Corrupt, "metadata mirror feature mismatch on device '" +
+                                         config.devices[i].bdevName + "'");
+            }
+        }
         if (chosen.deviceId != i) {
             return makeError<VolumeInfo>(Status::Corrupt,
                                          "device_id mismatch on device '" +
@@ -305,6 +330,13 @@ Result<VolumeInfo> mountVolume(SpdkRuntime &runtime, const Config &config) {
             volume.cleanShutdown = false;
         }
         volume.devices.push_back(stored);
+    }
+
+    if (metadataReplicaCount != config.metadataReplication ||
+        std::find(metadataReplicasSeen.begin(), metadataReplicasSeen.end(), false) !=
+            metadataReplicasSeen.end()) {
+        return makeError<VolumeInfo>(Status::Corrupt,
+                                     "metadata replica set is incomplete");
     }
 
     if (config.volumeUuid != "auto") {
