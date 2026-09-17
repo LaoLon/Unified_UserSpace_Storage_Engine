@@ -87,6 +87,10 @@ public:
     std::vector<DeviceGeometry> deviceGeometries() const;
     /* Returns allocatable data bytes across the configured data devices. */
     std::uint64_t freeDataBytes() const noexcept;
+    /* Acquires/releases a DMA buffer from the engine-owned shared arena. */
+    Result<std::span<std::byte>> acquireDmaBuffer(std::size_t size,
+                                                   std::uint32_t timeoutMs);
+    void releaseDmaBuffer(void *buffer, std::size_t size) noexcept;
 
     /* Control-path device block I/O (format/mount/tools); requires an active
      * runtime and a buffer that is a multiple of the device block size. */

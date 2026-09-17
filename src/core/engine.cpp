@@ -556,6 +556,23 @@ std::uint64_t Engine::freeDataBytes() const noexcept {
     return impl_->namespaceState->freeDataBytes();
 }
 
+/* Acquires one contiguous buffer from the mount-level DMA arena. */
+Result<std::span<std::byte>> Engine::acquireDmaBuffer(std::size_t size,
+                                                      std::uint32_t timeoutMs) {
+    if (impl_ == nullptr || impl_->dmaArena == nullptr) {
+        return makeError<std::span<std::byte>>(Status::InvalidState, "DMA arena is not active");
+    }
+    return impl_->dmaArena->acquire(size, timeoutMs);
+}
+
+/* Returns a buffer to the mount-level DMA arena. */
+void Engine::releaseDmaBuffer(void *buffer, std::size_t size) noexcept {
+    if (impl_ == nullptr || impl_->dmaArena == nullptr || buffer == nullptr || size == 0) {
+        return;
+    }
+    impl_->dmaArena->release(std::span<std::byte>(static_cast<std::byte *>(buffer), size));
+}
+
 Result<void> Engine::readDeviceBlocks(std::size_t deviceIndex, std::uint64_t offsetBlocks,
                                       std::span<std::byte> buffer) {
     if (!processValid()) {

@@ -16,6 +16,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <unordered_map>
 
 #include "fio.h"
 #include "optgroup.h"
@@ -27,10 +28,6 @@
 #include "hfs/config.hpp"
 #include "hfs/core.hpp"
 #include "hfs/file.hpp"
-
-#if defined(HFS_WITH_SPDK)
-#include <spdk/env.h>
-#endif
 
 namespace {
 
@@ -75,6 +72,13 @@ std::shared_ptr<hfs::Engine> processEngine;
 std::size_t processUsers = 0;
 std::string processConfigPath;
 
+std::mutex dmaBufferMutex;
+struct DmaBufferOwner {
+    std::weak_ptr<hfs::Engine> engine;
+    std::size_t allocationSize = 0;
+};
+std::unordered_map<void *, DmaBufferOwner> dmaBufferOwners;
+
 /* Preserve the parsed engine configuration for fio worker clones. */
 int fioHfsConfigOption(void *, const char *value) {
     if (value == nullptr || value[0] == '\0') {
@@ -118,26 +122,40 @@ void fioLog(const char *message) {
     std::fputs(message, stderr);
 }
 
-/* Allocate fio's complete requested buffer from the SPDK DMA heap. */
+/* Allocate fio's complete requested buffer from the shared HFS DMA arena. */
 int fioHfsIomemAlloc(struct thread_data *td, size_t totalMem) {
     if (td == nullptr || totalMem == 0) {
         if (td != nullptr) td->orig_buffer = nullptr;
         return totalMem == 0 ? 0 : 1;
     }
-#if defined(HFS_WITH_SPDK)
-    td->orig_buffer = static_cast<char *>(spdk_dma_zmalloc(totalMem, 4096, nullptr));
-    if (td->orig_buffer == nullptr) {
+    std::shared_ptr<hfs::Engine> engine;
+    {
+        std::lock_guard<std::mutex> lock(processMutex);
+        engine = processEngine;
+    }
+    if (engine == nullptr) {
+        fioLog("fio-hfs: engine is not active for DMA arena allocation\n");
+        return 1;
+    }
+    auto acquired = engine->acquireDmaBuffer(totalMem, 0);
+    if (!acquired.ok()) {
         fioLog("fio-hfs: complete DMA arena allocation failed\n");
         return 1;
     }
+    td->orig_buffer = reinterpret_cast<char *>(acquired.value().data());
     td->orig_buffer_size = totalMem;
+    try {
+        std::lock_guard<std::mutex> lock(dmaBufferMutex);
+        dmaBufferOwners.emplace(td->orig_buffer,
+                                DmaBufferOwner{engine, acquired.value().size()});
+    } catch (...) {
+        engine->releaseDmaBuffer(td->orig_buffer, td->orig_buffer_size);
+        td->orig_buffer = nullptr;
+        td->orig_buffer_size = 0;
+        fioLog("fio-hfs: DMA arena owner bookkeeping failed\n");
+        return 1;
+    }
     return 0;
-#else
-    (void)totalMem;
-    td->orig_buffer = nullptr;
-    fioLog("fio-hfs: DMA arena requires an SPDK-enabled build\n");
-    return 1;
-#endif
 }
 
 /* Release only the single arena owned by fio for this worker. */
@@ -145,9 +163,18 @@ void fioHfsIomemFree(struct thread_data *td) {
     if (td == nullptr || td->orig_buffer == nullptr) {
         return;
     }
-#if defined(HFS_WITH_SPDK)
-    spdk_dma_free(td->orig_buffer);
-#endif
+    DmaBufferOwner owner;
+    {
+        std::lock_guard<std::mutex> lock(dmaBufferMutex);
+        auto found = dmaBufferOwners.find(td->orig_buffer);
+        if (found != dmaBufferOwners.end()) {
+            owner = found->second;
+            dmaBufferOwners.erase(found);
+        }
+    }
+    if (auto engine = owner.engine.lock()) {
+        engine->releaseDmaBuffer(td->orig_buffer, owner.allocationSize);
+    }
     td->orig_buffer = nullptr;
     td->orig_buffer_size = 0;
 }

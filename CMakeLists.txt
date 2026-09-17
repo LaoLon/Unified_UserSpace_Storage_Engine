@@ -196,6 +196,7 @@ add_executable(data_plane_test
   src/common/stats.cpp
   src/common/trace.cpp
   src/core/actor.cpp
+  src/core/dma_arena.cpp
   src/core/frame_pool.cpp
   src/core/operation.cpp
   src/core/shard_ring.cpp

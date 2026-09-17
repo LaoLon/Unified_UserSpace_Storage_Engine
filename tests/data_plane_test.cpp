@@ -2,12 +2,14 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <new>
 #include <thread>
 #include <vector>
 
 #include "common/trace.hpp"
 #include "core/actor.hpp"
 #include "core/completion_queue.hpp"
+#include "core/dma_arena.hpp"
 #include "core/frame_pool.hpp"
 #include "core/operation.hpp"
 #include "core/shard_ring.hpp"
@@ -25,9 +27,28 @@ void onOpComplete(hfs::Operation *operation) {
     ++gCompletions;
 }
 
+void *testDmaAlloc(std::size_t size, void *) noexcept {
+    return ::operator new(size, std::nothrow);
+}
+
+void testDmaFree(void *ptr, void *) noexcept { ::operator delete(ptr); }
+
 } // namespace
 
 int main() {
+    /* 0. large contiguous allocations use the bounded arena path. */
+    {
+        hfs::DmaArena arena;
+        arena.configure(3 * 1024 * 1024, testDmaAlloc, testDmaFree, nullptr);
+        auto large = arena.acquire(2 * 1024 * 1024, 0);
+        HFS_TEST_CHECK(large.ok());
+        HFS_TEST_CHECK(arena.owns(large.value().data()));
+        auto over = arena.acquire(2 * 1024 * 1024, 0);
+        HFS_TEST_CHECK(!over.ok() && over.status() == hfs::Status::Busy);
+        arena.release(large.value());
+        HFS_TEST_CHECK(arena.stats().bytes == 0);
+    }
+
     /* 1. frame pool: bounded classes, reuse, overflow accounting */
     {
         auto &pool = hfs::FramePool::instance();

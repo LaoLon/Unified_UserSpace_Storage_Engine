@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <mutex>
 #include <span>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -88,6 +89,7 @@ private:
     std::size_t bytes_ = 0;
     std::size_t highWatermark_ = 0;
     std::array<SizeClass, kClassCount> classes_;
+    std::unordered_map<void *, std::size_t> largeLive_;
     std::unordered_set<const void *> live_;
     Allocator allocator_ = nullptr;
     Deallocator deallocator_ = nullptr;
