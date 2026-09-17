@@ -36,6 +36,8 @@ rocksdb::IOStatus toIoStatus(const hfs::Result<T> &result) {
     switch (result.status()) {
     case hfs::Status::NotFound:
         return rocksdb::IOStatus::NotFound(result.message());
+    case hfs::Status::NoSpace:
+        return rocksdb::IOStatus::NoSpace(result.message());
     case hfs::Status::AlreadyExists:
         return rocksdb::IOStatus::IOError(result.message());
     case hfs::Status::Busy:
