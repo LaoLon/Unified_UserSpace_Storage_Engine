@@ -96,6 +96,11 @@ if(EXISTS ${ROCKSDB_ROOT}/include/rocksdb/file_system.h)
   target_link_libraries(hfs_rocksdb PRIVATE hfs_core
     ${ROCKSDB_LIBRARY})
   set_target_properties(hfs_rocksdb PROPERTIES OUTPUT_NAME hfs_rocksdb)
+  add_executable(hfs_rocksdb_smoke rocksdb/hfs_filesystem_smoke.cpp)
+  target_include_directories(hfs_rocksdb_smoke PRIVATE
+    ${ROCKSDB_ROOT}/include ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(hfs_rocksdb_smoke PRIVATE hfs_rocksdb ${ROCKSDB_LIBRARY})
 endif()
 
 if(HFS_WITH_SPDK)

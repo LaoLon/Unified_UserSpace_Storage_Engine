@@ -66,7 +66,7 @@ rocksdb::IOStatus openFile(const std::shared_ptr<HfsContext> &context,
     }
     auto outer = context->client->open(hfsPath(path), flags).wait();
     if (!outer.ok()) {
-        return rocksdb::IOStatus::IOError(outer.message());
+        return toIoStatus(outer);
     }
     auto inner = std::move(outer).value();
     if (!inner.ok()) {
@@ -89,7 +89,7 @@ public:
         hfs::IoVec buffer{reinterpret_cast<std::byte *>(scratch), n};
         auto read = file_->read(std::span<hfs::IoVec>(&buffer, 1), offset_).wait();
         if (!read.ok()) {
-            return rocksdb::IOStatus::IOError(read.message());
+            return toIoStatus(read);
         }
         auto value = std::move(read).value();
         if (!value.ok()) {
@@ -128,7 +128,7 @@ public:
         hfs::IoVec buffer{reinterpret_cast<std::byte *>(scratch), n};
         auto read = file_->read(std::span<hfs::IoVec>(&buffer, 1), offset).wait();
         if (!read.ok()) {
-            return rocksdb::IOStatus::IOError(read.message());
+            return toIoStatus(read);
         }
         auto value = std::move(read).value();
         if (!value.ok()) {
@@ -153,7 +153,7 @@ public:
                           data.size()};
         auto written = file_->append(std::span<const hfs::IoVec>(&buffer, 1)).wait();
         if (!written.ok()) {
-            return rocksdb::IOStatus::IOError(written.message());
+            return toIoStatus(written);
         }
         auto value = std::move(written).value();
         return value.ok() ? rocksdb::IOStatus::OK() : toIoStatus(value);
@@ -267,7 +267,7 @@ public:
         std::string cursor;
         do {
             auto page = context_->client->getChildren(hfsPath(dir), cursor, 4096).wait();
-            if (!page.ok()) return rocksdb::IOStatus::IOError(page.message());
+            if (!page.ok()) return toIoStatus(page);
             auto value = std::move(page).value();
             if (!value.ok()) return toIoStatus(value);
             for (const auto &entry : value.value().entries) result->push_back(entry.name);
@@ -280,8 +280,7 @@ public:
     rocksdb::IOStatus DeleteFile(const std::string &fname, const rocksdb::IOOptions &,
                                  rocksdb::IODebugContext *) override {
         auto removed = context_->client->remove(hfsPath(fname)).wait();
-        return removed.ok() ? toIoStatus(std::move(removed).value())
-                            : rocksdb::IOStatus::IOError(removed.message());
+        return removed.ok() ? toIoStatus(std::move(removed).value()) : toIoStatus(removed);
     }
 
     /* Creates one HFS directory entry. */
@@ -305,8 +304,7 @@ public:
     rocksdb::IOStatus DeleteDir(const std::string &dirname, const rocksdb::IOOptions &,
                                 rocksdb::IODebugContext *) override {
         auto removed = context_->client->remove(hfsPath(dirname)).wait();
-        return removed.ok() ? toIoStatus(std::move(removed).value())
-                            : rocksdb::IOStatus::IOError(removed.message());
+        return removed.ok() ? toIoStatus(std::move(removed).value()) : toIoStatus(removed);
     }
 
     /* Returns the logical HFS size, not a host-file size. */
@@ -338,8 +336,7 @@ public:
     rocksdb::IOStatus RenameFile(const std::string &src, const std::string &target,
                                  const rocksdb::IOOptions &, rocksdb::IODebugContext *) override {
         auto renamed = context_->client->rename(hfsPath(src), hfsPath(target)).wait();
-        return renamed.ok() ? toIoStatus(std::move(renamed).value())
-                            : rocksdb::IOStatus::IOError(renamed.message());
+        return renamed.ok() ? toIoStatus(std::move(renamed).value()) : toIoStatus(renamed);
     }
 
     /* Acquires a process lock for RocksDB's DB identity. */
