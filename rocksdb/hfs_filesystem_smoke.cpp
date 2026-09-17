@@ -65,6 +65,22 @@ int main(int argc, char **argv) {
     if (!status.ok() || result.compare(payload) != 0) {
         return 11;
     }
+    /* Verify MultiRead preserves independent request results and statuses. */
+    char multiScratchA[12]{};
+    char multiScratchB[12]{};
+    rocksdb::FSReadRequest multiRequests[2];
+    multiRequests[0].offset = 0;
+    multiRequests[0].len = sizeof(multiScratchA);
+    multiRequests[0].scratch = multiScratchA;
+    multiRequests[1].offset = 0;
+    multiRequests[1].len = sizeof(multiScratchB);
+    multiRequests[1].scratch = multiScratchB;
+    status = random->MultiRead(multiRequests, 2, options.io_options, &debug);
+    if (!status.ok() || !multiRequests[0].status.ok() ||
+        !multiRequests[1].status.ok() || multiRequests[0].result.compare(payload) != 0 ||
+        multiRequests[1].result.compare(payload) != 0) {
+        return 11;
+    }
     std::atomic<bool> callbackCalled = false;
     rocksdb::FSReadRequest request;
     request.offset = 0;
