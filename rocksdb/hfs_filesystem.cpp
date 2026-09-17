@@ -609,7 +609,7 @@ public:
         auto status = openFile(context_, fname, hfs::OpenFlags::None, &file);
         if (!status.ok()) return status;
         auto stat = file->stat();
-        if (!stat.ok()) return rocksdb::IOStatus::IOError(stat.message());
+        if (!stat.ok()) return toIoStatus(stat);
         *fileSize = stat.value().logicalSize;
         return rocksdb::IOStatus::OK();
     }
@@ -622,7 +622,7 @@ public:
         auto status = openFile(context_, fname, hfs::OpenFlags::None, &file);
         if (!status.ok()) return status;
         auto stat = file->stat();
-        if (!stat.ok()) return rocksdb::IOStatus::IOError(stat.message());
+        if (!stat.ok()) return toIoStatus(stat);
         *mtime = stat.value().mtimeNs;
         return rocksdb::IOStatus::OK();
     }
