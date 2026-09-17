@@ -76,6 +76,10 @@ int main(int argc, char **argv) {
     if (!status.ok() || result.compare(payload) != 0) {
         return 11;
     }
+    if (!random->MultiRead(nullptr, 0, options.io_options, &debug).ok() ||
+        random->MultiRead(nullptr, 1, options.io_options, &debug).ok()) {
+        return 11;
+    }
     /* Verify MultiRead preserves independent request results and statuses. */
     char multiScratchA[12]{};
     char multiScratchB[12]{};
@@ -114,6 +118,17 @@ int main(int argc, char **argv) {
         return 12;
     }
     deleter(ioHandle);
+    rocksdb::FSReadRequest invalidRequest;
+    invalidRequest.offset = 0;
+    invalidRequest.len = 1;
+    invalidRequest.scratch = nullptr;
+    void *invalidHandle = nullptr;
+    rocksdb::IOHandleDeleter invalidDeleter;
+    if (random->ReadAsync(invalidRequest, options.io_options,
+                          [](const rocksdb::FSReadRequest &, void *) {}, nullptr,
+                          &invalidHandle, &invalidDeleter, &debug).ok()) {
+        return 12;
+    }
     /* Exercise immediate AbortIO against several in-flight reads. */
     constexpr std::size_t cancelCount = 8;
     char cancelScratch[cancelCount][12]{};
