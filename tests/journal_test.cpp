@@ -178,6 +178,24 @@ hfs::JournalRecord setSize(std::uint64_t objectId, std::uint64_t size) {
 } // namespace
 
 int main() {
+    /* 0. checkpoint generation selects the newest slot when txid/sequence tie. */
+    {
+        Fixture fixture;
+        HFS_TEST_CHECK(fixture.valid());
+        HFS_TEST_CHECK(fixture.format() == 0);
+        MemoryTarget writer;
+        auto journal = fixture.open(&writer);
+        HFS_TEST_CHECK(journal != nullptr);
+        writer.values[7] = 100;
+        HFS_TEST_CHECK(journal->checkpoint().ok());
+        writer.values[7] = 200;
+        HFS_TEST_CHECK(journal->checkpoint().ok());
+        MemoryTarget reader;
+        auto reopened = fixture.open(&reader);
+        HFS_TEST_CHECK(reopened != nullptr);
+        HFS_TEST_CHECK(reader.values[7] == 200);
+    }
+
     /* 0. Multiple metadata requests share one journal transaction and flush. */
     {
         Fixture fixture;

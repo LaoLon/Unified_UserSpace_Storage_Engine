@@ -145,6 +145,27 @@ int main() {
         HFS_TEST_CHECK(expectInvalid(text, "duplicate-metadata") == 0);
     }
 
+    /* 16. a complete two-device metadata/data set is accepted by the schema. */
+    {
+        std::string text = base;
+        HFS_TEST_CHECK(replaceAll(text, "metadata_devices = nvme0\n",
+                                  "metadata_devices = nvme0,nvme1\n"));
+        HFS_TEST_CHECK(replaceAll(text, "data_devices = nvme0\n",
+                                  "data_devices = nvme0,nvme1\n"));
+        HFS_TEST_CHECK(replaceAll(text, "metadata_replication = 1",
+                                  "metadata_replication = 2"));
+        text += "\n[device.nvme1]\n"
+                "bdev_name = Nvme1n1\n"
+                "pci_bdf = 0000:0c:00.0\n"
+                "role = metadata,data\n"
+                "weight = 1\n"
+                "required = true\n";
+        auto parsed = hfs::parseConfig(text, "two-device-schema");
+        HFS_TEST_CHECK(parsed.ok());
+        HFS_TEST_CHECK(parsed.value().devices.size() == 2);
+        HFS_TEST_CHECK(parsed.value().metadataReplication == 2);
+    }
+
     std::printf("config_parser_test: ok\n");
     return 0;
 }
