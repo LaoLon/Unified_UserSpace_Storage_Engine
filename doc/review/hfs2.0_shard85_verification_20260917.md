@@ -18,9 +18,9 @@
 | numjobs | 2 |
 | 结果 | 20/20 运行 `err=0`，submit/complete 闭合 |
 
-在加入 worker-backed pending/completion 队列后，补跑了 QD=1/8/32/64、numjobs=1/2/4/8、
-4K/16K/64K/1M、write/read/randwrite/randread/randrw 子矩阵，共 320/320 组合通过，
-每项 `err=0`。这仍是单盘证据；QD=128 及双盘矩阵尚未据此宣称完成。
+在加入 worker-backed pending/completion 队列后，补跑了 QD=1/8/32/64/128、
+numjobs=1/2/4/8、4K/16K/64K/1M、write/read/randwrite/randread/randrw 子矩阵，
+共 400/400 组合通过，每项 `err=0`。这仍是单盘证据；双盘矩阵尚未据此宣称完成。
 
 此前已完成同一正式设备上的 RocksDB direct/async、正常 reopen、SIGKILL recovery、
 `hfs_ldb checkconsistency` 和 `hfsctl check`；FIO 4K loader smoke 加 `--verify=crc32c`
