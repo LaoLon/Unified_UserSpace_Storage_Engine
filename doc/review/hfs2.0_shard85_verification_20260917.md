@@ -26,6 +26,11 @@ numjobs=1/2/4/8、4K/16K/64K/1M、write/read/randwrite/randread/randrw 子矩阵
 `hfs_ldb checkconsistency` 和 `hfsctl check`；FIO 4K loader smoke 加 `--verify=crc32c`
 也通过且 `err=0`。
 
+RocksDB FileSystem smoke 还验证了 allocator-backed `GetFreeSpace`：真实 NVMe 单盘
+上初始可分配空间为 `31,398,559,744` 字节，写入一个 extent 后为 `31,397,511,168`
+字节，释放最后一个硬链接并关闭读句柄后恢复为 `31,398,559,744` 字节。该结果只
+证明单盘 data extent 统计和 open-handle 回收语义，不替代多盘容量矩阵。
+
 ## Shard-81 raw 对照结果
 
 按 §16.2 口径在同一 `0000:0b:00.0` 上完成 raw SPDK `bdevperf` 与 HFS FIO
