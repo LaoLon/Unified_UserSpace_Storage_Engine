@@ -247,7 +247,7 @@ int main() {
         MemoryTarget corrupt;
         auto corruptJournal = fixture.open(&corrupt);
         HFS_TEST_CHECK(corruptJournal != nullptr);
-        HFS_TEST_CHECK(corruptJournal->replay().ok());
+        HFS_TEST_CHECK(corruptJournal->replay().status() == hfs::Status::Corrupt);
         HFS_TEST_CHECK(corruptJournal->stats().lastTxid == 4);
         HFS_TEST_CHECK(!corruptJournal->stats().corruption.empty());
         HFS_TEST_CHECK(corrupt.values[7] == 400);
@@ -294,7 +294,7 @@ int main() {
         MemoryTarget reader;
         auto reopened = fixture.open(&reader);
         HFS_TEST_CHECK(reopened != nullptr);
-        HFS_TEST_CHECK(reopened->replay().ok());
+        HFS_TEST_CHECK(reopened->replay().status() == hfs::Status::Corrupt);
         HFS_TEST_CHECK(reopened->stats().lastTxid == 0);
         HFS_TEST_CHECK(!reopened->stats().corruption.empty());
     }

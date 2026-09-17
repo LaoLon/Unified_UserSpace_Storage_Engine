@@ -692,6 +692,7 @@ Result<void> Journal::replay() {
     impl.refreshStats();
     if (!impl.corruption.empty()) {
         log::error("journal replay stopped: %s", impl.corruption.c_str());
+        return makeError(Status::Corrupt, impl.corruption);
     }
     return Result<void>(Status::Ok);
 }
