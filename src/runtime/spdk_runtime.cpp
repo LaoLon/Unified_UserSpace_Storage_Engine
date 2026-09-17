@@ -369,8 +369,9 @@ struct SpdkRuntime::Impl {
                                         controlIoDone, holder);
             break;
         case ControlIo::Op::Flush:
-            rc = spdk_bdev_flush(desc, channel, io->offsetBlocks, io->blocks, controlIoDone,
-                                 holder);
+            /* io->offsetBlocks and io->blocks are already in bdev blocks. */
+            rc = spdk_bdev_flush_blocks(desc, channel, io->offsetBlocks, io->blocks,
+                                        controlIoDone, holder);
             break;
         }
         if (rc != 0) {

@@ -574,7 +574,15 @@ public:
                                                        candidate);
             if (!readResult.ok()) return readResult;
             if (candidate != reference) {
-                return makeError(Status::Corrupt, "metadata replica bytes diverged");
+                const auto mismatch = std::mismatch(reference.begin(), reference.end(),
+                                                    candidate.begin());
+                const std::size_t byteOffset =
+                    static_cast<std::size_t>(mismatch.first - reference.begin());
+                return makeError(Status::Corrupt,
+                                 "metadata replica bytes diverged at block " +
+                                     std::to_string(offsetBlocks) + " byte " +
+                                     std::to_string(byteOffset) + " on device " +
+                                     std::to_string(devices_[i].first));
             }
         }
         std::copy(reference.begin(), reference.end(), buffer.begin());
@@ -588,8 +596,17 @@ public:
             if (isSuperblock(offsetBlocks) && replica.size() >= sizeof(Hfs2Superblock)) {
                 Hfs2Superblock superblock{};
                 std::memcpy(&superblock, replica.data(), sizeof(superblock));
+                const DeviceGeometry &geometry = geometries_[entry.first];
                 superblock.deviceId = static_cast<std::uint32_t>(entry.first);
-                superblock.replicaId = geometries_[entry.first].replicaId;
+                superblock.replicaId = geometry.replicaId;
+                superblock.deviceBlocks = geometry.deviceBlocks;
+                superblock.journalStart = geometry.journalStart;
+                superblock.journalBlocks = geometry.journalBlocks;
+                superblock.checkpointAStart = geometry.checkpointAStart;
+                superblock.checkpointBStart = geometry.checkpointBStart;
+                superblock.checkpointBlocks = geometry.checkpointBlocks;
+                superblock.dataStart = geometry.dataStart;
+                superblock.dataBlocks = geometry.dataBlocks;
                 superblockFinalize(superblock);
                 std::memcpy(replica.data(), &superblock, sizeof(superblock));
             }
@@ -637,7 +654,8 @@ private:
 
     SpdkRuntime &runtime_;
     const Config &config_;
-    const std::vector<DeviceGeometry> &geometries_;
+    /* Own the geometry because Journal can outlive the Engine accessor's copy. */
+    std::vector<DeviceGeometry> geometries_;
     std::size_t primaryIndex_;
     std::vector<std::pair<std::size_t, std::unique_ptr<RuntimeJournalDevice>>> devices_;
 };

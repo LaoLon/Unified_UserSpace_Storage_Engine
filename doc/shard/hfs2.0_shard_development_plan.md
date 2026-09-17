@@ -361,7 +361,9 @@ rename 后 Fsync 语义正确。
 > replay，以及 BEGIN/RECORD/COMMIT 三阶段写入失败、COMMIT 后 flush 失败、checkpoint
 > slot/superblock publish/flush 失败注入测试；mount/正常 stop 的 clean-flag 生命周期
 > 已落盘，真实 NVMe 上正常 reopen 显示 clean=1、SIGKILL recovery 显示 clean=0。
-> 其余 data flush crash 断点与多盘 fail-closed 仍待完成。
+> 其余 data flush crash 断点仍待完成；双盘真实 fail-closed 已覆盖缺失 BDF、落后
+> generation 和双槽 CRC，且修复了控制 flush 单位、目标盘 geometry 镜像及 mirrored
+> journal geometry 生命周期问题。
 
 **交付物**：§16.4 五个崩溃断点注入；orphan reclaim；内存 after-image 失败回滚；
 `hfsctl check` 取证；ext4 同 workload 语义对照；**多副本执行**：按 Shard-70/71 冻结的

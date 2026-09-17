@@ -113,3 +113,8 @@ clean/dirty 标志会造成 superblock generation 漂移，已修复为共享版
 | `Nvme1n1` 两个 superblock CRC 损坏 | mount 非零，报告设备未格式化 |
 
 每项探针后均重新 format 双盘并恢复两个 BDF 到 kernel `nvme`，未留下损坏测试状态。
+
+随后修复了三项双盘实现缺陷：控制 flush 的块/字节单位错误、镜像 superblock 未应用
+目标盘 geometry、以及 mirrored journal 保存临时 geometry 引用造成的悬空引用。修复
+后的真实双盘 `hfs_rocksdb_smoke` 和 `hfsctl check` 均返回 0；两盘分别报告有效
+superblock、checkpoint 和相同 journal 状态。
