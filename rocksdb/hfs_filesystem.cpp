@@ -482,7 +482,11 @@ public:
             if (handle == nullptr) continue;
             auto *state = static_cast<AsyncReadState *>(handle);
             std::lock_guard<std::mutex> lock(state->mutex);
-            if (!state->completed) state->aborted = true;
+            if (!state->completed) {
+                state->aborted = true;
+                state->request->status = rocksdb::IOStatus::IOError(
+                    "async read aborted");
+            }
         }
         return rocksdb::IOStatus::OK();
     }

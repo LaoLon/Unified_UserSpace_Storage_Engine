@@ -209,6 +209,14 @@ int main(int argc, char **argv) {
         return 12;
     }
     for (std::size_t index = 0; index < cancelCount; ++index) {
+        if (cancelRequests[index].status.ok()) {
+            for (std::size_t cleanup = 0; cleanup < cancelCount; ++cleanup) {
+                cancelDeleters[cleanup](cancelHandles[cleanup]);
+            }
+            return 12;
+        }
+    }
+    for (std::size_t index = 0; index < cancelCount; ++index) {
         cancelDeleters[index](cancelHandles[index]);
     }
     std::vector<std::string> children;
