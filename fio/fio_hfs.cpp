@@ -44,7 +44,6 @@ struct FioHfsFile {
 struct FioHfsThread {
     std::shared_ptr<hfs::Engine> engine;
     std::shared_ptr<hfs::Client> client;
-    std::size_t maxOutstanding = 32;
     std::vector<io_u *> completed;
     std::vector<io_u *> ready;
 };
@@ -249,7 +248,6 @@ int fioHfsInit(struct thread_data *td) {
     auto *state = new FioHfsThread;
     state->engine = std::move(engine);
     state->client = std::move(client).value();
-    state->maxOutstanding = clientDepth == 0 ? 1 : clientDepth;
     td->io_ops_data = state;
     return 0;
 }
@@ -347,10 +345,6 @@ enum fio_q_status fioHfsQueue(struct thread_data *td, struct io_u *io) {
             state->completed.push_back(io);
         }
         return FIO_Q_COMPLETED;
-    }
-    /* Bound completed-but-not-reaped requests so fio can apply backpressure. */
-    if (state->completed.size() >= state->maxOutstanding) {
-        return FIO_Q_BUSY;
     }
     hfs::IoVec buffer{static_cast<std::byte *>(io->xfer_buf), io->xfer_buflen};
     if (io->ddir == DDIR_READ) {
