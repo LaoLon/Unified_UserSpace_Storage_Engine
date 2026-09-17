@@ -665,6 +665,14 @@ Result<void> Journal::replay() {
             break;
         }
         if (impl.target != nullptr) {
+            std::vector<std::byte> beforeImage;
+            auto saved = impl.target->saveSnapshot(impl.lastTxid, beforeImage);
+            if (!saved.ok()) {
+                impl.corruption = "target snapshot failed before txid " +
+                                   std::to_string(begin.txid);
+                impl.refreshStats();
+                return makeError(Status::Corrupt, impl.corruption);
+            }
             for (const auto &payload : records) {
                 JournalRecord record;
                 record.type = static_cast<JournalRecordType>(payload.type);
@@ -673,7 +681,11 @@ Result<void> Journal::replay() {
                 record.arg1 = payload.arg1;
                 auto applied = impl.target->apply(record);
                 if (!applied.ok()) {
+                    auto restored = impl.target->loadSnapshot(beforeImage);
                     impl.corruption = "target rejected txid " + std::to_string(begin.txid);
+                    if (!restored.ok()) {
+                        impl.corruption += "; target after-image restore failed";
+                    }
                     impl.refreshStats();
                     return makeError(Status::Corrupt, impl.corruption);
                 }
@@ -769,17 +781,28 @@ Result<std::uint64_t> Journal::append(std::span<const JournalRecord> records,
         }
     }
     impl.head = sequence + 1;
-    impl.lastTxid = txid;
     if (impl.target != nullptr) {
         /* Committing a transaction publishes it to the in-memory state. */
+        std::vector<std::byte> beforeImage;
+        auto saved = impl.target->saveSnapshot(impl.lastTxid, beforeImage);
+        if (!saved.ok()) {
+            return makeError<std::uint64_t>(Status::Corrupt,
+                                            "target snapshot failed before committed record");
+        }
         for (const auto &record : records) {
             auto applied = impl.target->apply(record);
             if (!applied.ok()) {
+                auto restored = impl.target->loadSnapshot(beforeImage);
+                if (!restored.ok()) {
+                    return makeError<std::uint64_t>(
+                        Status::Corrupt, "replay target rejected record and restore failed");
+                }
                 return makeError<std::uint64_t>(Status::Corrupt,
                                                 "replay target rejected committed record");
             }
         }
     }
+    impl.lastTxid = txid;
     impl.refreshStats();
     return txid;
 }

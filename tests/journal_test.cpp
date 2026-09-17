@@ -1,5 +1,6 @@
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <memory>
 #include <string>
@@ -61,6 +62,9 @@ private:
 class MemoryTarget final : public hfs::JournalTarget {
 public:
     hfs::Result<void> apply(const hfs::JournalRecord &record) override {
+        if (applied >= failAfter) {
+            return hfs::makeError(hfs::Status::Corrupt, "injected target failure");
+        }
         if (record.type == hfs::JournalRecordType::SetSize) {
             values[record.objectId] = record.arg0;
         } else if (record.type == hfs::JournalRecordType::Create) {
@@ -97,6 +101,7 @@ public:
 
     std::map<std::uint64_t, std::uint64_t> values;
     std::uint64_t applied = 0;
+    std::uint64_t failAfter = std::numeric_limits<std::uint64_t>::max();
 
 private:
     static hfs::Result<void> ok() { return hfs::Result<void>(hfs::Status::Ok); }
@@ -253,7 +258,21 @@ int main() {
         HFS_TEST_CHECK(corrupt.values[7] == 400);
     }
 
-    /* 2. force threshold triggers an automatic checkpoint instead of NoSpace */
+    /* 2. A target failure rolls back the whole in-memory after-image. */
+    {
+        Fixture fixture;
+        HFS_TEST_CHECK(fixture.valid());
+        HFS_TEST_CHECK(fixture.format() == 0);
+        MemoryTarget target;
+        target.failAfter = 1;
+        auto journal = fixture.open(&target);
+        HFS_TEST_CHECK(journal != nullptr);
+        auto appended = journal->append({setSize(11, 100), setSize(11, 200)}, true);
+        HFS_TEST_CHECK(appended.status() == hfs::Status::Corrupt);
+        HFS_TEST_CHECK(target.values.empty());
+    }
+
+    /* 3. force threshold triggers an automatic checkpoint instead of NoSpace */
     {
         Fixture fixture;
         HFS_TEST_CHECK(fixture.valid());
@@ -277,7 +296,7 @@ int main() {
         HFS_TEST_CHECK(reopened->stats().corruption.empty());
     }
 
-    /* 3. orphan record at the ring tail is corruption evidence */
+    /* 4. orphan record at the ring tail is corruption evidence */
     {
         Fixture fixture;
         HFS_TEST_CHECK(fixture.valid());
