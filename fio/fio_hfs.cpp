@@ -2,14 +2,17 @@
  * contract synchronous while the core grows its reactor-backed polling path. */
 
 #include <cerrno>
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstdio>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <span>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "fio.h"
@@ -41,9 +44,19 @@ struct FioHfsFile {
     std::shared_ptr<hfs::File> file;
 };
 
+struct FioHfsPending {
+    io_u *io = nullptr;
+    std::shared_ptr<hfs::File> file;
+    std::thread worker;
+};
+
 struct FioHfsThread {
     std::shared_ptr<hfs::Engine> engine;
     std::shared_ptr<hfs::Client> client;
+    std::size_t maxOutstanding = 32;
+    std::mutex mutex;
+    std::condition_variable condition;
+    std::vector<std::unique_ptr<FioHfsPending>> pending;
     std::vector<io_u *> completed;
     std::vector<io_u *> ready;
 };
@@ -248,6 +261,7 @@ int fioHfsInit(struct thread_data *td) {
     auto *state = new FioHfsThread;
     state->engine = std::move(engine);
     state->client = std::move(client).value();
+    state->maxOutstanding = clientDepth == 0 ? 1 : clientDepth;
     td->io_ops_data = state;
     return 0;
 }
@@ -257,8 +271,19 @@ void fioHfsCleanup(struct thread_data *td) {
     if (state == nullptr) {
         return;
     }
-    state->ready.clear();
-    state->completed.clear();
+    /* Join every worker before releasing the client and its engine. */
+    std::vector<std::unique_ptr<FioHfsPending>> pending;
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        pending = std::move(state->pending);
+        state->ready.clear();
+        state->completed.clear();
+    }
+    for (auto &request : pending) {
+        if (request->worker.joinable()) {
+            request->worker.join();
+        }
+    }
     if (state->client != nullptr) {
         state->client->close().wait();
     }
@@ -335,42 +360,77 @@ int fioHfsGetFileSize(struct thread_data *td, struct fio_file *fioFile) {
     return 0;
 }
 
+/* Executes one FIO request without crossing the caller's queue callback. */
+void executeFioIo(io_u *io, const std::shared_ptr<hfs::File> &file) {
+    try {
+        hfs::IoVec buffer{static_cast<std::byte *>(io->xfer_buf), io->xfer_buflen};
+        if (io->ddir == DDIR_READ) {
+            auto taskResult = file->read(std::span<hfs::IoVec>(&buffer, 1), io->offset).wait();
+            if (!taskResult.ok() || !taskResult.value().ok()) {
+                io->error = taskResult.ok() ? fioError(taskResult.value().status()) : EIO;
+                io->resid = io->xfer_buflen;
+            } else {
+                io->error = 0;
+                io->resid = io->xfer_buflen - taskResult.value().value().bytes;
+            }
+        } else if (io->ddir == DDIR_WRITE) {
+            auto taskResult =
+                file->write(std::span<const hfs::IoVec>(&buffer, 1), io->offset).wait();
+            if (!taskResult.ok() || !taskResult.value().ok()) {
+                io->error = taskResult.ok() ? fioError(taskResult.value().status()) : EIO;
+                io->resid = io->xfer_buflen;
+            } else {
+                io->error = 0;
+                io->resid = io->xfer_buflen - taskResult.value().value().bytes;
+            }
+        } else {
+            io->error = EOPNOTSUPP;
+            io->resid = io->xfer_buflen;
+        }
+    } catch (...) {
+        io->error = EIO;
+        io->resid = io->xfer_buflen;
+    }
+}
+
 enum fio_q_status fioHfsQueue(struct thread_data *td, struct io_u *io) {
     auto *state = static_cast<FioHfsThread *>(td->io_ops_data);
     auto *file = io->file == nullptr ? nullptr
                                      : static_cast<FioHfsFile *>(io->file->engine_data);
     if (state == nullptr || file == nullptr || file->file == nullptr) {
         io->error = EINVAL;
-        /* FIO_Q_COMPLETED returns this failed request directly to fio. */
         return FIO_Q_COMPLETED;
     }
-    hfs::IoVec buffer{static_cast<std::byte *>(io->xfer_buf), io->xfer_buflen};
-    if (io->ddir == DDIR_READ) {
-        auto taskResult = file->file->read(std::span<hfs::IoVec>(&buffer, 1), io->offset).wait();
-        if (!taskResult.ok() || !taskResult.value().ok()) {
-            io->error = taskResult.ok() ? fioError(taskResult.value().status()) : EIO;
-            io->resid = io->xfer_buflen;
-        } else {
-            io->error = 0;
-            io->resid = io->xfer_buflen - taskResult.value().value().bytes;
+    auto request = std::make_unique<FioHfsPending>();
+    request->io = io;
+    request->file = file->file;
+    auto *requestPtr = request.get();
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        if (state->pending.size() >= state->maxOutstanding) {
+            return FIO_Q_BUSY;
         }
-    } else if (io->ddir == DDIR_WRITE) {
-        auto taskResult =
-            file->file->write(std::span<const hfs::IoVec>(&buffer, 1), io->offset).wait();
-        if (!taskResult.ok() || !taskResult.value().ok()) {
-            io->error = taskResult.ok() ? fioError(taskResult.value().status()) : EIO;
-            io->resid = io->xfer_buflen;
-        } else {
-            io->error = 0;
-            io->resid = io->xfer_buflen - taskResult.value().value().bytes;
-        }
-    } else {
-        io->error = EOPNOTSUPP;
-        io->resid = io->xfer_buflen;
+        state->pending.push_back(std::move(request));
     }
-    /* Synchronous HFS operations are already complete; do not enqueue them
-     * again, because FIO_Q_COMPLETED bypasses getevents(). */
-    return FIO_Q_COMPLETED;
+    try {
+        requestPtr->worker = std::thread([state, requestPtr] {
+            executeFioIo(requestPtr->io, requestPtr->file);
+            {
+                std::lock_guard<std::mutex> lock(state->mutex);
+                state->completed.push_back(requestPtr->io);
+            }
+            state->condition.notify_all();
+        });
+    } catch (...) {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->pending.erase(
+            std::remove_if(state->pending.begin(), state->pending.end(),
+                           [requestPtr](const auto &entry) { return entry.get() == requestPtr; }),
+            state->pending.end());
+        io->error = EAGAIN;
+        return FIO_Q_COMPLETED;
+    }
+    return FIO_Q_QUEUED;
 }
 
 int fioHfsGetevents(struct thread_data *td, unsigned int min, unsigned int max,
@@ -379,16 +439,32 @@ int fioHfsGetevents(struct thread_data *td, unsigned int min, unsigned int max,
     if (state == nullptr || max == 0) {
         return 0;
     }
-    state->ready.clear();
-    const unsigned int count = static_cast<unsigned int>(state->completed.size());
-    if (count < min) {
-        return 0;
+    std::vector<std::unique_ptr<FioHfsPending>> finished;
+    {
+        std::unique_lock<std::mutex> lock(state->mutex);
+        state->condition.wait(lock, [state, min] {
+            return state->completed.size() >= min;
+        });
+        const unsigned int take = static_cast<unsigned int>(
+            std::min<std::size_t>(max, state->completed.size()));
+        state->ready.assign(state->completed.begin(), state->completed.begin() + take);
+        state->completed.erase(state->completed.begin(), state->completed.begin() + take);
+        for (unsigned int index = 0; index < take; ++index) {
+            auto found = std::find_if(
+                state->pending.begin(), state->pending.end(),
+                [io = state->ready[index]](const auto &entry) { return entry->io == io; });
+            if (found != state->pending.end()) {
+                finished.push_back(std::move(*found));
+                state->pending.erase(found);
+            }
+        }
     }
-    const unsigned int take = count < max ? count : max;
-    state->ready.insert(state->ready.end(), state->completed.begin(),
-                        state->completed.begin() + take);
-    state->completed.erase(state->completed.begin(), state->completed.begin() + take);
-    return static_cast<int>(take);
+    for (auto &request : finished) {
+        if (request->worker.joinable()) {
+            request->worker.join();
+        }
+    }
+    return static_cast<int>(state->ready.size());
 }
 
 struct io_u *fioHfsEvent(struct thread_data *td, int event) {
