@@ -3,6 +3,7 @@
 #include "rocksdb/hfs_filesystem.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cerrno>
 #include <condition_variable>
 #include <cstdint>
@@ -213,6 +214,15 @@ struct AsyncReadState {
 void executeAsyncRead(AsyncReadState *state) {
     rocksdb::IOStatus status = rocksdb::IOStatus::IOError("async read failed");
     try {
+        /* Test-only delay makes the pre-callback AbortIO boundary deterministic. */
+        const char *delayText = std::getenv("HFS_TEST_ASYNC_READ_DELAY_MS");
+        if (delayText != nullptr && *delayText != '\0') {
+            char *end = nullptr;
+            const unsigned long delay = std::strtoul(delayText, &end, 10);
+            if (end != delayText && *end == '\0' && delay <= 60000) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+            }
+        }
         hfs::IoVec buffer{reinterpret_cast<std::byte *>(state->request->scratch),
                           state->request->len};
         auto read = state->file->read(std::span<hfs::IoVec>(&buffer, 1),

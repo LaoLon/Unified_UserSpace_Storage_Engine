@@ -513,6 +513,8 @@ RMW 放大；`AbortIO` 遵守 cancel boundary。
 > RocksDB smoke 中验证缺失路径不会退化为通用 I/O 错误。
 > 另补齐 `LockFile` 空输出参数保护、锁竞争与其他 host 错误的区分，以及 `NoSpace`
 > 到 RocksDB 子码的映射；真实 NVMe smoke 覆盖空输出、锁竞争和缺失路径断言。
+> FileSystem smoke 还覆盖了 atomic rename 的新旧路径语义，并在删除重命名后的文件
+> 后验证 free-space reclaim；该路径已随单盘真实 NVMe 全 smoke 通过。
 > 随后按 RocksDB 8.9.1 的 exact `IOStatus` 接口收口：`TryAgain` 统一映射为设置
 > `retryable` 的 `Busy`（该版本没有 `IOStatus::TryAgain`），`Cancelled` 映射为
 > `Aborted`，`TimedOut` 映射为 `TimedOut`，`Corrupt` 映射为 `Corruption`；构建、
