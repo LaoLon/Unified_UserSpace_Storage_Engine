@@ -1356,6 +1356,12 @@ checkpoint region 必须容纳 namespace/inode/extent map/各 device allocator b
   返回 `Cancelled`；in-flight 取消仍只由 RocksDB async `AbortIO` 契约负责。
   DataPath 已修正为按请求轮询已启动的 data reactors，不再把所有数据 I/O 固定到
   reactor 0；真实 NVMe FIO smoke 回归通过，性能 gate 仍以正式 raw 对照为准。
+  2026-09-18：RocksDB `ReadAsync` 已实现 `IOOptions::timeout` 的前端等待语义；超时
+  返回 `TimedOut` 后，后台 I/O 继续排空，句柄析构时才回收 worker 和 buffer，且不会
+  在 callback 后写回 request result。DataPath 的 `-ETIMEDOUT`、`-ECANCELED`、
+  `-EAGAIN` 和 `-ENOSPC` 也分别映射为 core 的 TimedOut、Cancelled、Busy 和 NoSpace；
+  RocksDB FileSystem 输出参数空指针统一返回 InvalidArgument。上述边界已由真实
+  `Nvme0n1` 回归覆盖，但完整错误/取消组合矩阵仍未闭合。
 - 所有 gate 通过后删除新树中最后的旧兼容残留；
 - `src_legacy_frozen/` 保持本地忽略或单独归档，不回到 product build；
 - 更新架构索引、性能基线、支持边界和迁移说明；
