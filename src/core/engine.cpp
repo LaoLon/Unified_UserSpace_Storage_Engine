@@ -19,6 +19,7 @@
 #include "core/operation.hpp"
 #include "metadata/namespace.hpp"
 #include "runtime/spdk_runtime.hpp"
+#include "hfs/journal.hpp"
 #include "storage/volume.hpp"
 
 #if defined(HFS_WITH_SPDK)
@@ -226,6 +227,21 @@ Task<Result<void>> Engine::mount() {
         runtime.stop();
         co_return makeError(volume.status(), volume.message());
     }
+    impl.geometries = volume.value().devices;
+
+    /* Validate the metadata journal before exposing any mounted namespace. */
+    auto journal = Journal::open(*this, nullptr, 0);
+    if (!journal.ok()) {
+        runtime.stop();
+        co_return makeError(journal.status(), "metadata journal open failed: " +
+                                               journal.message());
+    }
+    auto replay = journal.value()->replay();
+    if (!replay.ok()) {
+        runtime.stop();
+        co_return makeError(replay.status(), "metadata journal replay failed: " +
+                                                replay.message());
+    }
     /* Resident namespace state; durability is wired with the metadata
      * transaction path (journal replay/checkpoint of inode records). */
     metadata::NamespaceConfig namespaceConfig;
@@ -292,7 +308,6 @@ Task<Result<void>> Engine::mount() {
                                                  pathConfig);
     impl.formatted = true;
     impl.uuid = volume.value().uuid;
-    impl.geometries = volume.value().devices;
     impl.mounted = true;
     stats::setEnabled(impl.config.stats);
     trace::setEnabled(impl.config.trace);

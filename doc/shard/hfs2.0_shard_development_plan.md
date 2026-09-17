@@ -357,7 +357,8 @@ rename 后 Fsync 语义正确。
 ### Shard-79：crash replay、fault injection 与多盘 fail-closed
 
 > 状态：进行中（2026-09-17）。Journal replay 已对结构损坏返回 `Corrupt` 并保留
-> corruption evidence；其余 crash 断点、orphan reclaim 和多盘 fail-closed 仍待完成。
+> corruption evidence；已加入 transaction after-image 回滚和 mount 前 scan-only
+> replay，真实 NVMe 挂载回归通过。其余 crash 断点与多盘 fail-closed 仍待完成。
 
 **交付物**：§16.4 五个崩溃断点注入；orphan reclaim；内存 after-image 失败回滚；
 `hfsctl check` 取证；ext4 同 workload 语义对照；**多副本执行**：按 Shard-70/71 冻结的
