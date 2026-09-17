@@ -57,6 +57,23 @@ int runBenchmark(const BenchOptions &options) {
     }
     std::unique_ptr<rocksdb::DB> db(database);
     const bool readOnly = options.benchmark == "readrandom";
+    const bool overwrite = options.benchmark == "overwrite";
+    const bool readWhileWriting = options.benchmark == "readwhilewriting";
+
+    /* Seed stable keys before overwrite so the mode exercises replacement of
+     * existing values rather than another append-only workload. */
+    if (overwrite) {
+        for (std::uint64_t i = 0; i < options.num; ++i) {
+            const std::string key = "key-" + std::to_string(i);
+            const rocksdb::Status status =
+                db->Put(rocksdb::WriteOptions(), key, "initial-" + std::to_string(i));
+            if (!status.ok()) {
+                std::cerr << "seed Put failed: " << status.ToString() << "\n";
+                return 5;
+            }
+        }
+    }
+
     for (std::uint64_t i = 0; i < options.num; ++i) {
         const std::string key = "key-" + std::to_string(i);
         if (readOnly) {
@@ -67,11 +84,31 @@ int runBenchmark(const BenchOptions &options) {
                 return 4;
             }
         } else {
-            const std::string value = "value-" + std::to_string(i);
+            const std::string value = (overwrite ? "updated-" : "value-") +
+                                      std::to_string(i);
             rocksdb::Status status = db->Put(rocksdb::WriteOptions(), key, value);
             if (!status.ok()) {
                 std::cerr << "Put failed: " << status.ToString() << "\n";
                 return 5;
+            }
+            if (readWhileWriting) {
+                std::string readBack;
+                status = db->Get(rocksdb::ReadOptions(), key, &readBack);
+                if (!status.ok() || readBack != value) {
+                    std::cerr << "readwhilewriting verification failed for " << key << "\n";
+                    return 4;
+                }
+            }
+        }
+    }
+    if (overwrite) {
+        for (std::uint64_t i = 0; i < options.num; ++i) {
+            std::string value;
+            const std::string key = "key-" + std::to_string(i);
+            const rocksdb::Status status = db->Get(rocksdb::ReadOptions(), key, &value);
+            if (!status.ok() || value != "updated-" + std::to_string(i)) {
+                std::cerr << "overwrite verification failed for " << key << "\n";
+                return 4;
             }
         }
     }
