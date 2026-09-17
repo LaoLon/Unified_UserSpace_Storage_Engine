@@ -86,13 +86,15 @@ int main(int argc, char **argv) {
     }
     const uint64_t allocatedFreeSpace = freeSpace;
     uint64_t missingSize = 0;
-    if (fileSystem->GetFileSize("/rocksdb-missing", options.io_options, &missingSize,
-                                &debug).ok()) {
+    auto missingSizeStatus =
+        fileSystem->GetFileSize("/rocksdb-missing", options.io_options, &missingSize, &debug);
+    if (missingSizeStatus.ok() || !missingSizeStatus.IsNotFound()) {
         return 7;
     }
     uint64_t missingMtime = 0;
-    if (fileSystem->GetFileModificationTime("/rocksdb-missing", options.io_options,
-                                            &missingMtime, &debug).ok()) {
+    auto missingMtimeStatus = fileSystem->GetFileModificationTime(
+        "/rocksdb-missing", options.io_options, &missingMtime, &debug);
+    if (missingMtimeStatus.ok() || !missingMtimeStatus.IsNotFound()) {
         return 7;
     }
     /* Verify LinkFile preserves the same inode before deleting both names. */
