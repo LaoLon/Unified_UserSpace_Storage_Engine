@@ -270,7 +270,7 @@ int fioHfsInit(struct thread_data *td) {
     state->maxOutstanding = clientDepth == 0 ? 1 : clientDepth;
     try {
         /* Keep a small fixed pool per fio worker to bound host-thread fanout. */
-        const std::size_t workerCount = std::min<std::size_t>(4, state->maxOutstanding);
+        const std::size_t workerCount = std::min<std::size_t>(16, state->maxOutstanding);
         state->workers.reserve(workerCount);
         for (std::size_t index = 0; index < workerCount; ++index) {
             state->workers.emplace_back(fioHfsWorker, state);
