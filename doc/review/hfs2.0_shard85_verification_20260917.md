@@ -55,6 +55,9 @@ NVMe `--verify=crc32c` loader smoke 继续通过。另执行了 QD=128、numjobs
 failure。该项是可定位的资源边界，不是数据错误；矩阵因此停止，不能记录为 400/400
 通过，后续需在 arena 预算或 admission 设计修复后重跑。
 
+DmaArena 单元回归还覆盖了共享 cap 满载时的背压：释放在 200ms 等待窗口内唤醒
+成功，无释放时 10ms 后返回 `Busy`；该路径未引入无界等待。
+
 ## Shard-81 raw 对照结果
 
 按 §16.2 口径在同一 `0000:0b:00.0` 上完成 raw SPDK `bdevperf` 与 HFS FIO

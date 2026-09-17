@@ -390,6 +390,8 @@ fail closed 且现场保留；多盘掉一块 metadata device 拒绝 mount，不
 > 重新执行带持久化结果的完整矩阵后，前 315 项通过；在 QD=64、numjobs=8、1MiB、
 > write 首次触及 512 MiB 共享 arena cap，FIO 返回资源申请失败。该结果证明了
 > cap 边界和失败可定位，但完整矩阵仍未通过，不能把资源失败当作数据面通过。
+> DmaArena 单测同时覆盖了 cap 满时的有限等待：释放在超时窗口内会唤醒并成功取得
+> lease；无释放则按时返回 `Busy`，没有无界等待。
 
 **80A 交付物**：`fio-hfs.so`（`extern "C"` 注册）；options（`hfs_config/hfs_direct/
 hfs_preallocate/hfs_client_depth`）；`open_file` 完成 create/open/allocate +
