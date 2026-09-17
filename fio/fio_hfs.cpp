@@ -155,7 +155,11 @@ int fioHfsIomemAlloc(struct thread_data *td, size_t totalMem) {
     }
     auto acquired = engine->acquireDmaBuffer(totalMem, 0);
     if (!acquired.ok()) {
-        fioLog("fio-hfs: complete DMA arena allocation failed\n");
+        if (acquired.status() == hfs::Status::Busy) {
+            fioLog("fio-hfs: requested fio DMA arena exceeds mount cap\n");
+        } else {
+            fioLog("fio-hfs: complete DMA arena allocation failed\n");
+        }
         return 1;
     }
     td->orig_buffer = reinterpret_cast<char *>(acquired.value().data());
