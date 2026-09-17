@@ -341,9 +341,7 @@ enum fio_q_status fioHfsQueue(struct thread_data *td, struct io_u *io) {
                                      : static_cast<FioHfsFile *>(io->file->engine_data);
     if (state == nullptr || file == nullptr || file->file == nullptr) {
         io->error = EINVAL;
-        if (state != nullptr) {
-            state->completed.push_back(io);
-        }
+        /* FIO_Q_COMPLETED returns this failed request directly to fio. */
         return FIO_Q_COMPLETED;
     }
     hfs::IoVec buffer{static_cast<std::byte *>(io->xfer_buf), io->xfer_buflen};
@@ -370,7 +368,8 @@ enum fio_q_status fioHfsQueue(struct thread_data *td, struct io_u *io) {
         io->error = EOPNOTSUPP;
         io->resid = io->xfer_buflen;
     }
-    state->completed.push_back(io);
+    /* Synchronous HFS operations are already complete; do not enqueue them
+     * again, because FIO_Q_COMPLETED bypasses getevents(). */
     return FIO_Q_COMPLETED;
 }
 
