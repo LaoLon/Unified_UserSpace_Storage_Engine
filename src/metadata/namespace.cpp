@@ -1230,6 +1230,25 @@ std::uint64_t Namespace::deviceStartExtent(std::uint32_t deviceId) const noexcep
     return config_.deviceStartExtents[deviceId];
 }
 
+/* Sums allocator capacity without exposing metadata or reserved extents. */
+std::uint64_t Namespace::freeDataBytes() const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::uint64_t freeBytes = 0;
+    for (const auto &allocator : allocators_) {
+        const std::uint64_t freeExtents = allocator->allocatableExtents();
+        if (freeExtents > std::numeric_limits<std::uint64_t>::max() /
+                              config_.extentBytes) {
+            return std::numeric_limits<std::uint64_t>::max();
+        }
+        const std::uint64_t bytes = freeExtents * config_.extentBytes;
+        if (freeBytes > std::numeric_limits<std::uint64_t>::max() - bytes) {
+            return std::numeric_limits<std::uint64_t>::max();
+        }
+        freeBytes += bytes;
+    }
+    return freeBytes;
+}
+
 Namespace::Stats Namespace::stats() const {
     std::lock_guard<std::mutex> lock(mutex_);
     Stats stats = stats_;

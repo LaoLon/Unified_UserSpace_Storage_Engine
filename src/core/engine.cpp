@@ -548,6 +548,14 @@ std::array<std::uint8_t, 16> Engine::volumeUuid() const noexcept { return impl_-
 
 std::vector<DeviceGeometry> Engine::deviceGeometries() const { return impl_->geometries; }
 
+/* Exposes allocator-backed free data capacity to frontend adapters. */
+std::uint64_t Engine::freeDataBytes() const noexcept {
+    if (impl_ == nullptr || impl_->namespaceState == nullptr) {
+        return 0;
+    }
+    return impl_->namespaceState->freeDataBytes();
+}
+
 Result<void> Engine::readDeviceBlocks(std::size_t deviceIndex, std::uint64_t offsetBlocks,
                                       std::span<std::byte> buffer) {
     if (!processValid()) {

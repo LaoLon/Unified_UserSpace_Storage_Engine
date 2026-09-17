@@ -711,13 +711,10 @@ public:
         return rocksdb::IOStatus::OK();
     }
 
-    /* Reports aggregate configured device capacity as the buffered free-space bound. */
+    /* Reports only allocator-backed data capacity, excluding metadata regions. */
     rocksdb::IOStatus GetFreeSpace(const std::string &, const rocksdb::IOOptions &,
                                    uint64_t *freeSpace, rocksdb::IODebugContext *) override {
-        *freeSpace = 0;
-        for (std::size_t i = 0; i < context_->engine->deviceGeometries().size(); ++i) {
-            *freeSpace += context_->engine->deviceCapacityBytes(i);
-        }
+        *freeSpace = context_->engine->freeDataBytes();
         return rocksdb::IOStatus::OK();
     }
 

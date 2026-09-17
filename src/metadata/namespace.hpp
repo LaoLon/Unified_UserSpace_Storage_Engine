@@ -119,6 +119,8 @@ public:
 
     std::uint64_t extentBytes() const noexcept { return config_.extentBytes; }
     std::uint64_t deviceStartExtent(std::uint32_t deviceId) const noexcept;
+    /* Returns the currently allocatable data capacity in bytes. */
+    std::uint64_t freeDataBytes() const noexcept;
 
 private:
     Namespace(const NamespaceConfig &config, Clock clock, void *clockContext);

@@ -85,6 +85,8 @@ public:
     bool formatted() const noexcept;
     std::array<std::uint8_t, 16> volumeUuid() const noexcept;
     std::vector<DeviceGeometry> deviceGeometries() const;
+    /* Returns allocatable data bytes across the configured data devices. */
+    std::uint64_t freeDataBytes() const noexcept;
 
     /* Control-path device block I/O (format/mount/tools); requires an active
      * runtime and a buffer that is a multiple of the device block size. */

@@ -240,6 +240,7 @@ int main() {
         auto source = Namespace::create(config, fakeClock, nullptr);
         HFS_TEST_CHECK(source.ok());
         Namespace &sourceNs = *source.value();
+        HFS_TEST_CHECK(sourceNs.freeDataBytes() == 16 * config.extentBytes);
         auto file = sourceNs.create("/snapshot", false, false, false);
         HFS_TEST_CHECK(file.ok());
         HFS_TEST_CHECK(sourceNs.link("/snapshot", "/snapshot-link").ok());
