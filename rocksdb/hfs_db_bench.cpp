@@ -152,6 +152,21 @@ int runBenchmark(const BenchOptions &options, rocksdb::Env *sharedEnv = nullptr)
             }
         }
     }
+    if (!readOnly) {
+        /* Force the direct-I/O flush and compaction contract before close. */
+        rocksdb::FlushOptions flushOptions;
+        rocksdb::Status status = db->Flush(flushOptions);
+        if (!status.ok()) {
+            std::cerr << "Flush failed: " << status.ToString() << "\n";
+            return 7;
+        }
+        rocksdb::CompactRangeOptions compactOptions;
+        status = db->CompactRange(compactOptions, nullptr, nullptr);
+        if (!status.ok()) {
+            std::cerr << "CompactRange failed: " << status.ToString() << "\n";
+            return 7;
+        }
+    }
     /* Close RocksDB before checking publication of CURRENT and MANIFEST. */
     db.reset();
     /* Verify the RocksDB CURRENT publication before this process exits. */
