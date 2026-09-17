@@ -1351,6 +1351,8 @@ checkpoint region 必须容纳 namespace/inode/extent map/各 device allocator b
   data child 完成后、device flush 提交前的 `datasync` 失败边界；注入仅在显式测试
   环境变量下生效，清除后同一数据可完成 datasync/sync，不把该顺序注入等同于掉电
   或其余四个 crash 断点。
+  File API 的同步 `read/write` 也已尊重 pre-cancelled `stop_token`，在提交数据面前
+  返回 `Cancelled`；in-flight 取消仍只由 RocksDB async `AbortIO` 契约负责。
 - 所有 gate 通过后删除新树中最后的旧兼容残留；
 - `src_legacy_frozen/` 保持本地忽略或单独归档，不回到 product build；
 - 更新架构索引、性能基线、支持边界和迁移说明；

@@ -3,6 +3,7 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <stop_token>
 #include <unistd.h>
 #include <vector>
 
@@ -67,6 +68,31 @@ int main() {
             auto fileResult = client->open("/data.bin", OpenFlags::Create).wait().value();
             HFS_TEST_CHECK(fileResult.ok());
             auto file = fileResult.value();
+
+            /* Pre-cancelled synchronous I/O must not reach the data plane or
+             * reserve extents; in-flight cancellation uses the async API. */
+            std::vector<std::byte> cancelledBytes(4096, std::byte{0xA5});
+            IoVec cancelledVec{cancelledBytes.data(), cancelledBytes.size()};
+            std::stop_source cancelled;
+            cancelled.request_stop();
+            auto cancelledWrite =
+                file->write(std::span<const IoVec>(&cancelledVec, 1), 0,
+                            cancelled.get_token())
+                    .wait()
+                    .value();
+            HFS_TEST_CHECK(!cancelledWrite.ok() &&
+                           cancelledWrite.status() == Status::Cancelled);
+            auto cancelledStat = file->stat();
+            HFS_TEST_CHECK(cancelledStat.ok() && cancelledStat.value().logicalSize == 0);
+            std::vector<std::byte> cancelledRead(4096, std::byte{0x5A});
+            IoVec cancelledReadVec{cancelledRead.data(), cancelledRead.size()};
+            auto cancelledReadResult =
+                file->read(std::span<IoVec>(&cancelledReadVec, 1), 0,
+                           cancelled.get_token())
+                    .wait()
+                    .value();
+            HFS_TEST_CHECK(!cancelledReadResult.ok() &&
+                           cancelledReadResult.status() == Status::Cancelled);
 
             /* 1. explicit preallocation zero-initializes extents */
             auto allocateResult = file->allocate(0, 3 * kExtent).wait().value();

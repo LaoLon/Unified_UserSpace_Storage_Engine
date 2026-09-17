@@ -134,3 +134,7 @@ Shard-79 的真实 NVMe `file_api_test` 还验证了 `HFS_TEST_FAIL_FLUSH_DEVICE
 data child 已完成、device flush 尚未提交时，`datasync` 返回 `IoError`；清除变量后
 同一数据可继续完成 datasync/sync。该钩子默认关闭且只提供顺序边界证据，不替代掉电
 模拟，也不表示其余四个 §16.4 crash 断点已经完成。
+
+Shard-83 的真实 NVMe `file_data_test` 还覆盖了 pre-cancelled synchronous read/write：
+两者均在提交数据面前返回 `Cancelled`，且取消写不会改变文件 logical size；in-flight
+取消仍由已验证的 RocksDB `AbortIO` 路径负责。

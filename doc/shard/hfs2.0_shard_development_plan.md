@@ -458,6 +458,10 @@ readwhilewriting 基础运行；WAL、MANIFEST 能创建/rename/同步；stock `
 > 当前仍缺完整 SST 并发读、性能放大和更广泛 cancel/timeout 矩阵证据，不能据此宣称
 > 全部 direct IO 性能目标。
 
+> 2026-09-17：`File::read/write` 已实现 pre-cancelled boundary；请求在进入数据面
+> 前返回 `Cancelled`，写请求不会预留 extent。同步 I/O 的 in-flight 取消不伪装成可中断，
+> 仍由 RocksDB `ReadAsync/AbortIO` 契约承担；完整 cancel/timeout 矩阵仍待补齐。
+
 **交付物**：切换到 `use_direct_io()==true` 并**同时**落地 `PrepareWrite/Allocate/
 PositionedAppend`（三者必须一起启用）；`ReadAsync/Poll/AbortIO`（FSReadRequest/
 io_handle 生命周期、`IOHandleDeleter`）；`MultiRead`；`RangeSync`；

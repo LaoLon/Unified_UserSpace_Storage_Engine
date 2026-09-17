@@ -222,7 +222,6 @@ Result<FileStat> File::stat() const {
 
 Task<Result<ReadResult>> File::read(std::span<IoVec> buffers, std::uint64_t offset,
                                     std::stop_token stop) {
-    (void)stop;
     auto &state = *impl_->state;
     if (state.engine == nullptr || !state.engine->processValid()) {
         co_return Result<ReadResult>(Status::ForkedProcess,
@@ -230,6 +229,11 @@ Task<Result<ReadResult>> File::read(std::span<IoVec> buffers, std::uint64_t offs
     }
     if (state.namespaceState == nullptr || state.dataPlane == nullptr) {
         co_return Result<ReadResult>(Status::InvalidState, "engine is not mounted");
+    }
+    /* Honor cancellation before inspecting or submitting any data operation.
+     * In-flight synchronous requests use the async AbortIO contract instead. */
+    if (stop.stop_requested()) {
+        co_return makeError<ReadResult>(Status::Cancelled, "read cancelled before submission");
     }
     std::size_t total = 0;
     for (const IoVec &vec : buffers) {
@@ -276,7 +280,6 @@ Task<Result<ReadResult>> File::read(std::span<IoVec> buffers, std::uint64_t offs
 
 Task<Result<WriteResult>> File::write(std::span<const IoVec> buffers, std::uint64_t offset,
                                       std::stop_token stop) {
-    (void)stop;
     auto &state = *impl_->state;
     if (state.engine == nullptr || !state.engine->processValid()) {
         co_return Result<WriteResult>(Status::ForkedProcess,
@@ -284,6 +287,12 @@ Task<Result<WriteResult>> File::write(std::span<const IoVec> buffers, std::uint6
     }
     if (state.namespaceState == nullptr || state.dataPlane == nullptr) {
         co_return Result<WriteResult>(Status::InvalidState, "engine is not mounted");
+    }
+    /* Avoid reserving extents or mutating namespace state for a pre-cancelled
+     * write; in-flight cancellation remains the async AbortIO contract. */
+    if (stop.stop_requested()) {
+        co_return makeError<WriteResult>(Status::Cancelled,
+                                         "write cancelled before submission");
     }
     std::size_t total = 0;
     for (const IoVec &vec : buffers) {
