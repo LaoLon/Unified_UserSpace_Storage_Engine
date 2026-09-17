@@ -430,6 +430,11 @@ Result<void> Engine::syncMetadata(std::uint64_t epoch) {
     if (epoch > impl_->namespaceState->logicalEpoch()) {
         return makeError(Status::InvalidArgument, "sync epoch is ahead of logical epoch");
     }
+    /* A repeated barrier for an already durable epoch needs no checkpoint or
+     * metadata write; this keeps sync idempotent without fixed checkpoint cost. */
+    if (epoch <= impl_->namespaceState->durableEpoch()) {
+        return Result<void>(Status::Ok);
+    }
 
     /* DataPath operations are synchronous at this boundary, so device flush
      * closes the user-data and extent-initialization phase before metadata. */
