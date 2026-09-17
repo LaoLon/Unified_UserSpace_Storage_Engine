@@ -134,10 +134,9 @@ int main() {
                                 .value();
                 HFS_TEST_CHECK(read.ok() && read.value().bytes == pattern.size());
                 HFS_TEST_CHECK(readBack == pattern);
-                HFS_TEST_CHECK(first.value()->datasync().wait().value().status() ==
-                               Status::NotSupported);
-                HFS_TEST_CHECK(first.value()->sync().wait().value().status() ==
-                               Status::NotSupported);
+                /* Both barriers now flush data and checkpoint metadata. */
+                HFS_TEST_CHECK(first.value()->datasync().wait().value().ok());
+                HFS_TEST_CHECK(first.value()->sync().wait().value().ok());
             }
 
             /* 6. client open-file limit */
