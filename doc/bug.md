@@ -241,6 +241,21 @@ Bug 等级：**致命 > 严重 > 一般**。
 - **修复**：已补齐无 fd invalidate、get_file_size、open 时 preallocate，以及进程级 `hfs_config` callback；功能矩阵前保持 Shard-80 未完成。
 - **验证结果**：编译通过；无 `HFS_CONFIG` 环境变量时，真实 NVMe bind→format→mount→cleanup 下 `.fio` 内 `hfs_config`、`numjobs=2`、4K write 完成 4096B、errors=0；高 QD 功能矩阵与 DMA all-or-nothing 门禁仍未通过。
 
+### 20. FIO 高深度外部线程提交触发 SPDK 消息队列崩溃（处理中）
+- **状态**：处理中
+- **等级**：严重
+- **时间**：2026-09-17（Shard-80A）
+- **现象**：真实 NVMe 上，临时将 FIO `queue()` 请求交给外部 `std::thread` 后，
+  `iodepth=8` 的 read/write 在稳定路径清理或下一组请求期间触发 SIGSEGV/SIGABRT；
+  回溯落在 SPDK `msg_queue_run_batch`，或随后表现为 glibc heap corruption。
+- **复现条件**：`fio-hfs.so`、`.conf`、`Nvme0n1`、`numjobs=1/2`、`iodepth=8`；
+  固定 worker 数量仍可复现，故不是“每个请求创建线程”单一问题。
+- **当前边界**：FIO 请求暂保持在提交线程同步执行；真实 NVMe 4K `numjobs=2`
+  smoke 通过，高 QD 异步 queue、DMA all-or-nothing 和完整矩阵不得宣告通过。
+- **下一步**：在 core 内建立明确的前端提交/完成生命周期（包括 reactor 归属、
+  `io_handle` 保活和停止顺序），再恢复 FIO 三态 queue；不以普通 buffer 或降低 QD
+  替代异步验收。
+
 ## 记录模板
 
 ### N. 简短标题
