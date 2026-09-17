@@ -200,21 +200,27 @@ struct AsyncReadState {
     bool completed = false;
     bool aborted = false;
     bool callbackStarted = false;
+    bool ioCompleted = false;
+    rocksdb::IOStatus ioStatus = rocksdb::IOStatus::IOError("async read failed");
     std::thread worker;
+    std::thread ioWorker;
 
     /* Joins the worker before the opaque handle is reclaimed. */
     ~AsyncReadState() {
         if (worker.joinable()) {
             worker.join();
         }
+        if (ioWorker.joinable()) {
+            ioWorker.join();
+        }
     }
 };
 
-/* Runs the HFS read off the caller thread and publishes one completion. */
-void executeAsyncRead(AsyncReadState *state) {
+/* Runs the backend read and retains its completion until the handle is freed. */
+void executeAsyncReadIo(AsyncReadState *state) {
     rocksdb::IOStatus status = rocksdb::IOStatus::IOError("async read failed");
     try {
-        /* Test-only delay makes the pre-callback AbortIO boundary deterministic. */
+        /* Test-only delay makes timeout and pre-callback cancellation deterministic. */
         const char *delayText = std::getenv("HFS_TEST_ASYNC_READ_DELAY_MS");
         if (delayText != nullptr && *delayText != '\0') {
             char *end = nullptr;
@@ -244,6 +250,36 @@ void executeAsyncRead(AsyncReadState *state) {
             std::string("async read worker failed: ") + error.what());
     } catch (...) {
         status = rocksdb::IOStatus::IOError("async read worker failed");
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->ioStatus = status;
+        state->ioCompleted = true;
+    }
+    state->condition.notify_all();
+}
+
+/* Waits for backend completion, or publishes a frontend timeout safely. */
+void executeAsyncRead(AsyncReadState *state) {
+    try {
+        state->ioWorker = std::thread(executeAsyncReadIo, state);
+    } catch (...) {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->ioStatus = rocksdb::IOStatus::IOError("async read worker start failed");
+        state->ioCompleted = true;
+    }
+
+    rocksdb::IOStatus status;
+    {
+        std::unique_lock<std::mutex> lock(state->mutex);
+        const auto timeout = state->options.timeout;
+        const auto ready = [state]() { return state->ioCompleted; };
+        const bool finished = timeout.count() > 0
+                                  ? state->condition.wait_for(lock, timeout, ready)
+                                  : (state->condition.wait(lock, ready), true);
+        status = finished ? state->ioStatus
+                          : rocksdb::IOStatus::TimedOut("async read timed out");
     }
 
     bool invokeCallback = false;

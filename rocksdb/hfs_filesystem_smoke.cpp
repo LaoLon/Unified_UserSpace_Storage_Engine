@@ -2,6 +2,7 @@
 
 #include <cstdlib>
 #include <cstdint>
+#include <chrono>
 #include <atomic>
 #include <memory>
 #include <string>
@@ -214,6 +215,40 @@ int main(int argc, char **argv) {
         return 12;
     }
     deleter(ioHandle);
+    /* IOOptions timeout ends the frontend wait while the backend handle is
+     * drained by the deleter before its buffers are reclaimed. */
+    rocksdb::IOOptions timeoutOptions;
+    timeoutOptions.timeout = std::chrono::milliseconds(1);
+    rocksdb::FSReadRequest timeoutRequest;
+    timeoutRequest.offset = 0;
+    timeoutRequest.len = sizeof(scratch);
+    timeoutRequest.scratch = scratch;
+    std::atomic<bool> timeoutCallback = false;
+    void *timeoutHandle = nullptr;
+    rocksdb::IOHandleDeleter timeoutDeleter;
+    if (::setenv("HFS_TEST_ASYNC_READ_DELAY_MS", "25", 1) != 0) {
+        return 12;
+    }
+    status = random->ReadAsync(
+        timeoutRequest, timeoutOptions,
+        [&timeoutCallback](const rocksdb::FSReadRequest &, void *) {
+            timeoutCallback.store(true);
+        }, nullptr, &timeoutHandle, &timeoutDeleter, &debug);
+    if (!status.ok() || timeoutHandle == nullptr || !timeoutDeleter) {
+        ::unsetenv("HFS_TEST_ASYNC_READ_DELAY_MS");
+        return 12;
+    }
+    std::vector<void *> timeoutHandles{timeoutHandle};
+    status = fileSystem->Poll(timeoutHandles, 1);
+    if (!status.ok() || !timeoutCallback.load() || !timeoutRequest.status.IsTimedOut()) {
+        ::unsetenv("HFS_TEST_ASYNC_READ_DELAY_MS");
+        timeoutDeleter(timeoutHandle);
+        return 12;
+    }
+    timeoutDeleter(timeoutHandle);
+    if (::unsetenv("HFS_TEST_ASYNC_READ_DELAY_MS") != 0) {
+        return 12;
+    }
     /* Abort after callback entry must not rewrite callback-visible status. */
     char boundaryScratch[12]{};
     rocksdb::FSReadRequest boundaryRequest;
