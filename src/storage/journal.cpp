@@ -327,9 +327,10 @@ struct Journal::Impl {
         headerView->crc = crc32c(record.data() + sizeof(CheckpointHeader), snapshot.size(),
                                  crc32c(record.data(), offsetof(CheckpointHeader, crc)));
 
-        /* Inactive slot: the one with the smaller valid txid (A when none). */
-        const bool writeA = !checkpointBValid || (checkpointAValid && checkpointATxid <
-                                                                     checkpointBTxid);
+        /* Rotate to the inactive slot; once both are valid, replace the older
+         * sequence so one complete checkpoint remains available on failure. */
+        const bool writeA = !checkpointAValid ||
+                            (checkpointBValid && checkpointASequence < checkpointBSequence);
         const std::uint64_t start = writeA ? checkpointAStart : checkpointBStart;
         auto write = writeBlock(start, record);
         if (!write.ok()) {

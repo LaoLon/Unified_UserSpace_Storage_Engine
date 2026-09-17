@@ -219,6 +219,11 @@ int main() {
         /* checkpoint at txid 4, then two more transactions */
         HFS_TEST_CHECK(journal->checkpoint().ok());
         HFS_TEST_CHECK(journal->stats().lastCheckpointTxid == 4);
+        HFS_TEST_CHECK(journal->stats().checkpointAValid);
+        HFS_TEST_CHECK(!journal->stats().checkpointBValid);
+        HFS_TEST_CHECK(journal->checkpoint().ok());
+        HFS_TEST_CHECK(journal->stats().checkpointAValid);
+        HFS_TEST_CHECK(journal->stats().checkpointBValid);
         for (std::uint64_t i = 5; i <= 6; ++i) {
             HFS_TEST_CHECK(journal->append({setSize(7, i * 100)}, true).ok());
         }
