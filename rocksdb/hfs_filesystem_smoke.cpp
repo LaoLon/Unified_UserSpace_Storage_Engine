@@ -103,6 +103,40 @@ int main(int argc, char **argv) {
         return 12;
     }
     deleter(ioHandle);
+    /* Exercise immediate AbortIO against several in-flight reads. */
+    constexpr std::size_t cancelCount = 8;
+    char cancelScratch[cancelCount][12]{};
+    rocksdb::FSReadRequest cancelRequests[cancelCount];
+    void *cancelHandles[cancelCount]{};
+    rocksdb::IOHandleDeleter cancelDeleters[cancelCount];
+    std::vector<void *> cancelHandleList;
+    cancelHandleList.reserve(cancelCount);
+    std::atomic<std::size_t> cancelCallbacks = 0;
+    for (std::size_t index = 0; index < cancelCount; ++index) {
+        cancelRequests[index].offset = 0;
+        cancelRequests[index].len = sizeof(cancelScratch[index]);
+        cancelRequests[index].scratch = cancelScratch[index];
+        status = random->ReadAsync(
+            cancelRequests[index], options.io_options,
+            [&cancelCallbacks](const rocksdb::FSReadRequest &, void *) {
+                cancelCallbacks.fetch_add(1);
+            }, nullptr, &cancelHandles[index], &cancelDeleters[index], &debug);
+        if (!status.ok() || cancelHandles[index] == nullptr || !cancelDeleters[index]) {
+            return 12;
+        }
+        cancelHandleList.push_back(cancelHandles[index]);
+    }
+    status = fileSystem->AbortIO(cancelHandleList);
+    if (!status.ok() || !fileSystem->Poll(cancelHandleList, cancelCount).ok() ||
+        cancelCallbacks.load() > cancelCount) {
+        for (std::size_t index = 0; index < cancelCount; ++index) {
+            cancelDeleters[index](cancelHandles[index]);
+        }
+        return 12;
+    }
+    for (std::size_t index = 0; index < cancelCount; ++index) {
+        cancelDeleters[index](cancelHandles[index]);
+    }
     std::vector<std::string> children;
     status = fileSystem->GetChildren("/", options.io_options, &children, &debug);
     if (!status.ok()) {
