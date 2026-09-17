@@ -5,6 +5,7 @@
 #include <condition_variable>
 #include <cstring>
 #include <mutex>
+#include <string>
 
 #include "common/trace.hpp"
 #include "core/parent_completion.hpp"
@@ -42,6 +43,24 @@ int waitForChild(WaitState &state, std::uint32_t timeoutMs) {
     }
     state.cv.wait(lock, [&state]() { return state.done; });
     return -ETIMEDOUT;
+}
+
+/* Preserve the first child status and backend errno at the parent boundary. */
+Result<void> childFailureResult(int error) {
+    if (error > 0 && error <= static_cast<int>(Status::InvalidState)) {
+        const auto status = static_cast<Status>(error);
+        return makeError(status, std::string("data path child failed: ") +
+                                   statusName(status));
+    }
+    if (error < 0) {
+        const int backendErrno = -error;
+        return makeError(Status::IoError,
+                         "data path child failed: errno=" +
+                             std::to_string(backendErrno) + " (" +
+                             std::strerror(backendErrno) + ")");
+    }
+    return makeError(Status::IoError,
+                     "data path child failed: status=" + std::to_string(error));
 }
 
 } // namespace
@@ -240,9 +259,10 @@ Result<void> DataPath::execute(const ExtentMap &map, std::span<std::byte> readBu
     }
 
     ++stats_.parentWaits;
-    if (firstError != 0 || parent.firstError() != 0) {
+    const int childError = firstError != 0 ? firstError : parent.firstError();
+    if (childError != 0) {
         ++stats_.errors;
-        return makeError(Status::IoError, "data path child failed");
+        return childFailureResult(childError);
     }
     if (!parent.done() || parent.completedBytes() != plan.coveredBytes) {
         ++stats_.errors;
