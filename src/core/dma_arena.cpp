@@ -34,6 +34,10 @@ Result<std::span<std::byte>> DmaArena::acquire(std::size_t size, std::uint32_t t
         return makeError<std::span<std::byte>>(Status::InvalidState, "arena not configured");
     }
     if (classSize == 0) {
+        if (capacityBytes_ != 0 && size > capacityBytes_) {
+            return makeError<std::span<std::byte>>(
+                Status::InvalidArgument, "DMA request exceeds arena capacity");
+        }
         const auto deadline =
             std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
         for (;;) {
