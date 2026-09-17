@@ -431,8 +431,10 @@ p99 ≤ raw×110%。不达标时停在上游结构修复，不扩大 reactor/are
 
 > 2026-09-17：发现 `DataPath` 原先将所有请求固定投递到 data reactor 0；现已按请求
 > 在已启动的 data reactors 间轮询，真实 NVMe FIO smoke 通过。该修复尚未改变既有
-> raw 对照的失败结论，正式 5-run gate 仍需用正确加载 external engine 的 FIO 配置
-> 重跑并取得 p99。
+> raw 对照的历史失败结论；随后按正确 external-engine 配置完成新的 5-run 复测，
+> HFS/raw 中位 IOPS 比为 86.56%，但 raw bdevperf 结果没有 p99，且本轮 raw 使用
+> 单 core、HFS 使用两个 data reactor，故仍不能宣称 §16.2 通过。后续需取得同口径
+> raw p99 并统一 reactor/core 拓扑后再收口。
 
 ---
 

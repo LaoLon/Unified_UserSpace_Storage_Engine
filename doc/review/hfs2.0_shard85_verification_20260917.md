@@ -85,6 +85,18 @@ READ/WRITE 吞吐换算的总 IOPS 约为 `7066, 11418, 3550, 6554, 26266`，中
 7020`，并出现 60--80 ms 级 p99，说明盲目放大并发会造成排队和尾延迟放大。
 因此保留 4 worker/job 作为当前有界实现，性能 gate 仍未通过。
 
+随后修复 `DataPath` 将请求固定投递到 reactor 0 的问题，按请求在已启动的 data
+reactor 间轮询，并在真实 NVMe 上按相同 4K/randrw/50%/QD=32/32 jobs/10 秒口径
+重新各执行 5 次。HFS FIO 结果为 `28539.39, 26803.64, 28739.75, 23720.16,
+28577.68 IOPS`，中位数 `28539.39 IOPS`；read p99 为 `1941.50--2088.96 us`，
+write p99 为 `1957.89--2113.54 us`，5 次均 `err=0`。raw SPDK bdevperf 结果为
+`24988.20, 27774.53, 32968.52, 36885.66, 39526.06 IOPS`，中位数
+`32968.52 IOPS`，5 次均 `Fail=0/TO=0`。本轮 IOPS 比值为 `86.56%`，但 bdevperf
+输出只提供 average/min/max，没有 p99；同时 raw 使用单个 bdevperf core，HFS 使用
+两个 data reactor，故不能据此宣称 §16.2 已通过。两组原始结果分别保留在 VM
+`/mnt/hfs-data/hfs2-shard81-r2-20260917-134845` 和
+`/mnt/hfs-data/hfs2-shard81-raw-20260917-135017`。
+
 ## 当前硬门禁
 
 VM 现有两块独立 NVMe 控制器：`Nvme0n1`（`0000:0b:00.0`，30 GiB）和 `Nvme1n1`
