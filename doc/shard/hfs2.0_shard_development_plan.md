@@ -358,8 +358,9 @@ rename 后 Fsync 语义正确。
 
 > 状态：进行中（2026-09-17）。Journal replay 已对结构损坏返回 `Corrupt` 并保留
 > corruption evidence；已加入 transaction after-image 回滚、mount 前 scan-only
-> replay，以及 BEGIN/RECORD/COMMIT 三阶段写入失败注入测试，真实 NVMe 挂载回归通过。
-> 其余设备 flush/checkpoint/clean-flag crash 断点与多盘 fail-closed 仍待完成。
+> replay，以及 BEGIN/RECORD/COMMIT 三阶段写入失败和 COMMIT 后 flush 失败注入测试，
+> 真实 NVMe 挂载回归通过。其余 data flush/checkpoint/clean-flag crash 断点与多盘
+> fail-closed 仍待完成。
 
 **交付物**：§16.4 五个崩溃断点注入；orphan reclaim；内存 after-image 失败回滚；
 `hfsctl check` 取证；ext4 同 workload 语义对照；**多副本执行**：按 Shard-70/71 冻结的
