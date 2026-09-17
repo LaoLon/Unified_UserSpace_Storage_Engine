@@ -30,6 +30,8 @@ Bug 等级：**致命 > 严重 > 一般**。
 - 21：已修复（Shard-82，RocksDB LockFile 将 HFS 路径误当宿主机路径）。
 - 22：已修复（Shard-82，RocksDB DB 路径尾斜杠未规范化）。
 - 23：已修复（Shard-79，Journal::open ownership transfer 求值顺序不安全）。
+- 24：已修复（Shard-79，checkpoint generation 平局时 mount 选择旧槽位）。
+- 25：已修复（Shard-84，RocksDB File sync 使用 inode epoch 导致全局 durable epoch 回退）。
 
 ## Bug 记录
 
@@ -72,6 +74,34 @@ Bug 等级：**致命 > 严重 > 一般**。
 - **修复**：在 move 前保存 `JournalDevice*`，再把 ownership 传入 `Journal::create`。
 - **验证结果**：VM clean build、namespace/journal 回归和真实 NVMe RocksDB 多进程
   fillseq/readrandom/overwrite/readwhilewriting 均通过。
+
+### 24. checkpoint generation 平局时 mount 选择旧槽位
+
+- **状态**：已修复
+- **等级**：严重（跨进程恢复可能回到旧 namespace snapshot）
+- **时间**：2026-09-17（Shard-79）
+- **现象**：RocksDB 进程内可见 `CURRENT`，进程重启后 mount 选择旧 checkpoint，
+  `hfs_ldb checkconsistency` 报 `CURRENT` 不存在。
+- **根因**：RocksDB 元数据 checkpoint 的 journal txid/sequence 都可能为 0，A/B
+  选择逻辑以 txid 平局时恒选 A，忽略了 checkpoint header 的 generation。
+- **修复**：读取并比较 checkpoint generation，按 generation、txid、sequence 的
+  三元组选择最新有效槽位。
+- **验证结果**：真实 NVMe canonical RocksDB benchmark、正常 reopen 和 SIGKILL 后
+  `hfs_ldb checkconsistency` 均通过。
+
+### 25. File sync 使用 inode epoch 导致全局 durable epoch 回退
+
+- **状态**：已修复
+- **等级**：严重（RocksDB 连续发布文件时 DB::Open 失败）
+- **时间**：2026-09-17（Shard-84）
+- **现象**：多个 RocksDB 文件连续 rename/sync 后返回 `durable epoch cannot move
+  backwards`。
+- **根因**：`File::sync/datasync` 将单 inode 的 logical epoch 传给 namespace-wide
+  durability barrier；该值可能落后于已发布的全局 durable epoch。
+- **修复**：同步入口统一提交 namespace 当前 global logical epoch；RocksDB
+  `Close/Flush/RenameFile` 同时完成 durable metadata barrier。
+- **验证结果**：真实 NVMe 四模式 benchmark、canonical 参数、正常跨进程 reopen、
+  SIGKILL recovery 和 `hfs_ldb checkconsistency` 均通过。
 
 ### 1. `.conf` schema 表使用 `std::initializer_list` 导致静态存储悬空
 
