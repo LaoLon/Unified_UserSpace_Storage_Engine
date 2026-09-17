@@ -377,7 +377,8 @@ fail closed 且现场保留；多盘掉一块 metadata device 拒绝 mount，不
 > 状态：进行中（2026-09-17）。80A 外部模块已接入 CMake，FIO 3.42 ABI 编译通过；
 > 真实 NVMe bind→format→mount→cleanup 下 direct=1 和显式 bounce 的 direct=0 均通过
 > 4K `--verify=crc32c` smoke，numjobs worker 共享进程级 Engine；完整 DMA arena
-> all-or-nothing 证据仍待补齐。
+> all-or-nothing 证据仍待补齐；在 VM 上显式加入 FIO `iomem=malloc` 会被 FIO
+> 报告为与 external engine 冲突并拒绝分配，不能把该路径误记为 arena 通过证据。
 
 **80A 交付物**：`fio-hfs.so`（`extern "C"` 注册）；options（`hfs_config/hfs_direct/
 hfs_preallocate/hfs_client_depth`）；`open_file` 完成 create/open/allocate +
