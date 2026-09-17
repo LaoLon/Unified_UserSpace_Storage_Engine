@@ -111,6 +111,14 @@ int main(int argc, char **argv) {
     if (!status.ok() || ioHandle == nullptr || !deleter) {
         return 12;
     }
+    std::vector<void *> emptyHandles;
+    std::vector<void *> invalidHandles{nullptr};
+    if (!fileSystem->Poll(emptyHandles, 0).ok() ||
+        fileSystem->Poll(invalidHandles, 1).ok() ||
+        !fileSystem->AbortIO(emptyHandles).ok()) {
+        deleter(ioHandle);
+        return 12;
+    }
     std::vector<void *> asyncHandles{ioHandle};
     status = fileSystem->Poll(asyncHandles, 1);
     if (!status.ok() || !callbackCalled.load() || request.result.compare(payload) != 0) {
