@@ -210,7 +210,7 @@ int fioHfsOpen(struct thread_data *td, struct fio_file *fioFile) {
     }
     auto *options = static_cast<FioHfsOptions *>(td->eo);
     const std::uint64_t requestedSize = static_cast<std::uint64_t>(td->o.size);
-    if (options != nullptr && options->preallocate != 0 && requestedSize != 0) {
+    if ((options == nullptr || options->preallocate != 0) && requestedSize != 0) {
         auto allocated = file->file->allocate(0, requestedSize).wait();
         if (!allocated.ok() || !allocated.value().ok()) {
             delete file;

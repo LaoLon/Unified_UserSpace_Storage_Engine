@@ -239,7 +239,7 @@ Bug 等级：**致命 > 严重 > 一般**。
 - **排查过程**：初版因缺少 invalidate 回调报 Bad file descriptor；补齐后生命周期正常，仍需继续闭合 FIO `get_file_size`、open/layout 与请求调度契约。
 - **根因**：FIO 虚拟文件引擎不能依赖 host fd 的默认文件布局路径，当前 size/open 回调组合尚未满足 FIO 的实际请求准入条件。
 - **修复**：已补齐无 fd invalidate、get_file_size 和 open 时 preallocate 的骨架；功能矩阵前保持 Shard-80 未完成。
-- **验证结果**：编译通过；真实 NVMe bind→format→mount→engine cleanup 通过；实际 I/O 门禁仍未通过。
+- **验证结果**：编译通过；真实 NVMe bind→format→mount→cleanup 下 4K read/write 各 1 I/O、errors=0；高 QD 功能矩阵与 DMA all-or-nothing 门禁仍未通过。
 
 ## 记录模板
 
