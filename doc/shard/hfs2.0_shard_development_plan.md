@@ -387,6 +387,9 @@ fail closed 且现场保留；多盘掉一块 metadata device 拒绝 mount，不
 > 因而这里只记录为 cap 拒绝证据，不宣称“零 worker 启动”或完整容量矩阵通过。
 > 随后补跑 QD=128 的 80 项高深度功能矩阵（numjobs=1/2/4/8、4 种 block size、5 种
 > workload），脚本逐项检查 `err=0` 并全部通过；这仍不等价于完整 QD×jobs 矩阵。
+> 重新执行带持久化结果的完整矩阵后，前 315 项通过；在 QD=64、numjobs=8、1MiB、
+> write 首次触及 512 MiB 共享 arena cap，FIO 返回资源申请失败。该结果证明了
+> cap 边界和失败可定位，但完整矩阵仍未通过，不能把资源失败当作数据面通过。
 
 **80A 交付物**：`fio-hfs.so`（`extern "C"` 注册）；options（`hfs_config/hfs_direct/
 hfs_preallocate/hfs_client_depth`）；`open_file` 完成 create/open/allocate +

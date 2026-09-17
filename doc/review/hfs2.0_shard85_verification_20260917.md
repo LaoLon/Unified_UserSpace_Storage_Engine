@@ -50,6 +50,11 @@ NVMe `--verify=crc32c` loader smoke 继续通过。另执行了 QD=128、numjobs
 4K/16K/64K/1M、write/read/randwrite/randread/randrw；脚本逐项检查 `err=0`，
 80/80 通过。该结果补强了高深度功能正确性，但不替代完整 QD×jobs 矩阵和性能 gate。
 
+带持久化结果的完整矩阵重跑在前 315 项通过后，于 QD=64、numjobs=8、1MiB、write
+首次触及正式 512 MiB 共享 arena cap；FIO 返回 `rc=1` 并报告 DMA arena allocation
+failure。该项是可定位的资源边界，不是数据错误；矩阵因此停止，不能记录为 400/400
+通过，后续需在 arena 预算或 admission 设计修复后重跑。
+
 ## Shard-81 raw 对照结果
 
 按 §16.2 口径在同一 `0000:0b:00.0` 上完成 raw SPDK `bdevperf` 与 HFS FIO
