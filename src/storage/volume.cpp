@@ -241,6 +241,8 @@ Result<VolumeInfo> mountVolume(SpdkRuntime &runtime, const Config &config) {
      * fail closed before any journal or namespace state is opened. */
     std::vector<bool> metadataReplicasSeen(config.metadataReplication, false);
     std::size_t metadataReplicaCount = 0;
+    Hfs2Superblock metadataReference{};
+    bool haveMetadataReference = false;
 
     for (std::size_t i = 0; i < config.devices.size(); ++i) {
         const std::uint64_t deviceBytes = runtime.deviceCapacityBytes(i);
@@ -300,6 +302,19 @@ Result<VolumeInfo> mountVolume(SpdkRuntime &runtime, const Config &config) {
             if (mirrored != (config.metadataReplication > 1)) {
                 return makeError<VolumeInfo>(
                     Status::Corrupt, "metadata mirror feature mismatch on device '" +
+                                         config.devices[i].bdevName + "'");
+            }
+            if (!haveMetadataReference) {
+                metadataReference = chosen;
+                haveMetadataReference = true;
+            } else if (chosen.generation != metadataReference.generation ||
+                       chosen.checkpointGeneration != metadataReference.checkpointGeneration ||
+                       chosen.journalHead != metadataReference.journalHead ||
+                       chosen.journalTail != metadataReference.journalTail ||
+                       chosen.mountEpoch != metadataReference.mountEpoch ||
+                       chosen.cleanShutdown != metadataReference.cleanShutdown) {
+                return makeError<VolumeInfo>(
+                    Status::Corrupt, "metadata replica state is inconsistent on device '" +
                                          config.devices[i].bdevName + "'");
             }
         }
