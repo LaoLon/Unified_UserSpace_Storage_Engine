@@ -686,12 +686,20 @@ public:
                                rocksdb::FileLock **lock, rocksdb::IODebugContext *) override {
         auto *value = new HfsFileLock;
         value->fd = ::open(hostLockPath(fname).c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0644);
-        if (value->fd < 0 || ::flock(value->fd, LOCK_EX | LOCK_NB) != 0) {
-            if (value->fd >= 0) ::close(value->fd);
+        if (value->fd < 0) {
             delete value;
-            /* RocksDB treats an existing process lock as a retryable busy
-             * condition, not as filesystem corruption or I/O failure. */
-            return rocksdb::IOStatus::Busy("RocksDB lock is already held");
+            return rocksdb::IOStatus::IOError("RocksDB lock file open failed");
+        }
+        if (::flock(value->fd, LOCK_EX | LOCK_NB) != 0) {
+            const int error = errno;
+            ::close(value->fd);
+            delete value;
+            /* Only lock contention is retryable; preserve unrelated host I/O
+             * failures so RocksDB can report the actual acquisition problem. */
+            if (error == EWOULDBLOCK || error == EAGAIN) {
+                return rocksdb::IOStatus::Busy("RocksDB lock is already held");
+            }
+            return rocksdb::IOStatus::IOError("RocksDB lock acquisition failed");
         }
         *lock = value;
         return rocksdb::IOStatus::OK();
