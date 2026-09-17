@@ -143,6 +143,21 @@ int main() {
                 HFS_TEST_CHECK(::unsetenv("HFS_TEST_FAIL_FLUSH_DEVICE") == 0);
                 /* Both barriers now flush data and checkpoint metadata. */
                 HFS_TEST_CHECK(first.value()->datasync().wait().value().ok());
+                /* A checkpoint slot write must not publish without its flush. */
+                std::vector<std::byte> checkpointPattern(4096, std::byte{0x3C});
+                IoVec checkpointVec{checkpointPattern.data(), checkpointPattern.size()};
+                HFS_TEST_CHECK(first.value()
+                                   ->write(std::span<const IoVec>(&checkpointVec, 1), 0,
+                                           std::stop_token{})
+                                   .wait()
+                                   .value()
+                                   .ok());
+                HFS_TEST_CHECK(::setenv("HFS_TEST_FAIL_CHECKPOINT_FLUSH", "1", 1) == 0);
+                auto failedCheckpoint = first.value()->datasync().wait().value();
+                HFS_TEST_CHECK(!failedCheckpoint.ok() &&
+                               failedCheckpoint.status() == Status::IoError);
+                HFS_TEST_CHECK(::unsetenv("HFS_TEST_FAIL_CHECKPOINT_FLUSH") == 0);
+                HFS_TEST_CHECK(first.value()->datasync().wait().value().ok());
                 HFS_TEST_CHECK(first.value()->sync().wait().value().ok());
             }
 

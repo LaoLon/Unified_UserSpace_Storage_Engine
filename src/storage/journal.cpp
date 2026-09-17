@@ -1,6 +1,7 @@
 #include "hfs/journal.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -65,6 +66,13 @@ struct CheckpointHeader {
 
 std::uint64_t bytesToBlocks(std::uint64_t bytes, std::uint64_t blockSize) {
     return (bytes + blockSize - 1) / blockSize;
+}
+
+/* Test-only checkpoint barrier fault; production behavior is unchanged unless
+ * the caller explicitly requests this environment-variable injection. */
+bool testCheckpointFlushFailureRequested() {
+    const char *value = std::getenv("HFS_TEST_FAIL_CHECKPOINT_FLUSH");
+    return value != nullptr && std::string(value) == "1";
 }
 
 bool slotHeaderValid(const SlotHeader &header, std::uint32_t blockSize,
@@ -340,6 +348,9 @@ struct Journal::Impl {
         auto write = writeBlock(start, record);
         if (!write.ok()) {
             return write;
+        }
+        if (testCheckpointFlushFailureRequested()) {
+            return makeError(Status::IoError, "test-injected checkpoint flush failure");
         }
         auto flush = device->flush();
         if (!flush.ok()) {
