@@ -48,6 +48,17 @@ struct FioHfsThread {
 std::mutex processMutex;
 std::shared_ptr<hfs::Engine> processEngine;
 std::size_t processUsers = 0;
+std::string processConfigPath;
+
+/* Preserve the parsed engine configuration for fio worker clones. */
+int fioHfsConfigOption(void *, const char *value) {
+    if (value == nullptr || value[0] == '\0') {
+        return 1;
+    }
+    std::lock_guard<std::mutex> lock(processMutex);
+    processConfigPath = value;
+    return 0;
+}
 
 int fioError(hfs::Status status) {
     switch (status) {
@@ -93,53 +104,62 @@ std::string fioPath(const char *name) {
     return path;
 }
 
-static struct fio_option options[5]{};
-
-/* C++ cannot use C's out-of-order designated initializers for fio options. */
-struct FioHfsOptionInitializer {
-    FioHfsOptionInitializer() {
-        options[0].name = const_cast<char *>("hfs_config");
-        options[0].lname = const_cast<char *>("HFS .conf path");
-        options[0].type = FIO_OPT_STR_STORE;
-        options[0].off1 = offsetof(FioHfsOptions, config);
-        options[0].help = const_cast<char *>("HFS 2.0 .conf configuration path");
-        options[0].category = FIO_OPT_C_ENGINE;
-        options[0].group = FIO_OPT_G_INVALID;
-
-        options[1].name = const_cast<char *>("hfs_direct");
-        options[1].lname = const_cast<char *>("HFS direct mode");
-        options[1].type = FIO_OPT_BOOL;
-        options[1].off1 = offsetof(FioHfsOptions, direct);
-        options[1].def = const_cast<char *>("1");
-        options[1].help = const_cast<char *>("Use HFS direct data path");
-        options[1].category = FIO_OPT_C_ENGINE;
-        options[1].group = FIO_OPT_G_INVALID;
-
-        options[2].name = const_cast<char *>("hfs_preallocate");
-        options[2].lname = const_cast<char *>("HFS preallocation");
-        options[2].type = FIO_OPT_BOOL;
-        options[2].off1 = offsetof(FioHfsOptions, preallocate);
-        options[2].def = const_cast<char *>("1");
-        options[2].help = const_cast<char *>("Allocate HFS extents during open_file");
-        options[2].category = FIO_OPT_C_ENGINE;
-        options[2].group = FIO_OPT_G_INVALID;
-
-        options[3].name = const_cast<char *>("hfs_client_depth");
-        options[3].lname = const_cast<char *>("HFS client depth");
-        options[3].type = FIO_OPT_INT;
-        options[3].off1 = offsetof(FioHfsOptions, clientDepth);
-        options[3].def = const_cast<char *>("32");
-        options[3].help = const_cast<char *>("HFS client queue depth");
-        options[3].category = FIO_OPT_C_ENGINE;
-        options[3].group = FIO_OPT_G_INVALID;
-    }
+/* Keep engine options statically initialized like fio's external skeleton. */
+static struct fio_option options[5] = {
+    {
+        .name = "hfs_config",
+        .lname = "HFS .conf path",
+        .type = FIO_OPT_STR_STORE,
+        .off1 = offsetof(FioHfsOptions, config),
+        .cb = reinterpret_cast<void *>(fioHfsConfigOption),
+        .help = "HFS 2.0 .conf configuration path",
+        .category = FIO_OPT_C_ENGINE,
+        .group = FIO_OPT_G_INVALID,
+    },
+    {
+        .name = "hfs_direct",
+        .lname = "HFS direct mode",
+        .type = FIO_OPT_BOOL,
+        .off1 = offsetof(FioHfsOptions, direct),
+        .help = "Use HFS direct data path",
+        .def = "1",
+        .category = FIO_OPT_C_ENGINE,
+        .group = FIO_OPT_G_INVALID,
+    },
+    {
+        .name = "hfs_preallocate",
+        .lname = "HFS preallocation",
+        .type = FIO_OPT_BOOL,
+        .off1 = offsetof(FioHfsOptions, preallocate),
+        .help = "Allocate HFS extents during open_file",
+        .def = "1",
+        .category = FIO_OPT_C_ENGINE,
+        .group = FIO_OPT_G_INVALID,
+    },
+    {
+        .name = "hfs_client_depth",
+        .lname = "HFS client depth",
+        .type = FIO_OPT_INT,
+        .off1 = offsetof(FioHfsOptions, clientDepth),
+        .help = "HFS client queue depth",
+        .def = "32",
+        .category = FIO_OPT_C_ENGINE,
+        .group = FIO_OPT_G_INVALID,
+    },
+    {
+        .name = nullptr,
+    },
 };
-
-static FioHfsOptionInitializer optionInitializer;
 
 int fioHfsInit(struct thread_data *td) {
     auto *options = static_cast<FioHfsOptions *>(td->eo);
     const char *configPath = options == nullptr ? nullptr : options->config;
+    std::string callbackConfig;
+    if (configPath == nullptr || configPath[0] == '\0') {
+        std::lock_guard<std::mutex> lock(processMutex);
+        callbackConfig = processConfigPath;
+        configPath = callbackConfig.c_str();
+    }
     if (configPath == nullptr || configPath[0] == '\0') {
         configPath = std::getenv("HFS_CONFIG");
     }
