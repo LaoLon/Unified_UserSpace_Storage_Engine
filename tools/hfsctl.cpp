@@ -157,9 +157,43 @@ int runCheck(const hfs::Config &config) {
     auto engine = std::move(created).value();
     auto mounted = engine->mount().wait();
     if (!mounted.ok() || !mounted.value().ok()) {
-        std::fprintf(stderr, "hfsctl: mount failed: %s\n",
-                     mounted.ok() ? mounted.value().message().c_str() : mounted.message().c_str());
-        return 1;
+        const std::string mountError =
+            mounted.ok() ? mounted.value().message() : mounted.message();
+        std::fprintf(stderr, "hfsctl: mount failed, falling back to scan-only check: %s\n",
+                     mountError.c_str());
+        auto scanEngine = hfs::Engine::create(config);
+        if (!scanEngine.ok()) {
+            std::fprintf(stderr, "hfsctl: scan engine create failed: %s\n",
+                         scanEngine.message().c_str());
+            return 1;
+        }
+        auto scans = scanEngine.value()->scanMetadataJournals();
+        if (!scans.ok()) {
+            std::fprintf(stderr, "hfsctl: scan-only check failed: %s\n",
+                         scans.message().c_str());
+            return 1;
+        }
+        bool scanOk = true;
+        for (const auto &scan : scans.value()) {
+            const auto &stats = scan.stats;
+            std::printf("metadata device %zu: checkpointA=%s(txid %llu seq %llu) "
+                        "checkpointB=%s(txid %llu seq %llu) journal head=%llu tail=%llu "
+                        "last_txid=%llu transactions=%u usage=%.1f%% corruption=%s error=%s\n",
+                        scan.deviceIndex, stats.checkpointAValid ? "valid" : "empty",
+                        static_cast<unsigned long long>(stats.checkpointATxid),
+                        static_cast<unsigned long long>(stats.checkpointASequence),
+                        stats.checkpointBValid ? "valid" : "empty",
+                        static_cast<unsigned long long>(stats.checkpointBTxid),
+                        static_cast<unsigned long long>(stats.checkpointBSequence),
+                        static_cast<unsigned long long>(stats.head),
+                        static_cast<unsigned long long>(stats.tail),
+                        static_cast<unsigned long long>(stats.lastTxid), stats.validTransactions,
+                        scan.usageRatio * 100.0,
+                        stats.corruption.empty() ? "none" : stats.corruption.c_str(),
+                        scan.error.empty() ? "none" : scan.error.c_str());
+            if (!scan.error.empty() || !stats.corruption.empty()) scanOk = false;
+        }
+        return scanOk ? 0 : 1;
     }
 
     bool ok = true;

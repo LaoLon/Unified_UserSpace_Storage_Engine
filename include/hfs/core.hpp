@@ -6,11 +6,13 @@
 #include <functional>
 #include <memory>
 #include <span>
+#include <string>
 #include <vector>
 
 #include "hfs/config.hpp"
 #include "hfs/export.hpp"
 #include "hfs/file.hpp"
+#include "hfs/journal.hpp"
 #include "hfs/superblock.hpp"
 #include "hfs/task.hpp"
 #include "hfs/types.hpp"
@@ -45,6 +47,14 @@ struct SuperblockSlots {
     bool validB = false;
     Hfs2Superblock slotA{};
     Hfs2Superblock slotB{};
+};
+
+/* Scan-only metadata evidence collected without applying journal records. */
+struct MetadataJournalScan {
+    std::size_t deviceIndex = 0;
+    Journal::Stats stats{};
+    double usageRatio = 0.0;
+    std::string error;
 };
 
 /* Engine owns the parsed config, the process lock and (Phase 1+) the SPDK
@@ -88,6 +98,9 @@ public:
 
     /* Raw superblock slots of one device (requires an active runtime). */
     Result<SuperblockSlots> readSuperblockSlots(std::size_t deviceIndex) const;
+
+    /* Scans every metadata journal for hfsctl check after a mount failure. */
+    Result<std::vector<MetadataJournalScan>> scanMetadataJournals();
 
     /* Runtime diagnostics used by acceptance tests. */
     std::uint32_t dataReactorCount() const noexcept;

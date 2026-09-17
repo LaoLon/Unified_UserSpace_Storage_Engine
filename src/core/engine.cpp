@@ -455,6 +455,53 @@ Result<void> Engine::syncMetadata(std::uint64_t epoch) {
     return Result<void>(Status::Ok);
 }
 
+Result<std::vector<MetadataJournalScan>> Engine::scanMetadataJournals() {
+    if (!processValid()) {
+        return makeError<std::vector<MetadataJournalScan>>(
+            Status::ForkedProcess, "engine belongs to another process");
+    }
+    if (impl_->stopped || impl_->mounted) {
+        return makeError<std::vector<MetadataJournalScan>>(
+            Status::InvalidState, "scan-only journal check requires a fresh engine");
+    }
+
+    auto &runtime = SpdkRuntime::instance();
+    auto started = runtime.start(impl_->config);
+    if (!started.ok()) {
+        return makeError<std::vector<MetadataJournalScan>>(started.status(), started.message());
+    }
+    auto volume = mountVolume(runtime, impl_->config);
+    if (!volume.ok()) {
+        runtime.stop();
+        return makeError<std::vector<MetadataJournalScan>>(volume.status(), volume.message());
+    }
+    impl_->geometries = volume.value().devices;
+    impl_->uuid = volume.value().uuid;
+    impl_->formatted = true;
+
+    std::vector<MetadataJournalScan> scans;
+    for (std::size_t i = 0; i < impl_->config.devices.size(); ++i) {
+        if (!impl_->config.devices[i].metadata) continue;
+        MetadataJournalScan scan;
+        scan.deviceIndex = i;
+        auto journal = Journal::open(*this, nullptr, i);
+        if (!journal.ok()) {
+            scan.error = journal.message();
+            scans.push_back(std::move(scan));
+            continue;
+        }
+        auto replay = journal.value()->replay();
+        scan.stats = journal.value()->stats();
+        scan.usageRatio = journal.value()->usageRatio();
+        if (!replay.ok()) {
+            scan.error = replay.message();
+        }
+        scans.push_back(std::move(scan));
+    }
+    runtime.stop();
+    return scans;
+}
+
 const Config &Engine::config() const noexcept { return impl_->config; }
 
 bool Engine::mounted() const noexcept { return impl_->mounted; }
