@@ -25,6 +25,10 @@ public:
     std::size_t size() const noexcept { return data_.size(); }
 
     std::byte *raw() noexcept { return data_.data(); }
+    void failWriteAt(std::size_t writeIndex) noexcept {
+        writeCount_ = 0;
+        failWriteAt_ = writeIndex;
+    }
     std::byte *slot(std::uint64_t sequence, std::uint64_t journalStart,
                     std::uint64_t journalBlocks) noexcept {
         return data_.data() + (journalStart + (sequence % journalBlocks)) * kMeta;
@@ -42,6 +46,10 @@ public:
 
     hfs::Result<void> write(std::uint64_t offsetBlocks,
                             std::span<const std::byte> buffer) override {
+        if (writeCount_++ == failWriteAt_) {
+            return hfs::makeError(hfs::Status::InvalidArgument,
+                                  "injected journal write failure");
+        }
         const std::uint64_t bytes = offsetBlocks * kMeta;
         if (bytes + buffer.size() > data_.size()) {
             return fail();
@@ -57,6 +65,8 @@ private:
         return hfs::makeError(hfs::Status::InvalidArgument, "memory device out of range");
     }
     std::vector<std::byte> data_;
+    std::size_t writeCount_ = 0;
+    std::size_t failWriteAt_ = std::numeric_limits<std::size_t>::max();
 };
 
 class MemoryTarget final : public hfs::JournalTarget {
@@ -339,6 +349,26 @@ int main() {
         HFS_TEST_CHECK(reopened->replay().status() == hfs::Status::Corrupt);
         HFS_TEST_CHECK(reopened->stats().lastTxid == 0);
         HFS_TEST_CHECK(!reopened->stats().corruption.empty());
+    }
+
+    /* 5. BEGIN/RECORD/COMMIT write failures leave an ignorable tail. */
+    for (std::size_t failAt : {0U, 1U, 2U}) {
+        Fixture fixture;
+        HFS_TEST_CHECK(fixture.valid());
+        HFS_TEST_CHECK(fixture.format() == 0);
+        MemoryTarget writer;
+        auto journal = fixture.open(&writer);
+        HFS_TEST_CHECK(journal != nullptr);
+        fixture.device->failWriteAt(failAt);
+        HFS_TEST_CHECK(!journal->append({setSize(21, 42)}, true).ok());
+        fixture.device->failWriteAt(std::numeric_limits<std::size_t>::max());
+        MemoryTarget reader;
+        auto reopened = fixture.open(&reader);
+        HFS_TEST_CHECK(reopened != nullptr);
+        HFS_TEST_CHECK(reopened->replay().ok());
+        HFS_TEST_CHECK(reader.values.empty());
+        HFS_TEST_CHECK(reopened->stats().lastTxid == 0);
+        HFS_TEST_CHECK(reopened->stats().corruption.empty());
     }
 
     std::printf("journal_test: ok\n");
