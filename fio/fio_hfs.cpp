@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <cstdlib>
 #include <cstdio>
 #include <condition_variable>
@@ -53,6 +54,7 @@ struct FioHfsPending {
 struct FioHfsThread {
     std::shared_ptr<hfs::Engine> engine;
     std::shared_ptr<hfs::Client> client;
+    bool direct = true;
     std::size_t maxOutstanding = 32;
     std::mutex mutex;
     std::condition_variable condition;
@@ -267,6 +269,7 @@ int fioHfsInit(struct thread_data *td) {
     auto *state = new FioHfsThread;
     state->engine = std::move(engine);
     state->client = std::move(client).value();
+    state->direct = options == nullptr || options->direct != 0;
     state->maxOutstanding = clientDepth == 0 ? 1 : clientDepth;
     try {
         /* Keep a small fixed pool per fio worker to bound host-thread fanout. */
@@ -404,9 +407,19 @@ int fioHfsGetFileSize(struct thread_data *td, struct fio_file *fioFile) {
 }
 
 /* Executes one FIO request without crossing the caller's queue callback. */
-void executeFioIo(io_u *io, const std::shared_ptr<hfs::File> &file) {
+void executeFioIo(io_u *io, const std::shared_ptr<hfs::File> &file, bool direct) {
     try {
-        hfs::IoVec buffer{static_cast<std::byte *>(io->xfer_buf), io->xfer_buflen};
+        std::vector<std::byte> bounce;
+        std::byte *data = static_cast<std::byte *>(io->xfer_buf);
+        if (!direct) {
+            /* Explicit buffered mode makes the HFS core take its bounce path. */
+            bounce.resize(io->xfer_buflen);
+            data = bounce.data();
+            if (io->ddir == DDIR_WRITE) {
+                std::memcpy(data, io->xfer_buf, io->xfer_buflen);
+            }
+        }
+        hfs::IoVec buffer{data, io->xfer_buflen};
         if (io->ddir == DDIR_READ) {
             auto taskResult = file->read(std::span<hfs::IoVec>(&buffer, 1), io->offset).wait();
             if (!taskResult.ok() || !taskResult.value().ok()) {
@@ -415,6 +428,9 @@ void executeFioIo(io_u *io, const std::shared_ptr<hfs::File> &file) {
             } else {
                 io->error = 0;
                 io->resid = io->xfer_buflen - taskResult.value().value().bytes;
+                if (!direct) {
+                    std::memcpy(io->xfer_buf, data, taskResult.value().value().bytes);
+                }
             }
         } else if (io->ddir == DDIR_WRITE) {
             auto taskResult =
@@ -451,7 +467,7 @@ void fioHfsWorker(FioHfsThread *state) {
             request = state->workQueue.front();
             state->workQueue.pop_front();
         }
-        executeFioIo(request->io, request->file);
+        executeFioIo(request->io, request->file, state->direct);
         {
             std::lock_guard<std::mutex> lock(state->mutex);
             state->completed.push_back(request->io);
