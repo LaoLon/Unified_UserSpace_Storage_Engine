@@ -495,7 +495,7 @@ public:
             std::lock_guard<std::mutex> lock(state->mutex);
             if (!state->completed && !state->callbackStarted) {
                 state->aborted = true;
-                state->request->status = rocksdb::IOStatus::IOError(
+                state->request->status = rocksdb::IOStatus::Aborted(
                     "async read aborted");
             }
         }
