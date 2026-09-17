@@ -88,3 +88,7 @@ device set。因此以下项目没有伪造通过：
 
 补充第二块真实 NVMe 后，应以同一 `.conf` 声明完整 device set，重新执行上述缺失
 矩阵，并记录每盘 placement、submit/complete 和故障恢复结果。
+
+2026-09-17 复核 VM 设备状态：仅存在 `/dev/nvme0n1`，PCI 盘为 VMware NVMe
+`0000:0b:00.0`，当前绑定 `/sys/bus/pci/drivers/nvme`；其余设备为 SATA/块设备，
+因此本记录没有将它们替代为第二块 NVMe。
