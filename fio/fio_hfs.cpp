@@ -11,6 +11,7 @@
 #include <condition_variable>
 #include <deque>
 #include <memory>
+#include <limits>
 #include <mutex>
 #include <span>
 #include <string>
@@ -71,6 +72,7 @@ std::mutex processMutex;
 std::shared_ptr<hfs::Engine> processEngine;
 std::size_t processUsers = 0;
 std::string processConfigPath;
+std::uint64_t processDmaArenaCap = 0;
 
 std::mutex dmaBufferMutex;
 struct DmaBufferOwner {
@@ -136,6 +138,20 @@ int fioHfsIomemAlloc(struct thread_data *td, size_t totalMem) {
     if (engine == nullptr) {
         fioLog("fio-hfs: engine is not active for DMA arena allocation\n");
         return 1;
+    }
+    {
+        std::lock_guard<std::mutex> lock(processMutex);
+        /* FIO invokes this callback independently for each worker, so bound
+         * the complete queue reservation before any worker consumes arena space. */
+        const std::uint64_t depth = static_cast<std::uint64_t>(td->o.iodepth);
+        const std::uint64_t bytes = static_cast<std::uint64_t>(totalMem);
+        const bool overflow = bytes != 0 &&
+                              depth > std::numeric_limits<std::uint64_t>::max() / bytes;
+        if (processDmaArenaCap != 0 &&
+            (overflow || depth * bytes >= processDmaArenaCap)) {
+            fioLog("fio-hfs: requested fio DMA arena exceeds mount cap\n");
+            return 1;
+        }
     }
     auto acquired = engine->acquireDmaBuffer(totalMem, 0);
     if (!acquired.ok()) {
@@ -279,6 +295,10 @@ int fioHfsInit(struct thread_data *td) {
         }
         ++processUsers;
     }
+    {
+        std::lock_guard<std::mutex> lock(processMutex);
+        processDmaArenaCap = static_cast<std::uint64_t>(config.value().dmaArenaMb) << 20;
+    }
     const std::uint32_t clientDepth = options == nullptr ? 32 : options->clientDepth;
     auto client = hfs::Client::create(*engine, hfs::ClientOptions{clientDepth});
     if (!client.ok()) {
@@ -290,6 +310,7 @@ int fioHfsInit(struct thread_data *td) {
         if (processUsers == 0) {
             processEngine->stop().wait();
             processEngine.reset();
+            processDmaArenaCap = 0;
         }
         return 1;
     }
@@ -326,6 +347,7 @@ int fioHfsInit(struct thread_data *td) {
             if (processUsers == 0 && processEngine != nullptr) {
                 processEngine->stop().wait();
                 processEngine.reset();
+                processDmaArenaCap = 0;
             }
         }
         delete state;
@@ -369,6 +391,7 @@ void fioHfsCleanup(struct thread_data *td) {
         if (processUsers == 0 && processEngine != nullptr) {
             processEngine->stop().wait();
             processEngine.reset();
+            processDmaArenaCap = 0;
         }
     }
     delete state;
