@@ -3,6 +3,7 @@
 #include "rocksdb/hfs_filesystem.hpp"
 
 #include <cerrno>
+#include <cstdint>
 #include <fcntl.h>
 #include <memory>
 #include <mutex>
@@ -50,6 +51,16 @@ std::string hfsPath(const std::string &path) {
         return path;
     }
     return "/" + path;
+}
+
+/* Builds a stable host-side lock path for a database in the HFS namespace. */
+std::string hostLockPath(const std::string &path) {
+    std::uint64_t hash = 1469598103934665603ULL;
+    for (unsigned char byte : path) {
+        hash ^= byte;
+        hash *= 1099511628211ULL;
+    }
+    return "/var/tmp/hfs-rocksdb-lock-" + std::to_string(hash);
 }
 
 struct HfsContext {
@@ -358,7 +369,7 @@ public:
     rocksdb::IOStatus LockFile(const std::string &fname, const rocksdb::IOOptions &,
                                rocksdb::FileLock **lock, rocksdb::IODebugContext *) override {
         auto *value = new HfsFileLock;
-        value->fd = ::open(fname.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0644);
+        value->fd = ::open(hostLockPath(fname).c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0644);
         if (value->fd < 0 || ::flock(value->fd, LOCK_EX | LOCK_NB) != 0) {
             if (value->fd >= 0) ::close(value->fd);
             delete value;

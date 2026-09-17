@@ -864,8 +864,9 @@ public:
 
 ### 13.2 Namespace 规则
 
-- path 是绝对路径，按 `/` 分段；v1 不解析 `.`/`..`，不支持符号链接/硬链接
-  （`link count` 仅用于 unlink/orphan 生命周期）；
+- path 是绝对路径，按 `/` 分段；v1 不解析 `.`/`..`，不支持符号链接；regular inode
+  支持同一 namespace 内的 hard link（`link count` 用于 unlink/orphan 生命周期），供
+  RocksDB adapter 的 `LinkFile` contract 使用；
 - inode id 单调分配，handle 带 generation，旧 handle 不能解析到新 inode；
 - directory entry 由 name hash 查找、ordered cursor 遍历；
 - rename 是单一 journal transaction，源/目标不产生中间可见状态；
