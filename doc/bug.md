@@ -27,8 +27,25 @@ Bug 等级：**致命 > 严重 > 一般**。
 - 16：已修复（Shard-77，DataPlane 零初始化合成映射逻辑偏移全部叠加在 0）。
 - 17：已修复（Shard-77 边界收口，extent commit 失败可泄漏 allocator 状态）。
 - 18：已修复（Shard-77 边界收口，extent/range 计算整数溢出未拒绝）。
+- 21：已修复（Shard-82，RocksDB LockFile 将 HFS 路径误当宿主机路径）。
 
 ## Bug 记录
+
+### 21. RocksDB LockFile 将 HFS namespace 路径误当宿主机路径
+
+- **状态**：已修复
+- **等级**：严重（RocksDB 无法打开注入的 HFS Env）
+- **时间**：2026-09-17（Shard-82）
+- **现象**：`hfs_db_bench` 在真实 NVMe 上创建 HFS Env 后，`DB::Open` 报
+  `RocksDB lock is already held`。
+- **排查过程**：锁路径 `/rocksdb-bench/LOCK` 属于 HFS namespace，不存在于宿主机；
+  `open(2)` 失败后适配器统一返回了“已持有”错误。
+- **根因**：RocksDB `FileSystem::LockFile` 需要宿主机可见的稳定路径，不能直接把
+  HFS 绝对路径传给宿主机 syscall。
+- **修复**：按 HFS DB 路径计算稳定 FNV-1a 名称，锁文件落在 `/var/tmp`，仍由
+  `flock` 提供跨进程互斥。
+- **验证结果**：真实 NVMe smoke 中 lock 阶段通过；后续 `DB::Open` 继续到 WAL
+  `Sync`，并暴露当前 core 的 Shard-78 durability 未实现边界。
 
 ### 1. `.conf` schema 表使用 `std::initializer_list` 导致静态存储悬空
 
