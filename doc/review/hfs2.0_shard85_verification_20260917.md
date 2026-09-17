@@ -189,3 +189,7 @@ RocksDB `GetFileSize` 与 `GetFileModificationTime` 的底层 stat 失败现统�
 
 锁接口还覆盖了空输出参数保护、非竞争 host 错误保留为 `IOError`，以及 HFS
 `NoSpace` 映射为 RocksDB `NoSpace` 子码；相关构建和真实 NVMe smoke 均通过。
+
+跨进程顺序 reopen 复测使用两个独立 `hfs_db_bench` 进程：第一个 `fillseq` 64 项，
+第二个 `readrandom` 64 项，随后独立 `hfs_ldb checkconsistency` 报告 `entries=64`；
+正式 `.conf` 与真实 NVMe 均通过。

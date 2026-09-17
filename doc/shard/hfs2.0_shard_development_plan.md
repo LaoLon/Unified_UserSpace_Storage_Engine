@@ -508,6 +508,9 @@ RMW 放大；`AbortIO` 遵守 cancel boundary。
 > RocksDB smoke 中验证缺失路径不会退化为通用 I/O 错误。
 > 另补齐 `LockFile` 空输出参数保护、锁竞争与其他 host 错误的区分，以及 `NoSpace`
 > 到 RocksDB 子码的映射；真实 NVMe smoke 覆盖空输出、锁竞争和缺失路径断言。
+> 另以两个独立 `hfs_db_bench` 进程执行 `fillseq`→`readrandom`，再由独立
+> `hfs_ldb` 进程执行 `checkconsistency`；真实 NVMe 结果为 64/64 读写与
+> `entries=64`，补齐顺序跨进程 reopen 的直接证据。
 
 **交付物**：`hfs_db_bench`/`hfs_ldb` 完整参数；SIGKILL recovery、跨进程顺序 reopen、
 `checkconsistency`。
