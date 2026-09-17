@@ -526,6 +526,107 @@ private:
     std::uint32_t blockFactor_;
 };
 
+/* Mirrors journal and checkpoint I/O to every configured metadata device. */
+class MirroredRuntimeJournalDevice final : public JournalDevice {
+public:
+    MirroredRuntimeJournalDevice(SpdkRuntime &runtime, const Config &config,
+                                 const std::vector<DeviceGeometry> &geometries,
+                                 std::size_t primaryIndex)
+        : runtime_(runtime), config_(config), geometries_(geometries), primaryIndex_(primaryIndex) {
+        for (std::size_t i = 0; i < config_.devices.size(); ++i) {
+            if (!config_.devices[i].metadata) continue;
+            const std::uint32_t sectorSize = runtime_.deviceBlockSize(i);
+            devices_.push_back(std::make_pair(
+                i, std::make_unique<RuntimeJournalDevice>(runtime_, i,
+                                                           config_.metadataBlockSize,
+                                                           sectorSize)));
+        }
+    }
+
+    std::uint32_t blockSize() const noexcept override { return config_.metadataBlockSize; }
+
+    Result<void> read(std::uint64_t offsetBlocks, std::span<std::byte> buffer) override {
+        if (!isMirroredRegion(offsetBlocks)) {
+            return devices_.front().second->read(offsetBlocks, buffer);
+        }
+        std::vector<std::byte> reference(buffer.size());
+        auto first = devices_.front().second->read(translate(offsetBlocks, devices_.front().first),
+                                                   reference);
+        if (!first.ok()) return first;
+        for (std::size_t i = 1; i < devices_.size(); ++i) {
+            std::vector<std::byte> candidate(buffer.size());
+            auto readResult = devices_[i].second->read(translate(offsetBlocks, devices_[i].first),
+                                                       candidate);
+            if (!readResult.ok()) return readResult;
+            if (candidate != reference) {
+                return makeError(Status::Corrupt, "metadata replica bytes diverged");
+            }
+        }
+        std::copy(reference.begin(), reference.end(), buffer.begin());
+        return Result<void>(Status::Ok);
+    }
+
+    Result<void> write(std::uint64_t offsetBlocks,
+                       std::span<const std::byte> buffer) override {
+        for (auto &entry : devices_) {
+            std::vector<std::byte> replica(buffer.begin(), buffer.end());
+            if (isSuperblock(offsetBlocks) && replica.size() >= sizeof(Hfs2Superblock)) {
+                Hfs2Superblock superblock{};
+                std::memcpy(&superblock, replica.data(), sizeof(superblock));
+                superblock.deviceId = static_cast<std::uint32_t>(entry.first);
+                superblock.replicaId = geometries_[entry.first].replicaId;
+                superblockFinalize(superblock);
+                std::memcpy(replica.data(), &superblock, sizeof(superblock));
+            }
+            auto written = entry.second->write(translate(offsetBlocks, entry.first), replica);
+            if (!written.ok()) return written;
+        }
+        return Result<void>(Status::Ok);
+    }
+
+    Result<void> flush() override {
+        for (auto &entry : devices_) {
+            auto flushed = entry.second->flush();
+            if (!flushed.ok()) return flushed;
+        }
+        return Result<void>(Status::Ok);
+    }
+
+private:
+    bool isSuperblock(std::uint64_t offsetBlocks) const noexcept {
+        return offsetBlocks == 0 ||
+               offsetBlocks == kSuperblockSlotOffsetBytes / config_.metadataBlockSize;
+    }
+
+    bool isMirroredRegion(std::uint64_t offsetBlocks) const noexcept {
+        const DeviceGeometry &primary = geometries_[primaryIndex_];
+        return (offsetBlocks >= primary.journalStart &&
+                offsetBlocks < primary.journalStart + primary.journalBlocks) ||
+               (offsetBlocks >= primary.checkpointAStart &&
+                offsetBlocks < primary.checkpointAStart + primary.checkpointBlocks);
+    }
+
+    std::uint64_t translate(std::uint64_t offsetBlocks, std::size_t deviceIndex) const noexcept {
+        const DeviceGeometry &primary = geometries_[primaryIndex_];
+        const DeviceGeometry &target = geometries_[deviceIndex];
+        if (offsetBlocks >= primary.journalStart &&
+            offsetBlocks < primary.journalStart + primary.journalBlocks) {
+            return target.journalStart + (offsetBlocks - primary.journalStart);
+        }
+        if (offsetBlocks >= primary.checkpointAStart &&
+            offsetBlocks < primary.checkpointAStart + primary.checkpointBlocks) {
+            return target.checkpointAStart + (offsetBlocks - primary.checkpointAStart);
+        }
+        return offsetBlocks;
+    }
+
+    SpdkRuntime &runtime_;
+    const Config &config_;
+    const std::vector<DeviceGeometry> &geometries_;
+    std::size_t primaryIndex_;
+    std::vector<std::pair<std::size_t, std::unique_ptr<RuntimeJournalDevice>>> devices_;
+};
+
 } // namespace
 
 Result<std::unique_ptr<Journal>> Journal::open(Engine &engine, JournalTarget *target,
@@ -542,8 +643,14 @@ Result<std::unique_ptr<Journal>> Journal::open(Engine &engine, JournalTarget *ta
         return makeError<std::unique_ptr<Journal>>(Status::InvalidState,
                                                    "engine is not mounted");
     }
-    auto device = std::make_unique<RuntimeJournalDevice>(runtime, deviceIndex,
-                                                         config.metadataBlockSize, sectorSize);
+    std::unique_ptr<JournalDevice> device;
+    if (target != nullptr && config.metadataReplication > 1) {
+        device = std::make_unique<MirroredRuntimeJournalDevice>(runtime, config, geometries,
+                                                                deviceIndex);
+    } else {
+        device = std::make_unique<RuntimeJournalDevice>(runtime, deviceIndex,
+                                                        config.metadataBlockSize, sectorSize);
+    }
     /* Capture the raw pointer before transferring ownership to Journal. */
     JournalDevice *devicePtr = device.get();
     const auto &geometry = geometries[deviceIndex];

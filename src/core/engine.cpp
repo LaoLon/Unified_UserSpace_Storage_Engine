@@ -317,7 +317,18 @@ Task<Result<void>> Engine::mount() {
 
     /* Mount the metadata journal against the resident checkpoint target. */
     impl.metadataTarget = std::make_unique<NamespaceJournalTarget>(*impl.namespaceState);
-    auto journal = Journal::open(*this, impl.metadataTarget.get(), 0);
+    const auto metadataDevice = std::find_if(
+        impl.config.devices.begin(), impl.config.devices.end(),
+        [](const DeviceConfig &device) { return device.metadata; });
+    if (metadataDevice == impl.config.devices.end()) {
+        impl.metadataTarget.reset();
+        impl.namespaceState.reset();
+        runtime.stop();
+        co_return makeError(Status::Corrupt, "configured metadata device set is empty");
+    }
+    const std::size_t metadataIndex =
+        static_cast<std::size_t>(metadataDevice - impl.config.devices.begin());
+    auto journal = Journal::open(*this, impl.metadataTarget.get(), metadataIndex);
     if (!journal.ok()) {
         impl.metadataTarget.reset();
         impl.namespaceState.reset();
