@@ -373,6 +373,10 @@ Result<VolumeInfo> mountVolume(SpdkRuntime &runtime, const Config &config) {
 }
 
 Result<void> updateCleanShutdown(SpdkRuntime &runtime, const Config &config, bool clean) {
+    std::vector<Hfs2Superblock> current(config.devices.size());
+    std::vector<std::uint32_t> sectorSizes(config.devices.size(), 0);
+    std::vector<std::uint64_t> targetOffsets(config.devices.size(), 0);
+    /* Read every replica before publishing one shared lifecycle version. */
     for (std::size_t deviceIndex = 0; deviceIndex < config.devices.size(); ++deviceIndex) {
         const std::uint32_t sectorSize = runtime.deviceBlockSize(deviceIndex);
         if (sectorSize == 0 || config.metadataBlockSize == 0) {
@@ -390,19 +394,27 @@ Result<void> updateCleanShutdown(SpdkRuntime &runtime, const Config &config, boo
             return makeError(Status::NotFound, "no valid superblock while updating clean flag");
         }
         const bool useB = readB.value() && (!readA.value() || slotB.generation > slotA.generation);
-        Hfs2Superblock updated = useB ? slotB : slotA;
-        if (updated.generation == std::numeric_limits<std::uint64_t>::max() ||
-            updated.mountEpoch == std::numeric_limits<std::uint64_t>::max()) {
-            return makeError(Status::Corrupt, "superblock lifecycle counter overflow");
-        }
-        updated.generation += 1;
-        updated.mountEpoch += 1;
+        current[deviceIndex] = useB ? slotB : slotA;
+        sectorSizes[deviceIndex] = sectorSize;
+        targetOffsets[deviceIndex] = useB ? 0 : kSuperblockSlotOffsetBytes;
+    }
+    const Hfs2Superblock &reference = current.front();
+    if (reference.generation == std::numeric_limits<std::uint64_t>::max() ||
+        reference.mountEpoch == std::numeric_limits<std::uint64_t>::max()) {
+        return makeError(Status::Corrupt, "superblock lifecycle counter overflow");
+    }
+    const std::uint64_t nextGeneration = reference.generation + 1;
+    const std::uint64_t nextMountEpoch = reference.mountEpoch + 1;
+    /* Publish identical generation and epoch values to all configured devices. */
+    for (std::size_t deviceIndex = 0; deviceIndex < config.devices.size(); ++deviceIndex) {
+        Hfs2Superblock updated = current[deviceIndex];
+        updated.generation = nextGeneration;
+        updated.mountEpoch = nextMountEpoch;
         updated.cleanShutdown = clean ? 1 : 0;
         superblockFinalize(updated);
-        const std::uint64_t targetOffset = useB ? 0 : kSuperblockSlotOffsetBytes;
-        auto written = runtime.controlWrite(deviceIndex, targetOffset / sectorSize,
-                                            buildSuperblockRecord(updated,
-                                                                   config.metadataBlockSize));
+        auto written = runtime.controlWrite(
+            deviceIndex, targetOffsets[deviceIndex] / sectorSizes[deviceIndex],
+            buildSuperblockRecord(updated, config.metadataBlockSize));
         if (!written.ok()) return written;
         auto flushed = runtime.controlFlush(deviceIndex);
         if (!flushed.ok()) return flushed;

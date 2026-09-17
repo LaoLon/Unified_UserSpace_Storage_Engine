@@ -478,9 +478,16 @@ checkconsistency）；错误/超时/取消映射完整。
 ### Shard-85：多盘完整矩阵、性能基线与归档
 
 > 状态：单盘真实 NVMe 功能/FIO workload 矩阵和 `--verify=crc32c` loader smoke 已
-> 通过；当前 VM 只有 `Nvme0n1`（`0000:0b:00.0`），双盘、全 data device、metadata
+> 通过；VM 现有两块独立 NVMe：`Nvme0n1`（`0000:0b:00.0`）和 `Nvme1n1`
+> （`0000:13:00.0`）。新增 `config/hfs_nvme_dual.conf` 已通过双盘 format、mount、
+> metadata replica check，以及双盘 FIO `randrw`/CRC verify；完整双盘矩阵、metadata
 > replica 掉盘/CRC/generation 故障组合以及 raw 对照/5-run 性能门禁仍未完成，不能用
-> 重复 BDF、SATA 或 Malloc/Aio 替代。
+> SATA 或 Malloc/Aio 替代。
+
+2026-09-17 双盘验收还发现 clean/dirty 生命周期逐盘递增会使副本 generation 漂移，
+已改为先读取全部副本、计算一次共享版本后逐盘发布；修复后双盘 `hfsctl check` 连续
+通过。RocksDB smoke 仍在 free-space 立即减少的 extent 粒度断言处返回 7，需单独修订
+测试口径，不能记录为 smoke 全通过。
 
 **交付物**：
 

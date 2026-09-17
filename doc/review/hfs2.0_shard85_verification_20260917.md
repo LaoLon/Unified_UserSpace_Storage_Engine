@@ -87,20 +87,19 @@ READ/WRITE 吞吐换算的总 IOPS 约为 `7066, 11418, 3550, 6554, 26266`，中
 
 ## 当前硬门禁
 
-VM 设备盘点只有一块 NVMe；其余 `sda/sdb` 是虚拟 SATA/块设备，不能代替正式 NVMe
-device set。因此以下项目没有伪造通过：
+VM 现有两块独立 NVMe 控制器：`Nvme0n1`（`0000:0b:00.0`，30 GiB）和 `Nvme1n1`
+（`0000:13:00.0`，25 GiB）；其余 `sda/sdb` 是虚拟 SATA/块设备，不能代替正式 NVMe
+device set。双盘配置 `config/hfs_nvme_dual.conf` 已完成 format、mount、metadata
+replica check，以及 2 jobs/4 KiB/16 MiB 的 `randrw` CRC verify，返回 `err=0`。
+因此以下项目仍没有伪造通过：
 
 - 双盘 device set 和配置中全部 data device 矩阵；
 - metadata replica=2 的掉盘、CRC 不一致、generation 落后组合；
 - HFS 与 raw SPDK 的性能 gate 已执行但失败，且当前输出未提供正式 p99；不能作为
   Shard-81 完成证据。
 
-补充第二块真实 NVMe 后，应以同一 `.conf` 声明完整 device set，重新执行上述缺失
-矩阵，并记录每盘 placement、submit/complete 和故障恢复结果。
-
-2026-09-17 复核 VM 设备状态：出现 `/dev/nvme0n1`（30G）和 `/dev/nvme0n2`（25G），
-但二者均指向同一 VMware NVMe 控制器 `0000:0b:00.0` 和同一 serial，当前绑定
-`/sys/bus/pci/drivers/nvme`；其余设备为 SATA/块设备。临时配置将 `Nvme0n2` 作为
-第二 device 声明时，被正式 parser 以 duplicate PCI BDF 拒绝，因此没有将同一控制器
-的 namespace 冒充独立第二盘。VM 重启后的 hugepage 值曾为 0，已恢复并确认
-`vm.nr_hugepages=1024`、`HugePages_Free=1024`。
+此前缺盘环境下的重复 BDF 探针仍保留为边界证据；当前双盘测试使用两个独立 BDF，且
+已确认 `vm.nr_hugepages=1024`、`HugePages_Free=1024`。生命周期验收中发现逐盘更新
+clean/dirty 标志会造成 superblock generation 漂移，已修复为共享版本发布；修复后
+双盘 `hfsctl check` 连续通过。RocksDB smoke 仍因“12 字节写入后 free space 必须
+立即减少”这一与 extent 粒度统计不一致的断言返回 7，需另行修订测试口径。
