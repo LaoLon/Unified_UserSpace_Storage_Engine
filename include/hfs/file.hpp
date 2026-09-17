@@ -66,6 +66,7 @@ struct FileStat {
     std::uint64_t durableSize = 0;
     std::uint64_t mtimeNs = 0;
     std::uint64_t ctimeNs = 0;
+    std::uint64_t logicalEpoch = 0;
 };
 
 struct DirectoryEntry {

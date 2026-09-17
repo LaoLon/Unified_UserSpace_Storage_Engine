@@ -442,19 +442,25 @@ Task<Result<void>> File::truncate(std::uint64_t size) {
 }
 
 Task<Result<void>> File::datasync() {
-    if (!impl_->state->engine->processValid()) {
+    if (impl_->state->engine == nullptr || !impl_->state->engine->processValid()) {
         co_return Result<void>(Status::ForkedProcess, "engine belongs to another process");
     }
-    co_return makeError(Status::NotSupported,
-                        "file datasync lands with the metadata epoch path (Shard-78)");
+    auto statResult = stat();
+    if (!statResult.ok()) {
+        co_return makeError(statResult.status(), statResult.message());
+    }
+    co_return impl_->state->engine->syncMetadata(statResult.value().logicalEpoch);
 }
 
 Task<Result<void>> File::sync() {
-    if (!impl_->state->engine->processValid()) {
+    if (impl_->state->engine == nullptr || !impl_->state->engine->processValid()) {
         co_return Result<void>(Status::ForkedProcess, "engine belongs to another process");
     }
-    co_return makeError(Status::NotSupported,
-                        "file sync lands with the metadata epoch path (Shard-78)");
+    auto statResult = stat();
+    if (!statResult.ok()) {
+        co_return makeError(statResult.status(), statResult.message());
+    }
+    co_return impl_->state->engine->syncMetadata(statResult.value().logicalEpoch);
 }
 
 } // namespace hfs

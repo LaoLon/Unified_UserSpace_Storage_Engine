@@ -28,6 +28,7 @@ Bug 等级：**致命 > 严重 > 一般**。
 - 17：已修复（Shard-77 边界收口，extent commit 失败可泄漏 allocator 状态）。
 - 18：已修复（Shard-77 边界收口，extent/range 计算整数溢出未拒绝）。
 - 21：已修复（Shard-82，RocksDB LockFile 将 HFS 路径误当宿主机路径）。
+- 22：已修复（Shard-82，RocksDB DB 路径尾斜杠未规范化）。
 
 ## Bug 记录
 
@@ -46,6 +47,18 @@ Bug 等级：**致命 > 严重 > 一般**。
   `flock` 提供跨进程互斥。
 - **验证结果**：真实 NVMe smoke 中 lock 阶段通过；后续 `DB::Open` 继续到 WAL
   `Sync`，并暴露当前 core 的 Shard-78 durability 未实现边界。
+
+### 22. RocksDB DB 路径尾斜杠未规范化
+
+- **状态**：已修复
+- **等级**：一般（RocksDB Env 无法打开带尾斜杠的 DB 路径）
+- **时间**：2026-09-17（Shard-82）
+- **现象**：RocksDB 使用 `/rocksdb-bench/` 形式的 DB 路径时，HFS path parser 返回
+  `Invalid argument: trailing slash is not allowed`。
+- **根因**：RocksDB 的宿主路径约定允许 DB 目录尾斜杠，而 HFS namespace 要求除根
+  路径外不带尾斜杠。
+- **修复**：adapter 的统一路径转换去除尾斜杠，并保留 `/`。
+- **验证结果**：真实 NVMe `hfs_db_bench fillseq` 和跨进程 `readrandom` 均通过。
 
 ### 1. `.conf` schema 表使用 `std::initializer_list` 导致静态存储悬空
 

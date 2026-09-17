@@ -2,11 +2,58 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstring>
 #include <limits>
+#include <unordered_set>
 
 namespace hfs::metadata {
 
 namespace {
+
+constexpr std::uint64_t kNamespaceSnapshotMagic = 0x484653324e535031ULL; /* HFS2NSP1 */
+constexpr std::uint32_t kNamespaceSnapshotVersion = 1;
+
+/* Appends fixed-width fields so checkpoint encoding stays architecture-neutral. */
+template <typename T>
+void appendSnapshotField(std::vector<std::byte> &out, T value) {
+    const auto *raw = reinterpret_cast<const std::byte *>(&value);
+    out.insert(out.end(), raw, raw + sizeof(T));
+}
+
+/* Reads one fixed-width field with a bounded cursor. */
+template <typename T>
+bool readSnapshotField(std::span<const std::byte> data, std::size_t &cursor, T *value) {
+    if (value == nullptr || cursor > data.size() || data.size() - cursor < sizeof(T)) {
+        return false;
+    }
+    std::memcpy(value, data.data() + cursor, sizeof(T));
+    cursor += sizeof(T);
+    return true;
+}
+
+/* Encodes a bounded directory name. */
+bool appendSnapshotString(std::vector<std::byte> &out, std::string_view value) {
+    if (value.size() > std::numeric_limits<std::uint32_t>::max()) {
+        return false;
+    }
+    appendSnapshotField(out, static_cast<std::uint32_t>(value.size()));
+    const auto *raw = reinterpret_cast<const std::byte *>(value.data());
+    out.insert(out.end(), raw, raw + value.size());
+    return true;
+}
+
+/* Decodes a bounded directory name. */
+bool readSnapshotString(std::span<const std::byte> data, std::size_t &cursor,
+                        std::string *value) {
+    std::uint32_t length = 0;
+    if (value == nullptr || !readSnapshotField(data, cursor, &length) ||
+        length > data.size() - cursor) {
+        return false;
+    }
+    value->assign(reinterpret_cast<const char *>(data.data() + cursor), length);
+    cursor += length;
+    return true;
+}
 
 std::uint64_t systemNowNs(void *) {
     const auto now = std::chrono::system_clock::now().time_since_epoch();
@@ -594,7 +641,7 @@ Result<FileStat> Namespace::stat(FileHandle handle) const {
     const Inode &inode = *inodeResult.value();
     return FileStat{inode.id,        inode.generation, inode.directory, inode.linkCount,
                     inode.openCount, inode.logicalSize, inode.durableSize, inode.mtimeNs,
-                    inode.ctimeNs};
+                    inode.ctimeNs,   inode.logicalEpoch};
 }
 
 Result<FileStat> Namespace::stat(std::string_view path) const {
@@ -606,7 +653,7 @@ Result<FileStat> Namespace::stat(std::string_view path) const {
     const Inode &inode = inodes_[resolved.value().inode];
     return FileStat{inode.id,        inode.generation, inode.directory, inode.linkCount,
                     inode.openCount, inode.logicalSize, inode.durableSize, inode.mtimeNs,
-                    inode.ctimeNs};
+                    inode.ctimeNs,   inode.logicalEpoch};
 }
 
 Result<void> Namespace::close(FileHandle handle) {
@@ -920,7 +967,260 @@ Result<void> Namespace::publishDurableEpoch(std::uint64_t epoch) {
             inode.durableSize = inode.logicalSize;
         }
     }
+    preparedDurableSizes_.clear();
     return Result<void>(Status::Ok);
+}
+
+Result<void> Namespace::prepareDurableEpoch(std::uint64_t epoch) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (epoch > logicalEpoch_) {
+        return makeError(Status::InvalidArgument,
+                         "durable epoch is ahead of logical epoch");
+    }
+    if (epoch < durableEpoch_) {
+        return makeError(Status::InvalidArgument,
+                         "durable epoch cannot move backwards");
+    }
+    if (!preparedDurableSizes_.empty()) {
+        return makeError(Status::Busy, "another durable epoch is being prepared");
+    }
+    preparedDurableSizes_.reserve(inodes_.size());
+    for (const Inode &inode : inodes_) {
+        preparedDurableSizes_.push_back(inode.durableSize);
+    }
+    /* Stage file sizes before checkpoint; the epoch itself publishes afterward. */
+    for (Inode &inode : inodes_) {
+        if (inode.id != 0 && inode.logicalEpoch <= epoch) {
+            inode.durableSize = inode.logicalSize;
+        }
+    }
+    return Result<void>(Status::Ok);
+}
+
+/* Restores staged durable sizes after a failed checkpoint. */
+void Namespace::rollbackPreparedDurableEpoch() noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (preparedDurableSizes_.size() == inodes_.size()) {
+        for (std::size_t i = 0; i < inodes_.size(); ++i) {
+            inodes_[i].durableSize = preparedDurableSizes_[i];
+        }
+    }
+    preparedDurableSizes_.clear();
+}
+
+Result<void> Namespace::saveSnapshot(std::uint64_t txid, std::vector<std::byte> &out) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    out.clear();
+    appendSnapshotField(out, kNamespaceSnapshotMagic);
+    appendSnapshotField(out, kNamespaceSnapshotVersion);
+    appendSnapshotField(out, txid);
+    appendSnapshotField(out, static_cast<std::uint64_t>(inodes_.size()));
+    appendSnapshotField(out, static_cast<std::uint64_t>(freeSlots_.size()));
+    appendSnapshotField(out, namespaceBytes_);
+    appendSnapshotField(out, logicalEpoch_);
+    appendSnapshotField(out, durableEpoch_);
+    for (const Inode &inode : inodes_) {
+        appendSnapshotField(out, inode.id);
+        appendSnapshotField(out, inode.generation);
+        appendSnapshotField(out, static_cast<std::uint8_t>(inode.directory ? 1 : 0));
+        appendSnapshotField(out, inode.linkCount);
+        appendSnapshotField(out, inode.logicalSize);
+        appendSnapshotField(out, inode.durableSize);
+        appendSnapshotField(out, inode.logicalEpoch);
+        appendSnapshotField(out, inode.mtimeNs);
+        appendSnapshotField(out, inode.ctimeNs);
+        appendSnapshotField(out, inode.parent);
+        appendSnapshotField(out, inode.childCount);
+        const std::uint64_t entryCount =
+            inode.directory ? static_cast<std::uint64_t>(inode.index->ordered.size()) : 0;
+        appendSnapshotField(out, entryCount);
+        if (inode.directory) {
+            for (const auto &[name, child] : inode.index->ordered) {
+                if (!appendSnapshotString(out, name)) {
+                    return makeError(Status::NoMemory, "directory name is too large");
+                }
+                appendSnapshotField(out, child);
+            }
+        }
+        const auto descriptors = inode.extents.snapshot();
+        appendSnapshotField(out, static_cast<std::uint64_t>(descriptors.size()));
+        for (const ExtentDescriptor &descriptor : descriptors) {
+            appendSnapshotField(out, descriptor.logicalExtent);
+            appendSnapshotField(out, descriptor.physicalExtent);
+            appendSnapshotField(out, descriptor.count);
+            appendSnapshotField(out, descriptor.deviceId);
+        }
+    }
+    for (const std::uint64_t slot : freeSlots_) {
+        appendSnapshotField(out, slot);
+    }
+    appendSnapshotField(out, static_cast<std::uint64_t>(allocators_.size()));
+    for (const auto &allocator : allocators_) {
+        const auto encoded = allocator->serialize();
+        appendSnapshotField(out, static_cast<std::uint64_t>(encoded.size()));
+        out.insert(out.end(), encoded.begin(), encoded.end());
+    }
+    snapshotTxid_ = txid;
+    return Result<void>(Status::Ok);
+}
+
+Result<void> Namespace::loadSnapshot(std::span<const std::byte> data) {
+    std::size_t cursor = 0;
+    std::uint64_t magic = 0;
+    std::uint32_t version = 0;
+    std::uint64_t txid = 0;
+    std::uint64_t inodeCount = 0;
+    std::uint64_t freeCount = 0;
+    std::uint64_t savedNamespaceBytes = 0;
+    std::uint64_t savedLogicalEpoch = 0;
+    std::uint64_t savedDurableEpoch = 0;
+    if (!readSnapshotField(data, cursor, &magic) ||
+        !readSnapshotField(data, cursor, &version) ||
+        !readSnapshotField(data, cursor, &txid) ||
+        !readSnapshotField(data, cursor, &inodeCount) ||
+        !readSnapshotField(data, cursor, &freeCount) ||
+        !readSnapshotField(data, cursor, &savedNamespaceBytes) ||
+        !readSnapshotField(data, cursor, &savedLogicalEpoch) ||
+        !readSnapshotField(data, cursor, &savedDurableEpoch) ||
+        magic != kNamespaceSnapshotMagic || version != kNamespaceSnapshotVersion ||
+        inodeCount <= kRootInodeId || inodeCount > config_.maxInodes + 1 ||
+        freeCount > inodeCount) {
+        return makeError(Status::Corrupt, "invalid namespace snapshot header");
+    }
+
+    std::vector<Inode> restored(inodeCount);
+    for (std::uint64_t index = 0; index < inodeCount; ++index) {
+        Inode &inode = restored[index];
+        std::uint8_t directory = 0;
+        std::uint64_t entryCount = 0;
+        std::uint64_t extentCount = 0;
+        if (!readSnapshotField(data, cursor, &inode.id) ||
+            !readSnapshotField(data, cursor, &inode.generation) ||
+            !readSnapshotField(data, cursor, &directory) ||
+            !readSnapshotField(data, cursor, &inode.linkCount) ||
+            !readSnapshotField(data, cursor, &inode.logicalSize) ||
+            !readSnapshotField(data, cursor, &inode.durableSize) ||
+            !readSnapshotField(data, cursor, &inode.logicalEpoch) ||
+            !readSnapshotField(data, cursor, &inode.mtimeNs) ||
+            !readSnapshotField(data, cursor, &inode.ctimeNs) ||
+            !readSnapshotField(data, cursor, &inode.parent) ||
+            !readSnapshotField(data, cursor, &inode.childCount) ||
+            !readSnapshotField(data, cursor, &entryCount) ||
+            directory > 1 || entryCount > config_.maxInodes) {
+            return makeError(Status::Corrupt, "truncated inode snapshot");
+        }
+        inode.directory = directory != 0;
+        inode.openCount = 0;
+        inode.extents.configure(config_.extentBytes);
+        if (inode.directory) {
+            inode.index = std::make_shared<DirectoryIndex>();
+            for (std::uint64_t entry = 0; entry < entryCount; ++entry) {
+                std::string name;
+                std::uint64_t child = 0;
+                if (!readSnapshotString(data, cursor, &name) || name.empty() ||
+                    name.size() > kMaxNameBytes || !readSnapshotField(data, cursor, &child) ||
+                    child == 0 || child >= inodeCount ||
+                    !inode.index->byName.emplace(name, child).second ||
+                    !inode.index->ordered.emplace(name, child).second) {
+                    return makeError(Status::Corrupt, "invalid directory snapshot");
+                }
+            }
+        } else if (entryCount != 0) {
+            return makeError(Status::Corrupt, "regular inode has directory entries");
+        }
+        if (!readSnapshotField(data, cursor, &extentCount) || extentCount > config_.maxInodes) {
+            return makeError(Status::Corrupt, "invalid extent snapshot count");
+        }
+        std::vector<ExtentDescriptor> descriptors;
+        descriptors.reserve(static_cast<std::size_t>(extentCount));
+        for (std::uint64_t extent = 0; extent < extentCount; ++extent) {
+            ExtentDescriptor descriptor;
+            if (!readSnapshotField(data, cursor, &descriptor.logicalExtent) ||
+                !readSnapshotField(data, cursor, &descriptor.physicalExtent) ||
+                !readSnapshotField(data, cursor, &descriptor.count) ||
+                !readSnapshotField(data, cursor, &descriptor.deviceId) ||
+                descriptor.count == 0) {
+                return makeError(Status::Corrupt, "truncated extent snapshot");
+            }
+            descriptors.push_back(descriptor);
+        }
+        auto restoredMap = inode.extents.restore(descriptors);
+        if (!restoredMap.ok()) {
+            return makeError(Status::Corrupt, "invalid inode extent map snapshot");
+        }
+        if (index == 0 && inode.id != 0) {
+            return makeError(Status::Corrupt, "snapshot slot zero is occupied");
+        }
+        if (index != 0 && inode.id != 0 && inode.id != index) {
+            return makeError(Status::Corrupt, "inode id does not match snapshot slot");
+        }
+    }
+
+    std::vector<std::uint64_t> restoredFreeSlots;
+    restoredFreeSlots.reserve(static_cast<std::size_t>(freeCount));
+    std::unordered_set<std::uint64_t> freeSet;
+    for (std::uint64_t i = 0; i < freeCount; ++i) {
+        std::uint64_t slot = 0;
+        if (!readSnapshotField(data, cursor, &slot) || slot == 0 || slot >= inodeCount ||
+            restored[slot].id != 0 || !freeSet.insert(slot).second) {
+            return makeError(Status::Corrupt, "invalid free inode slot snapshot");
+        }
+        restoredFreeSlots.push_back(slot);
+    }
+
+    std::uint64_t allocatorCount = 0;
+    if (!readSnapshotField(data, cursor, &allocatorCount) ||
+        allocatorCount != allocators_.size()) {
+        return makeError(Status::Corrupt, "allocator count mismatch in namespace snapshot");
+    }
+    std::vector<std::unique_ptr<Allocator>> restoredAllocators;
+    restoredAllocators.reserve(allocatorCount);
+    for (std::size_t i = 0; i < allocatorCount; ++i) {
+        std::uint64_t length = 0;
+        if (!readSnapshotField(data, cursor, &length) || length > data.size() - cursor) {
+            return makeError(Status::Corrupt, "truncated allocator snapshot");
+        }
+        const auto current = allocators_[i]->stats();
+        AllocatorConfig allocatorConfig;
+        allocatorConfig.deviceId = allocators_[i]->deviceId();
+        allocatorConfig.totalExtents = current.total;
+        allocatorConfig.capacityExtents = current.capacity;
+        allocatorConfig.maxReserveExtents = config_.maxReserveExtents;
+        auto allocator = Allocator::create(allocatorConfig);
+        if (!allocator.ok() || !allocator.value()->deserialize(
+                                  data.subspan(cursor, static_cast<std::size_t>(length))).ok()) {
+            return makeError(Status::Corrupt, "invalid allocator snapshot");
+        }
+        restoredAllocators.push_back(std::move(allocator).value());
+        cursor += static_cast<std::size_t>(length);
+    }
+    if (cursor != data.size() || restored[kRootInodeId].id != kRootInodeId ||
+        !restored[kRootInodeId].directory) {
+        return makeError(Status::Corrupt, "namespace snapshot has trailing or invalid root data");
+    }
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    inodes_ = std::move(restored);
+    freeSlots_ = std::move(restoredFreeSlots);
+    allocators_ = std::move(restoredAllocators);
+    namespaceBytes_ = savedNamespaceBytes;
+    logicalEpoch_ = savedLogicalEpoch;
+    durableEpoch_ = savedDurableEpoch;
+    snapshotTxid_ = txid;
+    preparedDurableSizes_.clear();
+    stats_ = {};
+    for (const Inode &inode : inodes_) {
+        if (inode.id != 0) {
+            ++stats_.inodes;
+        }
+    }
+    stats_.namespaceBytes = namespaceBytes_;
+    return Result<void>(Status::Ok);
+}
+
+std::uint64_t Namespace::snapshotTxid() const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return snapshotTxid_;
 }
 
 std::uint64_t Namespace::deviceStartExtent(std::uint32_t deviceId) const noexcept {

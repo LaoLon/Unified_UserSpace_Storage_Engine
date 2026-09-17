@@ -98,6 +98,7 @@ public:
 private:
     explicit Engine(Config config);
     friend class Client;
+    friend class File;
     friend struct MetadataLease;
     /* Internal: mounted namespace state used by the frontend API. */
     metadata::Namespace *metadataNamespace() const noexcept;
@@ -105,6 +106,8 @@ private:
     DataPlane *dataPlane() const noexcept;
     void retainMetadataUser() noexcept;
     void releaseMetadataUser() noexcept;
+    /* Flushes data, checkpoints metadata, then publishes the durable epoch. */
+    Result<void> syncMetadata(std::uint64_t epoch);
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

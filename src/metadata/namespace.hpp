@@ -106,6 +106,16 @@ public:
     std::uint64_t logicalEpoch() const;
     std::uint64_t durableEpoch() const;
     Result<void> publishDurableEpoch(std::uint64_t epoch);
+    /* Stages durable sizes in the snapshot without publishing the epoch yet. */
+    Result<void> prepareDurableEpoch(std::uint64_t epoch);
+    /* Restores durable sizes when the checkpoint transaction fails. */
+    void rollbackPreparedDurableEpoch() noexcept;
+
+    /* Serializes the complete metadata state for a journal checkpoint. */
+    Result<void> saveSnapshot(std::uint64_t txid, std::vector<std::byte> &out);
+    /* Restores a checkpoint and drops non-durable open-handle references. */
+    Result<void> loadSnapshot(std::span<const std::byte> data);
+    std::uint64_t snapshotTxid() const noexcept;
 
     std::uint64_t extentBytes() const noexcept { return config_.extentBytes; }
     std::uint64_t deviceStartExtent(std::uint32_t deviceId) const noexcept;
@@ -152,6 +162,8 @@ private:
     std::uint64_t namespaceBytes_ = 0;
     std::uint64_t logicalEpoch_ = 0;
     std::uint64_t durableEpoch_ = 0;
+    std::uint64_t snapshotTxid_ = 0;
+    std::vector<std::uint64_t> preparedDurableSizes_;
     Stats stats_;
     std::vector<std::unique_ptr<Allocator>> allocators_;
     PlacementPicker picker_;

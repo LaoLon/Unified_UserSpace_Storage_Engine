@@ -47,10 +47,17 @@ rocksdb::IOStatus toIoStatus(const hfs::Result<T> &result) {
 
 /* Converts a path while preserving HFS's absolute namespace contract. */
 std::string hfsPath(const std::string &path) {
-    if (path.empty() || path.front() == '/') {
-        return path;
+    std::string normalized = path;
+    if (normalized.empty()) {
+        return normalized;
     }
-    return "/" + path;
+    if (normalized.front() != '/') {
+        normalized.insert(normalized.begin(), '/');
+    }
+    while (normalized.size() > 1 && normalized.back() == '/') {
+        normalized.pop_back();
+    }
+    return normalized;
 }
 
 /* Builds a stable host-side lock path for a database in the HFS namespace. */
@@ -181,9 +188,10 @@ public:
         return rocksdb::IOStatus::OK();
     }
 
-    /* Sync is explicit and remains visible as a core capability boundary. */
+    /* Persists user data and file metadata through the HFS durable epoch path. */
     rocksdb::IOStatus Sync(const rocksdb::IOOptions &, rocksdb::IODebugContext *) override {
-        return rocksdb::IOStatus::NotSupported("HFS sync wiring is pending Shard-78 completion");
+        auto synced = file_->sync().wait();
+        return synced.ok() ? toIoStatus(std::move(synced).value()) : toIoStatus(synced);
     }
 
 private:
@@ -194,9 +202,10 @@ class HfsDirectory final : public rocksdb::FSDirectory {
 public:
     HfsDirectory(std::shared_ptr<hfs::File> file) : file_(std::move(file)) {}
 
-    /* Directory durability is rejected until the metadata epoch is durable. */
+    /* Commits directory metadata through the HFS durable epoch path. */
     rocksdb::IOStatus Fsync(const rocksdb::IOOptions &, rocksdb::IODebugContext *) override {
-        return rocksdb::IOStatus::NotSupported("directory fsync is pending durable epoch wiring");
+        auto synced = file_->sync().wait();
+        return synced.ok() ? toIoStatus(std::move(synced).value()) : toIoStatus(synced);
     }
 
 private:

@@ -81,6 +81,40 @@ HugepageInfo readHugepageInfo() {
 HugepageInfo readHugepageInfo() { return {}; }
 #endif
 
+/* Adapts the resident namespace snapshot to the journal checkpoint contract. */
+class NamespaceJournalTarget final : public JournalTarget {
+public:
+    explicit NamespaceJournalTarget(metadata::Namespace &namespaceState)
+        : namespaceState_(namespaceState) {}
+
+    /* Journal records are not emitted by the legacy in-memory mutation path. */
+    Result<void> apply(const JournalRecord &record) override {
+        if (record.type == JournalRecordType::Checkpoint) {
+            return Result<void>(Status::Ok);
+        }
+        return makeError(Status::NotSupported,
+                         "metadata record replay requires the transaction path");
+    }
+
+    /* Saves the complete inode, directory, extent and allocator state. */
+    Result<void> saveSnapshot(std::uint64_t txid, std::vector<std::byte> &out) override {
+        return namespaceState_.saveSnapshot(txid, out);
+    }
+
+    /* Restores a validated checkpoint snapshot. */
+    Result<void> loadSnapshot(std::span<const std::byte> data) override {
+        return namespaceState_.loadSnapshot(data);
+    }
+
+    /* Reports the transaction id represented by the current snapshot. */
+    std::uint64_t snapshotTxid() const noexcept override {
+        return namespaceState_.snapshotTxid();
+    }
+
+private:
+    metadata::Namespace &namespaceState_;
+};
+
 /* required = ceil((DMA cap + SPDK baseline reserve) * 1.15 / page size) */
 std::uint64_t hugepagesRequired(const Config &config, std::uint64_t pageKb) {
     constexpr std::uint64_t kBaseReserveMb = 128;
@@ -102,6 +136,8 @@ struct Engine::Impl {
     std::vector<DeviceGeometry> geometries;
     pid_t ownerPid = 0;
     std::unique_ptr<metadata::Namespace> namespaceState;
+    std::unique_ptr<NamespaceJournalTarget> metadataTarget;
+    std::unique_ptr<Journal> journal;
     std::unique_ptr<DmaArena> dmaArena;
     std::unique_ptr<DataPlane> dataPlane;
     std::atomic<std::uint32_t> metadataUsers{0};
@@ -229,21 +265,7 @@ Task<Result<void>> Engine::mount() {
     }
     impl.geometries = volume.value().devices;
 
-    /* Validate the metadata journal before exposing any mounted namespace. */
-    auto journal = Journal::open(*this, nullptr, 0);
-    if (!journal.ok()) {
-        runtime.stop();
-        co_return makeError(journal.status(), "metadata journal open failed: " +
-                                               journal.message());
-    }
-    auto replay = journal.value()->replay();
-    if (!replay.ok()) {
-        runtime.stop();
-        co_return makeError(replay.status(), "metadata journal replay failed: " +
-                                                replay.message());
-    }
-    /* Resident namespace state; durability is wired with the metadata
-     * transaction path (journal replay/checkpoint of inode records). */
+    /* Build the resident namespace before replay so checkpoints can restore it. */
     metadata::NamespaceConfig namespaceConfig;
     namespaceConfig.maxInodes = impl.config.maxInodes;
     namespaceConfig.maxNamespaceBytes = impl.config.maxNamespaceBytes;
@@ -293,6 +315,27 @@ Task<Result<void>> Engine::mount() {
     }
     impl.namespaceState = std::move(namespaceState).value();
 
+    /* Mount the metadata journal against the resident checkpoint target. */
+    impl.metadataTarget = std::make_unique<NamespaceJournalTarget>(*impl.namespaceState);
+    auto journal = Journal::open(*this, impl.metadataTarget.get(), 0);
+    if (!journal.ok()) {
+        impl.metadataTarget.reset();
+        impl.namespaceState.reset();
+        runtime.stop();
+        co_return makeError(journal.status(), "metadata journal open failed: " +
+                                               journal.message());
+    }
+    impl.journal = std::move(journal).value();
+    auto replay = impl.journal->replay();
+    if (!replay.ok()) {
+        impl.journal.reset();
+        impl.metadataTarget.reset();
+        impl.namespaceState.reset();
+        runtime.stop();
+        co_return makeError(replay.status(), "metadata journal replay failed: " +
+                                                replay.message());
+    }
+
     /* Shared DMA arena and data plane (bounded by [limits] dma_arena_mb). */
     impl.dmaArena = std::make_unique<DmaArena>();
     impl.dmaArena->configure(impl.config.dmaArenaMb << 20, dataDmaAlloc, dataDmaFree,
@@ -341,6 +384,8 @@ Task<Result<void>> Engine::stop() {
         co_return Result<void>(Status::Busy, "clients or open files are still active");
     }
     if (impl.mounted) {
+        impl.journal.reset();
+        impl.metadataTarget.reset();
         auto stopped = SpdkRuntime::instance().stop();
         if (!stopped.ok()) {
             co_return stopped;
@@ -360,6 +405,43 @@ Task<Result<void>> Engine::stop() {
     stats::setEnabled(false);
     log::info("engine stopped");
     co_return Result<void>(Status::Ok);
+}
+
+/* Implements the durable ordering: data flush, staged metadata snapshot,
+ * checkpoint/superblock flush, and finally in-memory epoch publication. */
+Result<void> Engine::syncMetadata(std::uint64_t epoch) {
+    if (!processValid()) {
+        return makeError(Status::ForkedProcess, "engine belongs to another process");
+    }
+    if (!impl_->mounted || impl_->namespaceState == nullptr || impl_->journal == nullptr) {
+        return makeError(Status::InvalidState, "engine durability path is not mounted");
+    }
+    if (epoch > impl_->namespaceState->logicalEpoch()) {
+        return makeError(Status::InvalidArgument, "sync epoch is ahead of logical epoch");
+    }
+
+    /* DataPath operations are synchronous at this boundary, so device flush
+     * closes the user-data and extent-initialization phase before metadata. */
+    for (std::size_t i = 0; i < impl_->config.devices.size(); ++i) {
+        auto flushed = flushDevice(i);
+        if (!flushed.ok()) {
+            return flushed;
+        }
+    }
+    auto prepared = impl_->namespaceState->prepareDurableEpoch(epoch);
+    if (!prepared.ok()) {
+        return prepared;
+    }
+    auto checkpoint = impl_->journal->checkpoint();
+    if (!checkpoint.ok()) {
+        impl_->namespaceState->rollbackPreparedDurableEpoch();
+        return checkpoint;
+    }
+    auto published = impl_->namespaceState->publishDurableEpoch(epoch);
+    if (!published.ok()) {
+        return published;
+    }
+    return Result<void>(Status::Ok);
 }
 
 const Config &Engine::config() const noexcept { return impl_->config; }
