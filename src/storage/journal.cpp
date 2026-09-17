@@ -5,6 +5,7 @@
 #include <limits>
 #include <memory>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "common/log.hpp"
@@ -125,6 +126,8 @@ struct Journal::Impl {
     std::uint64_t checkpointBTxid = 0;
     std::uint64_t checkpointASequence = 0;
     std::uint64_t checkpointBSequence = 0;
+    std::uint64_t checkpointAGeneration = 0;
+    std::uint64_t checkpointBGeneration = 0;
     std::string corruption;
     Stats statsCache;
 
@@ -263,7 +266,8 @@ struct Journal::Impl {
     }
 
     Result<void> readCheckpoint(std::uint64_t slotStart, bool *valid, std::uint64_t *txid,
-                                std::uint64_t *sequence, std::vector<std::byte> *payload) {
+                                std::uint64_t *sequence, std::uint64_t *generation,
+                                std::vector<std::byte> *payload) {
         const std::uint64_t slotBlocks = checkpointBlocks / 2;
         std::vector<std::byte> first(blockSize, std::byte{0});
         auto read = readBlock(slotStart, first);
@@ -301,6 +305,7 @@ struct Journal::Impl {
         *valid = true;
         *txid = header.txid;
         *sequence = header.sequence;
+        *generation = header.generation;
         payload->assign(record.begin() + sizeof(CheckpointHeader), record.end());
         return Result<void>(Status::Ok);
     }
@@ -344,10 +349,12 @@ struct Journal::Impl {
             checkpointAValid = true;
             checkpointATxid = lastTxid;
             checkpointASequence = head;
+            checkpointAGeneration = superblock.generation;
         } else {
             checkpointBValid = true;
             checkpointBTxid = lastTxid;
             checkpointBSequence = head;
+            checkpointBGeneration = superblock.generation;
         }
         log::info("checkpoint written: slot=%c txid=%llu sequence=%llu bytes=%zu",
                   writeA ? 'A' : 'B', static_cast<unsigned long long>(lastTxid),
@@ -423,13 +430,15 @@ Result<std::unique_ptr<Journal>> Journal::create(std::unique_ptr<JournalDevice> 
     std::uint64_t sequenceB = 0;
     std::uint64_t txidA = 0;
     std::uint64_t txidB = 0;
+    std::uint64_t generationA = 0;
+    std::uint64_t generationB = 0;
     auto readA = impl.readCheckpoint(impl.checkpointAStart, &impl.checkpointAValid, &txidA,
-                                     &sequenceA, &payloadA);
+                                     &sequenceA, &generationA, &payloadA);
     if (!readA.ok()) {
         return makeError<std::unique_ptr<Journal>>(readA.status(), readA.message());
     }
     auto readB = impl.readCheckpoint(impl.checkpointBStart, &impl.checkpointBValid, &txidB,
-                                     &sequenceB, &payloadB);
+                                     &sequenceB, &generationB, &payloadB);
     if (!readB.ok()) {
         return makeError<std::unique_ptr<Journal>>(readB.status(), readB.message());
     }
@@ -437,9 +446,15 @@ Result<std::unique_ptr<Journal>> Journal::create(std::unique_ptr<JournalDevice> 
     impl.checkpointBTxid = txidB;
     impl.checkpointASequence = sequenceA;
     impl.checkpointBSequence = sequenceB;
+    impl.checkpointAGeneration = generationA;
+    impl.checkpointBGeneration = generationB;
 
     const bool useA = impl.checkpointAValid &&
-                      (!impl.checkpointBValid || impl.checkpointATxid >= impl.checkpointBTxid);
+                      (!impl.checkpointBValid ||
+                       std::tuple{impl.checkpointAGeneration, impl.checkpointATxid,
+                                  impl.checkpointASequence} >=
+                           std::tuple{impl.checkpointBGeneration, impl.checkpointBTxid,
+                                      impl.checkpointBSequence});
     const bool useB = impl.checkpointBValid && !useA;
     const std::uint64_t checkpointSequence = useA ? sequenceA : sequenceB;
     const std::uint64_t checkpointTxid = useA ? impl.checkpointATxid : impl.checkpointBTxid;
