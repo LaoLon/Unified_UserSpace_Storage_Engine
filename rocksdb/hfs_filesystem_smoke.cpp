@@ -5,6 +5,7 @@
 #include <atomic>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "rocksdb/hfs_filesystem.hpp"
@@ -121,6 +122,35 @@ int main(int argc, char **argv) {
     if (!status.ok() || !multiRequests[0].status.ok() ||
         !multiRequests[1].status.ok() || multiRequests[0].result.compare(payload) != 0 ||
         multiRequests[1].result.compare(payload) != 0) {
+        return 11;
+    }
+    /* Exercise concurrent SST-style positioned reads through one shared
+     * random-access handle and preserve the payload on every worker. */
+    constexpr std::size_t concurrentReaders = 8;
+    constexpr std::size_t readsPerReader = 32;
+    std::atomic<bool> concurrentReadsOk = true;
+    std::vector<std::thread> readerThreads;
+    readerThreads.reserve(concurrentReaders);
+    for (std::size_t reader = 0; reader < concurrentReaders; ++reader) {
+        readerThreads.emplace_back([&, reader] {
+            char readerScratch[12]{};
+            rocksdb::IODebugContext readerDebug;
+            for (std::size_t iteration = 0; iteration < readsPerReader; ++iteration) {
+                rocksdb::Slice readerResult;
+                auto readerStatus = random->Read(
+                    0, sizeof(readerScratch), options.io_options,
+                    &readerResult, readerScratch, &readerDebug);
+                if (!readerStatus.ok() || readerResult.compare(payload) != 0) {
+                    concurrentReadsOk.store(false);
+                    return;
+                }
+            }
+        });
+    }
+    for (auto &readerThread : readerThreads) {
+        readerThread.join();
+    }
+    if (!concurrentReadsOk.load()) {
         return 11;
     }
     /* A batch reports the first per-request failure while preserving each
