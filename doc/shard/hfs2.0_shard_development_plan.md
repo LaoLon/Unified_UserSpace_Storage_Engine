@@ -464,7 +464,9 @@ RMW 放大；`AbortIO` 遵守 cancel boundary。
 > 状态：核心验收工具和单盘真实 NVMe 最小闭环已完成；已验证 fillseq/readrandom/
 > overwrite/readwhilewriting、direct/async、显式 Flush/CompactRange、正常 reopen、
 > SIGKILL recovery、clean-flag 取证、`hfs_ldb checkconsistency`、`hfsctl check` 和 MultiRead。完整
-> §16.3 组合（含跨进程矩阵及所有错误/取消路径）仍保留为未完成证据项。
+> §16.3 组合（含跨进程矩阵及所有错误/取消路径）仍保留为未完成证据项。双盘
+> `hfs_nvme_dual.conf` 上已补跑四类 db_bench workload、SIGKILL 后 checkconsistency
+> 和 `hfsctl check`，均通过且两副本状态一致。
 
 **交付物**：`hfs_db_bench`/`hfs_ldb` 完整参数；SIGKILL recovery、跨进程顺序 reopen、
 `checkconsistency`。

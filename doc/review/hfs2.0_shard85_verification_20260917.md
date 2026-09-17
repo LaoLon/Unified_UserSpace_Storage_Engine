@@ -118,3 +118,10 @@ clean/dirty 标志会造成 superblock generation 漂移，已修复为共享版
 目标盘 geometry、以及 mirrored journal 保存临时 geometry 引用造成的悬空引用。修复
 后的真实双盘 `hfs_rocksdb_smoke` 和 `hfsctl check` 均返回 0；两盘分别报告有效
 superblock、checkpoint 和相同 journal 状态。
+
+双盘 RocksDB 验收随后完成：`hfs_db_bench` 的 `fillseq/readrandom/overwrite/
+readwhilewriting`（32 keys、2 threads）通过，首次 `checkconsistency` 报告
+`entries=32`；SIGKILL 中断 overwrite 后再次 `checkconsistency` 报告 `entries=98`，
+最后双盘 `hfsctl check` 返回 0，两盘 generation=393、mount_epoch=8、journal
+transaction/corruption 状态一致。该结果补强 Shard-84 的双盘恢复证据，但不替代
+完整跨进程错误/取消矩阵或 Shard-81 性能 gate。

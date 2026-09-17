@@ -1343,6 +1343,8 @@ checkpoint region 必须容纳 namespace/inode/extent map/各 device allocator b
   双盘回归期间还修复了控制 flush 的块/字节单位错误、镜像 superblock 未应用目标盘
   geometry，以及 mirrored journal 持有临时 geometry 引用导致的悬空引用；修复后
   双盘 RocksDB smoke 与 `hfsctl check` 均通过。
+  双盘 `hfs_db_bench` 的 fillseq/readrandom/overwrite/readwhilewriting、SIGKILL 后
+  checkconsistency 与 `hfsctl check` 也已通过；完整错误/取消矩阵和性能 gate 仍未闭合。
 - 所有 gate 通过后删除新树中最后的旧兼容残留；
 - `src_legacy_frozen/` 保持本地忽略或单独归档，不回到 product build；
 - 更新架构索引、性能基线、支持边界和迁移说明；
