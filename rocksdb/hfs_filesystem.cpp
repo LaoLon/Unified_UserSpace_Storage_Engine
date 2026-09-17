@@ -424,4 +424,13 @@ createFileSystem(const std::string &configPath) {
     return std::make_shared<HfsFileSystem>(std::move(context));
 }
 
+/* Injects HFS into DBOptions::env without transferring raw ownership to HFS. */
+std::unique_ptr<rocksdb::Env> createCompositeEnv(const std::string &configPath) {
+    auto fileSystem = createFileSystem(configPath);
+    if (fileSystem == nullptr) {
+        return nullptr;
+    }
+    return rocksdb::NewCompositeEnv(fileSystem);
+}
+
 } // namespace hfs::rocksdb_adapter
