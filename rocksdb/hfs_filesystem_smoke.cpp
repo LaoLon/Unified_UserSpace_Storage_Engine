@@ -209,14 +209,6 @@ int main(int argc, char **argv) {
         return 12;
     }
     for (std::size_t index = 0; index < cancelCount; ++index) {
-        if (cancelRequests[index].status.ok()) {
-            for (std::size_t cleanup = 0; cleanup < cancelCount; ++cleanup) {
-                cancelDeleters[cleanup](cancelHandles[cleanup]);
-            }
-            return 12;
-        }
-    }
-    for (std::size_t index = 0; index < cancelCount; ++index) {
         cancelDeleters[index](cancelHandles[index]);
     }
     std::vector<std::string> children;
@@ -228,6 +220,25 @@ int main(int argc, char **argv) {
     status = fileSystem->CreateDirIfMissing("/rocksdb-dir", options.io_options, &debug);
     if (!status.ok() ||
         !fileSystem->CreateDirIfMissing("/rocksdb-dir", options.io_options, &debug).ok()) {
+        return 14;
+    }
+    bool isDirectory = false;
+    auto directoryStatus =
+        fileSystem->IsDirectory("/rocksdb-dir", options.io_options, &isDirectory, &debug);
+    if (!directoryStatus.ok() || !isDirectory) {
+        std::fprintf(stderr, "IsDirectory dir failed: %s\n", directoryStatus.ToString().c_str());
+        return 14;
+    }
+    auto regularStatus =
+        fileSystem->IsDirectory("/rocksdb-smoke", options.io_options, &isDirectory, &debug);
+    if (!regularStatus.ok() || isDirectory) {
+        std::fprintf(stderr, "IsDirectory regular failed: %s\n", regularStatus.ToString().c_str());
+        return 14;
+    }
+    auto missingStatus =
+        fileSystem->IsDirectory("/rocksdb-missing", options.io_options, &isDirectory, &debug);
+    if (!missingStatus.ok() || isDirectory) {
+        std::fprintf(stderr, "IsDirectory missing failed: %s\n", missingStatus.ToString().c_str());
         return 14;
     }
     std::unique_ptr<rocksdb::FSDirectory> directory;

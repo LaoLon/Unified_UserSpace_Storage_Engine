@@ -735,6 +735,11 @@ public:
             *isDirectory = true;
             return rocksdb::IOStatus::OK();
         }
+        /* HFS uses InvalidArgument for an existing regular file opened with
+         * Directory; that is a valid negative answer, like NotFound. */
+        if (!status.IsNotFound() && !status.IsInvalidArgument()) {
+            return status;
+        }
         *isDirectory = false;
         return rocksdb::IOStatus::OK();
     }
