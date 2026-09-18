@@ -1,7 +1,7 @@
 # HFS 2.0 Shard-86~92 异步 FIO 性能与 trace 执行计划
 
 日期：2026-09-18
-状态：Shard-86/87 已实现并验证；Shard-88~92 尚未完成；Shard-81 正式性能 gate 未通过
+状态：Shard-86/87 已实现并验证；Shard-88 已实现并完成生命周期/拓扑验证，但中间性能目标未达成；Shard-89~92 尚未完成；Shard-81 正式性能 gate 未通过
 事实源：
 
 - `doc/design/hfs2.0.md`：架构、公共 API、性能门禁和 tracepoint 规范的唯一事实源；
@@ -239,14 +239,18 @@ Shard-88，不能声称 notifier 已解决瓶颈。
 - 新增 `fio/` 下的 FIO completion hub/dispatcher 文件；
 - FIO adapter 专用测试和测试脚本。
 
-Core `Client` API 如需扩展，先由主线程建立接口变更单，再由 Shard-91 实现，避免
-本 shard 和 Shard-91 同时修改 `src/core/client.*`。
+本 shard 允许由主线程增加一个窄化的 `ClientOptions::completionWake` 回调和对应的
+completion queue wake-hint plumbing：回调只传递“该 Client 的 completion endpoint 有新
+事件”这一 value-level 唤醒信号，且必须保持 context 到 Client close 完成。除此之外不在
+本 shard 做 slot/reap 或其他 Client API 优化；后者仍留给 Shard-91。
 
 #### 设计约束
 
 - FIO 的 process-wide `Engine` 继续共享；
 - 不能让多个 frontend thread 无锁调用当前只允许创建线程使用的 `Client`；
 - completion hub 只能传 value token、request id、status 和 completed bytes；
+- process-wide hub 只管理 endpoint，默认每个 worker/Client 独占一个 endpoint；禁止一个
+  endpoint 广播唤醒所有 FIO worker；endpoint 不可用时回退到原有 per-Client eventfd；
 - 不能把 `io_u*`、`thread_data*` 或 `FioHfsPending*` 传入 data reactor；
 - aggregate effective outstanding 必须仍由 closure 证明为 32；
 - 同一 job 的 `queue/getevents/event` 顺序必须保持，不能让别的 job 消费其 `io_u`。
@@ -268,7 +272,7 @@ Core `Client` API 如需扩展，先由主线程建立接口变更单，再由 S
   中位数的 75%（约 81297 IOPS），否则将结果标为未解决并进入 Shard-89/90 归因；
 - 不改变同步 bring-up 模式 `hfs_async=0`。
 
-如果共享 completion hub 导致 frontend 争用或 wake-up storm，立即回退到每 job queue，
+如果后续改成共享 dispatcher 导致 frontend 争用或 wake-up storm，立即回退到每 job endpoint，
 保留 trace 结果，不以降低 CPU 但增加 p99 的方式判定成功。
 
 ---
@@ -501,6 +505,28 @@ observability:  trace off / trace sample=1 / trace sample=N / trace drop
   1024），CPU 约 2.4% 的 trace-off smoke 仍无错误。
 - 本轮 `notify_write=notify_wait=notify_read=120647`，仍接近一 IO 一次；这说明
   单 Client/单 eventfd 拓扑是 Shard-88 的剩余主问题，Shard-87 不宣称已经解决该瓶颈。
+
+### 6.3 Shard-88 完成记录
+
+- FIO adapter 增加 process-wide endpoint registry；每个异步 worker 获取独占的 futex
+  endpoint，`ClientOptions::completionWake` 只回调所属 endpoint，避免原先单一广播 hub
+  将 32 个 worker 全部唤醒。使用 endpoint 的 Client 不创建 per-Client eventfd；超过 64
+  个 endpoint 或 hub 不可用时回退到原有 notifier。cleanup 在 Client close/drain 完成后
+  释放 endpoint，保证 callback context 不会悬空。
+- core completion queue 暴露 `pushWithWakeHint()`，保留原 `push()` 语义；非 eventfd
+  模式在 drain 后重新检查并 rearm 所有 ring，关闭 publish-to-wait 丢唤醒竞态。新增
+  `fio_completion_hub_test` 覆盖 endpoint 唤醒、超时、callback 和 endpoint 隔离。
+- VM `cmake --build build-async` 与 `ctest` 通过，当前为 23/23；真实 NVMe 使用
+  `config/hfs_nvme.conf`、`Nvme0n1`、`0000:0b:00.0` 串行验证：32 jobs/q1
+  randwrite 8 MiB 约 58.4k IOPS，32 jobs/q1 randrw 约 65.7k IOPS，32 jobs/q1
+  randread 约 65.2k IOPS，1 job/q32 randrw 的 `peak=32` 也完整闭合；各次均为
+  `queued=terminal=published=reaped`、`outstanding=0`、`token_mismatch=0`。
+  `hfs_async=0` 的 4 jobs/q1 回归通过。
+- `strace -f -c` 32 jobs 短跑中前端不再出现 eventfd2 和按 IO 的 eventfd write/read/poll
+  风暴，主要等待转为 endpoint futex；`gettid` 仍约 65582 次，留给 Shard-90。
+- Shard-88 的拓扑和生命周期问题已完成，但短跑 randrw 约为当前 Shard-81 正式中位数
+  66.538k IOPS 的 98.7%，尚未达到 raw 中位数 75% 的约 81.297k IOPS 中间目标；因此
+  性能阻塞明确移交 Shard-89/90，不能据此关闭 Shard-81 正式 gate。
 
 本计划的第一目标不是立即把 IOPS 拉到 85%，而是把当前“约 61% 且不知道时间花在哪”
 变成可重复的分段证据。预期顺序为：

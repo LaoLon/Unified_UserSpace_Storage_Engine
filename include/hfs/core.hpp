@@ -34,10 +34,16 @@ struct MetadataLease;
 
 class Operation; /* Phase 2+ */
 
+/* Nonblocking wake hook used by an external frontend completion dispatcher.
+ * The callback context must remain valid until the Client is closed. */
+using CompletionWakeCallback = void (*)(void *context) noexcept;
+
 /* Options for one frontend client instance. */
 struct ClientOptions {
     std::uint32_t maxOpenFiles = 0; /* 0 = only the namespace limits apply */
     std::uint32_t maxOutstanding = 32; /* bounded accepted async requests */
+    CompletionWakeCallback completionWake = nullptr;
+    void *completionWakeContext = nullptr;
 };
 
 /* Options for the destructive volume format. */

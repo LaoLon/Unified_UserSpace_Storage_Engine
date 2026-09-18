@@ -1453,6 +1453,15 @@ checkpoint region 必须容纳 namespace/inode/extent map/各 device allocator b
   并将固定 1024 次 active spin 改为 32~1024 的自适应预算；真实 NVMe 短跑平均预算约
   32.1、trace drop=0、completion closure 完整。notify/wait/read 仍接近一 IO 一次，
   该拓扑问题明确移交 Shard-88，不把 spin 优化误记为 notifier batching 完成。
+  2026-09-18：Shard-88 为外部 frontend 增加窄化的 `ClientOptions::completionWake` 唤醒
+  回调和 `AsyncCompletionQueue::pushWithWakeHint()`；配置该回调的 Client 不创建自己的
+  eventfd。FIO adapter 维护 process-wide endpoint registry，但每个 worker/Client 独占一个
+  futex endpoint，callback 只唤醒拥有该 Client 的 worker，不得使用广播唤醒；endpoint 数量
+  超限时回退到 per-Client eventfd。endpoint 只在 Client close/drain 完成后释放，保证回调
+  context 生命周期安全。真实 NVMe 32 jobs/q1 的 randrw 短跑约 65.7k IOPS，closure 为
+  `queued=terminal=published=reaped`、`outstanding=0`、`token_mismatch=0`；`ctest`
+  23/23 和同步 `hfs_async=0` 回归通过。该结果仍低于 raw 75% 中间目标，Shard-81 正式
+  性能 gate 继续保持未通过，后续由 Shard-89/90 处理 file-shard/reactor 热点。
   2026-09-18：RocksDB `ReadAsync` 已实现 `IOOptions::timeout` 的前端等待语义；超时
   返回 `TimedOut` 后，后台 I/O 继续排空，句柄析构时才回收 worker 和 buffer，且不会
   在 callback 后写回 request result。DataPath 的 `-ETIMEDOUT`、`-ECANCELED`、

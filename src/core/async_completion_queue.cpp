@@ -44,8 +44,11 @@ CompletionNotifier::CompletionNotifier() noexcept = default;
 
 CompletionNotifier::~CompletionNotifier() { closeEventFd(); }
 
-bool CompletionNotifier::initialize() noexcept {
+bool CompletionNotifier::initialize(bool enableEventFd) noexcept {
 #if defined(__linux__)
+    if (!enableEventFd) {
+        return true;
+    }
     if (eventFd_ >= 0) {
         return true;
     }
@@ -330,7 +333,8 @@ AsyncCompletionQueue::AsyncCompletionQueue(std::size_t shardCount,
 }
 
 bool AsyncCompletionQueue::initialize(std::size_t shardCount,
-                                      std::size_t perShardCapacity) noexcept {
+                                      std::size_t perShardCapacity,
+                                      bool enableEventFd) noexcept {
     if (shardCount == 0 || perShardCapacity == 0 || rings_ != nullptr) {
         return false;
     }
@@ -345,7 +349,7 @@ bool AsyncCompletionQueue::initialize(std::size_t shardCount,
             return false;
         }
     }
-    if (!notifier_.initialize()) {
+    if (!notifier_.initialize(enableEventFd)) {
         rings_.reset();
         return false;
     }
@@ -374,12 +378,15 @@ std::size_t AsyncCompletionQueue::totalCapacity() const noexcept {
     return shardCount_ * perShardCapacity_;
 }
 
-bool AsyncCompletionQueue::push(std::size_t shard, const CompletionEvent &event) noexcept {
+AsyncCompletionQueue::PushResult
+AsyncCompletionQueue::pushWithWakeHint(std::size_t shard,
+                                       const CompletionEvent &event) noexcept {
+    PushResult result;
     if (!valid() || shard >= shardCount_) {
         invalidShard_.fetch_add(1, std::memory_order_relaxed);
-        return false;
+        return result;
     }
-    const AsyncCompletionRing::PushResult result = rings_[shard].pushWithWakeHint(event);
+    result = rings_[shard].pushWithWakeHint(event);
     if (result.accepted && result.notify) {
         notifier_.notify();
     }
@@ -388,6 +395,11 @@ bool AsyncCompletionQueue::push(std::size_t shard, const CompletionEvent &event)
                      static_cast<std::uint64_t>(shard), event.completedBytes,
                      static_cast<std::uint64_t>(event.status));
     }
+    return result;
+}
+
+bool AsyncCompletionQueue::push(std::size_t shard, const CompletionEvent &event) noexcept {
+    const PushResult result = pushWithWakeHint(shard, event);
     return result.accepted;
 }
 
@@ -404,6 +416,9 @@ std::size_t AsyncCompletionQueue::drainAvailable(std::span<CompletionEvent> outp
         count += rings_[shard].drain(output.subspan(count, remaining));
     }
     cursor_ = (cursor_ + 1) % shardCount_;
+    for (std::size_t index = 0; index < shardCount_; ++index) {
+        rings_[index].rearmIfNonEmpty();
+    }
     if (count != 0) {
         trace::event(trace::EventId::CqReap, count, limit, cursor_);
     }

@@ -103,7 +103,8 @@ struct ClientState final : AsyncDataSink {
             return false;
         }
         const std::size_t effectiveShardCount = shardCount == 0 ? 1 : shardCount;
-        if (!completionQueue.initialize(effectiveShardCount, maxOutstandingValue)) {
+        if (!completionQueue.initialize(effectiveShardCount, maxOutstandingValue,
+                                        options.completionWake == nullptr)) {
             requestSlots.reset();
             maxOutstandingValue = 0;
             return false;
@@ -147,8 +148,13 @@ struct ClientState final : AsyncDataSink {
 
     /* Reactor callbacks only enqueue a value; they never touch frontend slots. */
     void publish(std::uint32_t shard, const CompletionEvent &event) noexcept override {
-        if (!completionQueue.push(shard, event)) {
+        const auto result = completionQueue.pushWithWakeHint(shard, event);
+        if (!result.accepted) {
             completionOverflow.store(true, std::memory_order_release);
+            return;
+        }
+        if (result.notify && options.completionWake != nullptr) {
+            options.completionWake(options.completionWakeContext);
         }
     }
 

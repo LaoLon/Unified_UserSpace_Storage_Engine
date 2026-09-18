@@ -27,8 +27,8 @@ public:
     CompletionNotifier(const CompletionNotifier &) = delete;
     CompletionNotifier &operator=(const CompletionNotifier &) = delete;
 
-    /* Initializes an eventfd when available and otherwise selects the atomic fallback. */
-    bool initialize() noexcept;
+    /* Initializes an eventfd when available; external frontends may disable it. */
+    bool initialize(bool enableEventFd = true) noexcept;
 
     /* Never waits and never allocates; EAGAIN still counts as a successful wake hint. */
     bool notify() noexcept;
@@ -138,15 +138,21 @@ public:
     AsyncCompletionQueue &operator=(const AsyncCompletionQueue &) = delete;
 
     /* Creates all rings with the same worst-case per-shard capacity. */
-    bool initialize(std::size_t shardCount, std::size_t perShardCapacity) noexcept;
+    bool initialize(std::size_t shardCount, std::size_t perShardCapacity,
+                    bool enableEventFd = true) noexcept;
 
     bool valid() const noexcept;
     std::size_t shardCount() const noexcept;
     std::size_t perShardCapacity() const noexcept;
     std::size_t totalCapacity() const noexcept;
 
+    using PushResult = AsyncCompletionRing::PushResult;
+
     /* Producer entry point; only the owning shard may call push for a shard. */
     bool push(std::size_t shard, const CompletionEvent &event) noexcept;
+
+    /* Returns whether this push changed the queue wake-arm state. */
+    PushResult pushWithWakeHint(std::size_t shard, const CompletionEvent &event) noexcept;
 
     /* Nonblocking drain across all shards. */
     std::size_t drain(std::span<CompletionEvent> output, std::size_t max) noexcept;

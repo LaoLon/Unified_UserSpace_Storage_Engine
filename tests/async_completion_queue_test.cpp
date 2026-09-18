@@ -77,7 +77,17 @@ int main() {
         HFS_TEST_CHECK(queue.shardDiagnostics(2).size == 0);
     }
 
-    /* 3. Four shard producers feed independent SPSC rings and one consumer drains them. */
+    /* 3. External frontends can disable per-client eventfd creation. */
+    {
+        hfs::AsyncCompletionQueue queue;
+        HFS_TEST_CHECK(queue.initialize(1, 4, false));
+        HFS_TEST_CHECK(!queue.diagnostics().notifier.eventFd);
+        HFS_TEST_CHECK(queue.push(0, makeEvent(900, 0)));
+        std::vector<hfs::CompletionEvent> output(1);
+        HFS_TEST_CHECK(queue.drain(output, output.size()) == 1);
+    }
+
+    /* 4. Four shard producers feed independent SPSC rings and one consumer drains them. */
     {
         constexpr std::size_t shardCount = 4;
         constexpr std::size_t perShard = 300;
@@ -144,7 +154,7 @@ int main() {
         }
     }
 
-    /* 4. Poll validates min/max, is nonblocking for zero timeout, and preserves events. */
+    /* 5. Poll validates min/max, is nonblocking for zero timeout, and preserves events. */
     {
         hfs::AsyncCompletionQueue queue(2, 4);
         std::vector<hfs::CompletionEvent> output(2);
@@ -160,7 +170,7 @@ int main() {
         HFS_TEST_CHECK(output[0].requestId == 991);
     }
 
-    /* 5. A new producer still wakes after the previous poll drained to empty. */
+    /* 6. A new producer still wakes after the previous poll drained to empty. */
     {
         hfs::AsyncCompletionQueue queue(1, 4);
         std::vector<hfs::CompletionEvent> output(1);
@@ -182,7 +192,7 @@ int main() {
         HFS_TEST_CHECK(output[0].requestId == 1001);
     }
 
-    /* 6. Timed poll wakes from a producer and leaves in-flight state untouched on timeout. */
+    /* 7. Timed poll wakes from a producer and leaves in-flight state untouched on timeout. */
     {
         hfs::AsyncCompletionQueue queue(1, 4);
         std::vector<hfs::CompletionEvent> output(1);
@@ -210,7 +220,7 @@ int main() {
         HFS_TEST_CHECK(queue.diagnostics().drained == 1);
     }
 
-    /* 7. Rearming clears stale wake state without losing a queued event. */
+    /* 8. Rearming clears stale wake state without losing a queued event. */
     {
         hfs::AsyncCompletionRing ring(4);
         HFS_TEST_CHECK(ring.push(makeEvent(2000, 0)));

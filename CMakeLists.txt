@@ -79,6 +79,7 @@ set(FIO_SOURCE_DIR "" CACHE PATH "fio source tree for the optional HFS external 
 if(EXISTS ${FIO_SOURCE_DIR}/fio.h)
   add_library(fio-hfs MODULE
     fio/fio_hfs.cpp
+    fio/fio_completion_hub.cpp
     fio/preallocation_single_flight.cpp
   )
   target_include_directories(fio-hfs PRIVATE
@@ -353,6 +354,19 @@ target_include_directories(preallocation_single_flight_test PRIVATE
 target_compile_options(preallocation_single_flight_test PRIVATE -fno-exceptions -fno-rtti)
 target_link_libraries(preallocation_single_flight_test PRIVATE Threads::Threads)
 add_test(NAME preallocation_single_flight_test COMMAND preallocation_single_flight_test)
+
+# Process-wide FIO completion wake generation test.
+add_executable(fio_completion_hub_test
+  tests/fio_completion_hub_test.cpp
+  fio/fio_completion_hub.cpp
+)
+target_include_directories(fio_completion_hub_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests
+)
+target_compile_options(fio_completion_hub_test PRIVATE -fno-exceptions -fno-rtti)
+target_link_libraries(fio_completion_hub_test PRIVATE Threads::Threads)
+add_test(NAME fio_completion_hub_test COMMAND fio_completion_hub_test)
 
 # Device-backed data-path test: real NVMe read/write through the async data
 # reactor path (compiles the core sources directly and links SPDK).

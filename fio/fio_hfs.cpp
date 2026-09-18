@@ -29,6 +29,7 @@
 #include "hfs/config.hpp"
 #include "hfs/core.hpp"
 #include "hfs/file.hpp"
+#include "fio_completion_hub.hpp"
 #include "preallocation_single_flight.hpp"
 
 namespace {
@@ -81,6 +82,7 @@ struct FioHfsThread {
     bool async = true;
     bool closing = false;
     bool protocolError = false;
+    hfs::fio::FioCompletionHub::Endpoint *completionEndpoint = nullptr;
     std::uint32_t clientDepth = 1;
     std::size_t slotCount = 0;
     std::size_t submitted = 0;
@@ -108,6 +110,8 @@ std::atomic<std::uint64_t> processOutstandingPeak{0};
 std::atomic<std::uint64_t> processPreallocationRequests{0};
 std::atomic<std::uint64_t> processPreallocationOwners{0};
 std::atomic<std::uint64_t> processPreallocationFailures{0};
+hfs::fio::FioCompletionHub processCompletionHub;
+bool processCompletionHubActive = false;
 
 /* Shared-file preallocation is process-scoped and generation-scoped. */
 hfs::fio::PreallocationSingleFlight processPreallocation(
@@ -438,6 +442,8 @@ void releaseProcessUser() {
         processEngine->stop().wait();
         processEngine.reset();
     }
+    processCompletionHub.shutdown();
+    processCompletionHubActive = false;
     std::fprintf(stderr,
                  "fio-hfs closure: queued=%llu busy=%llu completed_error=%llu "
                  "reaped=%llu outstanding=%llu peak=%llu token_mismatch=%llu "
@@ -569,6 +575,10 @@ int fioHfsInit(struct thread_data *td) {
                 processEngineGeneration = 1;
             }
             processPreallocation.resetForGeneration(processEngineGeneration);
+            processCompletionHubActive = processCompletionHub.initialize();
+            if (!processCompletionHubActive) {
+                fioLog("fio-hfs: completion hub unavailable; using per-client notifier\n");
+            }
         } else {
             engine = processEngine;
         }
@@ -576,11 +586,22 @@ int fioHfsInit(struct thread_data *td) {
     }
     const std::uint32_t requestedDepth = options == nullptr ? 32 : options->clientDepth;
     const std::uint32_t clientDepth = requestedDepth == 0 ? 1 : requestedDepth;
+    const bool asyncMode = options == nullptr || options->async != 0;
+    hfs::fio::FioCompletionHub::Endpoint *completionEndpoint = nullptr;
+    if (asyncMode && processCompletionHubActive) {
+        completionEndpoint = processCompletionHub.acquire();
+    }
+    const bool useCompletionHub = completionEndpoint != nullptr;
     hfs::ClientOptions clientOptions{};
     clientOptions.maxOutstanding = clientDepth;
+    if (useCompletionHub) {
+        clientOptions.completionWake = &hfs::fio::FioCompletionHub::wakeCallback;
+        clientOptions.completionWakeContext = completionEndpoint;
+    }
     auto client = hfs::Client::create(*engine, clientOptions);
     if (!client.ok()) {
         fioLog("fio-hfs: client create failed\n");
+        processCompletionHub.release(completionEndpoint);
         releaseProcessUser();
         return 1;
     }
@@ -588,6 +609,7 @@ int fioHfsInit(struct thread_data *td) {
     if (state == nullptr) {
         fioLog("fio-hfs: FIO state allocation failed\n");
         std::move(client).value()->close().wait();
+        processCompletionHub.release(completionEndpoint);
         releaseProcessUser();
         return 1;
     }
@@ -595,6 +617,7 @@ int fioHfsInit(struct thread_data *td) {
     state->client = std::move(client).value();
     state->direct = options == nullptr || options->direct != 0;
     state->async = options == nullptr || options->async != 0;
+    state->completionEndpoint = completionEndpoint;
     state->clientDepth = clientDepth;
     if (state->async) {
         state->slotCount = static_cast<std::size_t>(clientDepth);
@@ -606,6 +629,8 @@ int fioHfsInit(struct thread_data *td) {
             state->client->close().wait();
             state->client.reset();
             state->engine.reset();
+            processCompletionHub.release(state->completionEndpoint);
+            state->completionEndpoint = nullptr;
             delete state;
             releaseProcessUser();
             return 1;
@@ -727,6 +752,74 @@ void releaseAllReports(FioHfsThread &state) noexcept {
     }
 }
 
+/* Polls one worker's Client without crossing frontend ownership, then waits
+ * on that worker's private completion endpoint when its minimum is not met. */
+hfs::PollResult pollClient(FioHfsThread &state,
+                           std::span<hfs::CompletionEvent> output,
+                           std::size_t min, std::size_t max,
+                           std::chrono::microseconds timeout) {
+    auto *endpoint = state.completionEndpoint;
+    if (endpoint == nullptr || min == 0 || timeout.count() <= 0) {
+        return state.client->poll(output, min, max,
+                                  endpoint != nullptr
+                                      ? std::chrono::microseconds(0)
+                                      : timeout);
+    }
+
+    hfs::PollResult result;
+    const std::size_t limit = std::min(max, output.size());
+    if (min > limit || limit == 0) {
+        return state.client->poll(output, min, max, std::chrono::microseconds(0));
+    }
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    std::size_t total = 0;
+    for (;;) {
+        auto one = state.client->poll(output.subspan(total, limit - total), 0,
+                                      limit - total, std::chrono::microseconds(0));
+        if (one.status != hfs::Status::Ok) {
+            result.status = one.status;
+            result.count = total + one.count;
+            return result;
+        }
+        total += one.count;
+        if (total >= min || total == limit) {
+            result.count = total;
+            return result;
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            result.count = total;
+            return result;
+        }
+        const std::uint32_t observed = endpoint->epoch();
+        endpoint->prepareWait();
+
+        /* Final scan closes the publication-to-wait race. */
+        one = state.client->poll(output.subspan(total, limit - total), 0,
+                                 limit - total, std::chrono::microseconds(0));
+        if (one.status != hfs::Status::Ok) {
+            result.status = one.status;
+            result.count = total + one.count;
+            return result;
+        }
+        total += one.count;
+        if (total >= min || total == limit) {
+            result.count = total;
+            return result;
+        }
+
+        const auto waitNow = std::chrono::steady_clock::now();
+        const auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(
+            deadline - waitNow);
+        if (remaining.count() <= 0) {
+            result.count = total;
+            return result;
+        }
+        (void)endpoint->waitSince(observed, remaining);
+    }
+}
+
 /* Drain accepted operations before releasing Client, File, or fio memory. */
 void drainAsync(FioHfsThread &state) noexcept {
     if (!state.async || state.client == nullptr) {
@@ -741,7 +834,8 @@ void drainAsync(FioHfsThread &state) noexcept {
         if (state.submitted == 0 && state.reportedRemaining == 0 && coreOutstanding == 0) {
             return;
         }
-        auto result = state.client->poll(
+        auto result = pollClient(
+            state,
             std::span<hfs::CompletionEvent>(state.polled.get(), state.slotCount),
             state.submitted == 0 ? 0 : 1, state.slotCount,
             std::chrono::milliseconds(100));
@@ -776,6 +870,8 @@ void fioHfsCleanup(struct thread_data *td) {
         }
     }
     state->client.reset();
+    processCompletionHub.release(state->completionEndpoint);
+    state->completionEndpoint = nullptr;
     state->engine.reset();
     releaseProcessUser();
     delete state;
@@ -1006,7 +1102,8 @@ int fioHfsGetevents(struct thread_data *td, unsigned int min, unsigned int max,
     const std::size_t minimum = std::min<std::size_t>(min, limit);
     state->reportedCount = 0;
     state->reportedRemaining = 0;
-    auto result = state->client->poll(
+    auto result = pollClient(
+        *state,
         std::span<hfs::CompletionEvent>(state->polled.get(), limit), minimum, limit,
         fioTimeout(timeout));
     const std::size_t count = std::min(result.count, limit);
