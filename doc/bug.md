@@ -27,11 +27,24 @@ Bug 等级：**致命 > 严重 > 一般**。
 - 16：已修复（Shard-77，DataPlane 零初始化合成映射逻辑偏移全部叠加在 0）。
 - 17：已修复（Shard-77 边界收口，extent commit 失败可泄漏 allocator 状态）。
 - 18：已修复（Shard-77 边界收口，extent/range 计算整数溢出未拒绝）。
+- 19：已修复（Shard-81，FIO 异步完成路径落地，请求计数闭合）。
+- 20：已修复（Shard-81，core-native async 替代 external worker pool）。
 - 21：已修复（Shard-82，RocksDB LockFile 将 HFS 路径误当宿主机路径）。
 - 22：已修复（Shard-82，RocksDB DB 路径尾斜杠未规范化）。
 - 23：已修复（Shard-79，Journal::open ownership transfer 求值顺序不安全）。
 - 24：已修复（Shard-79，checkpoint generation 平局时 mount 选择旧槽位）。
 - 25：已修复（Shard-84，RocksDB File sync 使用 inode epoch 导致全局 durable epoch 回退）。
+- 26：已修复（Shard-81，共享文件并发 preallocate 竞争丢 job）。
+- 27：已修复（Shard-81，异步请求未保活 completion sink）。
+- 28：已修复（Shard-81，完成丢失/错配导致挂起而非 fail-fast）。
+- 29：已修复（Shard-81，child_submit/child_complete 计数语义不一致）。
+- 30：已修复（Shard-81，FIO DDIR_SYNC/errno/get_file_size/fork 契约收口）。
+- 31：已修复（Shard-81，后端 slot 耗尽被当终态数据错误）。
+- 32：已修复（Shard-81，DmaArena release 尺寸与析构不一致）。
+- 33：已修复（Shard-81，SpdkRuntime 停机竞态与无界排空）。
+- 34：已修复（Shard-81，trace TSC 校准与 stop/producer 竞争）。
+- 35：已修复（Shard-81，异步路径杂项收口）。
+- 36：已修复（Shard-81，shard inode 槽位线性扫描导致每 I/O ~5ms 延迟）。
 
 ## Bug 记录
 
@@ -303,9 +316,9 @@ Bug 等级：**致命 > 严重 > 一般**。
   truncate 同样避免加法回绕。
 - **验证结果**：新增极大范围 reservation 回归；Linux/CMake 结构测试通过。
 
-### 19. FIO 外部引擎文件布局未形成实际 I/O（处理中）
+### 19. FIO 外部引擎文件布局未形成实际 I/O
 
-- **状态**：处理中
+- **状态**：已修复
 - **等级**：严重
 - **时间**：2026-09-17（Shard-80A）
 - **现象**：真实 NVMe 上 FIO 引擎可加载、HFS 可 format/mount/stop，但最小 job 未产生 I/O 统计。
@@ -314,9 +327,13 @@ Bug 等级：**致命 > 严重 > 一般**。
 - **修复**：已补齐无 fd invalidate、get_file_size、open 时 preallocate，以及进程级 `hfs_config` callback；功能矩阵前保持 Shard-80 未完成。
 - **验证结果**：编译通过；无 `HFS_CONFIG` 环境变量时，真实 NVMe bind→format→mount→cleanup 下 `.fio` 内 `hfs_config`、`numjobs=2`、4K write 完成 4096B、errors=0；高 QD 功能矩阵与 DMA all-or-nothing 门禁仍未通过。
 - **2026-09-18 修复**：移除 external worker pool，`queue()` 在 FIO 提交线程同步执行 HFS core I/O 并返回 `FIO_Q_COMPLETED`，避免跨线程 SPDK reactor/`io_handle` 生命周期问题；真实 NVMe 4K randrw、4 jobs、3 秒 smoke 完成约 19 MiB，errors=0。正式 32-job 性能 gate 仍需在该修复上重跑。
+- **2026-09-18 收口**：异步完成路径（`hfs_async=1`，见 #27-#31）落地后，32 job 正式 gate 的
+  `accepted=terminal=published`、`queued=reaped`、`outstanding=0` 全部闭合；
+  `--verify=crc32c --verify_fatal=1 --end_fsync=1` 在 async 与 sync 回退均 `err=0`。
+  性能比值仍未达标，属独立性能问题，不由本 Bug 跟踪。
 
-### 20. FIO 高深度外部线程提交触发 SPDK 消息队列崩溃（处理中）
-- **状态**：处理中
+### 20. FIO 高深度外部线程提交触发 SPDK 消息队列崩溃
+- **状态**：已修复
 - **等级**：严重
 - **时间**：2026-09-17（Shard-80A）
 - **现象**：真实 NVMe 上，临时将 FIO `queue()` 请求交给外部 `std::thread` 后，
@@ -329,6 +346,230 @@ Bug 等级：**致命 > 严重 > 一般**。
 - **下一步**：在 core 内建立明确的前端提交/完成生命周期（包括 reactor 归属、
   `io_handle` 保活和停止顺序），再恢复 FIO 三态 queue；不以普通 buffer 或降低 QD
   替代异步验收。
+- **2026-09-18 收口**：core-native 异步路径已实现（`AsyncDataService`/`SpdkAsyncDataBackend`/
+  `AsyncCompletionQueue`，FIO `queue()` 返回 `FIO_Q_QUEUED`，`getevents/event` 消费
+  token），不再使用任何外部 `std::thread` 调 core。真实 NVMe 32 job gate 的
+  `accepted=terminal=published`、`child_submit=child_complete`、`queued=reaped`、
+  `outstanding=0`、`token_mismatch=0` 全部闭合；`#27-#31` 修复了该路径的
+  生命周期、fail-fast、计数、FIO 契约和后端 credit 缺陷。
+
+### 26. 共享文件并发 preallocate 竞争导致 31/32 FIO job 被静默丢弃
+
+- **状态**：已修复
+- **等级**：严重（并发 workload 未实际运行）
+- **时间**：2026-09-18（Shard-81）
+- **现象**：正式 gate 中 32 个 job 只有 1 个产生 I/O，HFS/raw=0.000019；插桩探针显示
+  4 个 job 中 3 个 `open_alloc_failed`、`queued=0` 且 fio `err=0`。
+- **排查过程**：在 VM 上给 `fioHfsOpen` 增加临时 trace，确认 loser 的
+  `File::allocate(0,size)` 返回错误；对照 `Namespace::reserveExtents` 与
+  `InodeExtentMap::addExtents`，确认 loser 与 winner 为同一逻辑区间预留了不同物理
+  extent，后 commit 者撞 `AlreadyExists`。
+- **根因**：`reserveExtents` 只以已提交 extent 判断占位，同 inode 在途 reservation
+  不可见，因此并发 allocate 非可串行化；adapter 又在每个 job 的 `open_file` 重复
+  执行整文件 preallocate。`fioHfsOpen` 只返回错误码不设置 `errno`，fio 以 err=0
+  静默丢弃这些 job。
+- **修复**：新增进程级 single-flight（`fio/preallocation_single_flight.*`），owner
+  唯一执行 allocate、waiter 复用同一结果；owner 通过新增的 `File::allocatedBytes()`
+  校验 committed extent 覆盖（不再硬编码 `coverageComplete`）；open 失败统一设置
+  `errno`。
+- **验证结果**：VM Release 主机/设备测试通过；真实 NVMe 32 job gate 请求计数闭合；
+  4 job 探针 owner=1/waiter=3、无失败；`hfs_async=0/1` verify+end_fsync 均 `err=0`。
+
+### 27. accepted 异步请求未保活 completion sink
+
+- **状态**：已修复
+- **等级**：严重（reactor 可 publish 到已释放的 ClientState）
+- **时间**：2026-09-18（Shard-81）
+- **现象**：代码审查发现 `RequestState::sink` 为裸指针，`Operation` 的
+  `CompletionSink` 明确 non-owning；若前端先释放 `IoHandle` 再销毁 Client/File，
+  reactor 完成回调会写入已释放的 `ClientState`。
+- **根因**：accepted 请求只在 frontend handle 上持有 sink 引用，operation 本身没有
+  保活；设计 §8.1/§13.3 要求 operation 持 `CompletionSinkRef` 直到 publish。
+- **修复**：`AsyncDataService::submit` 增加必填 `std::shared_ptr<void> sinkOwner`，
+  `RequestState` 持有到 terminal publish 之后；`Client` 传入自身 state；`~Client`
+  在存在在途 outstanding/handle/open file 时记录错误。
+- **验证结果**：新增 `OwnedSink` 生命周期用例（前端中途释放引用，publish 仍到达、
+  weak 在完成后才过期）；32 job gate 无异常。
+
+### 28. 完成丢失/错配导致 credit 泄漏与 cleanup 永久挂起
+
+- **状态**：已修复
+- **等级**：严重（挂起 + 计数失真）
+- **时间**：2026-09-18（Shard-81）
+- **现象**：代码审查发现 completion queue push 失败或 token 不匹配时只置
+  `completionOverflow` 就返回：credit/slot 不释放、`fioHfsCleanup` 的 drain 条件
+  永不满足；`completionPublished_` 在 publish 失败后仍自增。
+- **根因**：完成路径缺少 fail-fast 契约；`AsyncDataSink::publish` 无法把投递失败
+  反馈给 core。
+- **修复**：`publish` 改为返回 bool，core 分别统计
+  `completionPublished/completionDropped`；`Client::poll` 在 overflow 时立即返回
+  `Corrupt`；FIO `drainAsync` 遇到致命 poll/协议错误立即中止，并增加 30s 硬截止。
+- **验证结果**：`RejectingSink` 用例断言 `published==0/dropped==1`；
+  `async_completion_queue_test`/`fio_completion_hub_test` 通过；真实 NVMe 清理
+  不再挂起。
+
+### 29. child_submit/child_complete 计数语义不一致
+
+- **状态**：已修复
+- **等级**：一般（closure 证据失真）
+- **时间**：2026-09-18（Shard-81）
+- **现象**：`childSubmits_` 按 RMW phase 提交计数，`childCompletes_` 按 child 终结
+  计数；非对齐 I/O 必然 submit>complete，gate 的 `child_submit == child_complete`
+  只对 aligned direct 负载成立。
+- **根因**：两个计数器统计对象不同（phase vs child）。
+- **修复**：`ChildState::counted` 保证每个 child 只计一次 submit；completes 只统计
+  已提交 child；未提交即被拒的 child 计入新增 `childSubmitRejected`；Engine
+  closure 日志输出 `dropped/child_rejected`。
+- **验证结果**：RMW 用例断言 `childSubmits==childCompletes==1`、`rejected==0`；
+  32 job gate 中 `child_submit=child_complete`。
+
+### 30. FIO DDIR_SYNC/errno/get_file_size/fork 契约收口
+
+- **状态**：已修复
+- **等级**：严重（`--verify`/`end_fsync` 必然失败；open 失败静默）
+- **时间**：2026-09-18（Shard-81）
+- **现象**：`queue()` 对 `DDIR_SYNC` 返回 `EOPNOTSUPP`，fio `do_verify`/
+  `end_fsync`/`fsync_on_close` 无法通过；open/preallocate 失败不设置 `errno`，
+  fio 以 err=0 丢 job；`get_file_size` 在 `size=0` 时伪造 4096；fork 模式
+  `numjobs>1` 静默失败。
+- **根因**：adapter 未映射 sync 语义、未遵守 fio errno 契约、伪造文件尺寸。
+- **修复**：新增 `fio/fio_status_errno.hpp`（映射+设置 errno）；`DDIR_SYNC` 映射到
+  `File::sync()`（async 与 sync 路径）；`get_file_size` 优先 open+stat 真实大小，
+  否则返回请求尺寸（0 保持 0，由 fio 报缺 size）；fork 模式在 init 明确拒绝并提示
+  `thread=1`。
+- **验证结果**：`fio_status_errno_test` 通过；真实 NVMe
+  `--verify=crc32c --verify_fatal=1 --end_fsync=1` async/sync 均 `err=0`；缺 size
+  新文件报错、已有文件 `create_serialize=0` 省略 size 读取 `err=0`；fork 探针 rc=1
+  且输出提示。
+
+### 31. 后端 slot 耗尽被当终态数据错误
+
+- **状态**：已修复
+- **等级**：严重（压力下合法请求失败）
+- **时间**：2026-09-18（Shard-81）
+- **现象**：`SpdkAsyncDataBackend::acquireSlot()` 失败直接返回
+  `Rejected/ENOMEM`，service 把 Rejected 转成 child 终态错误；多 child/RMW 场景
+  在集中 shard 负载下会误报数据错误。
+- **根因**：设计要求的 `WaitingForCredit` io-wait 路径未实现。
+- **修复**：backend 增加有界 pending 队列，无 slot 时返回 `WaitingForCredit` 入队；
+  `AsyncDataBackend::pump()` 由 service 在所属 reactor 每轮调用，slot 释放后按
+  FIFO 补投；仅 pending 也满时才 Rejected。
+- **验证结果**：service 级 WaitingForCredit 用例通过；32 job gate
+  `child_rejected=0`、`child_submit=child_complete`。
+
+### 32. DmaArena release 尺寸与析构不一致
+
+- **状态**：已修复
+- **等级**：一般（静默泄漏/释放仍在使用的 DMA 内存）
+- **时间**：2026-09-18（Shard-81）
+- **现象**：`release` 要求 span 尺寸与登记一致，调用者传申请尺寸即静默泄漏；
+  析构释放了在途 large 分配却泄漏在途 class 分配。
+- **根因**：release 以调用者尺寸推导 class，析构未覆盖全部自有分配。
+- **修复**：release 按指针查表并使用登记尺寸；foreign 指针安全忽略；析构释放
+  class 缓存块、在途 class 与在途 large 全部分配。
+- **验证结果**：`io_planner_test` 计数分配器用例 alloc==free==2 且不同尺寸 release
+  生效。
+
+### 33. SpdkRuntime 停机竞态与无界排空
+
+- **状态**：已修复
+- **等级**：严重（潜在 UAF/挂起）
+- **时间**：2026-09-18（Shard-81）
+- **现象**：`stop()` 在 join 完成后才清 `activeFlag`，期间提交路径只检查
+  `activeFlag`，可向正在销毁的 reactor 线程 `send_msg`；reactor 排空在 stranded
+  `queue_io_wait` 上无上界自旋。
+- **根因**：停机不是提交栅栏；排空缺少截止时间。
+- **修复**：`controlIo`/`postToDataReactor`/`submitDataRead/Write`/
+  `setDataReactorPoller` 同时检查 `stoppingFlag`；`dataMain` 停止后最多排空 5 秒，
+  超时记录错误退出。
+- **验证结果**：`spdk_runtime_test` 断言 stop 后 `postToDataReactor` 失败；设备
+  测试通过。
+
+### 34. trace TSC 校准与 stop/producer 竞争
+
+- **状态**：已修复
+- **等级**：一般（归因数据失真/测量失败）
+- **时间**：2026-09-18（Shard-81）
+- **现象**：TSC 只在单线程单点校准且不检查 invariant TSC；`stop()` 与通过
+  `enabled` 检查的 producer 存在竞争，`recorded - dropped` 可能与落盘记录不一致；
+  channel 元数据在 claim 后写入存在数据竞争。
+- **根因**：校准假设跨 CPU TSC 可比；stop 未等待在途 producer；claim 发布顺序不严。
+- **修复**：CPUID 检查 invariant TSC，双采样并拒绝 >5% 漂移，不满足时回退
+  `steady_clock` ns（`tsc_hz=1e9`）；`event()` 使用 `ActiveProducerGuard`，`stop()`
+  有界等待在途 producer 后再写 manifest/关文件；channel 元数据先写后用 release
+  发布 claim。
+- **验证结果**：`trace_test` 新增并发 stop/producer 用例，落盘记录数 == recorded、
+  `dropped==0`；原有 manifest format v2 断言通过。
+
+### 35. 异步路径杂项收口
+
+- **状态**：已修复
+- **等级**：一般
+- **时间**：2026-09-18（Shard-81）
+- **现象/根因/修复**：
+  - Zero（hole）child 也申请 bounce lease，稀疏读在 arena 紧张时误报 NoMemory
+    → `acquireLeases` 跳过 Zero child；
+  - `hfs_async=0` 回退每 I/O `new` bounce → 改用 engine DMA arena + RAII guard；
+  - `OperationPool::create` 在 `noexcept` 中抛异常 `new` → 改 `new (std::nothrow)`；
+  - `CompletionNotifier::notify` 遇 EINTR 丢唤醒 → 重试写 eventfd；
+  - `ClientOptions` 提供外部 wait strategy 但缺少 wake hook 时静默全超时 →
+    `initializeAsync` 拒绝该组合；
+  - `FioCompletionHub::release/shutdown` 在 waiter 未退出时清除 inUse 造成复用
+    竞态 → notify 后有界等待 `waiterCount()==0` 再交接；
+  - `fioTimeout` 对超大 timespec 返回 `microseconds::max()`，与 steady_clock 相加
+    可能溢出 → 夹到 24h。
+- **验证结果**：`async_data_service_test`（hole lease）、`io_planner_test`、
+  `fio_completion_hub_test`（release 等待 waiter）、`trace_test`、
+  `async_completion_queue_test` 全部通过；真实 NVMe 探针与 verify smoke 无回归。
+
+### 36. shard inode 槽位线性扫描导致每 I/O ~5ms 延迟
+
+- **状态**：已修复
+- **等级**：严重（性能 gate 结构性失败）
+- **时间**：2026-09-18（Shard-81 性能复测定位）
+- **现象**：修复 #26-#35 后，正式口径 32 job gate 的 HFS 只有约 9k IOPS（raw 65k，
+  比值 13.7%）；单线程单 4K I/O 的 clat 也约 4.8ms（raw 约 0.48ms）。
+- **排查过程**：用 trace v2 分段定位（新增 `ActorPickup`/`PlanReady` 事件与 dump 的
+  `ring_wait/plan_exec/admit_exec` 段）：请求在 `PlanReady` 后到 `RequestShardSubmit`
+  前停留 5-7ms，且该窗口内 reactor 线程没有任何事件；对照 `prepare` 路径，确认停顿
+  发生在 `findInode`。`findInode` 对 `maxInodesPerShard`（默认 500k）做线性扫描，
+  而 `reclaimInodeSlot` 在每次请求完成且调度器清空后回收槽位，导致下一个请求重新
+  全表扫描；扫描 500k 个 `InodeSlot`（工作集约 100MB）约 5ms。
+- **根因**：inode 槽位查找为 O(maxInodesPerShard)，且槽位频繁回收使缓存命中失效。
+- **修复**：`ShardState` 增加 `RequestLookupTable`（fileId→slot 固定容量开放寻址、
+  backward-shift 删除）与 O(1) free 索引栈；`findInode` 改为哈希查找/插入，
+  `reclaimInodeSlot` 改为哈希删除并把索引还栈（`async_data_service.cpp`）。
+- **验证结果**：新增 2000 请求 × 262144 槽位计时回归（新实现 <2s，旧实现约 2s+ 超界）；
+  正式 5-run gate：HFS 中位 `59091 IOPS`、raw 中位 `66935 IOPS`、`HFS/raw=88.28%`、
+  errors=0、`accepted=terminal=published`、`child_submit=child_complete`、
+  `outstanding=0`、`token_mismatch=0`；p99 为 HFS `1433.6us` vs raw `1253.4us`
+  （1.144x），仍略高于 1.10x 门禁。证据目录
+  `/mnt/hfs-data/hfs2-postfix-gate-20260918`。
+
+### 37. fio cleanup 忽略 Engine::stop 失败导致 data reactor UAF
+
+- **状态**：已修复
+- **等级**：致命（停机期 SIGSEGV）
+- **时间**：2026-09-18（Shard-81 优化复测发现）
+- **现象**：优化后拓扑矩阵中 `official 8j×4`、`pin2 32j×1`、`pin2 8j×4` 三类
+  用例偶发 SIGSEGV（rc=-11，无 JSON 输出，约 3/7 概率）；gdb 栈显示 data reactor
+  线程在 `ShardRing::drain`（`ShardActor::runOnce` ← `AsyncDataService::pump`）
+  崩溃，且崩溃前已打印 `fio-hfs closure` 但没有 `hfs: engine stopped`。
+- **排查过程**：对比成功/失败日志顺序，确认失败运行中 `processEngine->stop().wait()`
+  已返回但引擎未执行 mounted 停机分支；`releaseProcessUser()` 不检查返回值即
+  `processEngine.reset()`，把仍在轮询的 data reactor 连同 `asyncService`/`ShardRing`
+  一起释放。复现时在 stop 失败分支加日志，捕获到原因字符串
+  `async data operations are still outstanding`（`Engine::stop` 的 `outstanding()!=0`
+  检查，属并发 cleanup 的瞬态窗口）。
+- **根因**：fio cleanup 把 stop 失败当成功继续释放引擎，违反“停机栅栏”语义；
+  瞬态 Busy 无人重试。
+- **修复**：`releaseProcessUser()` 对 `Engine::stop()` 做有界重试（200 × 10ms），
+  仅在成功后才 `reset()`；失败时保留引擎并打印原因（`fio/fio_hfs.cpp`）。
+- **验证结果**：复现矩阵 7/7 通过（`off_8j4`×4、`pin2_32j1`×3，rc=0、JSON 完整、
+  `hfs: engine stopped` 存在）；正式 5-run gate2 中 10 次 HFS 运行仅 2 次出现
+  `engine stop retried after: async data operations are still outstanding`，
+  均在有界重试内成功停机，无崩溃。证据目录
+  `/mnt/hfs-data/hfs2-teardown-check-20260918`、`/mnt/hfs-data/hfs2-postfix-gate2-20260918`。
 
 ## 记录模板
 

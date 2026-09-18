@@ -469,6 +469,16 @@ p99 ≤ raw×110%。不达标时停在上游结构修复，不扩大 reactor/are
 > HFS/raw=0.00017615；五次 errors 均为 0，但每次只完成 20-430 KiB，仍未兑现
 > 32-job 有效请求量，故性能 gate 继续结构性失败。当前需继续定位高并发 FIO job 与
 > HFS data reactor/Client 的阻塞关系。
+> 2026-09-18 收口（优化复测 #2）：修复 #36（inode 哈希查找）、cpuset 感知 pin、
+> inode 槽位池化（RSS 314→88 MiB）与 #37（cleanup stop 失败不再释放引擎）后，
+> 按统一 CPU 2-3、4K/randrw/50%/合计 QD=32/10 秒、5-run median 复测：
+> `config/hfs_nvme.conf`（`data_reactors=1`、`metadata_cpu=2`、`data_cpus=3`）
+> + HFS 8 jobs × iodepth 4 口径下 HFS 中位 `88646 IOPS`、raw `83094 IOPS`、
+> `HFS/raw=106.7%`，读写 p99 `856.1us` vs raw `938.0us`（`0.913x`），errors=0、
+> closure 全闭合，§16.2 主 gate 通过；原 official conf 32j×1 口径为 70.9%、
+> p99 `1.319x`，作为历史对比保留。证据目录
+> `/mnt/hfs-data/hfs2-postfix-gate2-20260918`（拓扑矩阵见
+> `doc/performance/hfs2_postfix_stress_20260918.md` §6）。
 
 ---
 

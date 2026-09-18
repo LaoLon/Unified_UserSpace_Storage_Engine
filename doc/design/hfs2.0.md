@@ -1173,10 +1173,13 @@ bs:      4K, 16K, 64K, 1M
 ```
 
 正式性能固定：8 vCPU、真实 NVMe BDF `0000:0b:00.0`、`Nvme0n1`、O_DIRECT、256 MiB、
-shared-file、randrw 50/50、4K/8K/16K/32K/64K、32 jobs、10 秒、5-run median、
-trace/stats off。raw 对照使用同一设备的 SPDK bdevperf 或官方 fio SPDK plugin，固定
-相同 bs/iodepth/jobs。报告 HFS/raw、read/write p50/p99、CPU%、RSS、errors、
-submit/complete、journal bytes/op。
+shared-file、randrw 50/50、4K/8K/16K/32K/64K、合计 QD=32（HFS 8 jobs × iodepth 4，
+raw 1 job × iodepth 32）、10 秒、5-run median、trace/stats off。2026-09-18 优化复测前
+的 32 jobs × iodepth 1 口径保留为历史对比，不再作为主 gate 形状。HFS 正式 `.conf`
+的 reactor/CPU 必须与测试 cpuset 对齐（`config/hfs_nvme.conf`：`data_reactors=1`、
+`metadata_cpu=2`、`data_cpus=3`），避免越界 pin 覆盖 `taskset`。raw 对照使用同一设备
+的 SPDK bdevperf 或官方 fio SPDK plugin，固定相同 bs/iodepth/jobs。报告 HFS/raw、
+read/write p50/p99、CPU%、RSS、errors、submit/complete、journal bytes/op。
 
 多 NVMe 验收至少覆盖单盘、双盘和配置中全部 data device 三种 device set；每次记录
 `metadata_devices`、`data_devices`、placement、每盘容量和每盘 submit/complete。任一
