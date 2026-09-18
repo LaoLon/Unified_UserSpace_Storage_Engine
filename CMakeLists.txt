@@ -371,6 +371,16 @@ target_compile_options(fio_completion_hub_test PRIVATE -fno-exceptions -fno-rtti
 target_link_libraries(fio_completion_hub_test PRIVATE Threads::Threads)
 add_test(NAME fio_completion_hub_test COMMAND fio_completion_hub_test)
 
+# Fixed-capacity requestId lookup and long-run deletion/churn test.
+add_executable(request_lookup_test tests/request_lookup_test.cpp)
+target_include_directories(request_lookup_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests
+)
+target_compile_options(request_lookup_test PRIVATE -fno-exceptions -fno-rtti)
+target_link_libraries(request_lookup_test PRIVATE Threads::Threads)
+add_test(NAME request_lookup_test COMMAND request_lookup_test)
+
 # Device-backed data-path test: real NVMe read/write through the async data
 # reactor path (compiles the core sources directly and links SPDK).
 if(HFS_WITH_SPDK)

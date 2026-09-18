@@ -15,6 +15,7 @@
 #include "core/async_completion_queue.hpp"
 #include "core/async_data_service.hpp"
 #include "core/data_plane.hpp"
+#include "core/request_lookup.hpp"
 #include "metadata/inode_map.hpp"
 #include "metadata/namespace.hpp"
 
@@ -56,7 +57,6 @@ struct AsyncFileSnapshot {
  * its completion event has been reaped by the creating thread. */
 struct AsyncRequestSlot {
     bool inUse = false;
-    bool lookupIndexed = false;
     std::uint64_t requestId = 0;
     CompletionToken token{};
     FileHandle file{};
@@ -64,26 +64,11 @@ struct AsyncRequestSlot {
 
     void release() noexcept {
         inUse = false;
-        lookupIndexed = false;
         requestId = 0;
         token = {};
         file = {};
         snapshot.reset();
     }
-};
-
-/* Fixed-capacity request lookup avoids allocating or scanning the slot table
- * on the normal completion path. Tombstones preserve open-addressing probes. */
-struct RequestLookupEntry {
-    enum class State : std::uint8_t {
-        Empty,
-        Occupied,
-        Tombstone,
-    };
-
-    State state = State::Empty;
-    std::uint64_t requestId = 0;
-    std::uint32_t slotIndex = 0;
 };
 
 /* Shared client state so open File handles keep working after Client::close
@@ -105,8 +90,7 @@ struct ClientState final : AsyncDataSink {
     std::unique_ptr<AsyncRequestSlot[]> requestSlots;
     std::unique_ptr<std::uint32_t[]> freeSlotStack;
     std::size_t freeSlotCount = 0;
-    std::unique_ptr<RequestLookupEntry[]> requestLookup;
-    std::size_t requestLookupCapacity = 0;
+    RequestLookupTable requestLookup;
     AsyncCompletionQueue completionQueue;
     bool asyncInitialized = false;
 
@@ -128,31 +112,10 @@ struct ClientState final : AsyncDataSink {
             maxOutstandingValue = 0;
             return false;
         }
-        const std::size_t requiredLookupCapacity =
-            static_cast<std::size_t>(maxOutstandingValue) * 2;
-        if (requiredLookupCapacity < maxOutstandingValue) {
+        if (!requestLookup.initialize(maxOutstandingValue)) {
             freeSlotStack.reset();
             requestSlots.reset();
             maxOutstandingValue = 0;
-            return false;
-        }
-        requestLookupCapacity = 1;
-        while (requestLookupCapacity < requiredLookupCapacity) {
-            if (requestLookupCapacity > std::numeric_limits<std::size_t>::max() / 2) {
-                freeSlotStack.reset();
-                requestSlots.reset();
-                maxOutstandingValue = 0;
-                requestLookupCapacity = 0;
-                return false;
-            }
-            requestLookupCapacity <<= 1;
-        }
-        requestLookup.reset(new (std::nothrow) RequestLookupEntry[requestLookupCapacity]);
-        if (requestLookup == nullptr) {
-            freeSlotStack.reset();
-            requestSlots.reset();
-            maxOutstandingValue = 0;
-            requestLookupCapacity = 0;
             return false;
         }
         for (std::size_t index = 0; index < maxOutstandingValue; ++index) {
@@ -163,7 +126,6 @@ struct ClientState final : AsyncDataSink {
         if (!completionQueue.initialize(effectiveShardCount, maxOutstandingValue,
                                         options.completionWake == nullptr)) {
             requestLookup.reset();
-            requestLookupCapacity = 0;
             freeSlotStack.reset();
             freeSlotCount = 0;
             requestSlots.reset();
@@ -219,15 +181,6 @@ struct ClientState final : AsyncDataSink {
         }
     }
 
-    static std::size_t lookupHash(std::uint64_t requestId) noexcept {
-        requestId ^= requestId >> 30;
-        requestId *= 0xbf58476d1ce4e5b9ULL;
-        requestId ^= requestId >> 27;
-        requestId *= 0x94d049bb133111ebULL;
-        requestId ^= requestId >> 31;
-        return static_cast<std::size_t>(requestId);
-    }
-
     void releaseSlot(std::size_t index) noexcept {
         if (index >= maxOutstandingValue || requestSlots == nullptr ||
             freeSlotStack == nullptr) {
@@ -240,87 +193,17 @@ struct ClientState final : AsyncDataSink {
     }
 
     bool indexRequest(std::uint64_t requestId, std::size_t slotIndex) noexcept {
-        if (requestId == 0 || slotIndex >= maxOutstandingValue || requestLookup == nullptr ||
-            requestLookupCapacity == 0) {
-            return false;
-        }
-        const std::size_t mask = requestLookupCapacity - 1;
-        const std::size_t start = lookupHash(requestId) & mask;
-        std::size_t firstTombstone = requestLookupCapacity;
-        for (std::size_t probe = 0; probe < requestLookupCapacity; ++probe) {
-            RequestLookupEntry &entry = requestLookup[(start + probe) & mask];
-            if (entry.state == RequestLookupEntry::State::Occupied) {
-                if (entry.requestId == requestId) {
-                    return false;
-                }
-                continue;
-            }
-            if (entry.state == RequestLookupEntry::State::Tombstone) {
-                if (firstTombstone == requestLookupCapacity) {
-                    firstTombstone = (start + probe) & mask;
-                }
-                continue;
-            }
-            const std::size_t target = firstTombstone == requestLookupCapacity
-                                           ? (start + probe) & mask
-                                           : firstTombstone;
-            RequestLookupEntry &targetEntry = requestLookup[target];
-            targetEntry.requestId = requestId;
-            targetEntry.slotIndex = static_cast<std::uint32_t>(slotIndex);
-            targetEntry.state = RequestLookupEntry::State::Occupied;
-            requestSlots[slotIndex].lookupIndexed = true;
-            return true;
-        }
-        if (firstTombstone != requestLookupCapacity) {
-            RequestLookupEntry &targetEntry = requestLookup[firstTombstone];
-            targetEntry.requestId = requestId;
-            targetEntry.slotIndex = static_cast<std::uint32_t>(slotIndex);
-            targetEntry.state = RequestLookupEntry::State::Occupied;
-            requestSlots[slotIndex].lookupIndexed = true;
-            return true;
-        }
-        return false;
-    }
-
-    void eraseRequest(std::uint64_t requestId) noexcept {
-        if (requestId == 0 || requestLookup == nullptr || requestLookupCapacity == 0) {
-            return;
-        }
-        const std::size_t mask = requestLookupCapacity - 1;
-        const std::size_t start = lookupHash(requestId) & mask;
-        for (std::size_t probe = 0; probe < requestLookupCapacity; ++probe) {
-            RequestLookupEntry &entry = requestLookup[(start + probe) & mask];
-            if (entry.state == RequestLookupEntry::State::Empty) {
-                return;
-            }
-            if (entry.state == RequestLookupEntry::State::Occupied &&
-                entry.requestId == requestId) {
-                entry.state = RequestLookupEntry::State::Tombstone;
-                entry.requestId = 0;
-                entry.slotIndex = 0;
-                return;
-            }
-        }
+        return requestId != 0 && slotIndex < maxOutstandingValue &&
+               requestLookup.insert(requestId, static_cast<std::uint32_t>(slotIndex));
     }
 
     AsyncRequestSlot *findRequest(std::uint64_t requestId, std::size_t &index) noexcept {
-        if (requestId != 0 && requestLookup != nullptr && requestLookupCapacity != 0) {
-            const std::size_t mask = requestLookupCapacity - 1;
-            const std::size_t start = lookupHash(requestId) & mask;
-            for (std::size_t probe = 0; probe < requestLookupCapacity; ++probe) {
-                RequestLookupEntry &entry = requestLookup[(start + probe) & mask];
-                if (entry.state == RequestLookupEntry::State::Empty) {
-                    break;
-                }
-                if (entry.state == RequestLookupEntry::State::Occupied &&
-                    entry.requestId == requestId) {
-                    index = entry.slotIndex;
-                    if (index < maxOutstandingValue && requestSlots[index].inUse &&
-                        requestSlots[index].requestId == requestId) {
-                        return &requestSlots[index];
-                    }
-                    break;
-                }
+        std::uint32_t mappedIndex = 0;
+        if (requestLookup.find(requestId, mappedIndex)) {
+            index = mappedIndex;
+            if (index < maxOutstandingValue && requestSlots[index].inUse &&
+                requestSlots[index].requestId == requestId) {
+                return &requestSlots[index];
             }
         }
         /* Keep an integrity-preserving fallback for an impossible full-table
@@ -359,20 +242,19 @@ struct ClientState final : AsyncDataSink {
     bool reapEvent(const CompletionEvent &event) noexcept {
         std::size_t index = 0;
         AsyncRequestSlot *slot = findRequest(event.requestId, index);
-        bool matched = false;
-        if (slot != nullptr) {
-            matched = slot->token.slot == event.token.slot &&
-                      slot->token.generation == event.token.generation;
-            if (slot->lookupIndexed) {
-                eraseRequest(event.requestId);
-            }
-            releaseSlot(index);
+        if (slot == nullptr || slot->token.slot != event.token.slot ||
+            slot->token.generation != event.token.generation) {
+            completionOverflow.store(true, std::memory_order_release);
+            return false;
         }
+
+        const bool erased = requestLookup.erase(event.requestId);
+        releaseSlot(index);
         releaseCredit();
-        if (!matched) {
+        if (!erased) {
             completionOverflow.store(true, std::memory_order_release);
         }
-        return matched;
+        return erased;
     }
 };
 
@@ -523,7 +405,9 @@ Result<IoHandle> submitAsyncRequest(ClientState &state, FileHandle handle,
     }
     IoHandle handleResult = std::move(submitted).value();
     slot->requestId = handleResult.requestId();
-    (void)state.indexRequest(slot->requestId, slotIndex);
+    if (!state.indexRequest(slot->requestId, slotIndex)) {
+        state.completionOverflow.store(true, std::memory_order_release);
+    }
     return Result<IoHandle>(std::move(handleResult));
 }
 
