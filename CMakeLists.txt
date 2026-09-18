@@ -76,6 +76,7 @@ target_include_directories(hfs_core
 target_link_libraries(hfs_core PRIVATE Threads::Threads)
 
 set(FIO_SOURCE_DIR "" CACHE PATH "fio source tree for the optional HFS external engine")
+option(HFS_FIO_DEBUG "Build fio-hfs without optimization and with debug symbols" OFF)
 if(EXISTS ${FIO_SOURCE_DIR}/fio.h)
   add_library(fio-hfs MODULE
     fio/fio_hfs.cpp
@@ -88,7 +89,9 @@ if(EXISTS ${FIO_SOURCE_DIR}/fio.h)
     ${CMAKE_CURRENT_SOURCE_DIR}/include
   )
   target_compile_options(fio-hfs PRIVATE -include ${FIO_SOURCE_DIR}/config-host.h)
-  target_compile_options(fio-hfs PRIVATE -O0 -g)
+  if(HFS_FIO_DEBUG)
+    target_compile_options(fio-hfs PRIVATE -O0 -g)
+  endif()
   target_link_libraries(fio-hfs PRIVATE hfs_core)
   if(HFS_WITH_SPDK)
     target_compile_definitions(fio-hfs PRIVATE HFS_WITH_SPDK=1)
