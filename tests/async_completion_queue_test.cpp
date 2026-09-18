@@ -210,6 +210,19 @@ int main() {
         HFS_TEST_CHECK(queue.diagnostics().drained == 1);
     }
 
+    /* 7. Rearming clears stale wake state without losing a queued event. */
+    {
+        hfs::AsyncCompletionRing ring(4);
+        HFS_TEST_CHECK(ring.push(makeEvent(2000, 0)));
+        HFS_TEST_CHECK(ring.rearmIfNonEmpty());
+        std::vector<hfs::CompletionEvent> output(1);
+        HFS_TEST_CHECK(ring.drain(output) == 1);
+        HFS_TEST_CHECK(!ring.rearmIfNonEmpty());
+        HFS_TEST_CHECK(ring.push(makeEvent(2001, 0)));
+        HFS_TEST_CHECK(ring.rearmIfNonEmpty());
+        HFS_TEST_CHECK(ring.drain(output) == 1);
+    }
+
     hfs::CompletionNotifier notifier;
     HFS_TEST_CHECK(notifier.initialize());
     std::printf("async_completion_queue_test: ok (eventfd=%s)\n",

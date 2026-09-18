@@ -169,6 +169,7 @@ private:
     std::size_t shardCount_ = 0;
     std::size_t perShardCapacity_ = 0;
     std::size_t cursor_ = 0; /* consumer-only round-robin start */
+    std::uint32_t activePollSpins_ = 128; /* consumer-only adaptive spin budget */
     std::atomic<std::uint64_t> invalidShard_{0};
     CompletionNotifier notifier_;
 };

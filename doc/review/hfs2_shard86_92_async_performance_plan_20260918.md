@@ -1,7 +1,7 @@
 # HFS 2.0 Shard-86~92 异步 FIO 性能与 trace 执行计划
 
 日期：2026-09-18
-状态：Shard-86 已实现并验证；Shard-87~92 尚未完成；Shard-81 正式性能 gate 未通过
+状态：Shard-86/87 已实现并验证；Shard-88~92 尚未完成；Shard-81 正式性能 gate 未通过
 事实源：
 
 - `doc/design/hfs2.0.md`：架构、公共 API、性能门禁和 tracepoint 规范的唯一事实源；
@@ -488,6 +488,19 @@ observability:  trace off / trace sample=1 / trace sample=N / trace drop
   bdev/parent/notify/poll 事件。
 - trace off 的既有 32-worker real-NVMe smoke 仍保持 `queued=reaped`、
   `outstanding=0`、`errors=0`；正式性能 gate 尚未重跑，不能据此关闭 Shard-81 性能阻塞。
+
+### 6.2 Shard-87 完成记录
+
+- `AsyncCompletionRing::rearmIfNonEmpty()` 改为先清除 wake arm、再二次检查队列；
+  生产者在 empty→non-empty 竞态中要么发出新 wake，要么被 consumer 的二次检查观察，
+  不改变 completion 内容和 timeout/min/max 语义。
+- `AsyncCompletionQueue::poll()` 的 active spin 从固定 1024 改为 32~1024 的自适应预算：
+  miss 减半、spin 内命中增加 64，并保留 trace `PollSpin` 的 budget/hit 证据。
+- VM `ctest` 22/22 通过；真实 NVMe 32-worker trace-on 短跑 closure 完整，
+  `recorded=2056917`、`dropped=0`、`closed=true`，平均 spin 约 32.1（旧固定预算为
+  1024），CPU 约 2.4% 的 trace-off smoke 仍无错误。
+- 本轮 `notify_write=notify_wait=notify_read=120647`，仍接近一 IO 一次；这说明
+  单 Client/单 eventfd 拓扑是 Shard-88 的剩余主问题，Shard-87 不宣称已经解决该瓶颈。
 
 本计划的第一目标不是立即把 IOPS 拉到 85%，而是把当前“约 61% 且不知道时间花在哪”
 变成可重复的分段证据。预期顺序为：

@@ -1449,6 +1449,10 @@ checkpoint region 必须容纳 namespace/inode/extent map/各 device allocator b
   bdev 路径已补齐 submit/complete/reap/notify/wait/spin 观测。真实 NVMe 32 worker
   trace-on 短跑 `queued=reaped`、`outstanding=0`、`token_mismatch=0`、`dropped=0`；
   trace 默认关闭，Shard-81 正式性能 gate 仍按 trace/stats off 执行。
+  2026-09-18：Shard-87 将 completion ring 的 wake-arm 竞态改为清除后二次检查，
+  并将固定 1024 次 active spin 改为 32~1024 的自适应预算；真实 NVMe 短跑平均预算约
+  32.1、trace drop=0、completion closure 完整。notify/wait/read 仍接近一 IO 一次，
+  该拓扑问题明确移交 Shard-88，不把 spin 优化误记为 notifier batching 完成。
   2026-09-18：RocksDB `ReadAsync` 已实现 `IOOptions::timeout` 的前端等待语义；超时
   返回 `TimedOut` 后，后台 I/O 继续排空，句柄析构时才回收 worker 和 buffer，且不会
   在 callback 后写回 request result。DataPath 的 `-ETIMEDOUT`、`-ECANCELED`、

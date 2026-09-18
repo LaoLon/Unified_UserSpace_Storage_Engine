@@ -19,6 +19,10 @@ namespace hfs {
 
 namespace {
 
+constexpr std::uint32_t kMinActivePollSpins = 32;
+constexpr std::uint32_t kMaxActivePollSpins = 1024;
+constexpr std::uint32_t kActivePollSpinStep = 64;
+
 /* Converts a positive duration to poll milliseconds without early timeout. */
 #if defined(__linux__)
 int timeoutMilliseconds(std::chrono::microseconds timeout) noexcept {
@@ -298,8 +302,10 @@ void AsyncCompletionRing::prepareWait() noexcept {
 }
 
 bool AsyncCompletionRing::rearmIfNonEmpty() noexcept {
+    /* Clear before the second empty check. A producer that races this
+     * transition either sends a new wake or is observed by the second check. */
+    wakeArmed_.store(false, std::memory_order_release);
     if (empty()) {
-        wakeArmed_.store(false, std::memory_order_release);
         return false;
     }
     wakeArmed_.store(true, std::memory_order_release);
@@ -449,17 +455,22 @@ PollResult AsyncCompletionQueue::poll(std::span<CompletionEvent> output, std::si
         /* Keep the previous wake arm while the reactor is likely to complete
          * the request. This avoids one eventfd write/read pair per shallow-QD
          * completion without changing the blocking timeout contract. */
-        constexpr unsigned kActivePollSpins = 1024;
-        unsigned spin = 0;
-        for (; spin < kActivePollSpins; ++spin) {
+        const std::uint32_t spinBudget = activePollSpins_;
+        std::uint32_t spin = 0;
+        for (; spin < spinBudget; ++spin) {
             result.count += drainAvailable(output.subspan(result.count, limit - result.count),
                                            limit - result.count);
             if (result.count >= min || result.count == limit) {
+                activePollSpins_ = std::min<std::uint32_t>(
+                    kMaxActivePollSpins, spinBudget + kActivePollSpinStep);
+                trace::event(trace::EventId::PollSpin, spin + 1, result.count,
+                             static_cast<std::uint64_t>(min), 1);
                 return result;
             }
         }
+        activePollSpins_ = std::max<std::uint32_t>(kMinActivePollSpins, spinBudget / 2);
         trace::event(trace::EventId::PollSpin, spin, result.count,
-                     static_cast<std::uint64_t>(min));
+                     static_cast<std::uint64_t>(min), 0);
     }
     for (;;) {
         result.count += drainAvailable(output.subspan(result.count, limit - result.count),
