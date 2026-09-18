@@ -52,12 +52,19 @@ enum class EventId : std::uint16_t {
     ShardPump,
     ShardBackendSubmit,
     ShardBackendComplete,
+    RequestShardSubmit,
+    RequestShardComplete,
+    RequestBdevSubmit,
+    RequestBdevComplete,
+    RequestParentComplete,
 };
+
+inline constexpr std::uint16_t kTraceFormatVersion = 2;
 
 /* Fixed-width on-disk event record; offline tools must not depend on ABI types. */
 struct TraceRecord {
     std::uint16_t eventId = 0;
-    std::uint16_t formatVersion = 1;
+    std::uint16_t formatVersion = kTraceFormatVersion;
     std::uint32_t sourceId = 0;
     std::uint64_t timestamp = 0;
     std::uint64_t arg0 = 0;

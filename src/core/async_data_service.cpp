@@ -151,6 +151,7 @@ private:
         Operation *operation = nullptr;
         AsyncDataSink *sink = nullptr;
         AsyncDataRequest request{};
+        std::uint64_t requestId = 0;
         ExtentSnapshotMap extentSnapshot{};
         std::uint32_t shard = 0;
         ShardState *shardState = nullptr;
@@ -187,6 +188,7 @@ private:
             operation = nullptr;
             sink = nullptr;
             request = {};
+            requestId = 0;
             extentSnapshot.reset();
             shard = 0;
             shardState = nullptr;
@@ -384,6 +386,7 @@ public:
                      request.write ? 1U : 0U, requestId);
         state->owner = this;
         state->operation = operation;
+        state->requestId = requestId;
         state->sink = &sink;
         state->request = request;
         state->request.extentMap = &state->extentSnapshot;
@@ -565,6 +568,9 @@ private:
         ChildState &child = state->children[childIndex];
         trace::event(trace::EventId::ShardBackendComplete, state->request.fileId,
                      state->shard, childIndex,
+                     static_cast<std::uint64_t>(completedBytes));
+        trace::event(trace::EventId::RequestShardComplete, state->requestId,
+                     state->request.fileId, childIndex,
                      static_cast<std::uint64_t>(completedBytes));
         if (child.terminal.load(std::memory_order_acquire)) {
             return;
@@ -861,6 +867,7 @@ private:
         request.write = child.phase == ChildState::Phase::WriteMerged ||
                         (child.phase == ChildState::Phase::Data && state.request.write);
         request.rmw = isRmw(child.plan.kind);
+        request.requestId = state.requestId;
         request.physicalBlock = child.plan.physicalBlock;
         request.deviceId = child.plan.deviceId;
         request.bytes = child.plan.bytes;
@@ -899,6 +906,8 @@ private:
         const AsyncDataBackend::Request request = backendRequest(state, child);
         trace::event(trace::EventId::ShardBackendSubmit, state.request.fileId,
                      state.shard, childIndex, request.bytes);
+        trace::event(trace::EventId::RequestShardSubmit, state.requestId,
+                     state.request.fileId, childIndex, request.bytes);
         const AsyncDataBackend::SubmitResult result =
             isReadPhase(state, child)
                 ? state.owner->shards_[state.shard].backend->submitRead(
@@ -1024,6 +1033,8 @@ private:
             backendErrno = state.firstErrno;
         }
         const std::uint64_t bytes = state.parent.completedBytes();
+        trace::event(trace::EventId::RequestParentComplete, state.requestId, bytes,
+                     static_cast<std::uint64_t>(backendErrno), state.childCount);
         if (!state.operation->completeTerminal(status, backendErrno, bytes)) {
             return;
         }

@@ -18,6 +18,8 @@ class ExtentMap;
 class AsyncDataBackend {
 public:
     struct Request {
+        /* Stable parent request id used by offline trace correlation. */
+        std::uint64_t requestId = 0;
         bool write = false;
         bool rmw = false;
         std::uint64_t physicalBlock = 0;

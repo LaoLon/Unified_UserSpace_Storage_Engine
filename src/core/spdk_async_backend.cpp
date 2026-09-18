@@ -115,6 +115,8 @@ bool SpdkAsyncDataBackend::releaseSlot(Slot &slot) noexcept {
         return false;
     }
     slot.request.stateTag = 0;
+    slot.request.traceRequestId = 0;
+    slot.request.traceChildIndex = 0;
     slot.callback = nullptr;
     slot.context = nullptr;
     slot.childIndex = 0;
@@ -228,6 +230,8 @@ AsyncDataBackend::SubmitResult SpdkAsyncDataBackend::submit(
     slot->context = context;
     slot->childIndex = request.childIndex;
     slot->completedBytes = native.spanBytes;
+    slot->request.traceRequestId = request.requestId;
+    slot->request.traceChildIndex = request.childIndex;
     inFlight_.fetch_add(1, std::memory_order_acq_rel);
 
     Result<void> submitted = write

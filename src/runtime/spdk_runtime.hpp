@@ -30,6 +30,9 @@ struct DataIoRequest {
 
     /* Zero means idle; the runtime owns the non-zero value while in flight. */
     std::uint64_t stateTag = 0;
+    /* Correlation metadata copied into the reactor-local runtime state. */
+    std::uint64_t traceRequestId = 0;
+    std::uint32_t traceChildIndex = 0;
     alignas(std::max_align_t) std::byte storage[kStorageBytes]{};
 };
 

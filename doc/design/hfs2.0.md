@@ -1232,7 +1232,8 @@ ring → actor → scheduler → DMA → planner → bdev → completion → fro
 - trace 不得改变 I/O 顺序、资源生命周期或 `spdk_submit == spdk_complete`；trace 数据
   不参与恢复；
 - event id 稳定，只增不改；record 带 `format_version` 和 TSC，TSC 使用同 CPU invariant
-  rdtsc，并在 session 开始写 wall-clock 校准点；
+  rdtsc，并在 session 开始写 wall-clock 校准点；manifest 同时记录 TSC 频率和
+  source→OS thread 映射；
 - 正式性能数字必须 trace off；归因跑使用采样或短时全量。
 
 record（示意）：
@@ -1270,6 +1271,14 @@ struct TraceRecord {
 | recovery | `RECOVERY_BEGIN` / `RECOVERY_END` | checkpoint generation, replay tx | mount 时间分解 |
 | error | `BACKEND_ERR` / `RETRY` / `BUSY_REJECT` / `TRACE_DROP` | errno, retry count | 失败与背压分布 |
 
+Repair-94 追加不改变既有点位语义的请求关联点：
+`REQUEST_SHARD_SUBMIT/COMPLETE` 的参数为 `(request_id, file_id, child_index, bytes)`，
+`REQUEST_BDEV_SUBMIT` 为 `(request_id, child_index, offset_blocks, blocks)`，
+`REQUEST_BDEV_COMPLETE` 为 `(request_id, child_index, errno, bytes)`，
+`REQUEST_PARENT_COMPLETE` 为 `(request_id, bytes, errno, child_count)`。这些点位使用
+append-only event id，并按 request id 成对采样，离线工具可据此计算 frontend、parent、
+shard 和 bdev 分段延迟；旧的 `BDEV_*` 和 `ShardBackend*` 点位保持原参数布局。
+
 关键延迟链（每段独立统计 p50/p99，不允许只报总数）：
 
 ```text
@@ -1303,10 +1312,11 @@ reap        = T8 - T7      // 完成到 frontend 消费
 
 输出与工具：
 
-- session 目录含 `manifest.json`（build id、config、device set、runtime stats）和
-  `trace-<shard>.bin`；默认写 `trace_dir`，正式 VM 为 `/mnt/hfs-data`；
-- 离线工具解析 record、合并多 shard 时间线，输出每段延迟直方图和 per-request 分段，
-  不在线格式化；
+- session 目录含 `trace-manifest.json`（format version、wall-clock、TSC 频率、
+  source thread 映射、recorded/dropped/closed）和 `trace-<shard>.bin`；默认写
+  `trace_dir`，正式 VM 为 `/mnt/hfs-data`；
+- 离线工具解析 record、校验 manifest 与文件记录数一致、合并多 shard 时间线，输出
+  frontend/parent/shard/bdev 的 p50/p99 和 per-request 分段，不在线格式化；
 - 固定归因流程：`stats` 先定位层级 → `trace_sample` 拉取分段分布 → 结构修复 →
   trace off 重跑正式门禁。
 
@@ -1499,6 +1509,10 @@ checkpoint region 必须容纳 namespace/inode/extent map/各 device allocator b
   hugepages 为 1024。因此生命周期和环境 gate 通过，但 85% 吞吐及 110% p99 性能门禁
   失败；Shard-81 性能仍未完成。详细证据见
   `doc/performance/hfs2_shard92_formal_gate_20260918.md`。
+  2026-09-18：Repair-94 扩展 trace format v2，加入 TSC 频率校准、source→thread
+  映射、manifest 记录完整性校验和请求关联 tracepoint；`hfs_trace_dump` 现在在
+  记录数、source id、closed 状态不一致时失败，并输出 frontend/parent/shard/bdev
+  分段 p50/p99。该修复只增强归因证据，不改变 trace-off 性能口径，也不关闭正式 gate。
   2026-09-18：RocksDB `ReadAsync` 已实现 `IOOptions::timeout` 的前端等待语义；超时
   返回 `TimedOut` 后，后台 I/O 继续排空，句柄析构时才回收 worker 和 buffer，且不会
   在 callback 后写回 request result。DataPath 的 `-ETIMEDOUT`、`-ECANCELED`、

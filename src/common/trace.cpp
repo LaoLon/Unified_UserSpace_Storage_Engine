@@ -7,15 +7,20 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdarg>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <fcntl.h>
+#include <limits>
 #include <memory>
 #include <new>
 #include <pthread.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#if defined(__linux__)
+#include <sys/syscall.h>
+#endif
 #include <unistd.h>
 
 #include "common/stats.hpp"
@@ -35,6 +40,7 @@ struct TraceChannel {
     std::atomic<std::uint64_t> tail{0};
     std::atomic<bool> claimed{false};
     std::uint32_t sourceId = 0;
+    std::uint64_t ownerTid = 0;
     int fd = -1;
 };
 
@@ -50,6 +56,7 @@ std::atomic<std::uint64_t> g_dropped{0};
 pthread_t g_writer{};
 char g_manifestPath[512]{};
 std::uint64_t g_wallClockNs = 0;
+std::uint64_t g_tscHz = 0;
 
 thread_local TraceChannel *g_tlsChannel = nullptr;
 thread_local std::uint64_t g_tlsGeneration = 0;
@@ -75,6 +82,11 @@ bool isHighFrequency(EventId id) noexcept {
     case EventId::ShardPump:
     case EventId::ShardBackendSubmit:
     case EventId::ShardBackendComplete:
+    case EventId::RequestShardSubmit:
+    case EventId::RequestShardComplete:
+    case EventId::RequestBdevSubmit:
+    case EventId::RequestBdevComplete:
+    case EventId::RequestParentComplete:
         return true;
     default:
         return false;
@@ -87,6 +99,39 @@ std::uint64_t timestamp() noexcept {
 #else
     return static_cast<std::uint64_t>(
         std::chrono::steady_clock::now().time_since_epoch().count());
+#endif
+}
+
+std::uint64_t currentThreadId() noexcept {
+#if defined(__linux__)
+    return static_cast<std::uint64_t>(::syscall(SYS_gettid));
+#else
+    pthread_t self = pthread_self();
+    std::uint64_t value = 0;
+    std::memcpy(&value, &self, std::min(sizeof(value), sizeof(self)));
+    return value;
+#endif
+}
+
+/* Calibrate TSC against monotonic time once per trace session. */
+void calibrateTsc() noexcept {
+    g_tscHz = 0;
+#if defined(__x86_64__) || defined(__i386__)
+    const auto begin = std::chrono::steady_clock::now();
+    const std::uint64_t beginTsc = timestamp();
+    const timespec delay{0, 1000000};
+    (void)::nanosleep(&delay, nullptr);
+    const std::uint64_t endTsc = timestamp();
+    const auto end = std::chrono::steady_clock::now();
+    const auto elapsedNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        end - begin).count();
+    if (elapsedNs > 0 && endTsc > beginTsc) {
+        const auto ticks = endTsc - beginTsc;
+        if (ticks <= std::numeric_limits<std::uint64_t>::max() / 1000000000ULL) {
+            g_tscHz = (ticks * 1000000000ULL) /
+                      static_cast<std::uint64_t>(elapsedNs);
+        }
+    }
 #endif
 }
 
@@ -193,6 +238,7 @@ TraceChannel *claimChannel() noexcept {
                                                     std::memory_order_acq_rel,
                                                     std::memory_order_relaxed)) {
             channel.sourceId = static_cast<std::uint32_t>(index);
+            channel.ownerTid = currentThreadId();
             g_tlsChannel = &channel;
             g_tlsGeneration = generation;
             return g_tlsChannel;
@@ -208,32 +254,90 @@ bool makePath(char *buffer, std::size_t bufferSize, const char *directory,
     return written > 0 && static_cast<std::size_t>(written) < bufferSize;
 }
 
+bool appendManifestText(char *buffer, std::size_t bufferSize, std::size_t &offset,
+                        const char *format, ...) noexcept {
+    if (offset >= bufferSize) {
+        return false;
+    }
+    va_list arguments;
+    va_start(arguments, format);
+    const int written = std::vsnprintf(buffer + offset, bufferSize - offset, format,
+                                       arguments);
+    va_end(arguments);
+    if (written < 0 || static_cast<std::size_t>(written) >= bufferSize - offset) {
+        return false;
+    }
+    offset += static_cast<std::size_t>(written);
+    return true;
+}
+
 bool writeManifest(bool closed) noexcept {
     if (g_manifestPath[0] == '\0') {
         return true;
     }
-    char manifest[1024];
-    const int bytes = std::snprintf(
-        manifest, sizeof(manifest),
-        "{\"format_version\":1,\"record_size\":%zu,\"ring_capacity\":%zu,"
-        "\"channel_count\":%zu,\"wall_clock_ns\":%llu,\"sample\":%u,\"recorded\":%llu,"
-        "\"dropped\":%llu,\"closed\":%s}\n",
-        sizeof(TraceRecord), kRingCapacity, kMaxChannels,
-        static_cast<unsigned long long>(g_wallClockNs),
-        g_sample.load(std::memory_order_relaxed),
-        static_cast<unsigned long long>(g_recorded.load(std::memory_order_relaxed)),
-        static_cast<unsigned long long>(g_dropped.load(std::memory_order_relaxed)),
-        closed ? "true" : "false");
-    if (bytes <= 0 || static_cast<std::size_t>(bytes) >= sizeof(manifest)) {
+    char manifest[8192];
+    std::size_t bytes = 0;
+    if (!appendManifestText(
+            manifest, sizeof(manifest), bytes,
+            "{\"format_version\":%u,\"record_size\":%zu,\"ring_capacity\":%zu,"
+            "\"channel_count\":%zu,\"wall_clock_ns\":%llu,\"tsc_hz\":%llu,"
+            "\"sample\":%u,\"recorded\":%llu,\"dropped\":%llu,\"closed\":%s,"
+            "\"source_threads\":[",
+            static_cast<unsigned>(kTraceFormatVersion), sizeof(TraceRecord), kRingCapacity,
+            kMaxChannels, static_cast<unsigned long long>(g_wallClockNs),
+            static_cast<unsigned long long>(g_tscHz),
+            g_sample.load(std::memory_order_relaxed),
+            static_cast<unsigned long long>(g_recorded.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(g_dropped.load(std::memory_order_relaxed)),
+            closed ? "true" : "false")) {
+        return false;
+    }
+    bool first = true;
+    for (const TraceChannel &channel : g_channels) {
+        if (!channel.claimed.load(std::memory_order_acquire)) {
+            continue;
+        }
+        if (!appendManifestText(manifest, sizeof(manifest), bytes,
+                                first ? "{\"source\":%u,\"tid\":%llu}"
+                                       : ", {\"source\":%u,\"tid\":%llu}",
+                                channel.sourceId,
+                                static_cast<unsigned long long>(channel.ownerTid))) {
+            return false;
+        }
+        first = false;
+    }
+    if (!appendManifestText(manifest, sizeof(manifest), bytes, "]}\n")) {
         return false;
     }
     const int fd = ::open(g_manifestPath, O_CREAT | O_WRONLY | O_TRUNC | O_CLOEXEC, 0644);
     if (fd < 0) {
         return false;
     }
-    const bool ok = writeAll(fd, manifest, static_cast<std::size_t>(bytes));
+    const bool ok = writeAll(fd, manifest, bytes);
     ::close(fd);
     return ok;
+}
+
+/* Return a stable request key for points that have a request id in their args. */
+std::uint64_t requestSamplingKey(EventId id, std::uint64_t a0, std::uint64_t a1,
+                                 std::uint64_t a2, std::uint64_t a3) noexcept {
+    (void)a1;
+    (void)a2;
+    switch (id) {
+    case EventId::FeSubmit:
+    case EventId::FeReap:
+    case EventId::CqPush:
+    case EventId::RequestShardSubmit:
+    case EventId::RequestShardComplete:
+    case EventId::RequestBdevSubmit:
+    case EventId::RequestBdevComplete:
+    case EventId::RequestParentComplete:
+        return a0;
+    case EventId::ShardMap:
+        return a3;
+    default:
+        return 0;
+    }
 }
 
 } // namespace
@@ -270,6 +374,7 @@ bool start(const char *directory) noexcept {
         channel.tail.store(0, std::memory_order_relaxed);
         channel.claimed.store(false, std::memory_order_relaxed);
         channel.sourceId = static_cast<std::uint32_t>(index);
+        channel.ownerTid = 0;
 
         char path[512];
         if (!makePath(path, sizeof(path), directory, channel.sourceId)) {
@@ -295,6 +400,7 @@ bool start(const char *directory) noexcept {
     g_wallClockNs = static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count());
+    calibrateTsc();
     if (!writeManifest(false)) {
         g_manifestPath[0] = '\0';
         closeFiles();
@@ -337,7 +443,11 @@ void event(EventId id, std::uint64_t a0, std::uint64_t a1, std::uint64_t a2,
     if (isHighFrequency(id)) {
         const std::uint32_t sample = g_sample.load(std::memory_order_relaxed);
         ++g_tlsHighFrequencySequence;
-        if (sample > 1 && (g_tlsHighFrequencySequence % sample) != 0) {
+        const std::uint64_t requestKey = requestSamplingKey(id, a0, a1, a2, a3);
+        const std::uint64_t sampleKey = requestKey == 0
+                                            ? g_tlsHighFrequencySequence
+                                            : requestKey;
+        if (sample > 1 && (sampleKey % sample) != 0) {
             return;
         }
     }
@@ -361,7 +471,7 @@ void event(EventId id, std::uint64_t a0, std::uint64_t a1, std::uint64_t a2,
 
     TraceRecord &record = channel->records[head & (kRingCapacity - 1)];
     record.eventId = static_cast<std::uint16_t>(id);
-    record.formatVersion = 1;
+    record.formatVersion = kTraceFormatVersion;
     record.sourceId = channel->sourceId;
     record.timestamp = timestamp();
     record.arg0 = a0;

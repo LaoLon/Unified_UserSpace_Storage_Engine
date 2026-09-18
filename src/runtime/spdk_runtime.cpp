@@ -823,6 +823,8 @@ struct SpdkRuntime::Impl {
         Impl *impl = nullptr;
         Reactor *reactor = nullptr;
         DataIoRequest *request = nullptr;
+        std::uint64_t traceRequestId = 0;
+        std::uint32_t traceChildIndex = 0;
         spdk_bdev_desc *desc = nullptr;
         spdk_bdev *bdev = nullptr;
         spdk_io_channel *channel = nullptr;
@@ -924,10 +926,19 @@ struct SpdkRuntime::Impl {
         const DataIoCompletion cb = state->cb;
         void *const cbCtx = state->cbCtx;
         const int rc = state->completionRc;
+        const std::uint64_t traceRequestId = state->traceRequestId;
+        const std::uint32_t traceChildIndex = state->traceChildIndex;
         trace::event(trace::EventId::BdevComplete,
                      static_cast<std::uint64_t>(rc < 0 ? -static_cast<std::int64_t>(rc) : rc),
                      state->bytes, state->write ? 1 : 0, state->offsetBlocks);
+        trace::event(trace::EventId::RequestBdevComplete, traceRequestId,
+                     traceChildIndex,
+                     static_cast<std::uint64_t>(
+                         rc < 0 ? -static_cast<std::int64_t>(rc) : rc),
+                     state->bytes);
         request->stateTag = 0;
+        request->traceRequestId = 0;
+        request->traceChildIndex = 0;
         state->~DataIoState();
         /* The caller supplied callback is already on the owning reactor; it
          * must remain nonblocking and must not enter frontend code. */
@@ -989,6 +1000,8 @@ struct SpdkRuntime::Impl {
         for (unsigned attempt = 0; attempt <= kImmediateRetryLimit; ++attempt) {
             trace::event(trace::EventId::BdevSubmit, state->offsetBlocks, state->blocks,
                          state->write ? 1 : 0, attempt);
+            trace::event(trace::EventId::RequestBdevSubmit, state->traceRequestId,
+                         state->traceChildIndex, state->offsetBlocks, state->blocks);
             const int rc = state->write
                                ? spdk_bdev_writev_blocks(state->desc, state->channel, &state->iov,
                                                          1,
@@ -1083,6 +1096,8 @@ struct SpdkRuntime::Impl {
         state->impl = this;
         state->reactor = reactor;
         state->request = &request;
+        state->traceRequestId = request.traceRequestId;
+        state->traceChildIndex = request.traceChildIndex;
         state->desc = device.desc;
         state->bdev = device.bdev;
         state->channel = reactor->channels[deviceIndex];

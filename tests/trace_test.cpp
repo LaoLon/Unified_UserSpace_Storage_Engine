@@ -1,6 +1,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -44,6 +46,17 @@ int main() {
     hfs::trace::stop();
     HFS_TEST_CHECK(!hfs::trace::sessionActive());
     HFS_TEST_CHECK(hfs::trace::dropped() == 0);
+
+    const int manifestFd = ::open("/tmp/hfs2-shard86-trace-test/trace-manifest.json",
+                                  O_RDONLY | O_CLOEXEC);
+    HFS_TEST_CHECK(manifestFd >= 0);
+    char manifest[4096]{};
+    const ssize_t manifestBytes = ::read(manifestFd, manifest, sizeof(manifest) - 1);
+    ::close(manifestFd);
+    HFS_TEST_CHECK(manifestBytes > 0);
+    HFS_TEST_CHECK(std::strstr(manifest, "\"format_version\":2") != nullptr);
+    HFS_TEST_CHECK(std::strstr(manifest, "\"closed\":true") != nullptr);
+    HFS_TEST_CHECK(std::strstr(manifest, "\"source_threads\":[") != nullptr);
 
     char path[256];
     const int written = std::snprintf(path, sizeof(path), "%s/trace-0.bin",
