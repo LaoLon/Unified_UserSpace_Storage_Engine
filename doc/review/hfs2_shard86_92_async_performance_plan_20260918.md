@@ -1,7 +1,7 @@
 # HFS 2.0 Shard-86~92 异步 FIO 性能与 trace 执行计划
 
 日期：2026-09-18
-状态：Shard-86/87 已实现并验证；Shard-88 已实现并完成生命周期/拓扑验证，但中间性能目标未达成；Shard-89~92 尚未完成；Shard-81 正式性能 gate 未通过
+状态：Shard-86/87 已实现并验证；Shard-88 已实现并完成生命周期/拓扑验证，但中间性能目标未达成；Shard-89 已完成归因验证并保留 file affinity；Shard-90~92 尚未完成；Shard-81 正式性能 gate 未通过
 事实源：
 
 - `doc/design/hfs2.0.md`：架构、公共 API、性能门禁和 tracepoint 规范的唯一事实源；
@@ -288,6 +288,7 @@ completion queue wake-hint plumbing：回调只传递“该 Client 的 completio
 
 - `src/core/async_data_service.hpp/.cpp`
 - `src/core/scheduler.hpp/.cpp`
+- 为归因追加稳定 trace event id 和对应 callsite；不改变 trace off 的数据路径。
 - 对应 scheduler/data service 测试。
 
 不得直接修改 runtime、FIO completion 或公共 API。
@@ -329,6 +330,11 @@ read-only vs randrw
 - 每个 active data reactor 的 submit/complete 和 busy ratio 可见；
 - 不因“看起来有两个 reactor”而把未使用的 reactor 计入性能收益；
 - 如果单 shard 不是主要瓶颈，保留现有 file affinity，不做无收益的架构改动。
+
+本 shard 不得只按 file hash 随机迁移请求。当前 `submitDataReadOnReactor()` 要求在目标
+reactor 上调用；任何跨 reactor child dispatch 都必须同时补齐 message、backend credit、
+callback context 和 stop/clear 生命周期，否则只记录为候选方案，交给后续 runtime shard，
+不能以牺牲 actor-local 边界换取表面吞吐。
 
 ---
 
@@ -527,6 +533,24 @@ observability:  trace off / trace sample=1 / trace sample=N / trace drop
 - Shard-88 的拓扑和生命周期问题已完成，但短跑 randrw 约为当前 Shard-81 正式中位数
   66.538k IOPS 的 98.7%，尚未达到 raw 中位数 75% 的约 81.297k IOPS 中间目标；因此
   性能阻塞明确移交 Shard-89/90，不能据此关闭 Shard-81 正式 gate。
+
+### 6.4 Shard-89 完成记录
+
+- 追加 `ShardMap`、`ShardPump`、`ShardBackendSubmit`、`ShardBackendComplete` trace
+  事件，记录 file id→logical shard、每 shard pump work/high-watermark 以及 backend
+  submit/complete；trace off 仅保留一次 cached-enabled 分支，不引入分配、锁或全局 RMW。
+- 在 `config/hfs_nvme.conf`、真实 `Nvme0n1`、2 个 data reactor、32 jobs/q1、8 MiB
+  randrw 上做 sample=64 trace-on 串行复核：`queued=terminal=published=reaped=65536`、
+  `outstanding=0`、`token_mismatch=0`；manifest `recorded=702039`、`dropped=0`、
+  `closed=true`。采样到的 1024 个 `ShardMap` 全为 `fileId=2 → shard=0`；backend
+  submit/complete 只出现在 shard 0；shard 0 `pump_work=2242`、high-watermark=31，
+  shard 1 `pump_work=0`、high-watermark=0。
+- 这确认 shared-file workload 的单 shard affinity 是真实热点，而不是 FIO completion
+  拓扑假象。没有按 hash 随机迁移请求：现有 actor-local backend API 在错误 reactor
+  调用会返回 `InvalidState`，安全跨 reactor dispatch 还需要 runtime message、credit、
+  callback 和 stop/clear 生命周期设计；本 shard 保留同一 file 的 scheduler owner 和
+  ordering 不变，将该候选方案移交 Shard-90 及后续 runtime 设计。scheduler/data-service
+  既有顺序、错误、取消和 late completion 测试均由 VM 23/23 ctest 覆盖。
 
 本计划的第一目标不是立即把 IOPS 拉到 85%，而是把当前“约 61% 且不知道时间花在哪”
 变成可重复的分段证据。预期顺序为：

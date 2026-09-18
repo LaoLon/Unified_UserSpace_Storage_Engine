@@ -48,6 +48,10 @@ enum class EventId : std::uint16_t {
     NotifyRead,
     PollSpin,
     PollReturn,
+    ShardMap,
+    ShardPump,
+    ShardBackendSubmit,
+    ShardBackendComplete,
 };
 
 /* Fixed-width on-disk event record; offline tools must not depend on ABI types. */

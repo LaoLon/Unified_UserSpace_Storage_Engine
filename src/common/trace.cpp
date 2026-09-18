@@ -71,6 +71,10 @@ bool isHighFrequency(EventId id) noexcept {
     case EventId::NotifyRead:
     case EventId::PollSpin:
     case EventId::PollReturn:
+    case EventId::ShardMap:
+    case EventId::ShardPump:
+    case EventId::ShardBackendSubmit:
+    case EventId::ShardBackendComplete:
         return true;
     default:
         return false;

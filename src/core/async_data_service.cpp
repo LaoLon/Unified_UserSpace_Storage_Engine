@@ -12,6 +12,7 @@
 #include <new>
 
 #include "core/actor.hpp"
+#include "common/trace.hpp"
 #include "core/dma_arena.hpp"
 #include "core/extent_map.hpp"
 #include "core/parent_completion.hpp"
@@ -379,6 +380,8 @@ public:
         }
 
         const std::uint32_t shard = shardForFile(request.fileId, config_.shardCount);
+        trace::event(trace::EventId::ShardMap, request.fileId, shard,
+                     request.write ? 1U : 0U, requestId);
         state->owner = this;
         state->operation = operation;
         state->sink = &sink;
@@ -444,6 +447,11 @@ public:
         std::size_t work = state.actor->runOnce();
         work += retryPreparing(state);
         work += drainReady(state);
+        if (trace::enabled()) {
+            const ShardRing::Stats ringStats = state.ring->stats();
+            trace::event(trace::EventId::ShardPump, shard, work,
+                         ringStats.highWatermark, state.preparingCount);
+        }
         return work;
     }
 
@@ -555,6 +563,9 @@ private:
             return;
         }
         ChildState &child = state->children[childIndex];
+        trace::event(trace::EventId::ShardBackendComplete, state->request.fileId,
+                     state->shard, childIndex,
+                     static_cast<std::uint64_t>(completedBytes));
         if (child.terminal.load(std::memory_order_acquire)) {
             return;
         }
@@ -886,6 +897,8 @@ private:
 
         child.submitted = true;
         const AsyncDataBackend::Request request = backendRequest(state, child);
+        trace::event(trace::EventId::ShardBackendSubmit, state.request.fileId,
+                     state.shard, childIndex, request.bytes);
         const AsyncDataBackend::SubmitResult result =
             isReadPhase(state, child)
                 ? state.owner->shards_[state.shard].backend->submitRead(

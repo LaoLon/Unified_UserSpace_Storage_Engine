@@ -1462,6 +1462,14 @@ checkpoint region 必须容纳 namespace/inode/extent map/各 device allocator b
   `queued=terminal=published=reaped`、`outstanding=0`、`token_mismatch=0`；`ctest`
   23/23 和同步 `hfs_async=0` 回归通过。该结果仍低于 raw 75% 中间目标，Shard-81 正式
   性能 gate 继续保持未通过，后续由 Shard-89/90 处理 file-shard/reactor 热点。
+  2026-09-18：Shard-89 追加 `ShardMap`、`ShardPump`、`ShardBackendSubmit`、
+  `ShardBackendComplete` tracepoint。真实 `Nvme0n1`、2 data reactors、32 jobs/q1
+  shared-file trace-on sample=64 的 `fileId=2 → shard=0`、backend submit/complete
+  和 pump work 证据确认 shard 0 是唯一实际工作的 file owner；shard 1 的 pump work
+  与 high-watermark 均为 0，不能把它计入有效利用率。现有 actor-local backend API 要求
+  在目标 reactor 调用，不能只修改 file hash 将 child 随机迁移；同一 file 的 ordering、
+  cancellation、late completion 边界继续保持单 owner，跨 reactor dispatch 留给后续
+  runtime 设计。该观测跑 closure 完整、trace dropped=0，未改变正式数据路径。
   2026-09-18：RocksDB `ReadAsync` 已实现 `IOOptions::timeout` 的前端等待语义；超时
   返回 `TimedOut` 后，后台 I/O 继续排空，句柄析构时才回收 worker 和 buffer，且不会
   在 callback 后写回 request result。DataPath 的 `-ETIMEDOUT`、`-ECANCELED`、
