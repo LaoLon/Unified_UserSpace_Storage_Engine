@@ -1528,6 +1528,16 @@ checkpoint region 必须容纳 namespace/inode/extent map/各 device allocator b
   边界、8 句柄批量取消及 RocksDB flush 错误映射；证据见
   `doc/review/hfs2_error_timeout_cancel_matrix_20260918.md`。真实掉电等价、性能
   gate 和完整 stock RocksDB 兼容性仍保持未完成边界。
+  2026-09-18：Repair-93～98 完成一轮异步性能修复收口。Release `fio-hfs` 构建已
+  移除默认 `-O0 -g`；completion wait、request lookup/reap、trace v2 关联和 FIO
+  per-job 文件拓扑均完成实现。VM Release 全量 CTest `24/24`、runtime stop/restart
+  `10/10` 通过；真实 `Nvme0n1` 的 per-job trace 产生 14 条 `ShardMap`，覆盖 7 个
+  file id 和两个 shard，manifest `closed=true`、`dropped=0`。随后 raw/HFS 各五次
+  正式采集均无错误，HFS 的 accepted/terminal/published、child submit/complete、
+  queued/reaped、outstanding 和 token mismatch 全部闭合；但中位 HFS/raw 吞吐为
+  `60.5303%`，read/write p99 比值为 `5.525x`，仍未达到 `85%` 和 `110%` 门槛。
+  该结果确认生命周期和环境边界已修复，但不关闭 Shard-81 性能 gate；完整证据见
+  `doc/performance/hfs2_repair98_final_matrix_20260918.md`。
 - 所有 gate 通过后删除新树中最后的旧兼容残留；
 - `src_legacy_frozen/` 保持本地忽略或单独归档，不回到 product build；
 - 更新架构索引、性能基线、支持边界和迁移说明；
