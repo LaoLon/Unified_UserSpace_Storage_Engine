@@ -1,7 +1,7 @@
 # HFS 2.0 Shard-86~92 异步 FIO 性能与 trace 执行计划
 
 日期：2026-09-18
-状态：Shard-86/87 已实现并验证；Shard-88 已实现并完成生命周期/拓扑验证，但中间性能目标未达成；Shard-89 已完成归因验证并保留 file affinity；Shard-90 已实现并通过热路径、生命周期和真实 NVMe 验证；Shard-91~92 尚未完成；Shard-81 正式性能 gate 未通过
+状态：Shard-86/87 已实现并验证；Shard-88 已实现并完成生命周期/拓扑验证，但中间性能目标未达成；Shard-89 已完成归因验证并保留 file affinity；Shard-90 已实现并通过热路径、生命周期和真实 NVMe 验证；Shard-91 已实现并通过 slot/reap、全量和真实 NVMe 验证；Shard-92 尚未完成；Shard-81 正式性能 gate 未通过
 事实源：
 
 - `doc/design/hfs2.0.md`：架构、公共 API、性能门禁和 tracepoint 规范的唯一事实源；
@@ -568,7 +568,23 @@ observability:  trace off / trace sample=1 / trace sample=N / trace drop
   `outstanding=0`、`token_mismatch=0`；`gettid` 从 Shard-88 约 65582 次降到 46 次，
   未出现 eventfd2 风暴。32 jobs/q1 randrw 真实 NVMe smoke 亦闭合，错误为 0。
 - 该结果证明 Shard-90 的热路径和生命周期目标完成，但不是 Shard-81 正式性能 gate：
-  尚未完成 Shard-91 微优化及 Shard-92 五次 raw/HFS 同口径 gate，不能关闭性能阻塞。
+  尚未完成 Shard-92 五次 raw/HFS 同口径 gate，不能关闭性能阻塞。
+
+### 6.6 Shard-91 完成记录
+
+- Client 初始化时一次性分配 bounded free-slot stack 和固定容量 requestId lookup table；
+  正常 `reserveSlot()` 为 O(1)，正常 `reapEvent()` 通过 open addressing 直接定位 slot，
+  不在每 IO 分配或获取锁。lookup 使用 tombstone 保持 probe chain；极端索引插入失败
+  或 lookup 损坏时保留线性扫描回退并继续执行 integrity check，不改变错误语义。
+- `CompletionToken` generation/slot 校验、重复/late completion、错误 token 后的
+  `Corrupt` 标记、credit release、close Busy 和 slot reuse 规则均保持不变。新增真实
+  file API 32-slot 并发回归，覆盖完整 bounded slot 表和 requestId reaping。
+- VM `cmake --build build-async` 与 `ctest` 23/23 通过。真实 `Nvme0n1`、32 jobs/q1、
+  8 MiB randrw smoke closure 为 `queued=terminal=published=reaped=65536`、
+  `child_submit=child_complete=65536`、`outstanding=0`、`token_mismatch=0`、错误为 0；
+  单次总吞吐约 63.8k IOPS，不能替代五次正式 gate，也未宣称达到 85% 门槛。
+- 该 shard 只优化 frontend slot/reap 管理，不改变 FIO topology、file affinity、
+  actor-local ownership 或公共 API；下一步进入 Shard-92 正式 raw/HFS 五次 gate 和归档。
 
 本计划的第一目标不是立即把 IOPS 拉到 85%，而是把当前“约 61% 且不知道时间花在哪”
 变成可重复的分段证据。预期顺序为：

@@ -227,6 +227,43 @@ int main() {
             HFS_TEST_CHECK(asyncPoll.status == Status::Ok && asyncPoll.count == 1);
             HFS_TEST_CHECK(asyncEvents[0].status == Status::Ok);
 
+            /* Exercise the full bounded slot table and request-id lookup path. */
+            HFS_TEST_CHECK(first.value()
+                               ->allocate(0, 32U * 4096U)
+                               .wait()
+                               .value()
+                               .ok());
+            {
+                std::vector<std::span<std::byte>> batchBuffers;
+                std::vector<IoHandle> batchHandles;
+                batchBuffers.reserve(32);
+                batchHandles.reserve(32);
+                for (std::size_t index = 0; index < 32; ++index) {
+                    auto acquired = engine->acquireDmaBuffer(4096, 0);
+                    HFS_TEST_CHECK(acquired.ok());
+                    batchBuffers.push_back(acquired.value());
+                    IoVec batchIo{batchBuffers.back().data(), batchBuffers.back().size()};
+                    auto submitted = client->submitRead(
+                        first.value(), batchIo, index * 4096,
+                        CompletionToken{static_cast<std::uint32_t>(100 + index), 1});
+                    HFS_TEST_CHECK(submitted.ok());
+                    batchHandles.push_back(std::move(submitted).value());
+                }
+                std::vector<CompletionEvent> batchEvents(32);
+                const auto batchPoll = client->poll(batchEvents, 32, 32,
+                                                    std::chrono::seconds(5));
+                HFS_TEST_CHECK(batchPoll.status == Status::Ok && batchPoll.count == 32);
+                for (std::size_t index = 0; index < batchPoll.count; ++index) {
+                    HFS_TEST_CHECK(batchEvents[index].status == Status::Ok);
+                }
+                for (auto &handle : batchHandles) {
+                    handle.reset();
+                }
+                for (const auto buffer : batchBuffers) {
+                    engine->releaseDmaBuffer(buffer.data(), buffer.size());
+                }
+            }
+
             /* 8. close rejects live file handles and reaped IoHandles, then
              * becomes terminal after every frontend reference is released. */
             auto closeWithFiles = client->close().wait().value();

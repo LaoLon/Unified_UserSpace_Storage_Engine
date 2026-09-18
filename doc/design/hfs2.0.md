@@ -1479,6 +1479,12 @@ checkpoint region 必须容纳 namespace/inode/extent map/各 device allocator b
   从约 65582 次降至 46 次，closure 与 token/outstanding 均闭合；VM ctest 23/23 以及
   连续 10 次 runtime stop/restart 回归通过。该优化未改变 actor-local ownership，Shard-81
   正式性能 gate 仍保持未通过。
+  2026-09-18：Shard-91 为每个 Client 预分配 bounded free-slot stack 和固定容量
+  requestId open-addressing lookup，正常 slot reserve/reap 不再线性扫描或每 IO 分配；
+  tombstone 保持 probe chain，索引异常时保留线性完整性回退。generation/token 校验、
+  late completion、credit release、close Busy 和 slot reuse 语义不变。新增 32-slot
+  真实 NVMe file API 回归、VM ctest 23/23 及 32 jobs/q1 randrw closure 全部通过；
+  单次 smoke 约 63.8k IOPS，仅作为实现验证，不关闭 Shard-81 正式性能 gate。
   2026-09-18：RocksDB `ReadAsync` 已实现 `IOOptions::timeout` 的前端等待语义；超时
   返回 `TimedOut` 后，后台 I/O 继续排空，句柄析构时才回收 worker 和 buffer，且不会
   在 callback 后写回 request result。DataPath 的 `-ETIMEDOUT`、`-ECANCELED`、
