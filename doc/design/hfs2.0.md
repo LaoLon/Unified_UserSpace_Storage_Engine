@@ -1485,6 +1485,17 @@ checkpoint region 必须容纳 namespace/inode/extent map/各 device allocator b
   late completion、credit release、close Busy 和 slot reuse 语义不变。新增 32-slot
   真实 NVMe file API 回归、VM ctest 23/23 及 32 jobs/q1 randrw closure 全部通过；
   单次 smoke 约 63.8k IOPS，仅作为实现验证，不关闭 Shard-81 正式性能 gate。
+  2026-09-18：Shard-92 在真实 `Nvme0n1` 上完成 trace/stats off 的 raw/HFS 五次正式
+  gate。raw SPDK 使用 `config/hfs_nvme.json` 作为 plugin 输入，HFS 使用正式
+  `config/hfs_nvme.conf`；两侧固定 CPU 2-3、4 KiB `randrw` 50/50、256 MiB、10 秒和
+  32 有效 outstanding。raw 中位数 `109474.152585 IOPS`，HFS 中位数
+  `76893.931820 IOPS`，HFS/raw=`70.239%`；HFS 读/写 p99 中位数为
+  `3227.648/3227.648 us`，raw 为 `643.072/643.072 us`，p99 约 `5.019x`。
+  五次 HFS 的 accepted/terminal/published、child submit/complete、queued/reaped
+  均闭合，outstanding、token mismatch 和 errors 均为 0，驱动为 `uio_pci_generic`、
+  hugepages 为 1024。因此生命周期和环境 gate 通过，但 85% 吞吐及 110% p99 性能门禁
+  失败；Shard-81 性能仍未完成。详细证据见
+  `doc/performance/hfs2_shard92_formal_gate_20260918.md`。
   2026-09-18：RocksDB `ReadAsync` 已实现 `IOOptions::timeout` 的前端等待语义；超时
   返回 `TimedOut` 后，后台 I/O 继续排空，句柄析构时才回收 worker 和 buffer，且不会
   在 callback 后写回 request result。DataPath 的 `-ETIMEDOUT`、`-ECANCELED`、

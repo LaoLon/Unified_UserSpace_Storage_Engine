@@ -1,7 +1,7 @@
 # HFS 2.0 Shard-86~92 异步 FIO 性能与 trace 执行计划
 
 日期：2026-09-18
-状态：Shard-86/87 已实现并验证；Shard-88 已实现并完成生命周期/拓扑验证，但中间性能目标未达成；Shard-89 已完成归因验证并保留 file affinity；Shard-90 已实现并通过热路径、生命周期和真实 NVMe 验证；Shard-91 已实现并通过 slot/reap、全量和真实 NVMe 验证；Shard-92 尚未完成；Shard-81 正式性能 gate 未通过
+状态：Shard-86/87 已实现并验证；Shard-88 已实现并完成生命周期/拓扑验证，但中间性能目标未达成；Shard-89 已完成归因验证并保留 file affinity；Shard-90 已实现并通过热路径、生命周期和真实 NVMe 验证；Shard-91 已实现并通过 slot/reap、全量和真实 NVMe 验证；Shard-92 已完成五次正式 gate 和证据归档，但性能阈值未通过；Shard-81 正式性能 gate 仍未通过
 事实源：
 
 - `doc/design/hfs2.0.md`：架构、公共 API、性能门禁和 tracepoint 规范的唯一事实源；
@@ -568,7 +568,8 @@ observability:  trace off / trace sample=1 / trace sample=N / trace drop
   `outstanding=0`、`token_mismatch=0`；`gettid` 从 Shard-88 约 65582 次降到 46 次，
   未出现 eventfd2 风暴。32 jobs/q1 randrw 真实 NVMe smoke 亦闭合，错误为 0。
 - 该结果证明 Shard-90 的热路径和生命周期目标完成，但不是 Shard-81 正式性能 gate：
-  尚未完成 Shard-92 五次 raw/HFS 同口径 gate，不能关闭性能阻塞。
+  在当时尚未完成 Shard-92 五次 raw/HFS 同口径 gate，不能关闭性能阻塞；该 gate
+  后续已在 §6.7 完成并归档，但性能阈值仍未通过。
 
 ### 6.6 Shard-91 完成记录
 
@@ -584,7 +585,26 @@ observability:  trace off / trace sample=1 / trace sample=N / trace drop
   `child_submit=child_complete=65536`、`outstanding=0`、`token_mismatch=0`、错误为 0；
   单次总吞吐约 63.8k IOPS，不能替代五次正式 gate，也未宣称达到 85% 门槛。
 - 该 shard 只优化 frontend slot/reap 管理，不改变 FIO topology、file affinity、
-  actor-local ownership 或公共 API；下一步进入 Shard-92 正式 raw/HFS 五次 gate 和归档。
+  actor-local ownership 或公共 API；该记录之后进入 Shard-92 正式 raw/HFS 五次 gate
+  和归档，结果见 §6.7。
+
+### 6.7 Shard-92 完成记录
+
+- 在真实 `Nvme0n1`、CPU 2-3、4 KiB `randrw` 50/50、256 MiB、10 秒、trace/stats off
+  的固定口径下，raw SPDK 与 HFS 各完成五次运行；raw 使用 `iodepth=32`，HFS 使用
+  `32 jobs × iodepth=1`，两侧有效 outstanding 均为 32。
+- raw 中位数为 `109474.152585 IOPS`，HFS 中位数为 `76893.931820 IOPS`，
+  HFS/raw=`70.239%`，低于正式 `85%` 门槛；HFS 读/写中位 p99 为
+  `3227.648/3227.648 us`，raw 为 `643.072/643.072 us`，p99 约为 `5.019x`，
+  高于 `1.10x` 门槛。
+- 五次 HFS 的 `accepted=terminal=published`、`child_submit=child_complete`、
+  `queued=reaped` 均闭合，`outstanding=0`、`token_mismatch=0`、错误数为 0；
+  驱动为 `uio_pci_generic`，hugepages 为 1024。说明本轮性能失败不再是请求数量
+  塌陷、completion 泄漏或设备绑定失败。
+- 正式报告为 `doc/performance/hfs2_shard92_formal_gate_20260918.md`，完整结果保存在
+  `/mnt/hfs-data/hfs2-shard81-spdk-fio-baseline-20260918-shard92` 和
+  `/mnt/hfs-data/hfs2-shard81-async-gate-20260918-shard92`。Shard-92 的 gate 证据
+  已闭合，但 Shard-81 性能门禁仍保持未通过，不能把 HFS 2.0 性能标记为完成。
 
 本计划的第一目标不是立即把 IOPS 拉到 85%，而是把当前“约 61% 且不知道时间花在哪”
 变成可重复的分段证据。预期顺序为：
