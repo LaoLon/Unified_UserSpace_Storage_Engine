@@ -1437,6 +1437,12 @@ checkpoint region 必须容纳 namespace/inode/extent map/各 device allocator b
   可证明的 32 jobs 有效并发，HFS/raw=0.000019，性能 gate 结构性失败。raw 仅有 aggregate p99，
   读写分离 p99 与 submit/complete 尚未闭合；不得据此宣称性能 gate 通过。证据见
   `doc/performance/hfs2_shard81_formal_gate_20260918.md`。
+  随后 Shard-81 的 core-native async backend、FIO `queue/getevents/event`、close/drain
+  和真实 NVMe 生命周期已闭合，但最新五次正式 gate 的 HFS/raw 中位数为 61.38%，
+  read/write p99 约为 raw 的 4.9 倍，性能门禁仍未通过。后续 Shard-86~92 的 trace、
+  completion、FIO topology、shard affinity 和 reactor 热路径执行计划见
+  `doc/review/hfs2_shard86_92_async_performance_plan_20260918.md`；该计划不放宽本节
+  §16 的正式门禁。
   2026-09-18：RocksDB `ReadAsync` 已实现 `IOOptions::timeout` 的前端等待语义；超时
   返回 `TimedOut` 后，后台 I/O 继续排空，句柄析构时才回收 worker 和 buffer，且不会
   在 callback 后写回 request result。DataPath 的 `-ETIMEDOUT`、`-ECANCELED`、
