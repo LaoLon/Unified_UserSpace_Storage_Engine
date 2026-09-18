@@ -1470,6 +1470,15 @@ checkpoint region 必须容纳 namespace/inode/extent map/各 device allocator b
   在目标 reactor 调用，不能只修改 file hash 将 child 随机迁移；同一 file 的 ordering、
   cancellation、late completion 边界继续保持单 owner，跨 reactor dispatch 留给后续
   runtime 设计。该观测跑 closure 完整、trace dropped=0，未改变正式数据路径。
+  2026-09-18：Shard-90 将 actor-local data I/O 的热路径线程归属校验改为
+  `spdk_get_thread()` 加 data-reactor thread-local marker，移除每 IO 的
+  `syscall(SYS_gettid)`；启动阶段仍保留 `osTid` 供诊断 API 和测试使用。data-reactor
+  poller 改用一个带 admission 位和 in-flight reader 计数的 reactor-owned atomic 状态字，
+  正常 loop 不再获取 `pollerMutex`，clear/stop 通过 C++20 `atomic::wait/notify_all` 等待
+  reader quiescence 后才释放 callback/context。真实 NVMe 32 jobs/q1 strace 中 gettid
+  从约 65582 次降至 46 次，closure 与 token/outstanding 均闭合；VM ctest 23/23 以及
+  连续 10 次 runtime stop/restart 回归通过。该优化未改变 actor-local ownership，Shard-81
+  正式性能 gate 仍保持未通过。
   2026-09-18：RocksDB `ReadAsync` 已实现 `IOOptions::timeout` 的前端等待语义；超时
   返回 `TimedOut` 后，后台 I/O 继续排空，句柄析构时才回收 worker 和 buffer，且不会
   在 callback 后写回 request result。DataPath 的 `-ETIMEDOUT`、`-ECANCELED`、

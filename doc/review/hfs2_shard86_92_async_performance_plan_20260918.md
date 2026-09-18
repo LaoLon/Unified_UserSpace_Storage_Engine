@@ -1,7 +1,7 @@
 # HFS 2.0 Shard-86~92 异步 FIO 性能与 trace 执行计划
 
 日期：2026-09-18
-状态：Shard-86/87 已实现并验证；Shard-88 已实现并完成生命周期/拓扑验证，但中间性能目标未达成；Shard-89 已完成归因验证并保留 file affinity；Shard-90~92 尚未完成；Shard-81 正式性能 gate 未通过
+状态：Shard-86/87 已实现并验证；Shard-88 已实现并完成生命周期/拓扑验证，但中间性能目标未达成；Shard-89 已完成归因验证并保留 file affinity；Shard-90 已实现并通过热路径、生命周期和真实 NVMe 验证；Shard-91~92 尚未完成；Shard-81 正式性能 gate 未通过
 事实源：
 
 - `doc/design/hfs2.0.md`：架构、公共 API、性能门禁和 tracepoint 规范的唯一事实源；
@@ -551,6 +551,24 @@ observability:  trace off / trace sample=1 / trace sample=N / trace drop
   callback 和 stop/clear 生命周期设计；本 shard 保留同一 file 的 scheduler owner 和
   ordering 不变，将该候选方案移交 Shard-90 及后续 runtime 设计。scheduler/data-service
   既有顺序、错误、取消和 late completion 测试均由 VM 23/23 ctest 覆盖。
+
+### 6.5 Shard-90 完成记录
+
+- `submitDataIoOnReactor()` 保留 `spdk_get_thread()` 校验，并使用 data-reactor
+  thread-local marker 确认调用者属于目标 reactor；正常 child submit 不再执行每 IO 的
+  `syscall(SYS_gettid)`。启动阶段仍记录 `osTid`，公共诊断 API 和已有错误线程测试不变。
+- poller 正常路径改为 reactor-owned 64 位状态字：最高位控制 callback admission，低位
+  记录 in-flight readers；每轮不再获取 `pollerMutex`，clear/stop 先关闭 admission、用
+  C++20 `atomic::wait/notify_all` 等待 reader 清零，再清理 callback/context，保留 UAF
+  和 callback 生命周期边界。registration mutex 只留在 set/clear/stop 控制面。
+- VM `cmake --build build-async` 成功，`ctest` 23/23 通过；额外连续执行 10 次
+  `spdk_runtime_test` 均通过，用于覆盖 stop/restart 与 poller clear 时序。
+- 真实 `Nvme0n1`、`config/hfs_nvme.conf`、32 jobs/q1、8 MiB randread 的
+  `strace -f -c` 短跑 closure 为 `queued=terminal=published=reaped=65536`、
+  `outstanding=0`、`token_mismatch=0`；`gettid` 从 Shard-88 约 65582 次降到 46 次，
+  未出现 eventfd2 风暴。32 jobs/q1 randrw 真实 NVMe smoke 亦闭合，错误为 0。
+- 该结果证明 Shard-90 的热路径和生命周期目标完成，但不是 Shard-81 正式性能 gate：
+  尚未完成 Shard-91 微优化及 Shard-92 五次 raw/HFS 同口径 gate，不能关闭性能阻塞。
 
 本计划的第一目标不是立即把 IOPS 拉到 85%，而是把当前“约 61% 且不知道时间花在哪”
 变成可重复的分段证据。预期顺序为：

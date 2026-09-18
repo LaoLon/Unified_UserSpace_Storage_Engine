@@ -62,6 +62,13 @@ std::uint32_t reactorCountFor(const Config &config, std::uint32_t cpuCount) {
 
 namespace {
 
+/* Fast ownership markers set once on each SPDK data-reactor thread. */
+thread_local const void *g_dataReactorMarker = nullptr;
+thread_local const void *g_pollerCallbackReactor = nullptr;
+
+constexpr std::uint64_t kPollerEnabledBit = std::uint64_t{1} << 63;
+constexpr std::uint64_t kPollerReaderMask = ~kPollerEnabledBit;
+
 /* "Nvme0n1" -> "Nvme0"; names without a trailing n<digits> are used as-is. */
 std::string controllerName(const std::string &bdevName) {
     std::size_t pos = bdevName.size();
@@ -220,11 +227,10 @@ struct SpdkRuntime::Impl {
         DataIoState *completionTail = nullptr;
         DataIoState *activeHead = nullptr;
         std::mutex pollerMutex;
-        std::condition_variable pollerChanged;
         DataReactorPoller poller = nullptr;
         void *pollerContext = nullptr;
-        std::thread::id pollerThread{};
-        bool pollerInFlight = false;
+        /* The high bit closes admission before registration data is retired. */
+        std::atomic<std::uint64_t> pollerState{0};
         bool pollerStopping = false;
     };
 
@@ -288,43 +294,60 @@ struct SpdkRuntime::Impl {
             }
             std::unique_lock<std::mutex> lock(reactor->pollerMutex);
             reactor->pollerStopping = true;
+            const std::uint64_t previousState = reactor->pollerState.fetch_and(
+                kPollerReaderMask, std::memory_order_acq_rel);
+            if ((previousState & kPollerReaderMask) != 0 &&
+                g_pollerCallbackReactor == reactor) {
+                /* The current callback owns its local copy and will release
+                 * the reader after this function returns. */
+            } else {
+                for (;;) {
+                    const std::uint64_t state =
+                        reactor->pollerState.load(std::memory_order_acquire);
+                    if ((state & kPollerReaderMask) == 0) {
+                        break;
+                    }
+                    reactor->pollerState.wait(state, std::memory_order_acquire);
+                }
+            }
             reactor->poller = nullptr;
             reactor->pollerContext = nullptr;
-            reactor->pollerChanged.notify_all();
-            if (reactor->pollerInFlight &&
-                reactor->pollerThread == std::this_thread::get_id()) {
-                continue;
-            }
-            reactor->pollerChanged.wait(lock, [reactor]() {
-                return !reactor->pollerInFlight;
-            });
         }
     }
 
-    /* Invoke the registered hook only after all same-round I/O work has been
-     * drained. The lock is not held while user code runs. */
+    /* Invoke the registered hook without taking the registration mutex. The
+     * reader count lets clear/stop retire caller-owned context safely. */
     void invokeDataReactorPoller(Reactor *reactor) noexcept {
-        DataReactorPoller callback = nullptr;
-        void *context = nullptr;
-        {
-            std::lock_guard<std::mutex> lock(reactor->pollerMutex);
-            if (reactor->pollerStopping || reactor->poller == nullptr) {
+        for (;;) {
+            std::uint64_t state = reactor->pollerState.load(std::memory_order_acquire);
+            if ((state & kPollerEnabledBit) == 0) {
                 return;
             }
-            callback = reactor->poller;
-            context = reactor->pollerContext;
-            reactor->pollerThread = std::this_thread::get_id();
-            reactor->pollerInFlight = true;
+            if (reactor->pollerState.compare_exchange_weak(
+                    state, state + 1, std::memory_order_acquire,
+                    std::memory_order_relaxed)) {
+                break;
+            }
         }
+        const auto leave = [reactor]() {
+            const std::uint64_t previousState = reactor->pollerState.fetch_sub(
+                1, std::memory_order_acq_rel);
+            if ((previousState & kPollerReaderMask) == 1) {
+                reactor->pollerState.notify_all();
+            }
+        };
 
+        const DataReactorPoller callback = reactor->poller;
+        void *const context = reactor->pollerContext;
+        if (callback == nullptr) {
+            leave();
+            return;
+        }
+        const void *previousPollerReactor = g_pollerCallbackReactor;
+        g_pollerCallbackReactor = reactor;
         callback(context);
-
-        {
-            std::lock_guard<std::mutex> lock(reactor->pollerMutex);
-            reactor->pollerInFlight = false;
-            reactor->pollerThread = std::thread::id{};
-            reactor->pollerChanged.notify_all();
-        }
+        g_pollerCallbackReactor = previousPollerReactor;
+        leave();
     }
 
     void closeDevicesLocked() {
@@ -654,6 +677,7 @@ struct SpdkRuntime::Impl {
             return;
         }
         spdk_set_thread(reactor->spdk);
+        g_dataReactorMarker = reactor;
 
         int rc = 0;
         for (auto &device : devices) {
@@ -685,6 +709,7 @@ struct SpdkRuntime::Impl {
         }
         reactor->channels.clear();
         drainThreadMessages(reactor->spdk);
+        g_dataReactorMarker = nullptr;
         spdk_set_thread(nullptr);
         spdk_thread_destroy(reactor->spdk);
         reactor->spdk = nullptr;
@@ -1025,9 +1050,7 @@ struct SpdkRuntime::Impl {
         }
         Reactor *reactor = reactors[reactorIndex + 1].get();
         if (reactor->spdk == nullptr ||
-            spdk_get_thread() != reactor->spdk ||
-            reactor->osTid.load(std::memory_order_acquire) !=
-                static_cast<std::uint64_t>(::syscall(SYS_gettid))) {
+            spdk_get_thread() != reactor->spdk || g_dataReactorMarker != reactor) {
             return makeError(Status::InvalidState,
                              "actor-local data I/O called from the wrong reactor");
         }
@@ -1346,17 +1369,23 @@ Result<void> SpdkRuntime::setDataReactorPoller(std::uint32_t index,
         }
         return makeError(Status::Busy, "data reactor poller is already registered");
     }
-    if (reactor->pollerInFlight &&
-        reactor->pollerThread != std::this_thread::get_id()) {
-        reactor->pollerChanged.wait(lock, [reactor]() {
-            return !reactor->pollerInFlight || reactor->pollerStopping;
-        });
+    if ((reactor->pollerState.load(std::memory_order_acquire) & kPollerReaderMask) != 0 &&
+        g_pollerCallbackReactor != reactor.get()) {
+        for (;;) {
+            const std::uint64_t state =
+                reactor->pollerState.load(std::memory_order_acquire);
+            if ((state & kPollerReaderMask) == 0 || reactor->pollerStopping) {
+                break;
+            }
+            reactor->pollerState.wait(state, std::memory_order_acquire);
+        }
         if (reactor->pollerStopping) {
             return makeError(Status::Busy, "data reactor poller is stopping");
         }
     }
     reactor->poller = callback;
     reactor->pollerContext = context;
+    reactor->pollerState.fetch_or(kPollerEnabledBit, std::memory_order_release);
     return Result<void>(Status::Ok);
 }
 
@@ -1378,14 +1407,21 @@ Result<void> SpdkRuntime::clearDataReactorPoller(std::uint32_t index, void *cont
     if (reactor->pollerContext != context) {
         return makeError(Status::InvalidState, "data reactor poller context does not match");
     }
+    const std::uint64_t previousState = reactor->pollerState.fetch_and(
+        kPollerReaderMask, std::memory_order_acq_rel);
+    if ((previousState & kPollerReaderMask) != 0 &&
+        g_pollerCallbackReactor != reactor.get()) {
+        for (;;) {
+            const std::uint64_t state =
+                reactor->pollerState.load(std::memory_order_acquire);
+            if ((state & kPollerReaderMask) == 0) {
+                break;
+            }
+            reactor->pollerState.wait(state, std::memory_order_acquire);
+        }
+    }
     reactor->poller = nullptr;
     reactor->pollerContext = nullptr;
-    if (reactor->pollerInFlight &&
-        reactor->pollerThread != std::this_thread::get_id()) {
-        reactor->pollerChanged.wait(lock, [reactor]() {
-            return !reactor->pollerInFlight;
-        });
-    }
     return Result<void>(Status::Ok);
 }
 
