@@ -1,3 +1,5 @@
+#include <array>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
@@ -211,7 +213,36 @@ int main() {
             limit4.value().reset();
             limited.reset();
 
-            /* 7. closed clients reject further path calls */
+            /* 7. A reaped operation still blocks close until its IoHandle is
+             * released, independently of open File references. */
+            auto asyncBuffer = engine->acquireDmaBuffer(4096, 0);
+            HFS_TEST_CHECK(asyncBuffer.ok());
+            IoVec asyncIo{asyncBuffer.value().data(), asyncBuffer.value().size()};
+            auto asyncRead = client->submitRead(
+                first.value(), asyncIo, 0, CompletionToken{7, 1});
+            HFS_TEST_CHECK(asyncRead.ok());
+            std::array<CompletionEvent, 1> asyncEvents{};
+            const auto asyncPoll = client->poll(asyncEvents, 1, 1,
+                                                std::chrono::seconds(5));
+            HFS_TEST_CHECK(asyncPoll.status == Status::Ok && asyncPoll.count == 1);
+            HFS_TEST_CHECK(asyncEvents[0].status == Status::Ok);
+
+            /* 8. close rejects live file handles and reaped IoHandles, then
+             * becomes terminal after every frontend reference is released. */
+            auto closeWithFiles = client->close().wait().value();
+            HFS_TEST_CHECK(!closeWithFiles.ok() &&
+                           closeWithFiles.status() == Status::Busy);
+            dbDir.value().reset();
+            first.value().reset();
+            dirOk.value().reset();
+            renamed.value().reset();
+            newer.value().reset();
+            auto closeWithIoHandle = client->close().wait().value();
+            HFS_TEST_CHECK(!closeWithIoHandle.ok() &&
+                           closeWithIoHandle.status() == Status::Busy);
+            asyncRead.value().reset();
+            engine->releaseDmaBuffer(asyncBuffer.value().data(),
+                                     asyncBuffer.value().size());
             HFS_TEST_CHECK(client->close().wait().value().ok());
             auto afterClose = client->open("/db").wait().value();
             HFS_TEST_CHECK(afterClose.status() == Status::InvalidState);
@@ -219,7 +250,7 @@ int main() {
             client.reset();
         }
 
-        /* 8. stop is Busy while a client or open file still exists */
+        /* 9. stop is Busy while a client or open file still exists */
         auto busyClient = Client::create(*engine, ClientOptions{});
         HFS_TEST_CHECK(busyClient.ok());
         auto busyFile = busyClient.value()->open("/db/FILE-000001").wait().value();

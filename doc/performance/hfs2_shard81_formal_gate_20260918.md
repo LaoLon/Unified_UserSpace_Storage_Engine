@@ -46,6 +46,43 @@
 
 因此 Shard-81 保持未完成。下一步必须先完成 core 内前端提交/完成生命周期、`io_handle` 保活和停止顺序，恢复真实 `queue/getevents/event` 并发后，再以同一拓扑重跑五次 raw/HFS gate。
 
+## 2026-09-18 async lifecycle gate（当前最新实现）
+
+上面的结果保留为历史记录。本节记录完成 async completion/lifecycle 修复后的同口径
+真实 NVMe 重跑，证据目录为 `/mnt/hfs-data/hfs2-shard81-async-gate-final20260918`。
+raw 基线仍使用既有官方 SPDK FIO 插件五次结果，证据位于
+`/mnt/hfs-data/hfs2-shard81-spdk-fio-baseline-20260918`；两侧均固定为 CPU 2-3、
+4 KiB `randrw` 50/50、256 MiB、10 秒，HFS 为 32 jobs、iodepth 1、O_DIRECT。
+
+| layer | run 1 | run 2 | run 3 | run 4 | run 5 | median |
+|---|---:|---:|---:|---:|---:|---:|
+| raw total IOPS | 108476.052 | 108018.698 | 108272.573 | 108396.060 | 108844.516 | **108396.060** |
+| HFS total IOPS | 68331.767 | 66538.784 | 60185.526 | 61880.948 | 70006.698 | **66538.784** |
+
+HFS/raw = **61.38%**，低于 85% 性能门槛，性能 gate **FAIL**。HFS 中位数
+read/write p99 为 `3227.648 us`，raw 对应中位数 read/write p99 为 `659.456 us`，
+约为 raw 的 4.9 倍，因此 latency gate 也 **FAIL**。HFS CPU 中位数为 `3.095%`，
+五次错误数均为 0。
+
+本轮已经证明功能生命周期闭合：每次 `queued == reaped`、`outstanding == 0`、
+`peak == 32`、`token_mismatch == 0`，preallocation 为 owner 1/reuse 31；engine
+closure 中 `accepted == terminal == published`，child submit/complete 逐次相等，
+`plan_fail/dma_fail/preparing` 均为 0。设备为 `uio_pci_generic`，hugepages 为 1024。
+因此当前失败不是早期的请求数量塌陷或 close 泄漏，而是 async completion 路径在
+32 个浅队列 job 下仍有明显额外开销。
+
+诊断结果：scheduler wait 几乎为零，主要额外成本来自独立 data reactor 与 FIO
+前端之间的 eventfd 通知/等待和跨 reactor completion；`strace -f -c` 可见约一对
+completion 对应的 `poll/read/write` 系统调用。completion queue 已加入有限的主动
+poll（1024 次）以减少浅队列下的通知往返，但不足以达到性能门槛。下一步应继续优化
+completion batching/通知策略和 reactor 拓扑，再以本节口径重跑，不能把本轮结果标记为
+Shard-81 性能通过。
+
+另外，32 jobs×iodepth32 共享同一随机写文件的 `fio --verify` 实验返回 FIO error 84；
+该 workload 存在多个 job 随机重叠写同一 verify 区域，不能据此判定 HFS 数据损坏。
+单 job qd32、有效 read/write 以及 bounce 路径的 verify/功能测试通过；共享文件的
+重叠随机 verify 保留为独立测试设计问题，不作为本性能 gate 的通过证据。
+
 ## 2026-09-18 修复后重跑
 
 修复 external worker pool 后，先完成真实 NVMe 4-job smoke；随后按本报告固定口径

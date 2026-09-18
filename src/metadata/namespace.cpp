@@ -125,6 +125,7 @@ void Namespace::touch(Inode &inode, std::uint64_t now, bool content) noexcept {
         ++logicalEpoch_;
     }
     inode.logicalEpoch = logicalEpoch_;
+    logicalEpochPublished_.store(logicalEpoch_, std::memory_order_release);
 }
 
 std::uint64_t Namespace::entryBytes(std::string_view name) const noexcept {
@@ -946,6 +947,11 @@ std::uint64_t Namespace::logicalEpoch() const {
     return logicalEpoch_;
 }
 
+/* Frontend caches use this acquire load only as an invalidation key. */
+std::uint64_t Namespace::logicalEpochFast() const noexcept {
+    return logicalEpochPublished_.load(std::memory_order_acquire);
+}
+
 std::uint64_t Namespace::durableEpoch() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return durableEpoch_;
@@ -1205,6 +1211,7 @@ Result<void> Namespace::loadSnapshot(std::span<const std::byte> data) {
     allocators_ = std::move(restoredAllocators);
     namespaceBytes_ = savedNamespaceBytes;
     logicalEpoch_ = savedLogicalEpoch;
+    logicalEpochPublished_.store(logicalEpoch_, std::memory_order_release);
     durableEpoch_ = savedDurableEpoch;
     snapshotTxid_ = txid;
     preparedDurableSizes_.clear();

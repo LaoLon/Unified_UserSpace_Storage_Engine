@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -9,6 +10,7 @@
 #include <string>
 #include <vector>
 
+#include "hfs/async.hpp"
 #include "hfs/config.hpp"
 #include "hfs/export.hpp"
 #include "hfs/file.hpp"
@@ -24,6 +26,7 @@ class Namespace;
 }
 
 class DataPlane;
+class AsyncDataService;
 
 /* Internal lease that keeps the engine from stopping while client metadata
  * users (clients and open files) are still alive (hfs2.0.md §14.3). */
@@ -34,6 +37,7 @@ class Operation; /* Phase 2+ */
 /* Options for one frontend client instance. */
 struct ClientOptions {
     std::uint32_t maxOpenFiles = 0; /* 0 = only the namespace limits apply */
+    std::uint32_t maxOutstanding = 32; /* bounded accepted async requests */
 };
 
 /* Options for the destructive volume format. */
@@ -123,6 +127,8 @@ private:
     metadata::Namespace *metadataNamespace() const noexcept;
     /* Internal: engine-owned data plane used by File I/O. */
     DataPlane *dataPlane() const noexcept;
+    /* Internal: engine-owned actor service used by async Client submissions. */
+    AsyncDataService *asyncDataService() const noexcept;
     void retainMetadataUser() noexcept;
     void releaseMetadataUser() noexcept;
     /* Flushes data, checkpoints metadata, then publishes the durable epoch. */
@@ -142,6 +148,18 @@ public:
     Client &operator=(const Client &) = delete;
 
     Task<Result<void>> close();
+
+    /* Submits one contiguous asynchronous read or fixed-size overwrite. */
+    Result<IoHandle> submitRead(const std::shared_ptr<File> &file, IoVec buffer,
+                                std::uint64_t offset, CompletionToken token);
+    Result<IoHandle> submitWrite(const std::shared_ptr<File> &file, IoVec buffer,
+                                 std::uint64_t offset, CompletionToken token);
+
+    /* Drains frontend completions and releases one Client credit per event. */
+    PollResult poll(std::span<CompletionEvent> events, std::size_t min,
+                    std::size_t max, std::chrono::microseconds timeout);
+    std::size_t outstanding() const noexcept;
+    std::size_t maxOutstanding() const noexcept;
 
     /* Path API; data operations on the returned File land with Shard-77. */
     Task<Result<std::shared_ptr<File>>> open(std::string_view path,

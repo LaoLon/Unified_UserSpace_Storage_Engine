@@ -73,7 +73,9 @@ int main() {
     auto parsed = hfs::parseConfig(validConfigText(lockPath), "memory");
     HFS_TEST_CHECK(parsed.ok());
 
-    /* session 1: format, append 4 transactions, checkpoint, append 2 more */
+    /* Keep the direct Journal recovery scenarios inside one engine mount.
+     * CounterTarget snapshots intentionally use a test-only format and must
+     * not be replayed by the engine's namespace journal on a later mount. */
     {
         auto created = hfs::Engine::create(parsed.value());
         HFS_TEST_CHECK(created.ok());
@@ -81,67 +83,60 @@ int main() {
         HFS_TEST_CHECK(engine->format({true}).wait().value().ok());
         HFS_TEST_CHECK(engine->mount().wait().value().ok());
 
-        CounterTarget target;
-        auto journal = hfs::Journal::open(*engine, &target);
-        HFS_TEST_CHECK(journal.ok());
-        for (std::uint64_t i = 1; i <= 4; ++i) {
-            auto appended = journal.value()->append({setSize(7, i * 100)}, true);
-            HFS_TEST_CHECK(appended.ok());
-            HFS_TEST_CHECK(appended.value() == i);
+        /* session 1: append 4 transactions, checkpoint, append 2 more */
+        {
+            CounterTarget target;
+            auto journal = hfs::Journal::open(*engine, &target);
+            HFS_TEST_CHECK(journal.ok());
+            for (std::uint64_t i = 1; i <= 4; ++i) {
+                auto appended = journal.value()->append({setSize(7, i * 100)}, true);
+                HFS_TEST_CHECK(appended.ok());
+                HFS_TEST_CHECK(appended.value() == i);
+            }
+            HFS_TEST_CHECK(journal.value()->checkpoint().ok());
+            for (std::uint64_t i = 5; i <= 6; ++i) {
+                HFS_TEST_CHECK(
+                    journal.value()->append({setSize(7, i * 100)}, true).ok());
+            }
+            HFS_TEST_CHECK(journal.value()->flush().ok());
         }
-        HFS_TEST_CHECK(journal.value()->checkpoint().ok());
-        for (std::uint64_t i = 5; i <= 6; ++i) {
-            HFS_TEST_CHECK(journal.value()->append({setSize(7, i * 100)}, true).ok());
+
+        /* session 2: replay from checkpoint, then corrupt the last commit */
+        {
+            CounterTarget target;
+            auto journal = hfs::Journal::open(*engine, &target);
+            HFS_TEST_CHECK(journal.ok());
+            HFS_TEST_CHECK(journal.value()->replay().ok());
+            HFS_TEST_CHECK(target.values[7] == 600);
+            const auto &stats = journal.value()->stats();
+            HFS_TEST_CHECK(stats.lastTxid == 6);
+            HFS_TEST_CHECK(stats.lastCheckpointTxid == 4);
+            HFS_TEST_CHECK(stats.corruption.empty());
+
+            /* txn 5 occupies slots 12-14, txn 6 slots 15-17 after checkpoint. */
+            const auto geometry = engine->deviceGeometries()[0];
+            const std::uint32_t metaBlock = engine->config().metadataBlockSize;
+            const std::uint32_t sector = engine->deviceBlockSize(0);
+            const std::uint64_t commitSlot = 17;
+            const std::uint64_t offsetMeta = geometry.journalStart + commitSlot;
+            const std::uint64_t offsetDevice = offsetMeta * (metaBlock / sector);
+            std::vector<std::byte> garbage(sector, std::byte{0xAB});
+            HFS_TEST_CHECK(engine->writeDeviceBlocks(0, offsetDevice, garbage).ok());
+            HFS_TEST_CHECK(engine->flushDevice(0).ok());
         }
-        HFS_TEST_CHECK(journal.value()->flush().ok());
-        HFS_TEST_CHECK(engine->stop().wait().value().ok());
-    }
 
-    /* session 2: replay from checkpoint, then corrupt the last commit slot */
-    {
-        auto created = hfs::Engine::create(parsed.value());
-        HFS_TEST_CHECK(created.ok());
-        auto engine = std::move(created).value();
-        HFS_TEST_CHECK(engine->mount().wait().value().ok());
-
-        CounterTarget target;
-        auto journal = hfs::Journal::open(*engine, &target);
-        HFS_TEST_CHECK(journal.ok());
-        HFS_TEST_CHECK(journal.value()->replay().ok());
-        HFS_TEST_CHECK(target.values[7] == 600);
-        const auto &stats = journal.value()->stats();
-        HFS_TEST_CHECK(stats.lastTxid == 6);
-        HFS_TEST_CHECK(stats.lastCheckpointTxid == 4);
-        HFS_TEST_CHECK(stats.corruption.empty());
-
-        /* txn 5 occupies slots 12-14, txn 6 slots 15-17 after the checkpoint. */
-        const auto geometry = engine->deviceGeometries()[0];
-        const std::uint32_t metaBlock = engine->config().metadataBlockSize;
-        const std::uint32_t sector = engine->deviceBlockSize(0);
-        const std::uint64_t commitSlot = 17;
-        const std::uint64_t offsetMeta = geometry.journalStart + commitSlot;
-        const std::uint64_t offsetDevice = offsetMeta * (metaBlock / sector);
-        std::vector<std::byte> garbage(sector, std::byte{0xAB});
-        HFS_TEST_CHECK(engine->writeDeviceBlocks(0, offsetDevice, garbage).ok());
-        HFS_TEST_CHECK(engine->flushDevice(0).ok());
-        HFS_TEST_CHECK(engine->stop().wait().value().ok());
-    }
-
-    /* session 3: torn commit is discarded, corruption is reported */
-    {
-        auto created = hfs::Engine::create(parsed.value());
-        HFS_TEST_CHECK(created.ok());
-        auto engine = std::move(created).value();
-        HFS_TEST_CHECK(engine->mount().wait().value().ok());
-
-        CounterTarget target;
-        auto journal = hfs::Journal::open(*engine, &target);
-        HFS_TEST_CHECK(journal.ok());
-        HFS_TEST_CHECK(journal.value()->replay().ok());
-        const auto &stats = journal.value()->stats();
-        HFS_TEST_CHECK(stats.lastTxid == 5);
-        HFS_TEST_CHECK(target.values[7] == 500);
-        HFS_TEST_CHECK(!stats.corruption.empty());
+        /* session 3: torn commit is discarded and corruption is reported */
+        {
+            CounterTarget target;
+            auto journal = hfs::Journal::open(*engine, &target);
+            HFS_TEST_CHECK(journal.ok());
+            auto replay = journal.value()->replay();
+            HFS_TEST_CHECK(!replay.ok() && replay.status() == hfs::Status::Corrupt);
+            const auto &stats = journal.value()->stats();
+            HFS_TEST_CHECK(stats.lastTxid == 5);
+            HFS_TEST_CHECK(target.values[7] == 500);
+            HFS_TEST_CHECK(!stats.corruption.empty());
+        }
         HFS_TEST_CHECK(engine->stop().wait().value().ok());
     }
 

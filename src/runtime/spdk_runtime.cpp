@@ -10,11 +10,14 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <limits>
 #include <mutex>
+#include <new>
 #include <pthread.h>
 #include <sstream>
 #include <string>
 #include <thread>
+#include <utility>
 #include <unistd.h>
 #include <vector>
 
@@ -116,6 +119,26 @@ void drainThreadMessages(spdk_thread *thread) {
     }
 }
 
+/* Keep a backend-provided negative errno when the bdev exposes one. NVMe
+ * completion status has no portable errno field, so it falls back to EIO
+ * except for the explicitly representable abort case. */
+int dataIoCompletionErrno(const struct spdk_bdev_io *bdevIo) noexcept {
+    int aioResult = 0;
+    spdk_bdev_io_get_aio_status(bdevIo, &aioResult);
+    if (aioResult != -EIO) {
+        return aioResult == 0 ? -EIO : (aioResult < 0 ? aioResult : -aioResult);
+    }
+
+    std::uint32_t cdw0 = 0;
+    int sct = 0;
+    int sc = 0;
+    spdk_bdev_io_get_nvme_status(bdevIo, &cdw0, &sct, &sc);
+    if (sct == SPDK_NVME_SCT_GENERIC && sc == SPDK_NVME_SC_ABORTED_BY_REQUEST) {
+        return -ECANCELED;
+    }
+    return -EIO;
+}
+
 /* One control-path block I/O executed on the metadata reactor. */
 struct ControlIo {
     enum class Op { Read, Write, Flush };
@@ -180,6 +203,8 @@ void controlIoDone(struct spdk_bdev_io *bdev_io, bool success, void *arg) {
 } // namespace
 
 struct SpdkRuntime::Impl {
+    struct DataIoState;
+
     struct Reactor {
         std::jthread thread;
         std::atomic<bool> stop{false};
@@ -188,6 +213,18 @@ struct SpdkRuntime::Impl {
         std::atomic<std::uint64_t> osTid{0};
         spdk_thread *spdk = nullptr;
         std::vector<spdk_io_channel *> channels;
+        DataIoState *retryHead = nullptr;
+        DataIoState *retryTail = nullptr;
+        DataIoState *completionHead = nullptr;
+        DataIoState *completionTail = nullptr;
+        DataIoState *activeHead = nullptr;
+        std::mutex pollerMutex;
+        std::condition_variable pollerChanged;
+        DataReactorPoller poller = nullptr;
+        void *pollerContext = nullptr;
+        std::thread::id pollerThread{};
+        bool pollerInFlight = false;
+        bool pollerStopping = false;
     };
 
     struct DeviceState {
@@ -202,7 +239,7 @@ struct SpdkRuntime::Impl {
     std::condition_variable stateChanged;
     Config config;
     std::vector<DeviceState> devices;
-    std::vector<std::unique_ptr<Reactor>> reactors; /* [0] metadata, [1..R] data */
+    std::vector<std::shared_ptr<Reactor>> reactors; /* [0] metadata, [1..R] data */
     std::atomic<bool> activeFlag{false};
     std::atomic<bool> stoppingFlag{false};
     std::atomic<std::uint32_t> reactorCount{0};
@@ -224,6 +261,7 @@ struct SpdkRuntime::Impl {
     /* Process exit without an explicit stop() must not join busy-polling
      * reactors without asking them to stop first. */
     ~Impl() {
+        disableDataReactorPollers();
         for (auto &reactor : reactors) {
             if (reactor != nullptr) {
                 reactor->stop.store(true, std::memory_order_release);
@@ -238,6 +276,55 @@ struct SpdkRuntime::Impl {
     }
 
     Reactor *reactorAt(std::size_t index) const { return reactors[index].get(); }
+
+    /* Stop accepting poller callbacks and synchronize with the one callback
+     * that may currently be using its caller-owned context. */
+    void disableDataReactorPollers() noexcept {
+        for (std::size_t index = 1; index < reactors.size(); ++index) {
+            Reactor *reactor = reactors[index].get();
+            if (reactor == nullptr) {
+                continue;
+            }
+            std::unique_lock<std::mutex> lock(reactor->pollerMutex);
+            reactor->pollerStopping = true;
+            reactor->poller = nullptr;
+            reactor->pollerContext = nullptr;
+            reactor->pollerChanged.notify_all();
+            if (reactor->pollerInFlight &&
+                reactor->pollerThread == std::this_thread::get_id()) {
+                continue;
+            }
+            reactor->pollerChanged.wait(lock, [reactor]() {
+                return !reactor->pollerInFlight;
+            });
+        }
+    }
+
+    /* Invoke the registered hook only after all same-round I/O work has been
+     * drained. The lock is not held while user code runs. */
+    void invokeDataReactorPoller(Reactor *reactor) noexcept {
+        DataReactorPoller callback = nullptr;
+        void *context = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(reactor->pollerMutex);
+            if (reactor->pollerStopping || reactor->poller == nullptr) {
+                return;
+            }
+            callback = reactor->poller;
+            context = reactor->pollerContext;
+            reactor->pollerThread = std::this_thread::get_id();
+            reactor->pollerInFlight = true;
+        }
+
+        callback(context);
+
+        {
+            std::lock_guard<std::mutex> lock(reactor->pollerMutex);
+            reactor->pollerInFlight = false;
+            reactor->pollerThread = std::thread::id{};
+            reactor->pollerChanged.notify_all();
+        }
+    }
 
     void closeDevicesLocked() {
         for (auto &device : devices) {
@@ -583,8 +670,13 @@ struct SpdkRuntime::Impl {
             stateChanged.notify_all();
         }
 
-        while (!reactor->stop.load(std::memory_order_acquire)) {
+        while (!reactor->stop.load(std::memory_order_acquire) ||
+               reactor->activeHead != nullptr || reactor->retryHead != nullptr ||
+               reactor->completionHead != nullptr) {
             spdk_thread_poll(reactor->spdk, 0, 0);
+            drainDataIoRetries(reactor);
+            drainDataIoCompletions(reactor);
+            invokeDataReactorPoller(reactor);
         }
 
         for (auto *channel : reactor->channels) {
@@ -599,6 +691,7 @@ struct SpdkRuntime::Impl {
 
     /* Stop and join all reactors; safe to call from start() failure paths. */
     void shutdownReactors() {
+        disableDataReactorPollers();
         {
             std::lock_guard<std::mutex> lock(mutex);
             for (auto &reactor : reactors) {
@@ -649,12 +742,15 @@ struct SpdkRuntime::Impl {
     struct DataIoHolder {
         void (*cb)(void *, int) = nullptr;
         void *cbCtx = nullptr;
+        /* SPDK retains the iovec until the asynchronous completion. */
+        struct iovec iov{};
     };
 
     static void dataIoDone(struct spdk_bdev_io *bdevIo, bool success, void *arg) {
         auto *holder = static_cast<DataIoHolder *>(arg);
+        const int rc = success ? 0 : dataIoCompletionErrno(bdevIo);
         spdk_bdev_free_io(bdevIo);
-        holder->cb(holder->cbCtx, success ? 0 : -EIO);
+        holder->cb(holder->cbCtx, rc);
         delete holder;
     }
 
@@ -671,15 +767,14 @@ struct SpdkRuntime::Impl {
         spdk_bdev_desc *desc = devices[call->deviceIndex].desc;
         spdk_io_channel *channel =
             reactors[call->reactorIndex]->channels[call->deviceIndex];
-        struct iovec iov;
-        iov.iov_base = call->buffer;
-        iov.iov_len = call->blocks * devices[call->deviceIndex].blockSize;
         auto *holder = new DataIoHolder{call->cb, call->cbCtx};
+        holder->iov.iov_base = call->buffer;
+        holder->iov.iov_len = call->blocks * devices[call->deviceIndex].blockSize;
         const int rc = call->write
-                           ? spdk_bdev_writev_blocks(desc, channel, &iov, 1,
+                           ? spdk_bdev_writev_blocks(desc, channel, &holder->iov, 1,
                                                      call->offsetBlocks, call->blocks,
                                                      dataIoDone, holder)
-                           : spdk_bdev_readv_blocks(desc, channel, &iov, 1,
+                           : spdk_bdev_readv_blocks(desc, channel, &holder->iov, 1,
                                                     call->offsetBlocks, call->blocks,
                                                     dataIoDone, holder);
         if (rc != 0) {
@@ -693,6 +788,281 @@ struct SpdkRuntime::Impl {
         auto *call = static_cast<DataIoCall *>(ctx);
         Impl *impl = call->impl;
         impl->submitDataIo(call);
+    }
+
+    /* State for the actor-local API. This object is placement-constructed in
+     * DataIoRequest storage and never allocated by the hot path. */
+    struct DataIoState {
+        std::uint64_t magic = 0;
+        Impl *impl = nullptr;
+        Reactor *reactor = nullptr;
+        DataIoRequest *request = nullptr;
+        spdk_bdev_desc *desc = nullptr;
+        spdk_bdev *bdev = nullptr;
+        spdk_io_channel *channel = nullptr;
+        void *buffer = nullptr;
+        std::uint64_t offsetBlocks = 0;
+        std::uint64_t blocks = 0;
+        std::size_t bytes = 0;
+        struct iovec iov{};
+        bool write = false;
+        DataIoCompletion cb = nullptr;
+        void *cbCtx = nullptr;
+        spdk_bdev_io_wait_entry waitEntry{};
+        DataIoState *activeNext = nullptr;
+        DataIoState *activePrev = nullptr;
+        DataIoState *retryNext = nullptr;
+        DataIoState *completionNext = nullptr;
+        int completionRc = 0;
+        bool activeLinked = false;
+        bool waitingForIo = false;
+        bool retryQueued = false;
+        bool completionQueued = false;
+        bool terminal = false;
+    };
+
+    static constexpr std::uint64_t kDataIoStateMagic = 0x4832465344415441ULL;
+    static constexpr unsigned kImmediateRetryLimit = 8;
+    static_assert(sizeof(DataIoState) <= DataIoRequest::kStorageBytes,
+                  "DataIoRequest storage is too small for the SPDK state");
+
+    static DataIoState *dataIoState(DataIoRequest &request) noexcept {
+        return reinterpret_cast<DataIoState *>(request.storage);
+    }
+
+    void linkDataIo(DataIoState *state) noexcept {
+        Reactor *reactor = state->reactor;
+        state->activePrev = nullptr;
+        state->activeNext = reactor->activeHead;
+        if (reactor->activeHead != nullptr) {
+            reactor->activeHead->activePrev = state;
+        }
+        reactor->activeHead = state;
+        state->activeLinked = true;
+    }
+
+    void unlinkDataIo(DataIoState *state) noexcept {
+        if (!state->activeLinked) {
+            return;
+        }
+        Reactor *reactor = state->reactor;
+        if (state->activePrev != nullptr) {
+            state->activePrev->activeNext = state->activeNext;
+        } else {
+            reactor->activeHead = state->activeNext;
+        }
+        if (state->activeNext != nullptr) {
+            state->activeNext->activePrev = state->activePrev;
+        }
+        state->activePrev = nullptr;
+        state->activeNext = nullptr;
+        state->activeLinked = false;
+    }
+
+    void enqueueDataIoRetry(DataIoState *state) noexcept {
+        if (state->terminal || state->completionQueued || state->retryQueued) {
+            return;
+        }
+        state->retryQueued = true;
+        state->retryNext = nullptr;
+        if (state->reactor->retryTail == nullptr) {
+            state->reactor->retryHead = state;
+        } else {
+            state->reactor->retryTail->retryNext = state;
+        }
+        state->reactor->retryTail = state;
+    }
+
+    void enqueueDataIoCompletion(DataIoState *state, int rc) noexcept {
+        if (state->terminal || state->completionQueued) {
+            return;
+        }
+        state->completionRc = rc == 0 ? 0 : (rc < 0 ? rc : -rc);
+        state->completionQueued = true;
+        state->completionNext = nullptr;
+        if (state->reactor->completionTail == nullptr) {
+            state->reactor->completionHead = state;
+        } else {
+            state->reactor->completionTail->completionNext = state;
+        }
+        state->reactor->completionTail = state;
+    }
+
+    void finishDataIo(DataIoState *state) noexcept {
+        if (state->terminal) {
+            return;
+        }
+        state->terminal = true;
+        unlinkDataIo(state);
+        DataIoRequest *request = state->request;
+        const DataIoCompletion cb = state->cb;
+        void *const cbCtx = state->cbCtx;
+        const int rc = state->completionRc;
+        request->stateTag = 0;
+        state->~DataIoState();
+        /* The caller supplied callback is already on the owning reactor; it
+         * must remain nonblocking and must not enter frontend code. */
+        cb(cbCtx, rc);
+    }
+
+    void drainDataIoRetries(Reactor *reactor) noexcept {
+        DataIoState *state = reactor->retryHead;
+        reactor->retryHead = nullptr;
+        reactor->retryTail = nullptr;
+        while (state != nullptr) {
+            DataIoState *next = state->retryNext;
+            state->retryNext = nullptr;
+            state->retryQueued = false;
+            if (!state->terminal && !state->completionQueued) {
+                trySubmitDataIo(state);
+            }
+            state = next;
+        }
+    }
+
+    void drainDataIoCompletions(Reactor *reactor) noexcept {
+        DataIoState *state = reactor->completionHead;
+        reactor->completionHead = nullptr;
+        reactor->completionTail = nullptr;
+        while (state != nullptr) {
+            DataIoState *next = state->completionNext;
+            state->completionNext = nullptr;
+            state->completionQueued = false;
+            finishDataIo(state);
+            state = next;
+        }
+    }
+
+    static void dataIoWait(void *ctx) {
+        auto *state = static_cast<DataIoState *>(ctx);
+        if (state->terminal || !state->waitingForIo) {
+            return;
+        }
+        state->waitingForIo = false;
+        /* SPDK invokes this on the same reactor. Defer the retry until the
+         * reactor loop, so submission never recurses through SPDK's waitq. */
+        state->impl->enqueueDataIoRetry(state);
+    }
+
+    static void actorDataIoDone(struct spdk_bdev_io *bdevIo, bool success, void *arg) {
+        auto *state = static_cast<DataIoState *>(arg);
+        const int rc = success ? 0 : dataIoCompletionErrno(bdevIo);
+        spdk_bdev_free_io(bdevIo);
+        /* Do not invoke the caller from the SPDK callback stack. */
+        state->impl->enqueueDataIoCompletion(state, rc);
+    }
+
+    /* Submit or wait one actor-local request. All calls happen on one data
+     * reactor, so the request state needs no synchronization. */
+    void trySubmitDataIo(DataIoState *state) noexcept {
+        state->iov.iov_base = state->buffer;
+        state->iov.iov_len = state->bytes;
+        for (unsigned attempt = 0; attempt <= kImmediateRetryLimit; ++attempt) {
+            const int rc = state->write
+                               ? spdk_bdev_writev_blocks(state->desc, state->channel, &state->iov,
+                                                         1,
+                                                         state->offsetBlocks, state->blocks,
+                                                         actorDataIoDone, state)
+                               : spdk_bdev_readv_blocks(state->desc, state->channel, &state->iov,
+                                                        1,
+                                                        state->offsetBlocks, state->blocks,
+                                                        actorDataIoDone, state);
+            if (rc == 0) {
+                return;
+            }
+            if (rc != -ENOMEM) {
+                enqueueDataIoCompletion(state, rc);
+                return;
+            }
+
+            state->waitEntry = {};
+            state->waitEntry.bdev = state->bdev;
+            state->waitEntry.cb_fn = dataIoWait;
+            state->waitEntry.cb_arg = state;
+            state->waitEntry.dep_unblock = false;
+            state->waitingForIo = true;
+            const int waitRc =
+                spdk_bdev_queue_io_wait(state->bdev, state->channel, &state->waitEntry);
+            if (waitRc == 0) {
+                return;
+            }
+            state->waitingForIo = false;
+            if (state->retryQueued) {
+                /* A bdev may have released an I/O while the wait entry was
+                 * being installed. Let the already queued retry win. */
+                return;
+            }
+            if (waitRc != -EINVAL || attempt == kImmediateRetryLimit) {
+                enqueueDataIoCompletion(state, waitRc);
+                return;
+            }
+            /* -EINVAL means a bdev I/O became available between the failed
+             * submit and queue_io_wait; retry on this same reactor. */
+        }
+    }
+
+    Result<void> submitDataIoOnReactor(std::uint32_t reactorIndex,
+                                       std::size_t deviceIndex, DataIoRequest &request,
+                                       void *buffer, std::uint64_t offsetBlocks,
+                                       std::uint64_t blocks, bool write,
+                                       DataIoCompletion cb, void *cbCtx) {
+        if (!activeFlag.load(std::memory_order_acquire)) {
+            return makeError(Status::Busy, "SPDK runtime is not active");
+        }
+        if (reactorIndex >= reactorCount.load(std::memory_order_acquire) ||
+            reactorIndex + 1 >= reactors.size()) {
+            return makeError(Status::InvalidArgument, "data reactor index out of range");
+        }
+        Reactor *reactor = reactors[reactorIndex + 1].get();
+        if (reactor->spdk == nullptr ||
+            spdk_get_thread() != reactor->spdk ||
+            reactor->osTid.load(std::memory_order_acquire) !=
+                static_cast<std::uint64_t>(::syscall(SYS_gettid))) {
+            return makeError(Status::InvalidState,
+                             "actor-local data I/O called from the wrong reactor");
+        }
+        if (deviceIndex >= devices.size()) {
+            return makeError(Status::InvalidArgument, "data device index out of range");
+        }
+        DeviceState &device = devices[deviceIndex];
+        if (device.bdev == nullptr || device.desc == nullptr ||
+            deviceIndex >= reactor->channels.size() ||
+            reactor->channels[deviceIndex] == nullptr) {
+            return makeError(Status::InvalidState, "data device channel is not ready");
+        }
+        if (request.stateTag != 0) {
+            return makeError(Status::Busy, "data I/O request storage is already in use");
+        }
+        if (buffer == nullptr || cb == nullptr || blocks == 0 || device.blockSize == 0) {
+            return makeError(Status::InvalidArgument, "invalid actor-local data I/O arguments");
+        }
+        if (offsetBlocks > device.numBlocks || blocks > device.numBlocks - offsetBlocks) {
+            return makeError(Status::InvalidArgument, "data I/O range exceeds device capacity");
+        }
+        if (blocks > std::numeric_limits<std::size_t>::max() / device.blockSize) {
+            return makeError(Status::InvalidArgument, "data I/O byte length overflows size_t");
+        }
+
+        auto *state = dataIoState(request);
+        ::new (static_cast<void *>(state)) DataIoState{};
+        request.stateTag = kDataIoStateMagic;
+        state->magic = kDataIoStateMagic;
+        state->impl = this;
+        state->reactor = reactor;
+        state->request = &request;
+        state->desc = device.desc;
+        state->bdev = device.bdev;
+        state->channel = reactor->channels[deviceIndex];
+        state->buffer = buffer;
+        state->offsetBlocks = offsetBlocks;
+        state->blocks = blocks;
+        state->bytes = static_cast<std::size_t>(blocks) * device.blockSize;
+        state->write = write;
+        state->cb = cb;
+        state->cbCtx = cbCtx;
+        linkDataIo(state);
+        trySubmitDataIo(state);
+        return Result<void>(Status::Ok);
     }
 
     /* Blocking control-path block I/O helper shared by the public methods. */
@@ -826,9 +1196,9 @@ Result<void> SpdkRuntime::start(const Config &config) {
     impl.stoppingFlag.store(false, std::memory_order_release);
 
     impl.reactors.clear();
-    impl.reactors.push_back(std::make_unique<Impl::Reactor>());
+    impl.reactors.push_back(std::make_shared<Impl::Reactor>());
     for (std::uint32_t i = 0; i < dataReactors; ++i) {
-        impl.reactors.push_back(std::make_unique<Impl::Reactor>());
+        impl.reactors.push_back(std::make_shared<Impl::Reactor>());
     }
 
     impl.reactors[0]->thread = std::jthread([&impl]() { impl.metadataMain(); });
@@ -932,6 +1302,81 @@ std::uint64_t SpdkRuntime::dataReactorThreadId(std::uint32_t index) const {
         return 0;
     }
     return impl_->reactors[index + 1]->osTid.load(std::memory_order_acquire);
+}
+
+Result<void> SpdkRuntime::setDataReactorPoller(std::uint32_t index,
+                                               DataReactorPoller callback,
+                                               void *context) {
+    if (callback == nullptr) {
+        return makeError(Status::InvalidArgument, "data reactor poller callback is null");
+    }
+    auto &impl = *impl_;
+    std::shared_ptr<Impl::Reactor> reactor;
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        if (!impl.activeFlag.load(std::memory_order_acquire)) {
+            return makeError(Status::Busy, "SPDK runtime is not active");
+        }
+        if (index + 1 >= impl.reactors.size() ||
+            impl.reactors[index + 1]->spdk == nullptr) {
+            return makeError(Status::InvalidArgument, "data reactor index out of range");
+        }
+        reactor = impl.reactors[index + 1];
+    }
+
+    std::unique_lock<std::mutex> lock(reactor->pollerMutex);
+    if (reactor->pollerStopping) {
+        return makeError(Status::Busy, "data reactor poller is stopping");
+    }
+    /* Each data reactor has one engine-owned actor pump. Replacing a live
+     * registration would orphan its caller-owned context during shutdown. */
+    if (reactor->poller != nullptr) {
+        if (reactor->poller == callback && reactor->pollerContext == context) {
+            return Result<void>(Status::Ok);
+        }
+        return makeError(Status::Busy, "data reactor poller is already registered");
+    }
+    if (reactor->pollerInFlight &&
+        reactor->pollerThread != std::this_thread::get_id()) {
+        reactor->pollerChanged.wait(lock, [reactor]() {
+            return !reactor->pollerInFlight || reactor->pollerStopping;
+        });
+        if (reactor->pollerStopping) {
+            return makeError(Status::Busy, "data reactor poller is stopping");
+        }
+    }
+    reactor->poller = callback;
+    reactor->pollerContext = context;
+    return Result<void>(Status::Ok);
+}
+
+Result<void> SpdkRuntime::clearDataReactorPoller(std::uint32_t index, void *context) {
+    auto &impl = *impl_;
+    std::shared_ptr<Impl::Reactor> reactor;
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        if (index + 1 >= impl.reactors.size()) {
+            return makeError(Status::InvalidArgument, "data reactor index out of range");
+        }
+        reactor = impl.reactors[index + 1];
+    }
+
+    std::unique_lock<std::mutex> lock(reactor->pollerMutex);
+    if (reactor->poller == nullptr) {
+        return Result<void>(Status::Ok);
+    }
+    if (reactor->pollerContext != context) {
+        return makeError(Status::InvalidState, "data reactor poller context does not match");
+    }
+    reactor->poller = nullptr;
+    reactor->pollerContext = nullptr;
+    if (reactor->pollerInFlight &&
+        reactor->pollerThread != std::this_thread::get_id()) {
+        reactor->pollerChanged.wait(lock, [reactor]() {
+            return !reactor->pollerInFlight;
+        });
+    }
+    return Result<void>(Status::Ok);
 }
 
 std::size_t SpdkRuntime::channelCount() const noexcept {
@@ -1047,6 +1492,27 @@ Result<void> SpdkRuntime::submitDataWrite(std::uint32_t reactorIndex,
     return Result<void>(Status::Ok);
 }
 
+Result<void> SpdkRuntime::submitDataReadOnReactor(std::uint32_t reactorIndex,
+                                                 std::size_t deviceIndex,
+                                                 DataIoRequest &request, void *buffer,
+                                                 std::uint64_t offsetBlocks,
+                                                 std::uint64_t blocks, DataIoCompletion cb,
+                                                 void *cbCtx) {
+    return impl_->submitDataIoOnReactor(reactorIndex, deviceIndex, request, buffer,
+                                        offsetBlocks, blocks, false, cb, cbCtx);
+}
+
+Result<void> SpdkRuntime::submitDataWriteOnReactor(std::uint32_t reactorIndex,
+                                                  std::size_t deviceIndex,
+                                                  DataIoRequest &request, const void *buffer,
+                                                  std::uint64_t offsetBlocks,
+                                                  std::uint64_t blocks, DataIoCompletion cb,
+                                                  void *cbCtx) {
+    return impl_->submitDataIoOnReactor(reactorIndex, deviceIndex, request,
+                                        const_cast<void *>(buffer), offsetBlocks, blocks, true,
+                                        cb, cbCtx);
+}
+
 bool SpdkRuntime::isDmaCapable(const void *buffer, std::size_t bytes) const noexcept {
     if (buffer == nullptr || bytes == 0) {
         return false;
@@ -1089,6 +1555,19 @@ Result<void> SpdkRuntime::postToDataReactor(std::uint32_t index, std::function<v
 std::uint64_t SpdkRuntime::dataReactorThreadId(std::uint32_t index) const {
     (void)index;
     return 0;
+}
+Result<void> SpdkRuntime::setDataReactorPoller(std::uint32_t index,
+                                               DataReactorPoller callback,
+                                               void *context) {
+    (void)index;
+    (void)callback;
+    (void)context;
+    return makeError(Status::NotSupported, "core built without SPDK support");
+}
+Result<void> SpdkRuntime::clearDataReactorPoller(std::uint32_t index, void *context) {
+    (void)index;
+    (void)context;
+    return makeError(Status::NotSupported, "core built without SPDK support");
 }
 std::size_t SpdkRuntime::channelCount() const noexcept { return 0; }
 std::int64_t SpdkRuntime::ownerPid() const noexcept { return 0; }
@@ -1140,6 +1619,40 @@ Result<void> SpdkRuntime::submitDataWrite(std::uint32_t reactorIndex,
                                           void (*cb)(void *, int), void *cbCtx) {
     (void)reactorIndex;
     (void)deviceIndex;
+    (void)buffer;
+    (void)offsetBlocks;
+    (void)blocks;
+    (void)cb;
+    (void)cbCtx;
+    return makeError(Status::NotSupported, "core built without SPDK support");
+}
+
+Result<void> SpdkRuntime::submitDataReadOnReactor(std::uint32_t reactorIndex,
+                                                 std::size_t deviceIndex,
+                                                 DataIoRequest &request, void *buffer,
+                                                 std::uint64_t offsetBlocks,
+                                                 std::uint64_t blocks, DataIoCompletion cb,
+                                                 void *cbCtx) {
+    (void)reactorIndex;
+    (void)deviceIndex;
+    (void)request;
+    (void)buffer;
+    (void)offsetBlocks;
+    (void)blocks;
+    (void)cb;
+    (void)cbCtx;
+    return makeError(Status::NotSupported, "core built without SPDK support");
+}
+
+Result<void> SpdkRuntime::submitDataWriteOnReactor(std::uint32_t reactorIndex,
+                                                  std::size_t deviceIndex,
+                                                  DataIoRequest &request, const void *buffer,
+                                                  std::uint64_t offsetBlocks,
+                                                  std::uint64_t blocks, DataIoCompletion cb,
+                                                  void *cbCtx) {
+    (void)reactorIndex;
+    (void)deviceIndex;
+    (void)request;
     (void)buffer;
     (void)offsetBlocks;
     (void)blocks;

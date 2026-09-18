@@ -47,6 +47,7 @@ set(HFS_CORE_SRC
   src/core/parent_completion.cpp
   src/core/scheduler.cpp
   src/core/shard_ring.cpp
+  src/core/spdk_async_backend.cpp
   src/metadata/allocator.cpp
   src/metadata/group_commit.cpp
   src/metadata/inode_map.cpp
@@ -201,6 +202,19 @@ foreach(test_name IN LISTS HFS_TESTS)
     HFS_DEFAULT_CONF_PATH="${CMAKE_CURRENT_SOURCE_DIR}/config/hfs_nvme.conf")
   add_test(NAME ${test_name} COMMAND ${test_name})
 endforeach()
+
+# Internal SPDK adapter test compiles its non-exported implementation directly.
+add_executable(spdk_async_backend_test
+  tests/spdk_async_backend_test.cpp
+  src/core/spdk_async_backend.cpp
+)
+target_link_libraries(spdk_async_backend_test PRIVATE hfs_core Threads::Threads)
+target_compile_options(spdk_async_backend_test PRIVATE -fno-exceptions -fno-rtti)
+target_include_directories(spdk_async_backend_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests
+)
+add_test(NAME spdk_async_backend_test COMMAND spdk_async_backend_test)
 
 # The data-plane structure test compiles the internal core sources directly so
 # it can run with ASAN/TSAN and without SPDK.

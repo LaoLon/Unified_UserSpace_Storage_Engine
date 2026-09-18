@@ -515,8 +515,12 @@ private:
                kind == IoPlanner::Child::Kind::TailRmw;
     }
 
-    static bool isReadPhase(const ChildState &child) noexcept {
-        return child.phase == ChildState::Phase::ReadOld;
+    static bool isReadPhase(const RequestState &state,
+                            const ChildState &child) noexcept {
+        /* RMW always starts with ReadOld. A direct Data phase follows the
+         * parent direction and must not turn ordinary reads into writes. */
+        return child.phase == ChildState::Phase::ReadOld ||
+               (child.phase == ChildState::Phase::Data && !state.request.write);
     }
 
     static void actorStep(void *context, Operation *operation) noexcept {
@@ -883,7 +887,7 @@ private:
         child.submitted = true;
         const AsyncDataBackend::Request request = backendRequest(state, child);
         const AsyncDataBackend::SubmitResult result =
-            isReadPhase(child)
+            isReadPhase(state, child)
                 ? state.owner->shards_[state.shard].backend->submitRead(
                       request, &Impl::backendCompletion, &child.callbackContext)
                 : state.owner->shards_[state.shard].backend->submitWrite(

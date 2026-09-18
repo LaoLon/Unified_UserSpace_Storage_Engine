@@ -9,7 +9,27 @@
 
 #include "hfs/config.hpp"
 #include "hfs/core.hpp"
+#include "runtime/spdk_runtime.hpp"
 #include "test_support.hpp"
+
+namespace {
+
+struct CompletionProbe {
+    std::atomic<int> calls{0};
+    std::atomic<int> rc{0};
+};
+
+/* Test callback records completion without entering the frontend. */
+void recordCompletion(void *ctx, int rc) {
+    auto *probe = static_cast<CompletionProbe *>(ctx);
+    probe->rc.store(rc, std::memory_order_release);
+    probe->calls.fetch_add(1, std::memory_order_acq_rel);
+}
+
+/* Conflicting registration probe must never replace the engine actor pump. */
+void conflictingPoller(void *ctx) noexcept { (void)ctx; }
+
+} // namespace
 
 int main() {
     const std::string lockPath = "/tmp/hfs2-spdk-" + std::to_string(::getpid()) + ".lock";
@@ -63,6 +83,53 @@ int main() {
     HFS_TEST_CHECK(ran.load(std::memory_order_acquire));
     HFS_TEST_CHECK(tid.load(std::memory_order_acquire) != 0);
     HFS_TEST_CHECK(tid.load(std::memory_order_acquire) == engine->dataReactorThreadId(1));
+
+    hfs::SpdkRuntime &runtime = hfs::SpdkRuntime::instance();
+    CompletionProbe wrongThreadProbe;
+    hfs::DataIoRequest wrongThreadRequest;
+    /* Actor-local calls from the frontend thread are rejected before any
+     * buffer or bdev access and never invoke the completion callback. */
+    auto wrongThread = runtime.submitDataReadOnReactor(
+        0, 0, wrongThreadRequest, reinterpret_cast<void *>(1), 0, 1,
+        recordCompletion, &wrongThreadProbe);
+    HFS_TEST_CHECK(!wrongThread.ok());
+    HFS_TEST_CHECK(wrongThread.status() == hfs::Status::InvalidState);
+    HFS_TEST_CHECK(wrongThreadProbe.calls.load(std::memory_order_acquire) == 0);
+
+    CompletionProbe badIndexProbe;
+    hfs::DataIoRequest badIndexRequest;
+    auto badIndex = runtime.submitDataReadOnReactor(
+        runtime.dataReactorCount(), 0, badIndexRequest, reinterpret_cast<void *>(1), 0, 1,
+        recordCompletion, &badIndexProbe);
+    HFS_TEST_CHECK(!badIndex.ok());
+    HFS_TEST_CHECK(badIndex.status() == hfs::Status::InvalidArgument);
+    HFS_TEST_CHECK(badIndexProbe.calls.load(std::memory_order_acquire) == 0);
+
+    std::atomic<bool> ownerValidationRan{false};
+    std::atomic<int> ownerValidationStatus{-1};
+    auto ownerValidation = engine->postToDataReactor(0, [&]() {
+        hfs::DataIoRequest request;
+        CompletionProbe probe;
+        auto result = runtime.submitDataReadOnReactor(0, 0, request, nullptr, 0, 0,
+                                                      recordCompletion, &probe);
+        ownerValidationStatus.store(static_cast<int>(result.status()),
+                                    std::memory_order_release);
+        ownerValidationRan.store(true, std::memory_order_release);
+    });
+    HFS_TEST_CHECK(ownerValidation.ok());
+    for (int i = 0; i < 1000 && !ownerValidationRan.load(std::memory_order_acquire); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    HFS_TEST_CHECK(ownerValidationRan.load(std::memory_order_acquire));
+    HFS_TEST_CHECK(ownerValidationStatus.load(std::memory_order_acquire) ==
+                   static_cast<int>(hfs::Status::InvalidArgument));
+
+    /* Engine mount owns the sole actor pump on every data reactor. */
+    int conflictingContext = 0;
+    auto pollerSet = runtime.setDataReactorPoller(
+        0, conflictingPoller, &conflictingContext);
+    HFS_TEST_CHECK(!pollerSet.ok());
+    HFS_TEST_CHECK(pollerSet.status() == hfs::Status::Busy);
 
     HFS_TEST_CHECK(engine->stop().wait().value().ok());
     HFS_TEST_CHECK(engine->channelCount() == 0);

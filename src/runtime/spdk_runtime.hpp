@@ -13,6 +13,26 @@
 
 namespace hfs {
 
+using DataIoCompletion = void (*)(void *, int);
+using DataReactorPoller = void (*)(void *) noexcept;
+
+/* Caller-owned storage for one actor-local data I/O. The storage remains
+ * opaque here so SPDK types never cross the internal runtime boundary. It
+ * must not be copied, moved, or destroyed until DataIoCompletion runs. */
+struct DataIoRequest {
+    static constexpr std::size_t kStorageBytes = 512;
+
+    DataIoRequest() noexcept = default;
+    DataIoRequest(const DataIoRequest &) = delete;
+    DataIoRequest &operator=(const DataIoRequest &) = delete;
+    DataIoRequest(DataIoRequest &&) = delete;
+    DataIoRequest &operator=(DataIoRequest &&) = delete;
+
+    /* Zero means idle; the runtime owns the non-zero value while in flight. */
+    std::uint64_t stateTag = 0;
+    alignas(std::max_align_t) std::byte storage[kStorageBytes]{};
+};
+
 /* Process-wide SPDK runtime (env, reactors, bdev descriptors and per-reactor
  * io channels). Engine mount/stop switch it between Active and EnvReady
  * without re-initializing DPDK; the env lives until process exit.
@@ -35,6 +55,14 @@ public:
     /* Control-path doorbell onto a data reactor (spdk_thread_send_msg). */
     Result<void> postToDataReactor(std::uint32_t index, std::function<void()> fn);
     std::uint64_t dataReactorThreadId(std::uint32_t index) const;
+
+    /* Installs one reactor-local poller called after SPDK completion and retry
+     * queues are drained. Registration is synchronized with callback entry. */
+    Result<void> setDataReactorPoller(std::uint32_t index, DataReactorPoller callback,
+                                      void *context);
+    /* Clears the matching poller and waits for an in-flight callback, so the
+     * caller may safely release its context after this method returns. */
+    Result<void> clearDataReactorPoller(std::uint32_t index, void *context);
 
     /* Acceptance/diagnostic counters. */
     std::size_t channelCount() const noexcept;
@@ -61,6 +89,24 @@ public:
                                  const void *buffer, std::uint64_t offsetBlocks,
                                  std::uint64_t blocks, void (*cb)(void *, int),
                                  void *cbCtx);
+
+    /* Actor-local hot path. The caller must already run on the selected data
+     * reactor and keep request, buffer, callback and context alive until the
+     * callback runs. A valid call returns Ok and produces exactly one callback;
+     * no per-request heap allocation, thread message, lock, or FIO call is
+     * performed by the runtime. */
+    Result<void> submitDataReadOnReactor(std::uint32_t reactorIndex,
+                                         std::size_t deviceIndex,
+                                         DataIoRequest &request, void *buffer,
+                                         std::uint64_t offsetBlocks,
+                                         std::uint64_t blocks, DataIoCompletion cb,
+                                         void *cbCtx);
+    Result<void> submitDataWriteOnReactor(std::uint32_t reactorIndex,
+                                          std::size_t deviceIndex,
+                                          DataIoRequest &request, const void *buffer,
+                                          std::uint64_t offsetBlocks,
+                                          std::uint64_t blocks, DataIoCompletion cb,
+                                          void *cbCtx);
 
     /* True when the buffer is DMA-mappable through SPDK. */
     bool isDmaCapable(const void *buffer, std::size_t bytes) const noexcept;

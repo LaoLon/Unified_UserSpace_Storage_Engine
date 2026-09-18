@@ -77,11 +77,13 @@ public:
 
     SubmitResult submitRead(const Request &request, CompletionCallback callback,
                             void *context) noexcept override {
+        ++readSubmissions;
         return submit(request, callback, context);
     }
 
     SubmitResult submitWrite(const Request &request, CompletionCallback callback,
                              void *context) noexcept override {
+        ++writeSubmissions;
         return submit(request, callback, context);
     }
 
@@ -135,6 +137,8 @@ public:
     int fastErrno = 0;
     std::size_t inFlight = 0;
     std::size_t maxInFlight = 0;
+    std::size_t readSubmissions = 0;
+    std::size_t writeSubmissions = 0;
     std::vector<Request> submissions;
     std::vector<Pending> pending;
 };
@@ -221,6 +225,8 @@ int main() {
         fixture.service.pump(0);
         HFS_TEST_CHECK(fixture.backend.pending.size() == 4);
         HFS_TEST_CHECK(fixture.backend.maxInFlight == 4);
+        HFS_TEST_CHECK(fixture.backend.readSubmissions == 4);
+        HFS_TEST_CHECK(fixture.backend.writeSubmissions == 0);
         while (!fixture.backend.pending.empty()) {
             HFS_TEST_CHECK(fixture.backend.completeFirst());
             fixture.service.pump(0);
@@ -245,6 +251,8 @@ int main() {
                                  handles));
         fixture.service.pump(0);
         HFS_TEST_CHECK(fixture.backend.pending.size() == 1);
+        HFS_TEST_CHECK(fixture.backend.readSubmissions == 0);
+        HFS_TEST_CHECK(fixture.backend.writeSubmissions == 1);
         HFS_TEST_CHECK(fixture.service.stats().schedulerWaits == 1);
         HFS_TEST_CHECK(fixture.backend.completeFirst());
         fixture.service.pump(0);

@@ -420,6 +420,19 @@ PollResult AsyncCompletionQueue::poll(std::span<CompletionEvent> output, std::si
 
     const auto boundedTimeout = timeout.count() > 0 ? timeout : std::chrono::microseconds(0);
     const auto deadline = std::chrono::steady_clock::now() + boundedTimeout;
+    if (min != 0 && boundedTimeout >= std::chrono::microseconds(50)) {
+        /* Keep the previous wake arm while the reactor is likely to complete
+         * the request. This avoids one eventfd write/read pair per shallow-QD
+         * completion without changing the blocking timeout contract. */
+        constexpr unsigned kActivePollSpins = 1024;
+        for (unsigned spin = 0; spin < kActivePollSpins; ++spin) {
+            result.count += drainAvailable(output.subspan(result.count, limit - result.count),
+                                           limit - result.count);
+            if (result.count >= min || result.count == limit) {
+                return result;
+            }
+        }
+    }
     for (;;) {
         result.count += drainAvailable(output.subspan(result.count, limit - result.count),
                                        limit - result.count);

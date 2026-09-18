@@ -5,9 +5,14 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <mutex>
+#include <new>
+#include <thread>
 #include <vector>
 
 #include "common/log.hpp"
+#include "core/async_completion_queue.hpp"
+#include "core/async_data_service.hpp"
 #include "core/data_plane.hpp"
 #include "metadata/inode_map.hpp"
 #include "metadata/namespace.hpp"
@@ -33,17 +38,170 @@ struct MetadataLease {
 
 namespace {
 
+enum class ClientLifecycle : std::uint8_t {
+    Open,
+    Closing,
+    Closed,
+};
+
+/* One immutable file view can be shared by every in-flight fixed I/O. */
+struct AsyncFileSnapshot {
+    FileStat stat{};
+    metadata::InodeExtentMap extentMap;
+    std::uint64_t namespaceEpoch = 0;
+};
+
+/* One bounded frontend slot keeps the immutable extent snapshot alive until
+ * its completion event has been reaped by the creating thread. */
+struct AsyncRequestSlot {
+    bool inUse = false;
+    std::uint64_t requestId = 0;
+    CompletionToken token{};
+    FileHandle file{};
+    std::shared_ptr<const AsyncFileSnapshot> snapshot;
+
+    void release() noexcept {
+        inUse = false;
+        requestId = 0;
+        token = {};
+        file = {};
+        snapshot.reset();
+    }
+};
+
 /* Shared client state so open File handles keep working after Client::close
  * (the engine must still outlive them). */
-struct ClientState {
+struct ClientState final : AsyncDataSink {
     Engine *engine = nullptr;
     metadata::Namespace *namespaceState = nullptr;
     DataPlane *dataPlane = nullptr;
+    AsyncDataService *asyncService = nullptr;
     ClientOptions options;
     std::shared_ptr<MetadataLease> lease;
     std::atomic<std::uint32_t> openFiles{0};
-    std::atomic<bool> closed{false};
+    std::atomic<std::size_t> outstandingCount{0};
+    std::atomic<std::size_t> handleCount{0};
+    std::atomic<ClientLifecycle> lifecycle{ClientLifecycle::Open};
+    std::atomic<bool> completionOverflow{false};
+    std::thread::id frontendThread{};
+    std::uint32_t maxOutstandingValue = 0;
+    std::unique_ptr<AsyncRequestSlot[]> requestSlots;
+    AsyncCompletionQueue completionQueue;
+    bool asyncInitialized = false;
+
+    /* Allocates every frontend-owned bounded slot before the first submit. */
+    bool initializeAsync(std::size_t shardCount) noexcept {
+        if (options.maxOutstanding == 0 || maxOutstandingValue != 0 ||
+            asyncInitialized) {
+            return false;
+        }
+        maxOutstandingValue = options.maxOutstanding;
+        requestSlots.reset(new (std::nothrow) AsyncRequestSlot[maxOutstandingValue]);
+        if (requestSlots == nullptr) {
+            maxOutstandingValue = 0;
+            return false;
+        }
+        const std::size_t effectiveShardCount = shardCount == 0 ? 1 : shardCount;
+        if (!completionQueue.initialize(effectiveShardCount, maxOutstandingValue)) {
+            requestSlots.reset();
+            maxOutstandingValue = 0;
+            return false;
+        }
+        frontendThread = std::this_thread::get_id();
+        asyncInitialized = true;
+        return true;
+    }
+
+    bool onFrontendThread() const noexcept {
+        return std::this_thread::get_id() == frontendThread;
+    }
+
+    /* The service owns credit acquisition; this is its bounded sink hook. */
+    bool tryAcquireCredit() noexcept override {
+        if (lifecycle.load(std::memory_order_acquire) != ClientLifecycle::Open ||
+            maxOutstandingValue == 0) {
+            return false;
+        }
+        std::size_t current = outstandingCount.load(std::memory_order_relaxed);
+        while (current < maxOutstandingValue) {
+            if (outstandingCount.compare_exchange_weak(
+                    current, current + 1, std::memory_order_acq_rel,
+                    std::memory_order_relaxed)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void releaseCredit() noexcept override {
+        std::size_t current = outstandingCount.load(std::memory_order_relaxed);
+        while (current != 0) {
+            if (outstandingCount.compare_exchange_weak(
+                    current, current - 1, std::memory_order_acq_rel,
+                    std::memory_order_relaxed)) {
+                return;
+            }
+        }
+    }
+
+    /* Reactor callbacks only enqueue a value; they never touch frontend slots. */
+    void publish(std::uint32_t shard, const CompletionEvent &event) noexcept override {
+        if (!completionQueue.push(shard, event)) {
+            completionOverflow.store(true, std::memory_order_release);
+        }
+    }
+
+    AsyncRequestSlot *reserveSlot(const CompletionToken &token,
+                                  std::size_t &index) noexcept {
+        if (!asyncInitialized || token.generation == 0 || requestSlots == nullptr) {
+            return nullptr;
+        }
+        for (std::size_t candidate = 0; candidate < maxOutstandingValue; ++candidate) {
+            AsyncRequestSlot &slot = requestSlots[candidate];
+            if (!slot.inUse) {
+                slot.inUse = true;
+                slot.requestId = 0;
+                slot.token = token;
+                slot.file = {};
+                index = candidate;
+                return &slot;
+            }
+        }
+        return nullptr;
+    }
+
+    bool reapEvent(const CompletionEvent &event) noexcept {
+        bool matched = false;
+        for (std::size_t index = 0; index < maxOutstandingValue; ++index) {
+            AsyncRequestSlot &slot = requestSlots[index];
+            if (slot.inUse && slot.requestId == event.requestId) {
+                matched = slot.token.slot == event.token.slot &&
+                          slot.token.generation == event.token.generation;
+                slot.release();
+                break;
+            }
+        }
+        releaseCredit();
+        if (!matched) {
+            completionOverflow.store(true, std::memory_order_release);
+        }
+        return matched;
+    }
 };
+
+/* IoHandle invokes this exactly once when its frontend reference is released. */
+void releaseClientHandle(void *context) noexcept {
+    auto *state = static_cast<ClientState *>(context);
+    if (state == nullptr) {
+        return;
+    }
+    std::size_t current = state->handleCount.load(std::memory_order_relaxed);
+    while (current != 0 &&
+           !state->handleCount.compare_exchange_weak(
+               current, current - 1, std::memory_order_acq_rel,
+               std::memory_order_relaxed)) {
+    }
+}
 
 /* Rebuilds the per-inode extent map view for one File handle. */
 Result<metadata::InodeExtentMap> extentMapFor(const ClientState &state, FileHandle handle) {
@@ -65,13 +223,121 @@ Result<void> validateClient(const ClientState &state) {
     if (state.engine == nullptr || !state.engine->processValid()) {
         return makeError(Status::ForkedProcess, "engine belongs to another process");
     }
-    if (state.closed.load(std::memory_order_acquire)) {
-        return makeError(Status::InvalidState, "client is closed");
+    if (state.lifecycle.load(std::memory_order_acquire) != ClientLifecycle::Open) {
+        return makeError(Status::InvalidState, "client is closing or closed");
     }
     if (!state.engine->mounted() || state.namespaceState == nullptr) {
         return makeError(Status::InvalidState, "engine is not mounted");
     }
     return Result<void>(Status::Ok);
+}
+
+/* Counts queued values without consuming them; this is used by close(). */
+std::size_t queuedCompletions(const ClientState &state) noexcept {
+    if (!state.asyncInitialized) {
+        return 0;
+    }
+    std::size_t count = 0;
+    for (std::size_t shard = 0; shard < state.completionQueue.shardCount(); ++shard) {
+        count += state.completionQueue.shardDiagnostics(shard).size;
+    }
+    return count;
+}
+
+Result<void> validateAsyncClient(const ClientState &state) {
+    auto valid = validateClient(state);
+    if (!valid.ok()) {
+        return valid;
+    }
+    if (!state.onFrontendThread()) {
+        return makeError(Status::InvalidState,
+                         "asynchronous Client API called from a non-frontend thread");
+    }
+    if (!state.asyncInitialized || state.asyncService == nullptr ||
+        !state.asyncService->valid()) {
+        return makeError(Status::InvalidState, "asynchronous data service is unavailable");
+    }
+    if (state.completionOverflow.load(std::memory_order_acquire)) {
+        return makeError(Status::Corrupt, "completion queue integrity failure");
+    }
+    return Result<void>(Status::Ok);
+}
+
+/* Builds one fixed request against a slot-owned extent snapshot. */
+Result<IoHandle> submitAsyncRequest(ClientState &state, FileHandle handle,
+                                    std::shared_ptr<const AsyncFileSnapshot> snapshot,
+                                    IoVec buffer,
+                                    std::uint64_t offset, CompletionToken token,
+                                    bool write) {
+    if (snapshot == nullptr) {
+        return makeError<IoHandle>(Status::InvalidState,
+                                   "asynchronous file snapshot is unavailable");
+    }
+    const FileStat &stat = snapshot->stat;
+    if (!token.valid()) {
+        return makeError<IoHandle>(Status::InvalidArgument,
+                                   "completion token generation is zero");
+    }
+    if (!handle.valid()) {
+        return makeError<IoHandle>(Status::InvalidArgument, "invalid file handle");
+    }
+    if (buffer.size == 0 || buffer.data == nullptr) {
+        return makeError<IoHandle>(Status::InvalidArgument,
+                                   "asynchronous I/O requires one non-empty buffer");
+    }
+
+    std::uint64_t length = static_cast<std::uint64_t>(buffer.size);
+    if (write) {
+        if (offset > std::numeric_limits<std::uint64_t>::max() - length) {
+            return makeError<IoHandle>(Status::InvalidArgument,
+                                       "write range overflows");
+        }
+        if (offset > stat.logicalSize || offset + length > stat.logicalSize) {
+            return makeError<IoHandle>(
+                Status::InvalidArgument,
+                "asynchronous write must stay within the preallocated logical size");
+        }
+    } else {
+        if (offset >= stat.logicalSize) {
+            return makeError<IoHandle>(Status::InvalidArgument,
+                                       "read starts at or beyond logical EOF");
+        }
+        length = std::min<std::uint64_t>(length, stat.logicalSize - offset);
+    }
+
+    if (state.outstandingCount.load(std::memory_order_acquire) >=
+        state.maxOutstandingValue) {
+        return makeError<IoHandle>(Status::Busy, "client outstanding credit exhausted");
+    }
+
+    std::size_t slotIndex = 0;
+    AsyncRequestSlot *slot = state.reserveSlot(token, slotIndex);
+    (void)slotIndex;
+    if (slot == nullptr) {
+        return makeError<IoHandle>(Status::Busy, "client frontend slot table is full");
+    }
+
+    slot->file = handle;
+    slot->snapshot = std::move(snapshot);
+
+    AsyncDataRequest request;
+    request.fileId = handle.inodeId;
+    request.offset = offset;
+    request.length = length;
+    request.buffer = std::span<std::byte>(buffer.data, static_cast<std::size_t>(length));
+    request.extentMap = &slot->snapshot->extentMap;
+    request.logicalSize = stat.logicalSize;
+    request.write = write;
+    request.fixedOverwrite = write;
+
+    auto submitted = state.asyncService->submit(request, token, state);
+    if (!submitted.ok()) {
+        slot->release();
+        return makeError<IoHandle>(submitted.status(), submitted.message());
+    }
+    IoHandle handleResult = std::move(submitted).value();
+    slot->requestId = handleResult.requestId();
+    return Result<IoHandle>(std::move(handleResult));
 }
 
 } // namespace
@@ -83,6 +349,56 @@ struct Client::Impl {
 struct File::Impl {
     std::shared_ptr<ClientState> state;
     FileHandle handle;
+    mutable std::mutex asyncCacheMutex;
+    mutable std::shared_ptr<const AsyncFileSnapshot> asyncCache;
+
+    /* Refresh metadata only when the namespace publication epoch changes. */
+    Result<std::shared_ptr<const AsyncFileSnapshot>> asyncSnapshot() const {
+        if (state == nullptr || state->namespaceState == nullptr) {
+            return makeError<std::shared_ptr<const AsyncFileSnapshot>>(
+                Status::InvalidState, "file namespace is unavailable");
+        }
+        const std::uint64_t currentEpoch = state->namespaceState->logicalEpochFast();
+        {
+            std::lock_guard<std::mutex> lock(asyncCacheMutex);
+            if (asyncCache != nullptr &&
+                asyncCache->namespaceEpoch == currentEpoch) {
+                return asyncCache;
+            }
+        }
+
+        /* A retry closes the stat/extents race with a concurrent metadata
+         * mutation without holding the namespace mutex across allocations. */
+        for (unsigned attempt = 0; attempt < 3; ++attempt) {
+            const std::uint64_t before = state->namespaceState->logicalEpochFast();
+            auto stat = state->namespaceState->stat(handle);
+            if (!stat.ok()) {
+                return makeError<std::shared_ptr<const AsyncFileSnapshot>>(
+                    stat.status(), stat.message());
+            }
+            auto map = extentMapFor(*state, handle);
+            if (!map.ok()) {
+                return makeError<std::shared_ptr<const AsyncFileSnapshot>>(
+                    map.status(), map.message());
+            }
+            const std::uint64_t after = state->namespaceState->logicalEpochFast();
+            if (before != after) {
+                continue;
+            }
+            auto refreshed = std::make_shared<AsyncFileSnapshot>();
+            refreshed->stat = stat.value();
+            refreshed->extentMap = std::move(map).value();
+            refreshed->namespaceEpoch = after;
+            std::lock_guard<std::mutex> lock(asyncCacheMutex);
+            if (state->namespaceState->logicalEpochFast() != after) {
+                continue;
+            }
+            asyncCache = std::move(refreshed);
+            return asyncCache;
+        }
+        return makeError<std::shared_ptr<const AsyncFileSnapshot>>(
+            Status::Busy, "namespace changed while building asynchronous snapshot");
+    }
 
     ~Impl() {
         if (state != nullptr) {
@@ -99,8 +415,10 @@ Client::Client(Engine &engine, const ClientOptions &options) : impl_(std::make_u
     impl_->state->engine = &engine;
     impl_->state->namespaceState = engine.metadataNamespace();
     impl_->state->dataPlane = engine.dataPlane();
+    impl_->state->asyncService = engine.asyncDataService();
     impl_->state->options = options;
     impl_->state->lease = std::make_shared<MetadataLease>(engine);
+    (void)impl_->state->initializeAsync(engine.dataReactorCount());
 }
 
 Client::~Client() = default;
@@ -114,7 +432,16 @@ Result<std::shared_ptr<Client>> Client::create(Engine &engine, const ClientOptio
         return makeError<std::shared_ptr<Client>>(Status::InvalidState,
                                                   "engine is not mounted");
     }
-    return std::shared_ptr<Client>(new Client(engine, options));
+    if (options.maxOutstanding == 0) {
+        return makeError<std::shared_ptr<Client>>(Status::InvalidArgument,
+                                                  "maxOutstanding must be non-zero");
+    }
+    auto client = std::shared_ptr<Client>(new Client(engine, options));
+    if (!client->impl_->state->asyncInitialized) {
+        return makeError<std::shared_ptr<Client>>(Status::NoMemory,
+                                                  "client async resources could not be initialized");
+    }
+    return client;
 }
 
 Task<Result<void>> Client::close() {
@@ -122,10 +449,149 @@ Task<Result<void>> Client::close() {
     if (state.engine == nullptr || !state.engine->processValid()) {
         co_return Result<void>(Status::ForkedProcess, "engine belongs to another process");
     }
-    state.closed.store(true, std::memory_order_release);
-    log::info("client closed: open files=%u",
-              state.openFiles.load(std::memory_order_relaxed));
+    if (!state.onFrontendThread()) {
+        co_return Result<void>(Status::InvalidState,
+                               "client close called from a non-frontend thread");
+    }
+    ClientLifecycle expected = ClientLifecycle::Open;
+    if (!state.lifecycle.compare_exchange_strong(expected, ClientLifecycle::Closing,
+                                                 std::memory_order_acq_rel,
+                                                 std::memory_order_acquire) &&
+        expected == ClientLifecycle::Closed) {
+        co_return Result<void>(Status::Ok);
+    }
+
+    const std::size_t outstanding =
+        state.outstandingCount.load(std::memory_order_acquire);
+    const std::size_t queued = queuedCompletions(state);
+    const std::size_t handles = state.handleCount.load(std::memory_order_acquire);
+    const std::uint32_t openFiles = state.openFiles.load(std::memory_order_acquire);
+    if (outstanding != 0 || queued != 0 || handles != 0 || openFiles != 0) {
+        log::info("client closing: open files=%u outstanding=%llu queued=%llu handles=%llu",
+                  openFiles,
+                  static_cast<unsigned long long>(outstanding),
+                  static_cast<unsigned long long>(queued),
+                  static_cast<unsigned long long>(handles));
+        co_return Result<void>(Status::Busy, "client resources are still active");
+    }
+    for (std::size_t index = 0; index < state.maxOutstandingValue; ++index) {
+        if (state.requestSlots[index].inUse) {
+            co_return Result<void>(Status::Busy, "client frontend handles are still active");
+        }
+    }
+    if (state.completionOverflow.load(std::memory_order_acquire)) {
+        co_return Result<void>(Status::Corrupt, "completion queue integrity failure");
+    }
+    state.lease.reset();
+    state.lifecycle.store(ClientLifecycle::Closed, std::memory_order_release);
+    log::info("client closed: open files=%u", openFiles);
     co_return Result<void>(Status::Ok);
+}
+
+Result<IoHandle> Client::submitRead(const std::shared_ptr<File> &file, IoVec buffer,
+                                    std::uint64_t offset, CompletionToken token) {
+    auto &state = *impl_->state;
+    auto valid = validateAsyncClient(state);
+    if (!valid.ok()) {
+        return makeError<IoHandle>(valid.status(), valid.message());
+    }
+    if (file == nullptr || file->impl_ == nullptr ||
+        file->impl_->state.get() != impl_->state.get()) {
+        return makeError<IoHandle>(Status::InvalidArgument,
+                                   "file does not belong to this client");
+    }
+    auto snapshot = file->impl_->asyncSnapshot();
+    if (!snapshot.ok()) {
+        return makeError<IoHandle>(snapshot.status(), snapshot.message());
+    }
+    if (snapshot.value()->stat.directory) {
+        return makeError<IoHandle>(Status::InvalidArgument,
+                                   "asynchronous read requires a regular file");
+    }
+    auto submitted = submitAsyncRequest(state, file->handle(), snapshot.value(),
+                                        buffer, offset, token, false);
+    if (!submitted.ok()) {
+        return submitted;
+    }
+    IoHandle handle = std::move(submitted).value();
+    state.handleCount.fetch_add(1, std::memory_order_acq_rel);
+    handle.attachOwner(std::static_pointer_cast<void>(impl_->state), impl_->state.get(),
+                       &releaseClientHandle);
+    return Result<IoHandle>(std::move(handle));
+}
+
+Result<IoHandle> Client::submitWrite(const std::shared_ptr<File> &file, IoVec buffer,
+                                     std::uint64_t offset, CompletionToken token) {
+    auto &state = *impl_->state;
+    auto valid = validateAsyncClient(state);
+    if (!valid.ok()) {
+        return makeError<IoHandle>(valid.status(), valid.message());
+    }
+    if (file == nullptr || file->impl_ == nullptr ||
+        file->impl_->state.get() != impl_->state.get()) {
+        return makeError<IoHandle>(Status::InvalidArgument,
+                                   "file does not belong to this client");
+    }
+    auto snapshot = file->impl_->asyncSnapshot();
+    if (!snapshot.ok()) {
+        return makeError<IoHandle>(snapshot.status(), snapshot.message());
+    }
+    if (snapshot.value()->stat.directory) {
+        return makeError<IoHandle>(Status::InvalidArgument,
+                                   "asynchronous write requires a regular file");
+    }
+    auto submitted = submitAsyncRequest(state, file->handle(), snapshot.value(),
+                                        buffer, offset, token, true);
+    if (!submitted.ok()) {
+        return submitted;
+    }
+    IoHandle handle = std::move(submitted).value();
+    state.handleCount.fetch_add(1, std::memory_order_acq_rel);
+    handle.attachOwner(std::static_pointer_cast<void>(impl_->state), impl_->state.get(),
+                       &releaseClientHandle);
+    return Result<IoHandle>(std::move(handle));
+}
+
+PollResult Client::poll(std::span<CompletionEvent> events, std::size_t min,
+                        std::size_t max, std::chrono::microseconds timeout) {
+    PollResult result;
+    auto &state = *impl_->state;
+    if (state.engine == nullptr || !state.engine->processValid()) {
+        result.status = Status::ForkedProcess;
+        return result;
+    }
+    if (!state.onFrontendThread()) {
+        result.status = Status::InvalidState;
+        return result;
+    }
+    if (!state.asyncInitialized) {
+        result.status = Status::InvalidState;
+        return result;
+    }
+    result = state.completionQueue.poll(events, min, max, timeout);
+    if (result.status != Status::Ok) {
+        return result;
+    }
+    for (std::size_t index = 0; index < result.count; ++index) {
+        if (!state.reapEvent(events[index])) {
+            result.status = Status::Corrupt;
+        }
+    }
+    return result;
+}
+
+std::size_t Client::outstanding() const noexcept {
+    if (impl_ == nullptr || impl_->state == nullptr) {
+        return 0;
+    }
+    return impl_->state->outstandingCount.load(std::memory_order_acquire);
+}
+
+std::size_t Client::maxOutstanding() const noexcept {
+    if (impl_ == nullptr || impl_->state == nullptr) {
+        return 0;
+    }
+    return impl_->state->maxOutstandingValue;
 }
 
 Task<Result<std::shared_ptr<File>>> Client::open(std::string_view path, OpenFlags flags) {

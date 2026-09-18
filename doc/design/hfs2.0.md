@@ -296,14 +296,20 @@ Task<ResultInfo> File::read(std::span<IoVec> iov,
 // C++ adapter: callback continuation
 client.submit(file.read(iov, offset, stop), callback);
 
-// FIO adapter: event queue
-auto handle = client.submit(file.read(iov, offset, stop));
+// FIO adapter: fixed-size async event queue
+CompletionToken token{slot, generation};
+auto handle = client.submitRead(file, iov, offset, token);
 client.poll(events, min_events, max_events, timeout);
 ```
 
 RocksDB `ReadAsync` 使用 callback；FIO `getevents()` 使用 client completion queue。
 同步 RocksDB 方法只在 frontend 线程等待 event，不阻塞 SPDK actor，也不把同步等待
-包装成 core 的 blocking worker。
+包装成 core 的 blocking worker。event queue 出口返回 move-only `IoHandle`，它持有
+operation 的 frontend intrusive ref；completion 使用 `slot + generation + request_id`
+值标识，不把 `io_u*`、pending slot 或其它 frontend 裸指针跨线程传递。固定覆盖读写的
+`submitRead/submitWrite` 返回前校验 logical size，并把 FileHandle、iovec descriptor、
+token、sink 和按请求裁剪的 extent snapshot 复制到 bounded operation state，不能在
+frontend 返回后访问调用栈上的临时 span。
 
 ## 6. Runtime、reactor 和所有权
 
@@ -354,6 +360,13 @@ data ring 是固定槽位 MPSC producer / single actor consumer：
 - ring 满返回 bounded `TryAgain/Busy`，不创建无界等待队列；
 - actor 清空 ring 后再次检查 tail，再清 armed 位，避免 lost wake；
 - shutdown 关闭 producer 后等待 ring、credit、operation 和 coroutine frame 全部闭合。
+
+SPDK callback 不直接 `scheduler.complete`，也不在 callback 栈中递归提交 RMW 下一阶段或
+下一笔 operation。callback 只释放 `spdk_bdev_io`、记录 child status，并把内嵌 ready node
+放入 reactor-local actor queue；actor 主循环负责 phase 推进、scheduler complete 和 frontend
+completion publish。每个 Client 为每个 shard 维护一个 bounded SPSC completion ring；
+producer 是该 shard actor，consumer 是 Client frontend。Linux 用 nonblocking eventfd 作为
+唤醒提示，ring 才是完成事实源，producer 不获取 frontend mutex 或执行堆分配。
 
 ### 6.4 所有权矩阵
 
@@ -444,11 +457,16 @@ metadata epoch 推进后整体发布新 snapshot。v1 不做 extent map 换出/�
 parent 保存 pending child count、first error、completed bytes、child bitmap 和引用：
 
 - 未提交 child 的 acquire/start 失败必须补偿 pending；
-- child callback 只更新 parent，不唤醒多个 frontend waiter；
-- 最后一个 child 通过 release store 发布 parent，并 wake-all；
+- SPDK child callback 只记录结果并排入 actor ready queue，不直接更新 scheduler 或 frontend；
+- actor continuation 更新 parent；最后一个 child 通过 release store 发布 parent，并只唤醒
+  operation 选定的唯一 completion sink；
 - read 统一 copy-out 后释放 lease，write 统一 release；
 - 一个 frontend operation 只能有一个 completion sink；
 - timeout/cancel 不提前销毁 SPDK callback 仍可见的 frame。
+
+SPDK submit 返回 `-ENOMEM` 时，child 在同一 reactor/channel 注册
+`spdk_bdev_queue_io_wait`；wait callback 只把 child 排入 actor ready queue，由 actor 重试。
+operation 已经被 ring 接受后不得把该错误倒退映射为 frontend submit Busy。
 
 ## 8. DMA 和资源上限
 
@@ -759,18 +777,28 @@ engine 直接调用 C++ `Engine/Client/File`，不通过 POSIX open/read/write�
 
 ### 12.2 FIO lifecycle
 
-- `queue()` 产生 coroutine operation，保存 `io_u` 引用直到 completion；
+- `queue()` 产生 async operation，pending slot 保存 move-only `IoHandle` 和 `io_u`
+  引用直到 `event()`；协议层仍区分 `Reserved/Submitted/Completed/Reported` 边界，
+  但当前 FIO adapter 将其压缩为 `Free→Submitted→Reaped→Free`：`Reaped` 表示
+  completion 已被 `getevents()` 取出但 `event()` 尚未交还 `io_u`，因此仍禁止复用
+  slot；每次从 `Free` 重新提交递增 generation；
 - `iomem_alloc/iomem_free` 从 shared arena 提供整块 DMA `orig_buffer`，是 all-or-nothing
   契约：engine 按 bs×iodepth×jobs 预检 arena 容量，无法完整提供时 FIO 初始化失败并明确
   报错，不做半量 fallback；不使用 `iomem_alloc` 的普通 FIO buffer 按 ≤1 MiB child bounce
-  并计入 copy 统计；
+  并计入 copy 统计；`io_u->xfer_buf` 是 allocation interior pointer 时用
+  `ownsRange(ptr,len)` 校验，不能只匹配 allocation base；
 - `queue()` 三态返回：成功 `FIO_Q_QUEUED`、临时资源不足 `FIO_Q_BUSY`、参数或永久错误
-  `FIO_Q_COMPLETED` + `io_u->error`；bounded ring/operation/DMA 满时返回 `FIO_Q_BUSY`，
-  不丢请求；
+  `FIO_Q_COMPLETED` + `io_u->error`；只有 client credit、operation pool 或 ring reservation
+  在 publish 前失败才能返回 `FIO_Q_BUSY`。publish 后 planner/DMA/backend/metadata 错误必须
+  产生唯一异步 terminal event，不能伪装成可重试 queue Busy；
 - `getevents(min,max,timeout)` 调用 `client.poll`，满足 FIO min/max 语义；
-- `event()` 写回 `io_u->error`、`resid` 和完成字节；
+- `getevents()` 用 slot、generation 和 request id 校验 token 并写回 `io_u->error/resid`；
+  `event()` 返回 `io_u` 后才释放 pending slot；
+- 同一 shared file 的 open/preallocate 使用 process-level single-flight：一个 owner 执行
+  allocate，全部 waiter 复用同一校验结果；
 - `FIO_NOEXTEND`、`fio --verify`、direct/bounce、iodepth 必须在测试中覆盖；
-- engine close 前 drain 全部 io_u、coroutine frame、File 和 Client。
+- cleanup 告警超时不得提前释放 FIO memory；engine close 前必须继续 drain 全部 callback、
+  token、IoHandle、io_u、coroutine frame、File 和 Client。
 
 ## 13. Namespace 和文件 API
 
@@ -790,6 +818,38 @@ public:
 
 struct ClientOptions {
     std::uint32_t maxOpenFiles = 0; /* 0 = only the namespace limit applies */
+    std::uint32_t maxOutstanding = 32;
+};
+
+struct CompletionToken {
+    std::uint32_t slot = 0;
+    std::uint32_t generation = 0;
+};
+
+struct CompletionEvent {
+    std::uint64_t requestId = 0;
+    CompletionToken token{};
+    Status status = Status::Ok;
+    int backendErrno = 0;
+    std::uint64_t completedBytes = 0;
+};
+
+struct PollResult {
+    Status status = Status::Ok;
+    std::size_t count = 0;
+};
+
+class IoHandle {
+public:
+    IoHandle(IoHandle&&) noexcept;
+    IoHandle& operator=(IoHandle&&) noexcept;
+    IoHandle(const IoHandle&) = delete;
+    IoHandle& operator=(const IoHandle&) = delete;
+    ~IoHandle();
+    bool valid() const noexcept;
+    std::uint64_t requestId() const noexcept;
+    CompletionToken token() const noexcept;
+    void reset() noexcept;
 };
 
 enum class OpenFlags : std::uint32_t {
@@ -836,8 +896,14 @@ public:
     Task<Result<DirectoryPage>> getChildren(std::string_view path,
                                             std::string_view cursor,
                                             std::size_t maxEntries);
+    Result<IoHandle> submitRead(const std::shared_ptr<File>&, IoVec,
+                                std::uint64_t offset, CompletionToken);
+    Result<IoHandle> submitWrite(const std::shared_ptr<File>&, IoVec,
+                                 std::uint64_t offset, CompletionToken);
     PollResult poll(std::span<CompletionEvent>, std::size_t min,
                     std::size_t max, std::chrono::microseconds timeout);
+    std::size_t outstanding() const noexcept;
+    std::size_t maxOutstanding() const noexcept;
 };
 
 class File {
@@ -914,11 +980,16 @@ RocksDB 8.9.1 没有 `IOStatus::TryAgain`；`ReadAsync` 对 `Busy` 的处置（�
 ### 14.2 Retry/cancel
 
 - only transient `TryAgain`/backend `-ENOMEM` retry；默认最多 3 次；
-- retry 不持 scheduler、DMA 或 metadata lock；
+- ring acceptance 前的 retry 不持 scheduler、DMA 或 metadata lock；
 - ring、frame、arena 满时立即 bounded busy；
+- ring publish 后的 arena 暂时不足停在 bounded Preparing FIFO，不持 scheduler node；所有
+  child bounce/RMW lease 必须 batch 全取或全不取；
+- backend `-ENOMEM` 使用同 channel `spdk_bdev_queue_io_wait`，此时 operation 保持已取得的
+  scheduler admission、lease 和引用；
 - submit 前 cancel 从 scheduler 删除 operation；
 - submit 后 cancel 只标记状态，等待 SPDK callback 完成，不能伪造 backend abort；
-- timeout 只结束 frontend 等待，不释放 callback 仍需要的 coroutine frame；
+- `Client::poll` timeout 只结束 frontend 等待；core operation timeout 进入 Draining，等待
+  已提交 child 返回后才发布 TimedOut，不释放 callback 仍需要的 frame/buffer；
 - coroutine cancellation 由 `std::stop_token` 传播到 awaiter，必须经过统一 state machine。
 
 ### 14.3 Teardown/fork/multiprocess
@@ -938,6 +1009,11 @@ reject new attach/submit
 活跃 client/operation 未 drain 时 `stop()` 返回 Busy，除非调用显式 drain API。SIGKILL
 不保证 clean flag，下次 mount 必须 recovery。第二进程打开任一已配置 bdev 或相同 volume
 返回 Busy；fork child 所有 core API 返回 ForkedProcess。
+
+Client 生命周期固定为 `Open→Closing→Closed`。Closing 后拒绝新 submit；outstanding、queued
+completion、IoHandle 或 open File 任一非零时 close 返回 Busy 但保持 Closing。operation
+使用 pool-backed intrusive completion-sink 引用，Client facade 保留最后一个 frontend 引用
+到 Closed，禁止在 reactor callback 上析构 Client/File 高层对象或提前销毁 completion ring。
 
 ## 15. 配置、ABI 和构建
 

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -104,6 +105,8 @@ public:
     /* Epoch state is published only after data flush and metadata transaction
      * work complete (Shard-78). */
     std::uint64_t logicalEpoch() const;
+    /* Lock-free invalidation key for immutable frontend snapshots. */
+    std::uint64_t logicalEpochFast() const noexcept;
     std::uint64_t durableEpoch() const;
     Result<void> publishDurableEpoch(std::uint64_t epoch);
     /* Stages durable sizes in the snapshot without publishing the epoch yet. */
@@ -163,6 +166,7 @@ private:
     std::vector<std::uint64_t> freeSlots_;
     std::uint64_t namespaceBytes_ = 0;
     std::uint64_t logicalEpoch_ = 0;
+    std::atomic<std::uint64_t> logicalEpochPublished_{0};
     std::uint64_t durableEpoch_ = 0;
     std::uint64_t snapshotTxid_ = 0;
     std::vector<std::uint64_t> preparedDurableSizes_;

@@ -2,12 +2,16 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
+#include <utility>
 
+#include "hfs/export.hpp"
 #include "hfs/types.hpp"
 
 namespace hfs {
 
 class Operation;
+class Client;
 
 /* Value token validated by the frontend slot table; never a raw pointer. */
 struct CompletionToken {
@@ -27,7 +31,7 @@ struct CompletionEvent {
 };
 
 /* Move-only frontend reference to one accepted internal operation. */
-class IoHandle {
+class HFS_API IoHandle {
 public:
     IoHandle() noexcept = default;
     IoHandle(IoHandle &&other) noexcept;
@@ -43,15 +47,27 @@ public:
 
 private:
     friend class Operation;
+    friend class Client;
 
     /* Adopts the frontend reference acquired by the internal operation. */
     IoHandle(Operation *operation, std::uint64_t requestId,
              CompletionToken token) noexcept
         : operation_(operation), requestId_(requestId), token_(token) {}
 
+    /* Keeps the completion sink alive and reports handle release to Client. */
+    void attachOwner(std::shared_ptr<void> owner, void *context,
+                     void (*release)(void *)) noexcept {
+        owner_ = std::move(owner);
+        ownerContext_ = context;
+        ownerRelease_ = release;
+    }
+
     Operation *operation_ = nullptr;
     std::uint64_t requestId_ = 0;
     CompletionToken token_{};
+    std::shared_ptr<void> owner_;
+    void *ownerContext_ = nullptr;
+    void (*ownerRelease_)(void *) = nullptr;
 };
 
 /* Result of a nonblocking or timed completion poll. */

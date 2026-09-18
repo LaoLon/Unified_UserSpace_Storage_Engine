@@ -221,10 +221,14 @@ IoHandle Operation::acquireFrontendHandle(CompletionToken token) noexcept {
 }
 
 IoHandle::IoHandle(IoHandle &&other) noexcept
-    : operation_(other.operation_), requestId_(other.requestId_), token_(other.token_) {
+    : operation_(other.operation_), requestId_(other.requestId_), token_(other.token_),
+      owner_(std::move(other.owner_)), ownerContext_(other.ownerContext_),
+      ownerRelease_(other.ownerRelease_) {
     other.operation_ = nullptr;
     other.requestId_ = 0;
     other.token_ = {};
+    other.ownerContext_ = nullptr;
+    other.ownerRelease_ = nullptr;
 }
 
 IoHandle &IoHandle::operator=(IoHandle &&other) noexcept {
@@ -235,9 +239,14 @@ IoHandle &IoHandle::operator=(IoHandle &&other) noexcept {
     operation_ = other.operation_;
     requestId_ = other.requestId_;
     token_ = other.token_;
+    owner_ = std::move(other.owner_);
+    ownerContext_ = other.ownerContext_;
+    ownerRelease_ = other.ownerRelease_;
     other.operation_ = nullptr;
     other.requestId_ = 0;
     other.token_ = {};
+    other.ownerContext_ = nullptr;
+    other.ownerRelease_ = nullptr;
     return *this;
 }
 
@@ -245,12 +254,20 @@ IoHandle::~IoHandle() { reset(); }
 
 void IoHandle::reset() noexcept {
     Operation *operation = operation_;
+    void *ownerContext = ownerContext_;
+    void (*ownerRelease)(void *) = ownerRelease_;
     operation_ = nullptr;
     requestId_ = 0;
     token_ = {};
+    ownerContext_ = nullptr;
+    ownerRelease_ = nullptr;
     if (operation != nullptr) {
         (void)operation->releaseRef(OperationRefRole::FrontendHandle);
     }
+    if (ownerRelease != nullptr) {
+        ownerRelease(ownerContext);
+    }
+    owner_.reset();
 }
 
 bool Operation::attachAsyncStorage(void *storage, std::size_t bytes,

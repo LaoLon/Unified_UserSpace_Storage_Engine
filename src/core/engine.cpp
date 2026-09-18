@@ -6,6 +6,8 @@
 #include <cstring>
 #include <fcntl.h>
 #include <fstream>
+#include <limits>
+#include <new>
 #include <sstream>
 #include <string>
 #include <sys/file.h>
@@ -14,10 +16,12 @@
 #include "common/log.hpp"
 #include "common/stats.hpp"
 #include "common/trace.hpp"
+#include "core/async_data_service.hpp"
 #include "core/data_plane.hpp"
 #include "core/dma_arena.hpp"
 #include "core/frame_pool.hpp"
 #include "core/operation.hpp"
+#include "core/spdk_async_backend.hpp"
 #include "metadata/namespace.hpp"
 #include "runtime/spdk_runtime.hpp"
 #include "hfs/journal.hpp"
@@ -131,6 +135,20 @@ std::uint64_t hugepagesRequired(const Config &config, std::uint64_t pageKb) {
     return (bytes + pageBytes - 1) / pageBytes;
 }
 
+struct AsyncDataPollerContext {
+    AsyncDataService *service = nullptr;
+    std::uint32_t shard = 0;
+};
+
+/* Runs only the owning shard actor from the data-reactor poll loop. */
+void pumpAsyncDataShard(void *context) noexcept {
+    auto *poller = static_cast<AsyncDataPollerContext *>(context);
+    if (poller == nullptr || poller->service == nullptr) {
+        return;
+    }
+    (void)poller->service->pump(poller->shard);
+}
+
 } // namespace
 
 struct Engine::Impl {
@@ -147,6 +165,11 @@ struct Engine::Impl {
     std::unique_ptr<Journal> journal;
     std::unique_ptr<DmaArena> dmaArena;
     std::unique_ptr<DataPlane> dataPlane;
+    std::vector<std::unique_ptr<SpdkAsyncDataBackend>> asyncBackends;
+    std::vector<AsyncDataBackend *> asyncBackendViews;
+    std::unique_ptr<AsyncDataService> asyncService;
+    std::vector<AsyncDataPollerContext> asyncPollers;
+    std::vector<std::uint8_t> asyncPollersRegistered;
     std::atomic<std::uint32_t> metadataUsers{0};
 };
 
@@ -373,6 +396,123 @@ Task<Result<void>> Engine::mount() {
     pathConfig.timeoutMs = static_cast<std::uint32_t>(impl.config.metadataWaitTimeoutMs);
     impl.dataPlane = std::make_unique<DataPlane>(runtime, *impl.dmaArena, plannerConfig,
                                                  pathConfig);
+
+    /* Build the bounded actor-local asynchronous data path after the shared
+     * arena and resident namespace are ready. */
+    const std::uint32_t shardCount = runtime.dataReactorCount();
+    if (shardCount == 0) {
+        impl.dataPlane.reset();
+        impl.dmaArena.reset();
+        impl.journal.reset();
+        impl.metadataTarget.reset();
+        impl.namespaceState.reset();
+        runtime.stop();
+        co_return makeError(Status::InvalidState,
+                            "SPDK runtime has no data reactors for async data service");
+    }
+
+    AsyncDataServiceConfig asyncConfig;
+    asyncConfig.shardCount = shardCount;
+    asyncConfig.ringDepth = std::max<std::size_t>(1, impl.config.ringDepth);
+    asyncConfig.maxOperations = std::max<std::size_t>(1, impl.config.operationPool);
+    const std::uint64_t configuredInodes = std::min<std::uint64_t>(
+        impl.config.maxInodes, static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()));
+    const std::uint64_t inodeShardCeiling = configuredInodes == 0
+                                                ? 0
+                                                : 1 + (configuredInodes - 1) /
+                                                          static_cast<std::uint64_t>(shardCount);
+    asyncConfig.maxInodesPerShard = std::max<std::size_t>(
+        1, static_cast<std::size_t>(std::min<std::uint64_t>(
+            inodeShardCeiling, static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()))));
+    asyncConfig.maxPreparingPerShard = asyncConfig.maxOperations;
+    asyncConfig.planner = plannerConfig;
+
+    /* Keep the backend credit bounded while allowing each shard to use its
+     * proportional share of the mount-level operation budget. */
+    const std::size_t maxInFlight = std::max<std::size_t>(
+        1, (asyncConfig.maxOperations + static_cast<std::size_t>(shardCount) - 1) /
+               static_cast<std::size_t>(shardCount));
+    impl.asyncBackends.clear();
+    impl.asyncBackendViews.clear();
+    impl.asyncPollers.clear();
+    impl.asyncPollersRegistered.clear();
+    impl.asyncBackends.reserve(shardCount);
+    impl.asyncBackendViews.reserve(shardCount);
+    impl.asyncPollers.resize(shardCount);
+    impl.asyncPollersRegistered.assign(shardCount, 0);
+
+    auto rollbackAsyncMount = [&]() {
+        /* Poller contexts must remain alive until every registration is gone. */
+        bool pollerClearFailed = false;
+        for (std::size_t index = impl.asyncPollersRegistered.size(); index > 0; --index) {
+            const std::size_t pollerIndex = index - 1;
+            if (impl.asyncPollersRegistered[pollerIndex] == 0) {
+                continue;
+            }
+            auto cleared = runtime.clearDataReactorPoller(
+                static_cast<std::uint32_t>(pollerIndex), &impl.asyncPollers[pollerIndex]);
+            if (!cleared.ok()) {
+                pollerClearFailed = true;
+            }
+            impl.asyncPollersRegistered[pollerIndex] = 0;
+        }
+        /* A failed detach is conservatively synchronized by stopping the
+         * runtime before releasing any callback-visible context. */
+        if (pollerClearFailed) {
+            (void)runtime.stop();
+        }
+        impl.asyncService.reset();
+        impl.asyncBackendViews.clear();
+        impl.asyncBackends.clear();
+        impl.asyncPollers.clear();
+        impl.asyncPollersRegistered.clear();
+        impl.dataPlane.reset();
+        impl.dmaArena.reset();
+        impl.journal.reset();
+        impl.metadataTarget.reset();
+        impl.namespaceState.reset();
+        if (!pollerClearFailed) {
+            (void)runtime.stop();
+        }
+    };
+
+    for (std::uint32_t index = 0; index < shardCount; ++index) {
+        auto backend = std::unique_ptr<SpdkAsyncDataBackend>(new (std::nothrow)
+            SpdkAsyncDataBackend(runtime, index, metaBlock, maxInFlight));
+        if (backend == nullptr || !backend->valid()) {
+            rollbackAsyncMount();
+            co_return makeError(backend == nullptr ? Status::NoMemory : Status::InvalidState,
+                                backend == nullptr ? "cannot allocate async data backend"
+                                                    : "cannot initialize async data backend");
+        }
+        impl.asyncBackendViews.push_back(backend.get());
+        impl.asyncBackends.push_back(std::move(backend));
+    }
+
+    impl.asyncService = std::unique_ptr<AsyncDataService>(
+        new (std::nothrow) AsyncDataService(asyncConfig, *impl.dmaArena,
+                                            std::span<AsyncDataBackend *>(
+                                                impl.asyncBackendViews.data(),
+                                                impl.asyncBackendViews.size())));
+    if (impl.asyncService == nullptr || !impl.asyncService->valid()) {
+        rollbackAsyncMount();
+        co_return makeError(Status::NoMemory,
+                            "cannot initialize async data service");
+    }
+
+    for (std::uint32_t index = 0; index < shardCount; ++index) {
+        impl.asyncPollers[index] = AsyncDataPollerContext{impl.asyncService.get(), index};
+        auto registered = runtime.setDataReactorPoller(index, &pumpAsyncDataShard,
+                                                       &impl.asyncPollers[index]);
+        if (!registered.ok()) {
+            rollbackAsyncMount();
+            co_return makeError(registered.status(),
+                                "cannot register async data reactor poller: " +
+                                    registered.message());
+        }
+        impl.asyncPollersRegistered[index] = 1;
+    }
+
     impl.formatted = true;
     impl.uuid = volume.value().uuid;
     impl.mounted = true;
@@ -389,8 +529,10 @@ Task<Result<void>> Engine::drain() {
     if (!processValid()) {
         co_return Result<void>(Status::ForkedProcess, "engine belongs to another process");
     }
-    /* Phase 0 has no in-flight operations; Shard-73+ drains rings and
-     * coroutine frames here. */
+    if (impl_->asyncService != nullptr && impl_->asyncService->outstanding() != 0) {
+        co_return makeError(Status::Busy,
+                            "async data operations are still outstanding");
+    }
     co_return Result<void>(Status::Ok);
 }
 
@@ -408,14 +550,59 @@ Task<Result<void>> Engine::stop() {
         co_return Result<void>(Status::Busy, "clients or open files are still active");
     }
     if (impl.mounted) {
+        if (impl.asyncService != nullptr && impl.asyncService->outstanding() != 0) {
+            co_return makeError(Status::Busy,
+                                "async data operations are still outstanding");
+        }
         /* No active clients remain here, so publish a clean lifecycle state
          * before releasing the runtime that owns the control path. */
         auto markedClean = updateCleanShutdown(SpdkRuntime::instance(), impl.config, true);
         if (!markedClean.ok()) {
             co_return markedClean;
         }
+
+        /* Pollers must be detached before their service and backend contexts
+         * are destroyed; a failed detach leaves the mount intact for retry. */
+        auto &runtime = SpdkRuntime::instance();
+        for (std::size_t index = impl.asyncPollersRegistered.size(); index > 0; --index) {
+            const std::size_t pollerIndex = index - 1;
+            if (impl.asyncPollersRegistered[pollerIndex] == 0) {
+                continue;
+            }
+            auto cleared = runtime.clearDataReactorPoller(
+                static_cast<std::uint32_t>(pollerIndex), &impl.asyncPollers[pollerIndex]);
+            if (!cleared.ok()) {
+                co_return makeError(cleared.status(),
+                                    "cannot clear async data reactor poller: " +
+                                        cleared.message());
+            }
+            impl.asyncPollersRegistered[pollerIndex] = 0;
+        }
+        if (impl.asyncService != nullptr) {
+            const auto asyncStats = impl.asyncService->stats();
+            log::info(
+                "async closure: accepted=%llu terminal=%llu published=%llu "
+                "scheduler_wait=%llu child_submit=%llu child_complete=%llu "
+                "plan_fail=%llu dma_fail=%llu preparing=%llu",
+                static_cast<unsigned long long>(asyncStats.accepted),
+                static_cast<unsigned long long>(asyncStats.terminal),
+                static_cast<unsigned long long>(asyncStats.completionPublished),
+                static_cast<unsigned long long>(asyncStats.schedulerWaits),
+                static_cast<unsigned long long>(asyncStats.childSubmits),
+                static_cast<unsigned long long>(asyncStats.childCompletes),
+                static_cast<unsigned long long>(asyncStats.planFailures),
+                static_cast<unsigned long long>(asyncStats.dmaFailures),
+                static_cast<unsigned long long>(asyncStats.preparing));
+        }
+        impl.asyncService.reset();
+        impl.asyncBackendViews.clear();
+        impl.asyncBackends.clear();
+        impl.asyncPollers.clear();
+        impl.asyncPollersRegistered.clear();
         impl.journal.reset();
         impl.metadataTarget.reset();
+        impl.dataPlane.reset();
+        impl.dmaArena.reset();
         auto stopped = SpdkRuntime::instance().stop();
         if (!stopped.ok()) {
             co_return stopped;
@@ -546,6 +733,10 @@ metadata::Namespace *Engine::metadataNamespace() const noexcept {
 }
 
 DataPlane *Engine::dataPlane() const noexcept { return impl_->dataPlane.get(); }
+
+AsyncDataService *Engine::asyncDataService() const noexcept {
+    return impl_ == nullptr ? nullptr : impl_->asyncService.get();
+}
 
 void Engine::retainMetadataUser() noexcept {
     impl_->metadataUsers.fetch_add(1, std::memory_order_acq_rel);
