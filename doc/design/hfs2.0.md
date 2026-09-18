@@ -769,6 +769,7 @@ hfs_config=/path/hfs2.conf
 hfs_direct=1
 hfs_preallocate=1
 hfs_client_depth=32
+hfs_file_per_job=0
 ```
 
 engine 直接调用 C++ `Engine/Client/File`，不通过 POSIX open/read/write。`open_file`
@@ -799,6 +800,10 @@ engine 直接调用 C++ `Engine/Client/File`，不通过 POSIX open/read/write�
   `event()` 返回 `io_u` 后才释放 pending slot；
 - 同一 shared file 的 open/preallocate 使用 process-level single-flight：一个 owner 执行
   allocate，全部 waiter 复用同一校验结果；
+- `hfs_file_per_job=0` 保持正式 shared-file 口径；设置为 `1` 时，FIO adapter 为每个
+  worker 在原始路径后追加稳定的 `.job-<thread_number>` 后缀，使每个 worker 获得独立
+  HFS file 和 file-owned shard。该选项只用于多 file 拓扑归因/对照，不改变默认 shared
+  file gate，也不把同一 file 的请求跨 shard 迁移；
 - `FIO_NOEXTEND`、`fio --verify`、direct/bounce、iodepth 必须在测试中覆盖；
 - cleanup 告警超时不得提前释放 FIO memory；engine close 前必须继续 drain 全部 callback、
   token、IoHandle、io_u、coroutine frame、File 和 Client。

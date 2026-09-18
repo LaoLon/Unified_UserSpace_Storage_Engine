@@ -41,6 +41,7 @@ struct FioHfsOptions {
     unsigned int preallocate = 1;
     unsigned int clientDepth = 32;
     unsigned int async = 1;
+    unsigned int filePerJob = 0;
 };
 
 enum class PendingState : std::uint8_t {
@@ -476,7 +477,7 @@ void releaseProcessUser() {
 }
 
 /* Keep engine options statically initialized like fio's external skeleton. */
-static struct fio_option options[6] = {
+static struct fio_option options[7] = {
     {
         .name = "hfs_config",
         .lname = "HFS .conf path",
@@ -524,6 +525,16 @@ static struct fio_option options[6] = {
         .off1 = offsetof(FioHfsOptions, async),
         .help = "Use HFS QUEUED/getevents/event completion",
         .def = "1",
+        .category = FIO_OPT_C_ENGINE,
+        .group = FIO_OPT_G_INVALID,
+    },
+    {
+        .name = "hfs_file_per_job",
+        .lname = "HFS file per job",
+        .type = FIO_OPT_BOOL,
+        .off1 = offsetof(FioHfsOptions, filePerJob),
+        .help = "Use a unique HFS file for each fio worker",
+        .def = "0",
         .category = FIO_OPT_C_ENGINE,
         .group = FIO_OPT_G_INVALID,
     },
@@ -831,7 +842,13 @@ int fioHfsOpen(struct thread_data *td, struct fio_file *fioFile) {
     if (state == nullptr || state->client == nullptr) {
         return EINVAL;
     }
-    auto opened = state->client->open(fioPath(fioFile->file_name), hfs::OpenFlags::Create).wait();
+    auto *options = static_cast<FioHfsOptions *>(td->eo);
+    std::string path = fioPath(fioFile->file_name);
+    if (options != nullptr && options->filePerJob != 0) {
+        /* Preserve shared-file behavior by default; opt in to per-worker files. */
+        path += ".job-" + std::to_string(td->thread_number);
+    }
+    auto opened = state->client->open(path, hfs::OpenFlags::Create).wait();
     if (!opened.ok()) {
         return fioError(opened.status());
     }
@@ -850,7 +867,6 @@ int fioHfsOpen(struct thread_data *td, struct fio_file *fioFile) {
         delete file;
         return fioError(stat.status());
     }
-    auto *options = static_cast<FioHfsOptions *>(td->eo);
     const std::uint64_t requestedSize = static_cast<std::uint64_t>(td->o.size);
     if ((options == nullptr || options->preallocate != 0) && requestedSize != 0) {
         std::uint64_t generation = 0;
