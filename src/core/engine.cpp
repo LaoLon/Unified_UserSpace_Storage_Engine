@@ -517,8 +517,12 @@ Task<Result<void>> Engine::mount() {
     impl.uuid = volume.value().uuid;
     impl.mounted = true;
     stats::setEnabled(impl.config.stats);
-    trace::setEnabled(impl.config.trace);
     trace::setSample(impl.config.traceSample);
+    trace::stop();
+    if (impl.config.trace && !trace::start(impl.config.traceDir.c_str())) {
+        log::info("trace session unavailable; tracing disabled");
+    }
+    trace::setEnabled(impl.config.trace && trace::sessionActive());
     log::info("engine mounted: generation=%llu clean=%d",
               static_cast<unsigned long long>(volume.value().generation),
               volume.value().cleanShutdown ? 1 : 0);
@@ -619,6 +623,7 @@ Task<Result<void>> Engine::stop() {
     }
     impl.stopped = true;
     trace::setEnabled(false);
+    trace::stop();
     stats::setEnabled(false);
     log::info("engine stopped");
     co_return Result<void>(Status::Ok);

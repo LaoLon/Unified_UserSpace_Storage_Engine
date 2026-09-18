@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "common/log.hpp"
+#include "common/trace.hpp"
 #include "core/async_completion_queue.hpp"
 #include "core/async_data_service.hpp"
 #include "core/data_plane.hpp"
@@ -517,6 +518,7 @@ Result<IoHandle> Client::submitRead(const std::shared_ptr<File> &file, IoVec buf
     state.handleCount.fetch_add(1, std::memory_order_acq_rel);
     handle.attachOwner(std::static_pointer_cast<void>(impl_->state), impl_->state.get(),
                        &releaseClientHandle);
+    trace::event(trace::EventId::FeSubmit, handle.requestId(), offset, buffer.size, 0);
     return Result<IoHandle>(std::move(handle));
 }
 
@@ -549,6 +551,7 @@ Result<IoHandle> Client::submitWrite(const std::shared_ptr<File> &file, IoVec bu
     state.handleCount.fetch_add(1, std::memory_order_acq_rel);
     handle.attachOwner(std::static_pointer_cast<void>(impl_->state), impl_->state.get(),
                        &releaseClientHandle);
+    trace::event(trace::EventId::FeSubmit, handle.requestId(), offset, buffer.size, 1);
     return Result<IoHandle>(std::move(handle));
 }
 
@@ -569,10 +572,17 @@ PollResult Client::poll(std::span<CompletionEvent> events, std::size_t min,
         return result;
     }
     result = state.completionQueue.poll(events, min, max, timeout);
+    trace::event(trace::EventId::PollReturn, result.count,
+                 static_cast<std::uint64_t>(timeout.count()),
+                 static_cast<std::uint64_t>(min), static_cast<std::uint64_t>(max));
     if (result.status != Status::Ok) {
         return result;
     }
     for (std::size_t index = 0; index < result.count; ++index) {
+        trace::event(trace::EventId::FeReap, events[index].requestId,
+                     static_cast<std::uint64_t>(events[index].status),
+                     events[index].completedBytes,
+                     static_cast<std::uint64_t>(events[index].backendErrno));
         if (!state.reapEvent(events[index])) {
             result.status = Status::Corrupt;
         }

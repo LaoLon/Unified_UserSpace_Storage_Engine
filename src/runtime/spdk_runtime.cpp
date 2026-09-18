@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "common/log.hpp"
+#include "common/trace.hpp"
 
 #ifdef HFS_WITH_SPDK
 #include <spdk/bdev.h>
@@ -898,6 +899,9 @@ struct SpdkRuntime::Impl {
         const DataIoCompletion cb = state->cb;
         void *const cbCtx = state->cbCtx;
         const int rc = state->completionRc;
+        trace::event(trace::EventId::BdevComplete,
+                     static_cast<std::uint64_t>(rc < 0 ? -static_cast<std::int64_t>(rc) : rc),
+                     state->bytes, state->write ? 1 : 0, state->offsetBlocks);
         request->stateTag = 0;
         state->~DataIoState();
         /* The caller supplied callback is already on the owning reactor; it
@@ -958,6 +962,8 @@ struct SpdkRuntime::Impl {
         state->iov.iov_base = state->buffer;
         state->iov.iov_len = state->bytes;
         for (unsigned attempt = 0; attempt <= kImmediateRetryLimit; ++attempt) {
+            trace::event(trace::EventId::BdevSubmit, state->offsetBlocks, state->blocks,
+                         state->write ? 1 : 0, attempt);
             const int rc = state->write
                                ? spdk_bdev_writev_blocks(state->desc, state->channel, &state->iov,
                                                          1,
@@ -971,6 +977,10 @@ struct SpdkRuntime::Impl {
                 return;
             }
             if (rc != -ENOMEM) {
+                trace::event(trace::EventId::BackendErr,
+                             static_cast<std::uint64_t>(
+                                 rc < 0 ? -static_cast<std::int64_t>(rc) : rc),
+                             state->write ? 1 : 0, state->offsetBlocks);
                 enqueueDataIoCompletion(state, rc);
                 return;
             }

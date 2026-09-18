@@ -184,6 +184,13 @@ add_executable(hfs_lock_probe tools/hfs_lock_probe.cpp)
 target_link_libraries(hfs_lock_probe PRIVATE hfs_core)
 target_compile_options(hfs_lock_probe PRIVATE -fno-exceptions -fno-rtti)
 
+add_executable(hfs_trace_dump tools/hfs_trace_dump.cpp)
+target_include_directories(hfs_trace_dump PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_compile_options(hfs_trace_dump PRIVATE -fno-exceptions -fno-rtti)
+
 enable_testing()
 set(HFS_TESTS config_parser_test task_test crc_test geometry_test journal_test)
 if(HFS_WITH_SPDK)
@@ -278,6 +285,8 @@ add_test(NAME io_planner_test COMMAND io_planner_test)
 # Async completion value queue and intrusive handle lifecycle test.
 add_executable(async_completion_queue_test
   tests/async_completion_queue_test.cpp
+  src/common/stats.cpp
+  src/common/trace.cpp
   src/core/async.cpp
   src/core/async_completion_queue.cpp
   src/core/operation.cpp
@@ -290,6 +299,21 @@ target_include_directories(async_completion_queue_test PRIVATE
 target_compile_options(async_completion_queue_test PRIVATE -fno-exceptions -fno-rtti)
 target_link_libraries(async_completion_queue_test PRIVATE Threads::Threads)
 add_test(NAME async_completion_queue_test COMMAND async_completion_queue_test)
+
+# File-backed trace ring and writer lifecycle test.
+add_executable(trace_test
+  tests/trace_test.cpp
+  src/common/stats.cpp
+  src/common/trace.cpp
+)
+target_include_directories(trace_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests
+)
+target_compile_options(trace_test PRIVATE -fno-exceptions -fno-rtti)
+target_link_libraries(trace_test PRIVATE Threads::Threads)
+add_test(NAME trace_test COMMAND trace_test)
 
 # Actor/scheduler async data-service test with a fake backend.
 add_executable(async_data_service_test

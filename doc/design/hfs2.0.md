@@ -1443,6 +1443,12 @@ checkpoint region 必须容纳 namespace/inode/extent map/各 device allocator b
   completion、FIO topology、shard affinity 和 reactor 热路径执行计划见
   `doc/review/hfs2_shard86_92_async_performance_plan_20260918.md`；该计划不放宽本节
   §16 的正式门禁。
+  2026-09-18：Shard-86 已落地请求级 trace 基础：固定 48B record、每 producer 独立
+  SPSC ring、后台 writer、`trace-manifest.json`（含 wall-clock 校准、recorded/drop/closed）
+  和 `hfs_trace_dump` 离线统计工具；现行 Client、completion notifier/queue、actor-local
+  bdev 路径已补齐 submit/complete/reap/notify/wait/spin 观测。真实 NVMe 32 worker
+  trace-on 短跑 `queued=reaped`、`outstanding=0`、`token_mismatch=0`、`dropped=0`；
+  trace 默认关闭，Shard-81 正式性能 gate 仍按 trace/stats off 执行。
   2026-09-18：RocksDB `ReadAsync` 已实现 `IOOptions::timeout` 的前端等待语义；超时
   返回 `TimedOut` 后，后台 I/O 继续排空，句柄析构时才回收 worker 和 buffer，且不会
   在 callback 后写回 request result。DataPath 的 `-ETIMEDOUT`、`-ECANCELED`、

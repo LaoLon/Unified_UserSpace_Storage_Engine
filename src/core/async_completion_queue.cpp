@@ -13,6 +13,8 @@
 #include <unistd.h>
 #endif
 
+#include "common/trace.hpp"
+
 namespace hfs {
 
 namespace {
@@ -60,28 +62,34 @@ void CompletionNotifier::closeEventFd() noexcept {
 
 bool CompletionNotifier::notify() noexcept {
     epoch_.fetch_add(1, std::memory_order_release);
-    notifications_.fetch_add(1, std::memory_order_relaxed);
+    const std::uint64_t notification =
+        notifications_.fetch_add(1, std::memory_order_relaxed) + 1;
 #if defined(__linux__)
     if (eventFd_ >= 0) {
         const std::uint64_t increment = 1;
         const ssize_t written = ::write(eventFd_, &increment, sizeof(increment));
         if (written == static_cast<ssize_t>(sizeof(increment))) {
+            trace::event(trace::EventId::NotifyWrite, notification, 1);
             return true;
         }
         if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
             /* A saturated eventfd already represents a pending wake. */
             saturated_.fetch_add(1, std::memory_order_relaxed);
+            trace::event(trace::EventId::NotifyWrite, notification, 2);
             return true;
         }
         if (written < 0 && errno == EINTR) {
             /* The ring remains authoritative; a later transition will retry. */
             errors_.fetch_add(1, std::memory_order_relaxed);
+            trace::event(trace::EventId::NotifyWrite, notification, 3);
             return false;
         }
         errors_.fetch_add(1, std::memory_order_relaxed);
+        trace::event(trace::EventId::NotifyWrite, notification, 4);
         return false;
     }
 #endif
+    trace::event(trace::EventId::NotifyWrite, notification, 0);
     return true;
 }
 
@@ -96,11 +104,14 @@ bool CompletionNotifier::waitSince(std::uint64_t observed,
     }
 #if defined(__linux__)
     if (eventFd_ >= 0) {
+        trace::event(trace::EventId::NotifyWait, observed,
+                     static_cast<std::uint64_t>(timeout.count()), 1);
         pollfd descriptor{};
         descriptor.fd = eventFd_;
         descriptor.events = POLLIN;
         const int result = ::poll(&descriptor, 1, timeoutMilliseconds(timeout));
         if (result <= 0) {
+            trace::event(trace::EventId::NotifyRead, static_cast<std::uint64_t>(result), 0);
             return false;
         }
         if ((descriptor.revents & (POLLIN | POLLERR | POLLHUP)) != 0) {
@@ -109,8 +120,12 @@ bool CompletionNotifier::waitSince(std::uint64_t observed,
             if (readCount < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
                 errors_.fetch_add(1, std::memory_order_relaxed);
             }
+            trace::event(trace::EventId::NotifyRead,
+                         readCount > 0 ? value : 0,
+                         readCount > 0 ? 1 : 2);
             return true;
         }
+        trace::event(trace::EventId::NotifyRead, 0, 3);
         return false;
     }
 #endif
@@ -119,10 +134,12 @@ bool CompletionNotifier::waitSince(std::uint64_t observed,
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     for (;;) {
         if (epoch_.load(std::memory_order_acquire) != observed) {
+            trace::event(trace::EventId::NotifyRead, 0, 4);
             return true;
         }
         const auto now = std::chrono::steady_clock::now();
         if (now >= deadline) {
+            trace::event(trace::EventId::NotifyRead, 0, 0);
             return false;
         }
         const auto remaining = deadline - now;
@@ -360,6 +377,11 @@ bool AsyncCompletionQueue::push(std::size_t shard, const CompletionEvent &event)
     if (result.accepted && result.notify) {
         notifier_.notify();
     }
+    if (result.accepted) {
+        trace::event(trace::EventId::CqPush, event.requestId,
+                     static_cast<std::uint64_t>(shard), event.completedBytes,
+                     static_cast<std::uint64_t>(event.status));
+    }
     return result.accepted;
 }
 
@@ -376,6 +398,9 @@ std::size_t AsyncCompletionQueue::drainAvailable(std::span<CompletionEvent> outp
         count += rings_[shard].drain(output.subspan(count, remaining));
     }
     cursor_ = (cursor_ + 1) % shardCount_;
+    if (count != 0) {
+        trace::event(trace::EventId::CqReap, count, limit, cursor_);
+    }
     return count;
 }
 
@@ -425,13 +450,16 @@ PollResult AsyncCompletionQueue::poll(std::span<CompletionEvent> output, std::si
          * the request. This avoids one eventfd write/read pair per shallow-QD
          * completion without changing the blocking timeout contract. */
         constexpr unsigned kActivePollSpins = 1024;
-        for (unsigned spin = 0; spin < kActivePollSpins; ++spin) {
+        unsigned spin = 0;
+        for (; spin < kActivePollSpins; ++spin) {
             result.count += drainAvailable(output.subspan(result.count, limit - result.count),
                                            limit - result.count);
             if (result.count >= min || result.count == limit) {
                 return result;
             }
         }
+        trace::event(trace::EventId::PollSpin, spin, result.count,
+                     static_cast<std::uint64_t>(min));
     }
     for (;;) {
         result.count += drainAvailable(output.subspan(result.count, limit - result.count),

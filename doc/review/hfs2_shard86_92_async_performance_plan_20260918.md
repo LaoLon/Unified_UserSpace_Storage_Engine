@@ -1,7 +1,7 @@
 # HFS 2.0 Shard-86~92 异步 FIO 性能与 trace 执行计划
 
 日期：2026-09-18
-状态：计划稿；Shard-81 功能生命周期已闭合，但正式性能 gate 未通过
+状态：Shard-86 已实现并验证；Shard-87~92 尚未完成；Shard-81 正式性能 gate 未通过
 事实源：
 
 - `doc/design/hfs2.0.md`：架构、公共 API、性能门禁和 tracepoint 规范的唯一事实源；
@@ -59,26 +59,19 @@ closure 中 `scheduler_wait` 仅约 97~126 次/约 60 万次 IO，`plan_fail`、
 `preparing` 为 0，`child_submit == child_complete`。因此当前第一嫌疑是 frontend
 completion wait 和跨 reactor handoff，不是 scheduler、DMA 或 NVMe 错误。
 
-### 1.3 当前 trace 的实现缺口
+### 1.3 Shard-86 前的 trace 缺口与当前落地状态
 
-`src/common/trace.cpp` 当前只做以下工作：
+Shard-86 前的 `src/common/trace.cpp` 只做计数：`event()` 丢弃 `a0-a3`，使用全局
+原子计数，不记录 TSC、source、request id 或 status，也不创建 trace 文件；当前 async
+路径的 `FE_SUBMIT/FE_REAP`、`AsyncCompletionQueue` 和 actor-local bdev 也没有完整
+producer。该历史缺口是本计划启动的原因。
 
-- `event()` 丢弃 `a0-a3`；
-- 用全局 `g_sequence` 和 `g_recorded` 做原子计数；
-- 不记录 TSC、shard、线程、request id、status 或队列深度；
-- 不写 per-reactor ring，也不创建 `trace-<shard>.bin`；
-- `traceDropped` 没有真实递增路径。
-
-另外，当前 async 热路径没有完整 producer：
-
-- `FE_SUBMIT/FE_REAP` 没有真实调用点；
-- `CQ_PUSH/CQ_REAP` 只在旧 `CompletionQueue` 中出现，当前 `AsyncCompletionQueue` 未覆盖；
-- `BDEV_SUBMIT/BDEV_COMPLETE` 仍主要覆盖旧同步 `DataPath`，未覆盖
-  `SpdkRuntime::trySubmitDataIo()` 的 actor-local backend；
-- `BackendErr/Retry/BusyReject/TraceDrop` 没有完整 producer。
-
-所以当前不能直接计算 `FE_SUBMIT → ... → CQ_REAP` 的分段 p50/p99；Shard-86 是后续
-性能修改的前置 shard。
+Shard-86 已补齐最小可用链路：固定 48B record、每 producer 一个 SPSC ring、独立后台
+writer、`trace-manifest.json`、sample/drop 统计，并在 Client、AsyncCompletionQueue、
+CompletionNotifier 和 `SpdkRuntime` 的现行 async 路径补埋点。`tools/hfs_trace_dump`
+可离线统计各 `trace-*.bin` 的文件数、record 数和 event 计数；不在线格式化，也不参与
+I/O 控制流。仍未覆盖的 `Retry/BusyReject/Checkpoint/Recovery` producer 留给后续故障
+与生命周期 shard，不把不存在的事件伪装成已完成。
 
 ---
 
@@ -115,7 +108,7 @@ P0 最终 raw/HFS gate 与回归归档
 
 | shard | 目标 | 主要目录/文件边界 | 依赖 | 交付判定 |
 |---|---|---|---|---|
-| 86 | 可用的请求级 trace | `src/common/trace.*`、`tools/trace`、trace tests | 无 | 可输出完整链路记录，trace off 无热路径分配 |
+| 86 | 可用的请求级 trace | `src/common/trace.*`、现行 async callsites、`tools/hfs_trace_dump`、trace tests | 无 | 可输出完整链路记录，trace off 无热路径分配 |
 | 87 | completion notifier batching | `src/core/async_completion_queue.*`、queue tests | 86 的事件定义可先并行设计，集成依赖 86 | 降低 wake/poll 频率且 lifecycle 矩阵全过 |
 | 88 | FIO 多 worker / aggregate completion | `fio/`、FIO 专用 tests | 86、87 | 32 jobs 有效 outstanding 保持 32，完成通知可批量化 |
 | 89 | file shard / reactor 利用率 | `src/core/async_data_service.*`、`src/core/scheduler.*` | 86、88 的 trace 结果 | 不破坏 inode ordering，确认或修复单 shard 热点 |
@@ -141,10 +134,13 @@ Shard-86~91 不得单独宣布 Shard-81 完成；只有 Shard-92 的正式 gate 
 
 - `src/common/trace.hpp`
 - `src/common/trace.cpp`
+- 现行 async 观测插点：`src/core/client.cpp`、`src/core/async_completion_queue.cpp`、
+  `src/core/engine.cpp`、`src/runtime/spdk_runtime.cpp`；
 - 新增 `tools/hfs_trace_dump.*` 或等价离线解析工具；
 - 新增 trace 专用测试。
 
-`CMakeLists.txt` 由主线程在集成阶段统一修改；本 shard 不直接改共享构建清单。
+`CMakeLists.txt` 由主线程串行集成；本 shard 的构建改动只增加 trace 工具/测试目标，
+不改变既有 target 的源文件边界。
 
 #### 记录格式
 
@@ -168,11 +164,11 @@ request_id, arg0, arg1, arg2, arg3
 
 #### 验收
 
-- trace on 短跑生成每个 active reactor/client 的 `trace-*.bin`；
+- trace on 短跑生成 active producer 的 `trace-*.bin`，manifest 在 stop 后标记 closed；
 - trace record 的 request id 能闭合 submit/complete/reap；
 - 人为制造 backend error、busy、timeout 时能看到对应事件；
 - trace ring 满时只增加 `traceDropped`，不阻塞 I/O；
-- trace off 跑结构测试时 recorded/drop 均为 0，代码路径不分配；
+- trace off 跑结构测试时不创建 session、不落盘，代码路径不分配；
 - trace off 短测相对当前基线不得出现超过 2% 的稳定回退；
 - 真实 NVMe 4K randread 短跑 errors=0、queued=reaped、outstanding=0。
 
@@ -479,6 +475,19 @@ observability:  trace off / trace sample=1 / trace sample=N / trace drop
 ---
 
 ## 6. 预期结果
+
+### 6.1 Shard-86 完成记录
+
+- VM `cmake --build build-async` 成功，`ctest` 22/22 通过；新增 `trace_test` 和
+  `hfs_trace_dump` target 均通过编译。
+- 真实 NVMe `Nvme0n1`、32 jobs、iodepth=1、trace sample=1 短跑：
+  `queued=169943`、`reaped=169943`、`outstanding=0`、`token_mismatch=0`、
+  `completed_error=0`、`peak=32`。
+- trace manifest：`recorded=2876086`、`dropped=0`、`closed=true`；离线工具统计的
+  binary record 数与 manifest recorded 一致，覆盖 FE/CQ/ring/actor/scheduler/DMA/
+  bdev/parent/notify/poll 事件。
+- trace off 的既有 32-worker real-NVMe smoke 仍保持 `queued=reaped`、
+  `outstanding=0`、`errors=0`；正式性能 gate 尚未重跑，不能据此关闭 Shard-81 性能阻塞。
 
 本计划的第一目标不是立即把 IOPS 拉到 85%，而是把当前“约 61% 且不知道时间花在哪”
 变成可重复的分段证据。预期顺序为：
