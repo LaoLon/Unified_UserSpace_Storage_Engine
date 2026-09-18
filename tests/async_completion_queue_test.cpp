@@ -24,6 +24,25 @@ hfs::CompletionEvent makeEvent(std::uint64_t requestId, std::uint32_t shard) {
     return event;
 }
 
+struct ExternalWaitContext {
+    hfs::CompletionNotifier notifier;
+    std::atomic<std::uint32_t> prepares{0};
+};
+
+void prepareExternalWait(void *opaque) noexcept {
+    auto *context = static_cast<ExternalWaitContext *>(opaque);
+    context->prepares.fetch_add(1, std::memory_order_relaxed);
+}
+
+std::uint64_t externalEpoch(void *opaque) noexcept {
+    return static_cast<ExternalWaitContext *>(opaque)->notifier.epoch();
+}
+
+bool externalWaitSince(void *opaque, std::uint64_t observed,
+                       std::chrono::microseconds timeout) noexcept {
+    return static_cast<ExternalWaitContext *>(opaque)->notifier.waitSince(observed, timeout);
+}
+
 } // namespace
 
 int main() {
@@ -231,6 +250,30 @@ int main() {
         HFS_TEST_CHECK(ring.push(makeEvent(2001, 0)));
         HFS_TEST_CHECK(ring.rearmIfNonEmpty());
         HFS_TEST_CHECK(ring.drain(output) == 1);
+    }
+
+    /* 9. An external wake source uses the same core spin/rescan/deadline path. */
+    {
+        hfs::AsyncCompletionQueue queue;
+        HFS_TEST_CHECK(queue.initialize(1, 4, false));
+        ExternalWaitContext context;
+        HFS_TEST_CHECK(context.notifier.initialize(false));
+        const hfs::CompletionWaitStrategy strategy{
+            &prepareExternalWait, &externalEpoch, &externalWaitSince, &context};
+        std::vector<hfs::CompletionEvent> output(1);
+        std::atomic<bool> producerFailed{false};
+        std::thread producer([&queue, &context, &producerFailed] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            if (!queue.push(0, makeEvent(3000, 0)) || !context.notifier.notify()) {
+                producerFailed.store(true, std::memory_order_release);
+            }
+        });
+        const auto result = queue.poll(output, 1, 1, std::chrono::milliseconds(250), &strategy);
+        producer.join();
+        HFS_TEST_CHECK(!producerFailed.load(std::memory_order_acquire));
+        HFS_TEST_CHECK(result.status == hfs::Status::Ok && result.count == 1);
+        HFS_TEST_CHECK(output[0].requestId == 3000);
+        HFS_TEST_CHECK(context.prepares.load(std::memory_order_relaxed) != 0);
     }
 
     hfs::CompletionNotifier notifier;

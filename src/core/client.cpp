@@ -757,7 +757,8 @@ PollResult Client::poll(std::span<CompletionEvent> events, std::size_t min,
         result.status = Status::InvalidState;
         return result;
     }
-    result = state.completionQueue.poll(events, min, max, timeout);
+    result = state.completionQueue.poll(events, min, max, timeout,
+                                        &state.options.completionWait);
     trace::event(trace::EventId::PollReturn, result.count,
                  static_cast<std::uint64_t>(timeout.count()),
                  static_cast<std::uint64_t>(min), static_cast<std::uint64_t>(max));

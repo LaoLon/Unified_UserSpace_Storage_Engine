@@ -159,7 +159,8 @@ public:
 
     /* Drains available completions and waits only when min is not met. */
     PollResult poll(std::span<CompletionEvent> output, std::size_t min,
-                    std::size_t max, std::chrono::microseconds timeout) noexcept;
+                    std::size_t max, std::chrono::microseconds timeout,
+                    const CompletionWaitStrategy *waitStrategy = nullptr) noexcept;
 
     AsyncCompletionRing::Diagnostics shardDiagnostics(std::size_t shard) const noexcept;
     Diagnostics diagnostics() const noexcept;

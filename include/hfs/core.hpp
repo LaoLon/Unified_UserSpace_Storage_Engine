@@ -44,6 +44,7 @@ struct ClientOptions {
     std::uint32_t maxOutstanding = 32; /* bounded accepted async requests */
     CompletionWakeCallback completionWake = nullptr;
     void *completionWakeContext = nullptr;
+    CompletionWaitStrategy completionWait{};
 };
 
 /* Options for the destructive volume format. */

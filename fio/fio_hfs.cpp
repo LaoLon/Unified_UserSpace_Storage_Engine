@@ -597,6 +597,13 @@ int fioHfsInit(struct thread_data *td) {
     if (useCompletionHub) {
         clientOptions.completionWake = &hfs::fio::FioCompletionHub::wakeCallback;
         clientOptions.completionWakeContext = completionEndpoint;
+        clientOptions.completionWait.prepare =
+            &hfs::fio::FioCompletionHub::Endpoint::prepareWaitCallback;
+        clientOptions.completionWait.epoch =
+            &hfs::fio::FioCompletionHub::Endpoint::epochCallback;
+        clientOptions.completionWait.waitSince =
+            &hfs::fio::FioCompletionHub::Endpoint::waitSinceCallback;
+        clientOptions.completionWait.context = completionEndpoint;
     }
     auto client = hfs::Client::create(*engine, clientOptions);
     if (!client.ok()) {
@@ -752,72 +759,13 @@ void releaseAllReports(FioHfsThread &state) noexcept {
     }
 }
 
-/* Polls one worker's Client without crossing frontend ownership, then waits
- * on that worker's private completion endpoint when its minimum is not met. */
+/* Uses the Client-owned drain, spin, rescan, and wait sequence. The FIO
+ * endpoint is injected through ClientOptions instead of duplicating polling. */
 hfs::PollResult pollClient(FioHfsThread &state,
                            std::span<hfs::CompletionEvent> output,
                            std::size_t min, std::size_t max,
                            std::chrono::microseconds timeout) {
-    auto *endpoint = state.completionEndpoint;
-    if (endpoint == nullptr || min == 0 || timeout.count() <= 0) {
-        return state.client->poll(output, min, max,
-                                  endpoint != nullptr
-                                      ? std::chrono::microseconds(0)
-                                      : timeout);
-    }
-
-    hfs::PollResult result;
-    const std::size_t limit = std::min(max, output.size());
-    if (min > limit || limit == 0) {
-        return state.client->poll(output, min, max, std::chrono::microseconds(0));
-    }
-    const auto deadline = std::chrono::steady_clock::now() + timeout;
-    std::size_t total = 0;
-    for (;;) {
-        auto one = state.client->poll(output.subspan(total, limit - total), 0,
-                                      limit - total, std::chrono::microseconds(0));
-        if (one.status != hfs::Status::Ok) {
-            result.status = one.status;
-            result.count = total + one.count;
-            return result;
-        }
-        total += one.count;
-        if (total >= min || total == limit) {
-            result.count = total;
-            return result;
-        }
-
-        const auto now = std::chrono::steady_clock::now();
-        if (now >= deadline) {
-            result.count = total;
-            return result;
-        }
-        const std::uint32_t observed = endpoint->epoch();
-        endpoint->prepareWait();
-
-        /* Final scan closes the publication-to-wait race. */
-        one = state.client->poll(output.subspan(total, limit - total), 0,
-                                 limit - total, std::chrono::microseconds(0));
-        if (one.status != hfs::Status::Ok) {
-            result.status = one.status;
-            result.count = total + one.count;
-            return result;
-        }
-        total += one.count;
-        if (total >= min || total == limit) {
-            result.count = total;
-            return result;
-        }
-
-        const auto waitNow = std::chrono::steady_clock::now();
-        const auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(
-            deadline - waitNow);
-        if (remaining.count() <= 0) {
-            result.count = total;
-            return result;
-        }
-        (void)endpoint->waitSince(observed, remaining);
-    }
+    return state.client->poll(output, min, max, timeout);
 }
 
 /* Drain accepted operations before releasing Client, File, or fio memory. */

@@ -26,9 +26,14 @@ public:
         bool waitSince(std::uint32_t observed,
                        std::chrono::microseconds timeout) noexcept;
 
+        static void prepareWaitCallback(void *context) noexcept;
+        static std::uint64_t epochCallback(void *context) noexcept;
+        static bool waitSinceCallback(void *context, std::uint64_t observed,
+                                      std::chrono::microseconds timeout) noexcept;
+
     private:
         friend class FioCompletionHub;
-        std::atomic<std::uint32_t> epoch_{0};
+        alignas(4) std::uint32_t epoch_ = 0;
         std::atomic<std::uint32_t> waiters_{0};
         std::atomic<bool> armed_{false};
         std::atomic<bool> inUse_{false};

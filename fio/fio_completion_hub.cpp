@@ -15,13 +15,13 @@
 namespace hfs::fio {
 
 void FioCompletionHub::Endpoint::reset() noexcept {
-    epoch_.store(0, std::memory_order_relaxed);
+    std::atomic_ref<std::uint32_t>(epoch_).store(0, std::memory_order_relaxed);
     waiters_.store(0, std::memory_order_relaxed);
     armed_.store(false, std::memory_order_relaxed);
 }
 
 void FioCompletionHub::Endpoint::notify() noexcept {
-    epoch_.fetch_add(1, std::memory_order_release);
+    std::atomic_ref<std::uint32_t>(epoch_).fetch_add(1, std::memory_order_release);
 #if defined(__linux__)
     if (waiters_.load(std::memory_order_acquire) == 0) {
         return;
@@ -29,7 +29,7 @@ void FioCompletionHub::Endpoint::notify() noexcept {
     bool expected = false;
     if (armed_.compare_exchange_strong(expected, true, std::memory_order_acq_rel,
                                        std::memory_order_relaxed)) {
-        (void)::syscall(SYS_futex, reinterpret_cast<std::uint32_t *>(&epoch_),
+        (void)::syscall(SYS_futex, &epoch_,
                         FUTEX_WAKE_PRIVATE, 1, nullptr, nullptr, 0);
     }
 #endif
@@ -40,7 +40,7 @@ void FioCompletionHub::Endpoint::prepareWait() noexcept {
 }
 
 std::uint32_t FioCompletionHub::Endpoint::epoch() const noexcept {
-    return epoch_.load(std::memory_order_acquire);
+    return std::atomic_ref<const std::uint32_t>(epoch_).load(std::memory_order_acquire);
 }
 
 bool FioCompletionHub::Endpoint::waitSince(
@@ -58,7 +58,7 @@ bool FioCompletionHub::Endpoint::waitSince(
         return true;
     }
     const int result = static_cast<int>(::syscall(
-        SYS_futex, reinterpret_cast<std::uint32_t *>(&epoch_), FUTEX_WAIT_PRIVATE,
+        SYS_futex, &epoch_, FUTEX_WAIT_PRIVATE,
         observed, &duration, nullptr, 0));
     const int error = errno;
     waiters_.fetch_sub(1, std::memory_order_acq_rel);
@@ -81,6 +81,25 @@ bool FioCompletionHub::Endpoint::waitSince(
 #endif
 }
 
+void FioCompletionHub::Endpoint::prepareWaitCallback(void *context) noexcept {
+    if (context != nullptr) {
+        static_cast<Endpoint *>(context)->prepareWait();
+    }
+}
+
+std::uint64_t FioCompletionHub::Endpoint::epochCallback(void *context) noexcept {
+    return context == nullptr ? 0 : static_cast<Endpoint *>(context)->epoch();
+}
+
+bool FioCompletionHub::Endpoint::waitSinceCallback(
+    void *context, std::uint64_t observed, std::chrono::microseconds timeout) noexcept {
+    if (context == nullptr) {
+        return false;
+    }
+    return static_cast<Endpoint *>(context)->waitSince(
+        static_cast<std::uint32_t>(observed), timeout);
+}
+
 bool FioCompletionHub::initialize() noexcept {
     for (Endpoint &endpoint : endpoints_) {
         endpoint.reset();
@@ -93,6 +112,7 @@ bool FioCompletionHub::initialize() noexcept {
 void FioCompletionHub::shutdown() noexcept {
     active_.store(false, std::memory_order_release);
     for (Endpoint &endpoint : endpoints_) {
+        endpoint.notify();
         endpoint.prepareWait();
         endpoint.inUse_.store(false, std::memory_order_release);
     }

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -28,6 +29,24 @@ struct CompletionEvent {
     Status status = Status::Ok;
     int backendErrno = 0;
     std::uint64_t completedBytes = 0;
+};
+
+/* Optional external wait strategy used by frontends that own their wake
+ * primitive. The core still owns draining and timeout accounting. */
+using CompletionWaitPrepareCallback = void (*)(void *context) noexcept;
+using CompletionWaitEpochCallback = std::uint64_t (*)(void *context) noexcept;
+using CompletionWaitSinceCallback = bool (*)(void *context, std::uint64_t observed,
+                                             std::chrono::microseconds timeout) noexcept;
+
+struct CompletionWaitStrategy {
+    CompletionWaitPrepareCallback prepare = nullptr;
+    CompletionWaitEpochCallback epoch = nullptr;
+    CompletionWaitSinceCallback waitSince = nullptr;
+    void *context = nullptr;
+
+    bool valid() const noexcept {
+        return prepare != nullptr && epoch != nullptr && waitSince != nullptr;
+    }
 };
 
 /* Move-only frontend reference to one accepted internal operation. */

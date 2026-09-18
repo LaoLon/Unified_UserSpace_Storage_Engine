@@ -792,6 +792,9 @@ engine 直接调用 C++ `Engine/Client/File`，不通过 POSIX open/read/write�
   在 publish 前失败才能返回 `FIO_Q_BUSY`。publish 后 planner/DMA/backend/metadata 错误必须
   产生唯一异步 terminal event，不能伪装成可重试 queue Busy；
 - `getevents(min,max,timeout)` 调用 `client.poll`，满足 FIO min/max 语义；
+- `ClientOptions` 可注入 frontend-owned completion wait strategy；core 仍统一负责
+  adaptive spin、ring rearm/rescan、deadline 和 completion drain，外部策略只提供
+  prepare/epoch/waitSince，不能绕过 Client poll 生命周期；
 - `getevents()` 用 slot、generation 和 request id 校验 token 并写回 `io_u->error/resid`；
   `event()` 返回 `io_u` 后才释放 pending slot；
 - 同一 shared file 的 open/preallocate 使用 process-level single-flight：一个 owner 执行

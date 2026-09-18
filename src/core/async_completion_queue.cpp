@@ -444,7 +444,8 @@ bool AsyncCompletionQueue::rearmAndRescan(std::span<CompletionEvent> output,
 
 PollResult AsyncCompletionQueue::poll(std::span<CompletionEvent> output, std::size_t min,
                                       std::size_t max,
-                                      std::chrono::microseconds timeout) noexcept {
+                                      std::chrono::microseconds timeout,
+                                      const CompletionWaitStrategy *waitStrategy) noexcept {
     PollResult result;
     if (!valid()) {
         result.status = Status::InvalidState;
@@ -466,6 +467,8 @@ PollResult AsyncCompletionQueue::poll(std::span<CompletionEvent> output, std::si
 
     const auto boundedTimeout = timeout.count() > 0 ? timeout : std::chrono::microseconds(0);
     const auto deadline = std::chrono::steady_clock::now() + boundedTimeout;
+    const CompletionWaitStrategy *externalWait =
+        waitStrategy != nullptr && waitStrategy->valid() ? waitStrategy : nullptr;
     if (min != 0 && boundedTimeout >= std::chrono::microseconds(50)) {
         /* Keep the previous wake arm while the reactor is likely to complete
          * the request. This avoids one eventfd write/read pair per shallow-QD
@@ -473,6 +476,9 @@ PollResult AsyncCompletionQueue::poll(std::span<CompletionEvent> output, std::si
         const std::uint32_t spinBudget = activePollSpins_;
         std::uint32_t spin = 0;
         for (; spin < spinBudget; ++spin) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                break;
+            }
             result.count += drainAvailable(output.subspan(result.count, limit - result.count),
                                            limit - result.count);
             if (result.count >= min || result.count == limit) {
@@ -500,7 +506,12 @@ PollResult AsyncCompletionQueue::poll(std::span<CompletionEvent> output, std::si
         }
 
         /* Clear wake arms, rescan, and only then sleep to close the race with push. */
-        const std::uint64_t observedEpoch = notifier_.epoch();
+        const std::uint64_t observedEpoch = externalWait != nullptr
+                                                ? externalWait->epoch(externalWait->context)
+                                                : notifier_.epoch();
+        if (externalWait != nullptr) {
+            externalWait->prepare(externalWait->context);
+        }
         for (std::size_t index = 0; index < shardCount_; ++index) {
             rings_[index].prepareWait();
         }
@@ -519,7 +530,11 @@ PollResult AsyncCompletionQueue::poll(std::span<CompletionEvent> output, std::si
         if (remaining.count() <= 0) {
             return result;
         }
-        notifier_.waitSince(observedEpoch, remaining);
+        if (externalWait != nullptr) {
+            (void)externalWait->waitSince(externalWait->context, observedEpoch, remaining);
+        } else {
+            (void)notifier_.waitSince(observedEpoch, remaining);
+        }
     }
 }
 
