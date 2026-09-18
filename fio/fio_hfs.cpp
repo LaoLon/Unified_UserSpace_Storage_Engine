@@ -30,6 +30,7 @@
 #include "hfs/core.hpp"
 #include "hfs/file.hpp"
 #include "fio_completion_hub.hpp"
+#include "fio_status_errno.hpp"
 #include "preallocation_single_flight.hpp"
 
 namespace {
@@ -137,31 +138,7 @@ int fioHfsConfigOption(void *, const char *value) {
 }
 
 int fioError(hfs::Status status) {
-    switch (status) {
-    case hfs::Status::Busy:
-    case hfs::Status::TryAgain:
-        return EAGAIN;
-    case hfs::Status::NoMemory:
-        return ENOMEM;
-    case hfs::Status::NoSpace:
-        return ENOSPC;
-    case hfs::Status::NotFound:
-        return ENOENT;
-    case hfs::Status::AlreadyExists:
-        return EEXIST;
-    case hfs::Status::InvalidArgument:
-        return EINVAL;
-    case hfs::Status::NotSupported:
-        return ENOTSUP;
-    case hfs::Status::Cancelled:
-        return ECANCELED;
-    case hfs::Status::TimedOut:
-        return ETIMEDOUT;
-    case hfs::Status::IoError:
-        return EIO;
-    default:
-        return EIO;
-    }
+    return hfs::fio::mapStatusToErrno(status);
 }
 
 /* Keep diagnostics inside the module so C++ name mangling cannot affect fio symbols. */
@@ -325,7 +302,9 @@ std::chrono::microseconds fioTimeout(const struct timespec *timeout) noexcept {
         std::chrono::microseconds::max().count());
     if (seconds > maximum / kMicrosPerSecond ||
         seconds * kMicrosPerSecond > maximum - nanos / 1000U) {
-        return std::chrono::microseconds::max();
+        /* Clamp to a deadline-safe bound: poll() adds this to a steady_clock
+         * point, and microseconds::max() would overflow the nanosecond sum. */
+        return std::chrono::hours(24);
     }
     return std::chrono::microseconds(
         static_cast<std::int64_t>(seconds * kMicrosPerSecond + nanos / 1000U));
@@ -422,6 +401,11 @@ hfs::fio::PreallocationResult preallocationOwner(
     if (stat.value().logicalSize < end) {
         return hfs::fio::PreallocationResult::makeFailure(EIO);
     }
+    /* Coverage must be real committed extents, not just a logical size. */
+    auto coverage = context->file->allocatedBytes();
+    if (!coverage.ok() || coverage.value() < end) {
+        return hfs::fio::PreallocationResult::makeFailure(EIO);
+    }
     return hfs::fio::PreallocationResult::makeSuccess(
         stat.value().logicalSize, key.offset, key.length, true);
 }
@@ -440,8 +424,29 @@ void releaseProcessUser() {
         fioLog("fio-hfs: DMA reservations remain at process shutdown\n");
     }
     if (processEngine != nullptr) {
-        processEngine->stop().wait();
-        processEngine.reset();
+        /* Sibling cleanup threads may still hold metadata leases, and a
+         * failed stop means the runtime is alive: never free it here. */
+        bool stopped = false;
+        std::string lastError;
+        for (int attempt = 0; attempt < 200; ++attempt) {
+            auto result = processEngine->stop().wait();
+            if (result.ok() && result.value().ok()) {
+                stopped = true;
+                break;
+            }
+            lastError = result.ok() ? result.value().message() : result.message();
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        if (stopped) {
+            if (!lastError.empty()) {
+                std::fprintf(stderr, "fio-hfs: engine stop retried after: %s\n",
+                             lastError.c_str());
+            }
+            processEngine.reset();
+        } else {
+            std::fprintf(stderr, "fio-hfs: engine stop failed (%s); retaining engine\n",
+                         lastError.c_str());
+        }
     }
     processCompletionHub.shutdown();
     processCompletionHubActive = false;
@@ -544,6 +549,13 @@ static struct fio_option options[7] = {
 };
 
 int fioHfsInit(struct thread_data *td) {
+    /* Forked jobs cannot share one Engine (exclusive process lock); fail with
+     * a concrete message instead of a per-child engine create error. */
+    if (td->o.use_thread == 0 && td->o.numjobs > 1) {
+        fioLog("fio-hfs: numjobs>1 requires thread=1 (forked jobs cannot share "
+               "one HFS engine)\n");
+        return 1;
+    }
     auto *options = static_cast<FioHfsOptions *>(td->eo);
     const char *configPath = options == nullptr ? nullptr : options->config;
     std::string callbackConfig;
@@ -786,6 +798,9 @@ void drainAsync(FioHfsThread &state) noexcept {
     }
     state.closing = true;
     const auto drainStart = std::chrono::steady_clock::now();
+    /* Bounded drain: a protocol error or a wedged device must fail the run
+     * instead of spinning forever in cleanup. */
+    const auto drainDeadline = drainStart + std::chrono::seconds(30);
     bool warned = false;
     for (;;) {
         releaseAllReports(state);
@@ -799,17 +814,25 @@ void drainAsync(FioHfsThread &state) noexcept {
             state.submitted == 0 ? 0 : 1, state.slotCount,
             std::chrono::milliseconds(100));
         if (result.status != hfs::Status::Ok && result.status != hfs::Status::TimedOut) {
-            fioLog("fio-hfs: Client poll failed while draining\n");
+            fioLog("fio-hfs: Client poll failed while draining; aborting drain\n");
+            return;
         }
         const std::size_t count = result.count > state.slotCount ? state.slotCount : result.count;
         for (std::size_t index = 0; index < count; ++index) {
-            (void)consumeCompletion(state, state.polled[index], true);
+            if (!consumeCompletion(state, state.polled[index], true)) {
+                fioLog("fio-hfs: completion protocol error while draining; aborting drain\n");
+                return;
+            }
         }
         if (count == 0) {
             std::this_thread::yield();
         }
-        if (!warned && std::chrono::steady_clock::now() - drainStart >=
-                             std::chrono::seconds(5)) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= drainDeadline) {
+            fioLog("fio-hfs: async cleanup drain deadline exceeded; failing cleanup\n");
+            return;
+        }
+        if (!warned && now - drainStart >= std::chrono::seconds(5)) {
             fioLog("fio-hfs: async cleanup is still draining; retaining all resources\n");
             warned = true;
         }
@@ -837,35 +860,45 @@ void fioHfsCleanup(struct thread_data *td) {
     td->io_ops_data = nullptr;
 }
 
-int fioHfsOpen(struct thread_data *td, struct fio_file *fioFile) {
-    auto *state = static_cast<FioHfsThread *>(td->io_ops_data);
-    if (state == nullptr || state->client == nullptr) {
-        return EINVAL;
-    }
-    auto *options = static_cast<FioHfsOptions *>(td->eo);
+/* One path helper so get_file_size and open_file agree on per-job names. */
+std::string fioHfsFilePath(struct thread_data *td, struct fio_file *fioFile) {
     std::string path = fioPath(fioFile->file_name);
+    auto *options = static_cast<FioHfsOptions *>(td->eo);
     if (options != nullptr && options->filePerJob != 0) {
         /* Preserve shared-file behavior by default; opt in to per-worker files. */
         path += ".job-" + std::to_string(td->thread_number);
     }
-    auto opened = state->client->open(path, hfs::OpenFlags::Create).wait();
+    return path;
+}
+
+int fioHfsOpen(struct thread_data *td, struct fio_file *fioFile) {
+    auto *state = static_cast<FioHfsThread *>(td->io_ops_data);
+    if (state == nullptr || state->client == nullptr) {
+        errno = EINVAL;
+        return EINVAL;
+    }
+    auto *options = static_cast<FioHfsOptions *>(td->eo);
+    auto opened =
+        state->client->open(fioHfsFilePath(td, fioFile), hfs::OpenFlags::Create).wait();
     if (!opened.ok()) {
-        return fioError(opened.status());
+        /* fio reads errno, not the return value, when reporting open errors. */
+        return hfs::fio::setErrnoFromStatus(opened.status());
     }
     auto *file = new (std::nothrow) FioHfsFile;
     if (file == nullptr) {
+        errno = ENOMEM;
         return ENOMEM;
     }
     auto openedResult = std::move(opened).value();
     if (!openedResult.ok()) {
         delete file;
-        return fioError(openedResult.status());
+        return hfs::fio::setErrnoFromStatus(openedResult.status());
     }
     file->file = std::move(openedResult).value();
     auto stat = file->file->stat();
     if (!stat.ok()) {
         delete file;
-        return fioError(stat.status());
+        return hfs::fio::setErrnoFromStatus(stat.status());
     }
     const std::uint64_t requestedSize = static_cast<std::uint64_t>(td->o.size);
     if ((options == nullptr || options->preallocate != 0) && requestedSize != 0) {
@@ -883,7 +916,9 @@ int fioHfsOpen(struct thread_data *td, struct fio_file *fioFile) {
         if (!allocation.ok()) {
             processPreallocationFailures.fetch_add(1, std::memory_order_relaxed);
             delete file;
-            return allocation.backendErrno == 0 ? EIO : allocation.backendErrno;
+            const int error = allocation.backendErrno == 0 ? EIO : allocation.backendErrno;
+            errno = error;
+            return error;
         }
         stat.value().logicalSize = allocation.logicalSize;
     }
@@ -903,25 +938,90 @@ int fioHfsClose(struct thread_data *, struct fio_file *fioFile) {
 /* HFS owns cache coherency; fio has no host file descriptor to invalidate. */
 int fioHfsInvalidate(struct thread_data *, struct fio_file *) { return 0; }
 
-/* Fio needs a logical extent before it schedules the first request. */
+/* Fio calls this before open_file, so report the real logical size when the
+ * file already exists; otherwise expose the requested size (0 stays 0 so fio
+ * reports the missing size instead of receiving a fabricated layout).
+ * Note: with create_serialize=1 (fio default) the main process calls this
+ * before the engine is initialized and only the explicit size is available;
+ * size-less workloads need create_serialize=0 so the per-thread setup can
+ * stat the existing file. */
 int fioHfsGetFileSize(struct thread_data *td, struct fio_file *fioFile) {
-    const std::uint64_t size = static_cast<std::uint64_t>(td->o.size);
-    fioFile->real_file_size = size == 0 ? 4096 : size;
+    const std::uint64_t requestedSize = static_cast<std::uint64_t>(td->o.size);
+    auto *state = static_cast<FioHfsThread *>(td->io_ops_data);
+    if (state != nullptr && state->client != nullptr && fioFile->file_name != nullptr) {
+        auto opened =
+            state->client->open(fioHfsFilePath(td, fioFile), hfs::OpenFlags::None).wait();
+        if (opened.ok()) {
+            auto openedResult = std::move(opened).value();
+            if (openedResult.ok()) {
+                auto file = std::move(openedResult).value();
+                auto stat = file->stat();
+                if (stat.ok()) {
+                    fioFile->real_file_size = stat.value().logicalSize;
+                    return 0;
+                }
+                fioLog("fio-hfs: get_file_size stat failed\n");
+            } else {
+                fioLog("fio-hfs: get_file_size open result failed\n");
+            }
+        } else {
+            fioLog("fio-hfs: get_file_size open failed\n");
+        }
+    } else {
+        fioLog("fio-hfs: get_file_size has no client state\n");
+    }
+    fioFile->real_file_size = requestedSize;
     return 0;
 }
 
+/* Maps fio's DDIR_SYNC onto the HFS namespace durability barrier. */
+void executeSyncIo(io_u *io, const std::shared_ptr<hfs::File> &file) {
+    auto synced = file->sync().wait();
+    if (!synced.ok() || !synced.value().ok()) {
+        setIoFailure(io, synced.ok() ? fioError(synced.value().status()) : EIO);
+        return;
+    }
+    io->error = 0;
+    io->resid = 0;
+}
+
+/* Releases a synchronous bounce lease on every return path. */
+struct DmaBufferGuard {
+    std::shared_ptr<hfs::Engine> engine;
+    void *pointer = nullptr;
+    std::size_t size = 0;
+
+    ~DmaBufferGuard() {
+        if (engine != nullptr && pointer != nullptr) {
+            engine->releaseDmaBuffer(pointer, size);
+        }
+    }
+};
+
 /* Executes one FIO request without crossing the caller's queue callback. */
-void executeFioIo(io_u *io, const std::shared_ptr<hfs::File> &file, bool direct) {
-    std::unique_ptr<std::byte[]> bounce;
+void executeFioIo(io_u *io, const std::shared_ptr<hfs::File> &file, bool direct,
+                  const std::shared_ptr<hfs::Engine> &engine) {
+    if (io->ddir == DDIR_SYNC) {
+        executeSyncIo(io, file);
+        return;
+    }
+    DmaBufferGuard bounceGuard;
     std::byte *data = static_cast<std::byte *>(io->xfer_buf);
     if (!direct) {
-        /* The synchronous fallback keeps a bounded per-request bounce buffer. */
-        bounce.reset(new (std::nothrow) std::byte[io->xfer_buflen]);
-        if (bounce == nullptr) {
-            setIoFailure(io, ENOMEM);
+        /* The synchronous fallback uses the bounded engine DMA arena too. */
+        if (engine == nullptr) {
+            setIoFailure(io, EIO);
             return;
         }
-        data = bounce.get();
+        auto acquired = engine->acquireDmaBuffer(io->xfer_buflen, 0);
+        if (!acquired.ok()) {
+            setIoFailure(io, fioError(acquired.status()));
+            return;
+        }
+        bounceGuard.engine = engine;
+        bounceGuard.pointer = acquired.value().data();
+        bounceGuard.size = acquired.value().size();
+        data = acquired.value().data();
         if (io->ddir == DDIR_WRITE) {
             std::memcpy(data, io->xfer_buf, io->xfer_buflen);
         }
@@ -966,8 +1066,12 @@ enum fio_q_status fioHfsQueue(struct thread_data *td, struct io_u *io) {
         io->error = EINVAL;
         return FIO_Q_COMPLETED;
     }
+    if (io->ddir == DDIR_SYNC) {
+        executeSyncIo(io, file->file);
+        return FIO_Q_COMPLETED;
+    }
     if (!state->async) {
-        executeFioIo(io, file->file, state->direct);
+        executeFioIo(io, file->file, state->direct, state->engine);
         return FIO_Q_COMPLETED;
     }
     if (state->closing || state->protocolError || state->client == nullptr) {

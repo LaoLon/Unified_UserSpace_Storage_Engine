@@ -1,5 +1,6 @@
 #include <array>
 #include <cerrno>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -39,9 +40,10 @@ struct RecordingSink final : hfs::AsyncDataSink {
         }
     }
 
-    void publish(std::uint32_t shard, const hfs::CompletionEvent &event) noexcept override {
+    bool publish(std::uint32_t shard, const hfs::CompletionEvent &event) noexcept override {
         (void)shard;
         events.push_back(event);
+        return true;
     }
 
     void reap(std::size_t count) {
@@ -57,6 +59,42 @@ struct RecordingSink final : hfs::AsyncDataSink {
 private:
     std::size_t limit_ = 0;
     std::size_t credits_ = 0;
+};
+
+/* Owned sink used to prove the service keeps it alive until publish. */
+struct OwnedSink final : hfs::AsyncDataSink {
+    explicit OwnedSink(std::shared_ptr<std::size_t> counter) : published(std::move(counter)) {}
+
+    bool tryAcquireCredit() noexcept override {
+        if (credits_ >= 4) {
+            return false;
+        }
+        ++credits_;
+        return true;
+    }
+
+    void releaseCredit() noexcept override {
+        if (credits_ != 0) {
+            --credits_;
+        }
+    }
+
+    bool publish(std::uint32_t, const hfs::CompletionEvent &) noexcept override {
+        ++*published;
+        return true;
+    }
+
+    std::shared_ptr<std::size_t> published;
+    std::size_t credits_ = 0;
+};
+
+/* Sink that refuses delivery to exercise the dropped-completion accounting. */
+struct RejectingSink final : hfs::AsyncDataSink {
+    bool tryAcquireCredit() noexcept override { return true; }
+    void releaseCredit() noexcept override {}
+    bool publish(std::uint32_t, const hfs::CompletionEvent &) noexcept override {
+        return false;
+    }
 };
 
 struct FailingExtentMap final : hfs::ExtentMap {
@@ -185,10 +223,18 @@ hfs::AsyncDataRequest makeRequest(const hfs::ExtentMap &map, std::vector<std::by
     return request;
 }
 
-bool submitOne(Fixture &fixture, RecordingSink &sink, const hfs::AsyncDataRequest &request,
+/* Stack sinks outlive every request in this test, so a no-op owner satisfies
+ * the core ownership contract without transferring lifetime. */
+template <typename Sink>
+std::shared_ptr<void> borrowedOwner(Sink &sink) {
+    return std::shared_ptr<void>(static_cast<void *>(&sink), [](void *) {});
+}
+
+template <typename Sink>
+bool submitOne(Fixture &fixture, Sink &sink, const hfs::AsyncDataRequest &request,
                std::uint32_t generation, std::vector<hfs::IoHandle> &handles) {
     auto result = fixture.service.submit(
-        request, hfs::CompletionToken{generation, generation}, sink);
+        request, hfs::CompletionToken{generation, generation}, sink, borrowedOwner(sink));
     if (!result.ok()) {
         return false;
     }
@@ -280,7 +326,8 @@ int main() {
         HFS_TEST_CHECK(submitOne(fixture, sink, makeRequest(map, secondBuffer, 13, 4096), 2,
                                  handles));
         auto rejected = fixture.service.submit(
-            makeRequest(map, rejectedBuffer, 13, 8192), hfs::CompletionToken{3, 3}, sink);
+            makeRequest(map, rejectedBuffer, 13, 8192), hfs::CompletionToken{3, 3}, sink,
+            borrowedOwner(sink));
         HFS_TEST_CHECK(!rejected.ok() && rejected.status() == hfs::Status::Busy);
         HFS_TEST_CHECK(sink.credits() == 2);
         fixture.service.pump(0);
@@ -334,6 +381,20 @@ int main() {
         reap(sink, handles);
     }
 
+    /* Accepted requests require an owner that keeps the sink alive. */
+    {
+        Fixture fixture;
+        RecordingSink sink(1);
+        hfs::SyntheticExtentMap map;
+        map.add(0, 1U << 20, 0);
+        std::vector<std::byte> buffer(4096);
+        auto result = fixture.service.submit(
+            makeRequest(map, buffer, 17, 0), hfs::CompletionToken{1, 1}, sink, nullptr);
+        HFS_TEST_CHECK(!result.ok() && result.status() == hfs::Status::InvalidArgument);
+        HFS_TEST_CHECK(sink.credits() == 0);
+        HFS_TEST_CHECK(fixture.service.outstanding() == 0);
+    }
+
     /* Snapshot failure rolls back credit, operation, sidecar, and publication. */
     {
         Fixture fixture;
@@ -342,7 +403,8 @@ int main() {
         std::vector<std::byte> buffer(4096);
         const std::size_t liveBefore = hfs::Operation::liveCount();
         auto result = fixture.service.submit(
-            makeRequest(map, buffer, 18, 0), hfs::CompletionToken{1, 1}, sink);
+            makeRequest(map, buffer, 18, 0), hfs::CompletionToken{1, 1}, sink,
+            borrowedOwner(sink));
         HFS_TEST_CHECK(!result.ok() && result.status() == hfs::Status::NoMemory);
         HFS_TEST_CHECK(sink.credits() == 0);
         HFS_TEST_CHECK(sink.events.empty());
@@ -477,7 +539,120 @@ int main() {
         fixture.service.pump(0);
         HFS_TEST_CHECK(sink.events.size() == 1);
         HFS_TEST_CHECK(sink.events[0].completedBytes == buffer.size());
+        /* One RMW child performs two backend phases but counts as one child. */
+        const auto stats = fixture.service.stats();
+        HFS_TEST_CHECK(stats.childSubmits == 1);
+        HFS_TEST_CHECK(stats.childCompletes == 1);
+        HFS_TEST_CHECK(stats.childSubmitRejected == 0);
         reap(sink, handles);
+    }
+
+    /* The service keeps the sink alive until the terminal completion publish. */
+    {
+        Fixture fixture;
+        auto published = std::make_shared<std::size_t>(0);
+        auto sink = std::make_shared<OwnedSink>(published);
+        std::weak_ptr<OwnedSink> weak = sink;
+        hfs::SyntheticExtentMap map;
+        map.add(0, 1U << 20, 0);
+        std::vector<std::byte> buffer(4096);
+        auto submitted = fixture.service.submit(
+            makeRequest(map, buffer, 31, 0), hfs::CompletionToken{1, 1}, *sink, sink);
+        HFS_TEST_CHECK(submitted.ok());
+        hfs::IoHandle handle = std::move(submitted).value();
+        /* Drop the frontend reference while the request is still in flight. */
+        sink.reset();
+        HFS_TEST_CHECK(!weak.expired());
+        fixture.service.pump(0);
+        HFS_TEST_CHECK(fixture.backend.pending.size() == 1);
+        HFS_TEST_CHECK(fixture.backend.completeFirst());
+        fixture.service.pump(0);
+        HFS_TEST_CHECK(*published == 1);
+        handle.reset();
+        HFS_TEST_CHECK(weak.expired());
+    }
+
+    /* A sink that refuses delivery is accounted as dropped, never published. */
+    {
+        Fixture fixture;
+        RejectingSink sink;
+        hfs::SyntheticExtentMap map;
+        map.add(0, 1U << 20, 0);
+        std::vector<std::byte> buffer(4096);
+        std::vector<hfs::IoHandle> handles;
+        HFS_TEST_CHECK(submitOne(fixture, sink, makeRequest(map, buffer, 33, 0), 1, handles));
+        fixture.service.pump(0);
+        HFS_TEST_CHECK(fixture.backend.completeFirst());
+        fixture.service.pump(0);
+        const auto stats = fixture.service.stats();
+        HFS_TEST_CHECK(stats.completionPublished == 0);
+        HFS_TEST_CHECK(stats.completionDropped == 1);
+        HFS_TEST_CHECK(stats.accepted == 1);
+        HFS_TEST_CHECK(stats.terminal == 1);
+        handles.clear();
+    }
+
+    /* WaitingForCredit is accepted and completes through the normal callback. */
+    {
+        Fixture fixture;
+        fixture.backend.waitingForCredit = true;
+        RecordingSink sink(2);
+        hfs::SyntheticExtentMap map;
+        map.add(0, 1U << 20, 0);
+        std::vector<std::byte> buffer(4096);
+        std::vector<hfs::IoHandle> handles;
+        HFS_TEST_CHECK(submitOne(fixture, sink, makeRequest(map, buffer, 35, 0), 1, handles));
+        fixture.service.pump(0);
+        HFS_TEST_CHECK(fixture.backend.pending.size() == 1);
+        HFS_TEST_CHECK(sink.events.empty());
+        HFS_TEST_CHECK(fixture.backend.completeFirst());
+        fixture.service.pump(0);
+        HFS_TEST_CHECK(sink.events.size() == 1);
+        HFS_TEST_CHECK(fixture.service.stats().childSubmitRejected == 0);
+        reap(sink, handles);
+    }
+
+    /* Hole (zero) children never consume bounce leases from a tiny arena. */
+    {
+        Fixture fixture(4096); /* arena smaller than the read */
+        RecordingSink sink(2);
+        hfs::SyntheticExtentMap map;
+        map.add(1U << 20, 1U << 20, 0); /* extent starts after the read range */
+        std::vector<std::byte> buffer(1U << 20, std::byte{0xAB});
+        std::vector<hfs::IoHandle> handles;
+        HFS_TEST_CHECK(submitOne(fixture, sink, makeRequest(map, buffer, 37, 0), 1, handles));
+        fixture.service.pump(0);
+        HFS_TEST_CHECK(fixture.backend.pending.empty());
+        HFS_TEST_CHECK(sink.events.size() == 1);
+        HFS_TEST_CHECK(sink.events[0].status == hfs::Status::Ok);
+        for (const std::byte byte : buffer) {
+            HFS_TEST_CHECK(byte == std::byte{0});
+        }
+        reap(sink, handles);
+    }
+
+    /* Inode slot lookup stays O(1): a linear scan of max_inodes/shard cost
+     * milliseconds per request once the file's slot had been reclaimed. */
+    {
+        Fixture fixture(1U << 20, false, false, 8, 262144);
+        RecordingSink sink(2);
+        hfs::SyntheticExtentMap map;
+        map.add(0, 1U << 20, 0);
+        std::vector<std::byte> buffer(4096);
+        const auto started = std::chrono::steady_clock::now();
+        for (std::uint64_t index = 0; index < 2000; ++index) {
+            std::vector<hfs::IoHandle> handles;
+            HFS_TEST_CHECK(submitOne(
+                fixture, sink, makeRequest(map, buffer, 100000 + index, 0), 1, handles));
+            fixture.service.pump(0);
+            HFS_TEST_CHECK(fixture.backend.pending.size() == 1);
+            HFS_TEST_CHECK(fixture.backend.completeFirst());
+            fixture.service.pump(0);
+            HFS_TEST_CHECK(sink.events.size() == 1);
+            reap(sink, handles);
+        }
+        const auto elapsed = std::chrono::steady_clock::now() - started;
+        HFS_TEST_CHECK(elapsed < std::chrono::seconds(2));
     }
 
     /* Inline backend completion is deferred through the ready node and publishes once. */

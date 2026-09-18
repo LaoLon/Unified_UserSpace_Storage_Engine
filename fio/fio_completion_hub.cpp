@@ -114,6 +114,10 @@ void FioCompletionHub::shutdown() noexcept {
     for (Endpoint &endpoint : endpoints_) {
         endpoint.notify();
         endpoint.prepareWait();
+        /* Do not hand the endpoint to a new owner while a waiter still runs. */
+        for (int attempt = 0; attempt < 1000 && endpoint.waiterCount() != 0; ++attempt) {
+            std::this_thread::yield();
+        }
         endpoint.inUse_.store(false, std::memory_order_release);
     }
 }
@@ -135,10 +139,15 @@ FioCompletionHub::Endpoint *FioCompletionHub::acquire() noexcept {
 }
 
 void FioCompletionHub::release(Endpoint *endpoint) noexcept {
-    if (endpoint != nullptr) {
-        endpoint->prepareWait();
-        endpoint->inUse_.store(false, std::memory_order_release);
+    if (endpoint == nullptr) {
+        return;
     }
+    endpoint->prepareWait();
+    endpoint->notify(); /* wake any waiter so it can drop its reference */
+    for (int attempt = 0; attempt < 1000 && endpoint->waiterCount() != 0; ++attempt) {
+        std::this_thread::yield();
+    }
+    endpoint->inUse_.store(false, std::memory_order_release);
 }
 
 void FioCompletionHub::wakeCallback(void *context) noexcept {

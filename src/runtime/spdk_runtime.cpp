@@ -81,7 +81,16 @@ std::string controllerName(const std::string &bdevName) {
     return bdevName;
 }
 
+/* Pins only when the target CPU is inside the caller's allowed affinity set,
+ * so an outer taskset/cgroup restriction is never widened by reactor pins. */
 void pinToCpu(unsigned int cpu) {
+    cpu_set_t allowed;
+    CPU_ZERO(&allowed);
+    if (pthread_getaffinity_np(pthread_self(), sizeof(allowed), &allowed) == 0 &&
+        !CPU_ISSET(cpu, &allowed)) {
+        log::info("cpu pin to %u skipped (outside allowed cpuset)", cpu);
+        return;
+    }
     cpu_set_t set;
     CPU_ZERO(&set);
     CPU_SET(cpu, &set);
@@ -695,6 +704,10 @@ struct SpdkRuntime::Impl {
             stateChanged.notify_all();
         }
 
+        /* A stopping reactor drains its lists, but never spins forever on a
+         * stranded io-wait entry (device removal or a lost completion). */
+        bool drainDeadlineSet = false;
+        std::chrono::steady_clock::time_point drainDeadline{};
         while (!reactor->stop.load(std::memory_order_acquire) ||
                reactor->activeHead != nullptr || reactor->retryHead != nullptr ||
                reactor->completionHead != nullptr) {
@@ -702,6 +715,18 @@ struct SpdkRuntime::Impl {
             drainDataIoRetries(reactor);
             drainDataIoCompletions(reactor);
             invokeDataReactorPoller(reactor);
+            if (reactor->stop.load(std::memory_order_acquire)) {
+                const auto now = std::chrono::steady_clock::now();
+                if (!drainDeadlineSet) {
+                    drainDeadline = now + std::chrono::seconds(5);
+                    drainDeadlineSet = true;
+                } else if (now >= drainDeadline) {
+                    log::error("data reactor %zu drain deadline exceeded with in-flight "
+                               "states; abandoning them",
+                               dataIndex - 1);
+                    break;
+                }
+            }
         }
 
         for (auto *channel : reactor->channels) {
@@ -776,17 +801,22 @@ struct SpdkRuntime::Impl {
         auto *holder = static_cast<DataIoHolder *>(arg);
         const int rc = success ? 0 : dataIoCompletionErrno(bdevIo);
         spdk_bdev_free_io(bdevIo);
-        holder->cb(holder->cbCtx, rc);
+        if (holder->cb != nullptr) {
+            holder->cb(holder->cbCtx, rc);
+        }
         delete holder;
     }
 
     void submitDataIo(DataIoCall *call) {
-        if (call->reactorIndex >= reactors.size() || call->deviceIndex >= devices.size() ||
+        if (call->cb == nullptr || call->reactorIndex >= reactors.size() ||
+            call->deviceIndex >= devices.size() ||
             reactors[call->reactorIndex]->spdk == nullptr ||
             call->deviceIndex >= reactors[call->reactorIndex]->channels.size() ||
             devices[call->deviceIndex].desc == nullptr || call->buffer == nullptr ||
             call->blocks == 0) {
-            call->cb(call->cbCtx, -EINVAL);
+            if (call->cb != nullptr) {
+                call->cb(call->cbCtx, -EINVAL);
+            }
             delete call;
             return;
         }
@@ -805,7 +835,9 @@ struct SpdkRuntime::Impl {
                                                     dataIoDone, holder);
         if (rc != 0) {
             delete holder;
-            call->cb(call->cbCtx, rc);
+            if (call->cb != nullptr) {
+                call->cb(call->cbCtx, rc);
+            }
         }
         delete call;
     }
@@ -1117,7 +1149,8 @@ struct SpdkRuntime::Impl {
     Result<void> controlIo(ControlIo::Op op, std::size_t index, std::uint64_t offsetBlocks,
                            std::span<std::byte> readTarget,
                            std::span<const std::byte> writeSource) {
-        if (!activeFlag.load(std::memory_order_acquire)) {
+        if (!activeFlag.load(std::memory_order_acquire) ||
+            stoppingFlag.load(std::memory_order_acquire)) {
             return makeError(Status::Busy, "SPDK runtime is not active");
         }
         if (index >= devices.size() || devices[index].desc == nullptr || reactors.empty() ||
@@ -1328,7 +1361,8 @@ Result<void> SpdkRuntime::postToDataReactor(std::uint32_t index, std::function<v
     spdk_thread *target = nullptr;
     {
         std::lock_guard<std::mutex> lock(impl.mutex);
-        if (!impl.activeFlag.load(std::memory_order_acquire)) {
+        if (!impl.activeFlag.load(std::memory_order_acquire) ||
+            impl.stoppingFlag.load(std::memory_order_acquire)) {
             return makeError(Status::Busy, "SPDK runtime is not active");
         }
         if (index + 1 >= impl.reactors.size() || impl.reactors[index + 1]->spdk == nullptr) {
@@ -1362,7 +1396,8 @@ Result<void> SpdkRuntime::setDataReactorPoller(std::uint32_t index,
     std::shared_ptr<Impl::Reactor> reactor;
     {
         std::lock_guard<std::mutex> lock(impl.mutex);
-        if (!impl.activeFlag.load(std::memory_order_acquire)) {
+        if (!impl.activeFlag.load(std::memory_order_acquire) ||
+            impl.stoppingFlag.load(std::memory_order_acquire)) {
             return makeError(Status::Busy, "SPDK runtime is not active");
         }
         if (index + 1 >= impl.reactors.size() ||
@@ -1491,7 +1526,8 @@ Result<void> SpdkRuntime::submitDataRead(std::uint32_t reactorIndex,
     spdk_thread *thread = nullptr;
     {
         std::lock_guard<std::mutex> lock(impl.mutex);
-        if (!impl.activeFlag.load(std::memory_order_acquire)) {
+        if (!impl.activeFlag.load(std::memory_order_acquire) ||
+            impl.stoppingFlag.load(std::memory_order_acquire)) {
             return makeError(Status::Busy, "SPDK runtime is not active");
         }
         if (reactorIndex + 1 >= impl.reactors.size() ||
@@ -1526,7 +1562,8 @@ Result<void> SpdkRuntime::submitDataWrite(std::uint32_t reactorIndex,
     spdk_thread *thread = nullptr;
     {
         std::lock_guard<std::mutex> lock(impl.mutex);
-        if (!impl.activeFlag.load(std::memory_order_acquire)) {
+        if (!impl.activeFlag.load(std::memory_order_acquire) ||
+            impl.stoppingFlag.load(std::memory_order_acquire)) {
             return makeError(Status::Busy, "SPDK runtime is not active");
         }
         if (reactorIndex + 1 >= impl.reactors.size() ||

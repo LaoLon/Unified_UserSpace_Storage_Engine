@@ -57,6 +57,9 @@ enum class EventId : std::uint16_t {
     RequestBdevSubmit,
     RequestBdevComplete,
     RequestParentComplete,
+    /* Appended for plan-latency attribution; ids are frozen and only grow. */
+    ActorPickup = 51,
+    PlanReady = 52,
 };
 
 inline constexpr std::uint16_t kTraceFormatVersion = 2;

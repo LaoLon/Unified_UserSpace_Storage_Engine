@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <limits>
 #include <mutex>
+#include <new>
 
 #include "hfs/types.hpp"
 
@@ -34,7 +35,12 @@ public:
                 operation->freeNext_ = nullptr;
                 --freeCount_;
             } else if (live_ < capacity_) {
-                operation = new Operation();
+                /* noexcept path: a throwing new would terminate the core. */
+                operation = new (std::nothrow) Operation();
+                if (operation == nullptr) {
+                    overflow_.fetch_add(1, std::memory_order_relaxed);
+                    return nullptr;
+                }
             } else {
                 overflow_.fetch_add(1, std::memory_order_relaxed);
                 return nullptr;

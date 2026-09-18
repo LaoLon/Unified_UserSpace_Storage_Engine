@@ -133,6 +133,8 @@ int main() {
 
     HFS_TEST_CHECK(engine->stop().wait().value().ok());
     HFS_TEST_CHECK(engine->channelCount() == 0);
+    /* A stopped runtime rejects new messages instead of racing reactor teardown. */
+    HFS_TEST_CHECK(!engine->postToDataReactor(0, []() {}).ok());
 
     /* restart in the same process: env stays alive, bdevs/channels reopen */
     auto created2 = hfs::Engine::create(parsed.value());

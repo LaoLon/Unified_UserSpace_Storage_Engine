@@ -101,6 +101,8 @@ public:
     Task<Result<void>> sync();
 
     Result<FileStat> stat() const;
+    /* Sum of committed extent bytes for this inode (coverage evidence). */
+    Result<std::uint64_t> allocatedBytes() const;
     FileHandle handle() const noexcept;
 
 private:

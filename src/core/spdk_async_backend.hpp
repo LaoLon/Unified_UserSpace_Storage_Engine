@@ -43,15 +43,28 @@ public:
                             void *context) noexcept override;
     SubmitResult submitWrite(const Request &request, CompletionCallback callback,
                              void *context) noexcept override;
+    /* Submits queued requests once slot credit frees; actor thread only. */
+    void pump() noexcept override;
+
+    std::size_t pending() const noexcept {
+        return pendingCount_;
+    }
+    std::size_t pendingDropped() const noexcept {
+        return pendingDropped_.load(std::memory_order_relaxed);
+    }
 
 private:
     struct Geometry;
     struct Slot;
+    struct PendingEntry;
 
     static void onRuntimeCompletion(void *context, int backendErrno) noexcept;
 
     SubmitResult submit(const Request &request, CompletionCallback callback,
                         void *context, bool write) noexcept;
+    SubmitResult enqueuePending(const Request &request, CompletionCallback callback,
+                                void *context, bool write) noexcept;
+    void submitPending() noexcept;
     Slot *acquireSlot() noexcept;
     bool releaseSlot(Slot &slot) noexcept;
 
@@ -65,6 +78,11 @@ private:
     std::size_t deviceCount_ = 0;
     std::unique_ptr<Geometry[]> geometry_;
     std::unique_ptr<Slot[]> slots_;
+    std::unique_ptr<PendingEntry[]> pending_;
+    std::size_t pendingCapacity_ = 0;
+    std::size_t pendingHead_ = 0;
+    std::size_t pendingCount_ = 0;
+    std::atomic<std::size_t> pendingDropped_{0};
     std::atomic<std::size_t> inFlight_{0};
     bool valid_ = false;
 };

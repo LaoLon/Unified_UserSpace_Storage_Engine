@@ -27,6 +27,19 @@ void memFree(void *ptr, void *ctx) {
     ::free(ptr);
 }
 
+std::atomic<std::size_t> gArenaAllocs{0};
+std::atomic<std::size_t> gArenaFrees{0};
+
+void *countingAlloc(std::size_t size, void *) {
+    gArenaAllocs.fetch_add(1, std::memory_order_relaxed);
+    return ::aligned_alloc(4096, size);
+}
+
+void countingFree(void *ptr, void *) {
+    gArenaFrees.fetch_add(1, std::memory_order_relaxed);
+    ::free(ptr);
+}
+
 struct ParentProbe {
     std::atomic<int> calls{0};
     int status = 0;
@@ -216,6 +229,30 @@ int main() {
 
         auto oversized = arena.acquire(4U << 20, 0);
         HFS_TEST_CHECK(!oversized.ok() && oversized.status() == Status::InvalidArgument);
+    }
+
+    /* 7b. release accepts the requested size; the destructor frees every
+     * block the arena still owns, including outstanding class and large
+     * allocations. */
+    {
+        gArenaAllocs.store(0, std::memory_order_relaxed);
+        gArenaFrees.store(0, std::memory_order_relaxed);
+        {
+            DmaArena arena;
+            arena.configure(8U << 20, countingAlloc, countingFree, nullptr);
+            auto classLease = arena.acquire(100, 0);
+            HFS_TEST_CHECK(classLease.ok() && classLease.value().size() == 4096);
+            auto largeLease = arena.acquire(4U << 20, 0);
+            HFS_TEST_CHECK(largeLease.ok());
+
+            /* Callers may pass the requested size, not the rounded span. */
+            arena.release(std::span<std::byte>(classLease.value().data(), 100));
+            HFS_TEST_CHECK(!arena.ownsRange(classLease.value().data(), 1));
+            /* largeLease is still outstanding when the arena is destroyed. */
+            HFS_TEST_CHECK(arena.ownsRange(largeLease.value().data(), 1));
+        }
+        HFS_TEST_CHECK(gArenaAllocs.load(std::memory_order_relaxed) == 2);
+        HFS_TEST_CHECK(gArenaFrees.load(std::memory_order_relaxed) == 2);
     }
 
     /* 8. BufferLease returns arena slices and ignores caller memory */

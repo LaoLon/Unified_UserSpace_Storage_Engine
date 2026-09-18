@@ -55,6 +55,10 @@ public:
                                     void *context) noexcept = 0;
     virtual SubmitResult submitWrite(const Request &request, CompletionCallback callback,
                                      void *context) noexcept = 0;
+
+    /* Actor-local retry pump for backends that accept requests while their
+     * internal credit is exhausted (SubmitDisposition::WaitingForCredit). */
+    virtual void pump() noexcept {}
 };
 
 /* Credit and completion sink owned by the frontend client. */
@@ -68,8 +72,10 @@ public:
     /* Rolls back a credit for a request rejected before ring publish. */
     virtual void releaseCredit() noexcept = 0;
 
-    /* Receives exactly one value completion for every accepted request. */
-    virtual void publish(std::uint32_t shard, const CompletionEvent &event) noexcept = 0;
+    /* Receives exactly one value completion for every accepted request.
+     * Returns false when the event could not be delivered (queue overflow or
+     * invalid shard); the sink must then fail closed with its own fatal state. */
+    virtual bool publish(std::uint32_t shard, const CompletionEvent &event) noexcept = 0;
 };
 
 /* One contiguous read or fixed-size preallocated overwrite request. */
@@ -107,9 +113,11 @@ public:
 
     bool valid() const noexcept;
 
-    /* Publishes only after all pre-publish resources and references exist. */
+    /* Publishes only after all pre-publish resources and references exist.
+     * sinkOwner keeps the sink (and the client state behind it) alive until
+     * the terminal completion has been published; it must not be null. */
     Result<IoHandle> submit(const AsyncDataRequest &request, CompletionToken token,
-                            AsyncDataSink &sink);
+                            AsyncDataSink &sink, std::shared_ptr<void> sinkOwner);
 
     /* Runs one shard actor and its deferred preparation/completion work. */
     std::size_t pump(std::uint32_t shard) noexcept;
@@ -120,12 +128,17 @@ public:
         std::uint64_t busy = 0;
         std::uint64_t terminal = 0;
         std::uint64_t completionPublished = 0;
+        std::uint64_t completionDropped = 0;
         std::uint64_t planFailures = 0;
         std::uint64_t dmaFailures = 0;
         std::uint64_t preparing = 0;
         std::uint64_t schedulerWaits = 0;
+        /* Children with at least one accepted backend submission. */
         std::uint64_t childSubmits = 0;
+        /* Terminal children that had been submitted. */
         std::uint64_t childCompletes = 0;
+        /* Children rejected before any accepted submission. */
+        std::uint64_t childSubmitRejected = 0;
         std::uint64_t tokenEvents = 0;
     };
 

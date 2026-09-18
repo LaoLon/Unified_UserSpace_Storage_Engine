@@ -22,6 +22,9 @@
 #include <sys/syscall.h>
 #endif
 #include <unistd.h>
+#if defined(__x86_64__) || defined(__i386__)
+#include <cpuid.h>
+#endif
 
 #include "common/stats.hpp"
 
@@ -53,10 +56,14 @@ std::atomic<std::uint32_t> g_sample{1};
 std::atomic<std::uint64_t> g_generation{0};
 std::atomic<std::uint64_t> g_recorded{0};
 std::atomic<std::uint64_t> g_dropped{0};
+/* Producers that passed the enabled check and may still push one record. */
+std::atomic<std::uint64_t> g_activeProducers{0};
 pthread_t g_writer{};
 char g_manifestPath[512]{};
 std::uint64_t g_wallClockNs = 0;
 std::uint64_t g_tscHz = 0;
+/* False when the host has no invariant TSC; timestamps then use ns clocks. */
+bool g_useTsc = false;
 
 thread_local TraceChannel *g_tlsChannel = nullptr;
 thread_local std::uint64_t g_tlsGeneration = 0;
@@ -93,13 +100,35 @@ bool isHighFrequency(EventId id) noexcept {
     }
 }
 
+/* Only an invariant TSC is comparable across CPUs/threads. */
+bool invariantTscAvailable() noexcept {
+#if defined(__x86_64__) || defined(__i386__)
+    unsigned int eax = 0;
+    unsigned int ebx = 0;
+    unsigned int ecx = 0;
+    unsigned int edx = 0;
+    if (__get_cpuid_max(0x80000000U, nullptr) < 0x80000007U) {
+        return false;
+    }
+    __cpuid(0x80000007U, eax, ebx, ecx, edx);
+    return (edx & (1U << 8)) != 0; /* EDX[8] = invariant TSC */
+#else
+    return false;
+#endif
+}
+
 std::uint64_t timestamp() noexcept {
 #if defined(__x86_64__) || defined(__i386__)
-    return __builtin_ia32_rdtsc();
-#else
-    return static_cast<std::uint64_t>(
-        std::chrono::steady_clock::now().time_since_epoch().count());
+    if (g_useTsc) {
+        return __builtin_ia32_rdtsc();
+    }
 #endif
+    /* Fallback timestamps are nanoseconds; g_tscHz is set to 1e9 so the
+     * trace dump conversion stays valid for every host. */
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
 }
 
 std::uint64_t currentThreadId() noexcept {
@@ -113,26 +142,55 @@ std::uint64_t currentThreadId() noexcept {
 #endif
 }
 
-/* Calibrate TSC against monotonic time once per trace session. */
+/* Calibrate TSC against monotonic time once per trace session. Hosts without
+ * an invariant TSC fall back to steady_clock nanoseconds. */
 void calibrateTsc() noexcept {
     g_tscHz = 0;
-#if defined(__x86_64__) || defined(__i386__)
-    const auto begin = std::chrono::steady_clock::now();
-    const std::uint64_t beginTsc = timestamp();
-    const timespec delay{0, 1000000};
-    (void)::nanosleep(&delay, nullptr);
-    const std::uint64_t endTsc = timestamp();
-    const auto end = std::chrono::steady_clock::now();
-    const auto elapsedNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
-        end - begin).count();
-    if (elapsedNs > 0 && endTsc > beginTsc) {
-        const auto ticks = endTsc - beginTsc;
-        if (ticks <= std::numeric_limits<std::uint64_t>::max() / 1000000000ULL) {
-            g_tscHz = (ticks * 1000000000ULL) /
-                      static_cast<std::uint64_t>(elapsedNs);
-        }
+    g_useTsc = false;
+    if (!invariantTscAvailable()) {
+        g_tscHz = 1000000000ULL; /* timestamps are nanoseconds */
+        return;
     }
-#endif
+
+    /* Two samples reject a single scheduling hiccup during calibration. */
+    std::uint64_t lastHz = 0;
+    for (int sample = 0; sample < 2; ++sample) {
+        const auto begin = std::chrono::steady_clock::now();
+        const std::uint64_t beginTsc = __builtin_ia32_rdtsc();
+        const timespec delay{0, 1000000};
+        (void)::nanosleep(&delay, nullptr);
+        const std::uint64_t endTsc = __builtin_ia32_rdtsc();
+        const auto end = std::chrono::steady_clock::now();
+        const auto elapsedNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            end - begin).count();
+        if (elapsedNs <= 0 || endTsc <= beginTsc) {
+            continue;
+        }
+        const std::uint64_t ticks = endTsc - beginTsc;
+        if (ticks > std::numeric_limits<std::uint64_t>::max() / 1000000000ULL) {
+            continue;
+        }
+        const std::uint64_t hz = (ticks * 1000000000ULL) /
+                                 static_cast<std::uint64_t>(elapsedNs);
+        if (hz == 0) {
+            continue;
+        }
+        if (lastHz != 0) {
+            const std::uint64_t low = std::min(lastHz, hz);
+            const std::uint64_t high = std::max(lastHz, hz);
+            if (high - low > high / 20) { /* >5% spread: unstable TSC */
+                g_tscHz = 1000000000ULL;
+                return;
+            }
+        }
+        lastHz = hz;
+    }
+    if (lastHz != 0) {
+        g_tscHz = lastHz;
+        g_useTsc = true;
+    } else {
+        g_tscHz = 1000000000ULL;
+    }
 }
 
 bool writeAll(int fd, const void *data, std::size_t size) noexcept {
@@ -239,6 +297,9 @@ TraceChannel *claimChannel() noexcept {
                                                     std::memory_order_relaxed)) {
             channel.sourceId = static_cast<std::uint32_t>(index);
             channel.ownerTid = currentThreadId();
+            /* Publish the metadata with release so manifest readers that
+             * acquire the claim observe initialized fields. */
+            channel.claimed.store(true, std::memory_order_release);
             g_tlsChannel = &channel;
             g_tlsGeneration = generation;
             return g_tlsChannel;
@@ -422,6 +483,15 @@ bool start(const char *directory) noexcept {
 
 void stop() noexcept {
     g_enabled.store(false, std::memory_order_release);
+    /* Bounded wait for producers that already passed the enabled check, so the
+     * final manifest and file set contain every recorded event. */
+    for (int attempt = 0; attempt < 1000; ++attempt) {
+        if (g_activeProducers.load(std::memory_order_acquire) == 0) {
+            break;
+        }
+        const timespec pause{0, 100000};
+        (void)::nanosleep(&pause, nullptr);
+    }
     if (g_writerStarted.load(std::memory_order_acquire)) {
         g_writerStop.store(true, std::memory_order_release);
         ::pthread_join(g_writer, nullptr);
@@ -435,9 +505,27 @@ void stop() noexcept {
 
 bool sessionActive() noexcept { return g_sessionActive.load(std::memory_order_acquire); }
 
+namespace {
+
+/* Keeps stop() from closing the session under an in-flight producer. */
+struct ActiveProducerGuard {
+    ActiveProducerGuard() noexcept {
+        g_activeProducers.fetch_add(1, std::memory_order_acq_rel);
+    }
+    ~ActiveProducerGuard() noexcept {
+        g_activeProducers.fetch_sub(1, std::memory_order_acq_rel);
+    }
+};
+
+} // namespace
+
 void event(EventId id, std::uint64_t a0, std::uint64_t a1, std::uint64_t a2,
            std::uint64_t a3) noexcept {
     if (!g_enabled.load(std::memory_order_relaxed)) {
+        return;
+    }
+    ActiveProducerGuard producer;
+    if (!g_enabled.load(std::memory_order_acquire)) {
         return;
     }
     if (isHighFrequency(id)) {

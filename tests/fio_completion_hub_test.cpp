@@ -38,6 +38,27 @@ int main() {
     hfs::fio::FioCompletionHub::wakeCallback(endpoint);
     HFS_TEST_CHECK(endpoint->epoch() != second);
     HFS_TEST_CHECK(endpoint->waitSince(second, std::chrono::microseconds(0)));
+
+    /* release() wakes and waits for an active waiter before reuse. */
+    {
+        auto *busy = hub.acquire();
+        HFS_TEST_CHECK(busy != nullptr);
+        const std::uint32_t observed = busy->epoch();
+        busy->prepareWait();
+        std::atomic<bool> waiterDone{false};
+        std::thread waiter([busy, observed, &waiterDone] {
+            (void)busy->waitSince(observed, std::chrono::milliseconds(500));
+            waiterDone.store(true, std::memory_order_release);
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        hub.release(busy);
+        waiter.join();
+        HFS_TEST_CHECK(waiterDone.load(std::memory_order_acquire));
+        auto *reused = hub.acquire();
+        HFS_TEST_CHECK(reused != nullptr);
+        hub.release(reused);
+    }
+
     hub.release(other);
     hub.release(endpoint);
     hub.shutdown();

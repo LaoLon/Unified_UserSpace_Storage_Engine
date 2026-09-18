@@ -26,6 +26,11 @@ public:
         bool waitSince(std::uint32_t observed,
                        std::chrono::microseconds timeout) noexcept;
 
+        /* Active waiters on this endpoint; ownership handoff waits for 0. */
+        std::uint32_t waiterCount() const noexcept {
+            return waiters_.load(std::memory_order_acquire);
+        }
+
         static void prepareWaitCallback(void *context) noexcept;
         static std::uint64_t epochCallback(void *context) noexcept;
         static bool waitSinceCallback(void *context, std::uint64_t observed,

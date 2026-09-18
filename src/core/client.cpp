@@ -100,6 +100,12 @@ struct ClientState final : AsyncDataSink {
             asyncInitialized) {
             return false;
         }
+        /* An external wait strategy is only valid together with its wake hook;
+         * otherwise every blocking poll would silently run to full timeout. */
+        if (options.completionWait.valid() && options.completionWake == nullptr) {
+            log::error("client options require completionWake with an external wait strategy");
+            return false;
+        }
         maxOutstandingValue = options.maxOutstanding;
         requestSlots.reset(new (std::nothrow) AsyncRequestSlot[maxOutstandingValue]);
         if (requestSlots == nullptr) {
@@ -169,16 +175,18 @@ struct ClientState final : AsyncDataSink {
         }
     }
 
-    /* Reactor callbacks only enqueue a value; they never touch frontend slots. */
-    void publish(std::uint32_t shard, const CompletionEvent &event) noexcept override {
+    /* Reactor callbacks only enqueue a value; they never touch frontend slots.
+     * Returns false on overflow so the core never claims a published closure. */
+    bool publish(std::uint32_t shard, const CompletionEvent &event) noexcept override {
         const auto result = completionQueue.pushWithWakeHint(shard, event);
         if (!result.accepted) {
             completionOverflow.store(true, std::memory_order_release);
-            return;
+            return false;
         }
         if (result.notify && options.completionWake != nullptr) {
             options.completionWake(options.completionWakeContext);
         }
+        return true;
     }
 
     void releaseSlot(std::size_t index) noexcept {
@@ -332,12 +340,15 @@ Result<void> validateAsyncClient(const ClientState &state) {
     return Result<void>(Status::Ok);
 }
 
-/* Builds one fixed request against a slot-owned extent snapshot. */
-Result<IoHandle> submitAsyncRequest(ClientState &state, FileHandle handle,
+/* Builds one fixed request against a slot-owned extent snapshot. The owner
+ * reference keeps the completion sink alive until the terminal publish. */
+Result<IoHandle> submitAsyncRequest(const std::shared_ptr<ClientState> &stateOwner,
+                                    FileHandle handle,
                                     std::shared_ptr<const AsyncFileSnapshot> snapshot,
                                     IoVec buffer,
                                     std::uint64_t offset, CompletionToken token,
                                     bool write) {
+    ClientState &state = *stateOwner;
     if (snapshot == nullptr) {
         return makeError<IoHandle>(Status::InvalidState,
                                    "asynchronous file snapshot is unavailable");
@@ -398,7 +409,7 @@ Result<IoHandle> submitAsyncRequest(ClientState &state, FileHandle handle,
     request.write = write;
     request.fixedOverwrite = write;
 
-    auto submitted = state.asyncService->submit(request, token, state);
+    auto submitted = state.asyncService->submit(request, token, state, stateOwner);
     if (!submitted.ok()) {
         state.releaseSlot(slotIndex);
         return makeError<IoHandle>(submitted.status(), submitted.message());
@@ -492,7 +503,27 @@ Client::Client(Engine &engine, const ClientOptions &options) : impl_(std::make_u
     (void)impl_->state->initializeAsync(engine.dataReactorCount());
 }
 
-Client::~Client() = default;
+Client::~Client() {
+    if (impl_ == nullptr || impl_->state == nullptr) {
+        return;
+    }
+    const auto lifecycle = impl_->state->lifecycle.load(std::memory_order_acquire);
+    const std::size_t outstanding =
+        impl_->state->outstandingCount.load(std::memory_order_acquire);
+    const std::size_t handles = impl_->state->handleCount.load(std::memory_order_acquire);
+    const std::uint32_t openFiles = impl_->state->openFiles.load(std::memory_order_acquire);
+    if (outstanding != 0 || handles != 0 || openFiles != 0) {
+        /* In-flight work at facade destruction is a real contract violation;
+         * a fully drained client that skipped close() is only informational. */
+        log::error("client destroyed with live work: lifecycle=%u outstanding=%llu "
+                   "handles=%llu open_files=%u",
+                   static_cast<unsigned>(lifecycle),
+                   static_cast<unsigned long long>(outstanding),
+                   static_cast<unsigned long long>(handles), openFiles);
+    } else if (lifecycle != ClientLifecycle::Closed) {
+        log::info("client destroyed without close after drain");
+    }
+}
 
 Result<std::shared_ptr<Client>> Client::create(Engine &engine, const ClientOptions &options) {
     if (!engine.processValid()) {
@@ -579,7 +610,7 @@ Result<IoHandle> Client::submitRead(const std::shared_ptr<File> &file, IoVec buf
         return makeError<IoHandle>(Status::InvalidArgument,
                                    "asynchronous read requires a regular file");
     }
-    auto submitted = submitAsyncRequest(state, file->handle(), snapshot.value(),
+    auto submitted = submitAsyncRequest(impl_->state, file->handle(), snapshot.value(),
                                         buffer, offset, token, false);
     if (!submitted.ok()) {
         return submitted;
@@ -612,7 +643,7 @@ Result<IoHandle> Client::submitWrite(const std::shared_ptr<File> &file, IoVec bu
         return makeError<IoHandle>(Status::InvalidArgument,
                                    "asynchronous write requires a regular file");
     }
-    auto submitted = submitAsyncRequest(state, file->handle(), snapshot.value(),
+    auto submitted = submitAsyncRequest(impl_->state, file->handle(), snapshot.value(),
                                         buffer, offset, token, true);
     if (!submitted.ok()) {
         return submitted;
@@ -639,6 +670,12 @@ PollResult Client::poll(std::span<CompletionEvent> events, std::size_t min,
     }
     if (!state.asyncInitialized) {
         result.status = Status::InvalidState;
+        return result;
+    }
+    /* A dropped or mismatched completion is fatal: never block the frontend on
+     * a queue that can no longer satisfy its outstanding credits. */
+    if (state.completionOverflow.load(std::memory_order_acquire)) {
+        result.status = Status::Corrupt;
         return result;
     }
     result = state.completionQueue.poll(events, min, max, timeout,
@@ -765,6 +802,36 @@ Result<FileStat> File::stat() const {
         return makeError<FileStat>(Status::InvalidState, "engine is not mounted");
     }
     return state.namespaceState->stat(impl_->handle);
+}
+
+/* Sums committed extent bytes so frontends can verify allocation coverage. */
+Result<std::uint64_t> File::allocatedBytes() const {
+    auto &state = *impl_->state;
+    if (state.engine == nullptr || !state.engine->processValid()) {
+        return makeError<std::uint64_t>(Status::ForkedProcess,
+                                        "engine belongs to another process");
+    }
+    if (state.namespaceState == nullptr) {
+        return makeError<std::uint64_t>(Status::InvalidState, "engine is not mounted");
+    }
+    auto descriptors = state.namespaceState->extents(impl_->handle);
+    if (!descriptors.ok()) {
+        return makeError<std::uint64_t>(descriptors.status(), descriptors.message());
+    }
+    const std::uint64_t extentBytes = state.namespaceState->extentBytes();
+    if (extentBytes == 0) {
+        return makeError<std::uint64_t>(Status::InvalidState, "invalid extent size");
+    }
+    std::uint64_t bytes = 0;
+    for (const metadata::ExtentDescriptor &descriptor : descriptors.value()) {
+        if (descriptor.count >
+            (std::numeric_limits<std::uint64_t>::max() - bytes) / extentBytes) {
+            return makeError<std::uint64_t>(Status::InvalidArgument,
+                                            "extent byte count overflows");
+        }
+        bytes += descriptor.count * extentBytes;
+    }
+    return Result<std::uint64_t>(bytes);
 }
 
 Task<Result<ReadResult>> File::read(std::span<IoVec> buffers, std::uint64_t offset,

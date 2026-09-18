@@ -1,10 +1,13 @@
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <thread>
 #include <unistd.h>
+#include <vector>
 
 #include "common/trace.hpp"
 #include "test_support.hpp"
@@ -72,6 +75,46 @@ int main() {
     hfs::trace::event(hfs::trace::EventId::SchedDone, 13);
     HFS_TEST_CHECK(hfs::trace::recorded() == beforeFallback + 1);
     hfs::trace::setEnabled(false);
+
+    /* Concurrent producers stopped mid-flight keep recorded == on-disk. */
+    {
+        HFS_TEST_CHECK(hfs::trace::start(kTraceDirectory));
+        hfs::trace::setEnabled(true);
+        std::atomic<bool> stopNow{false};
+        std::atomic<std::uint64_t> emitted{0};
+        std::vector<std::thread> producers;
+        for (int index = 0; index < 4; ++index) {
+            producers.emplace_back([&stopNow, &emitted] {
+                while (!stopNow.load(std::memory_order_acquire) &&
+                       emitted.fetch_add(1, std::memory_order_relaxed) < 16000) {
+                    hfs::trace::event(hfs::trace::EventId::ActorBatch, 1);
+                }
+            });
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        stopNow.store(true, std::memory_order_release);
+        hfs::trace::stop();
+        for (std::thread &thread : producers) {
+            thread.join();
+        }
+        HFS_TEST_CHECK(hfs::trace::dropped() == 0);
+
+        std::uint64_t onDisk = 0;
+        for (std::uint32_t index = 0; index < 64; ++index) {
+            const int line = std::snprintf(path, sizeof(path), "%s/trace-%u.bin",
+                                           kTraceDirectory, index);
+            if (line <= 0 || static_cast<std::size_t>(line) >= sizeof(path)) {
+                break;
+            }
+            struct stat fileStatus {};
+            if (::stat(path, &fileStatus) == 0) {
+                onDisk += static_cast<std::uint64_t>(fileStatus.st_size) /
+                          sizeof(hfs::trace::TraceRecord);
+            }
+        }
+        HFS_TEST_CHECK(onDisk == hfs::trace::recorded());
+    }
+
     cleanupTraceDirectory();
     std::printf("trace_test: ok\n");
     return 0;

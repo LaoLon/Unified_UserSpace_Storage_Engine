@@ -22,6 +22,14 @@ struct SpdkAsyncDataBackend::Slot {
     std::atomic<bool> inUse{false};
 };
 
+/* One accepted request waiting for slot credit; actor-thread private. */
+struct SpdkAsyncDataBackend::PendingEntry {
+    Request request{};
+    CompletionCallback callback = nullptr;
+    void *context = nullptr;
+    bool write = false;
+};
+
 bool SpdkAsyncDataBackend::convertPlannerRequest(const Request &request,
                                                  std::uint32_t plannerBlockSize,
                                                  std::uint32_t nativeBlockSize,
@@ -75,9 +83,11 @@ SpdkAsyncDataBackend::SpdkAsyncDataBackend(SpdkRuntime &runtime,
     }
     geometry_ = std::unique_ptr<Geometry[]>(new (std::nothrow) Geometry[deviceCount_]);
     slots_ = std::unique_ptr<Slot[]>(new (std::nothrow) Slot[maxInFlight_]);
-    if (geometry_ == nullptr || slots_ == nullptr) {
+    pending_ = std::unique_ptr<PendingEntry[]>(new (std::nothrow) PendingEntry[maxInFlight_]);
+    if (geometry_ == nullptr || slots_ == nullptr || pending_ == nullptr) {
         return;
     }
+    pendingCapacity_ = maxInFlight_;
     for (std::size_t index = 0; index < deviceCount_; ++index) {
         geometry_[index].capacityBytes = runtime_.deviceCapacityBytes(index);
         geometry_[index].nativeBlockSize = runtime_.deviceBlockSize(index);
@@ -224,7 +234,7 @@ AsyncDataBackend::SubmitResult SpdkAsyncDataBackend::submit(
 
     Slot *slot = acquireSlot();
     if (slot == nullptr) {
-        return SubmitResult{SubmitDisposition::Rejected, ENOMEM};
+        return enqueuePending(request, callback, context, write);
     }
     slot->callback = callback;
     slot->context = context;
@@ -249,5 +259,79 @@ AsyncDataBackend::SubmitResult SpdkAsyncDataBackend::submit(
     }
     return SubmitResult{SubmitDisposition::Accepted, 0};
 }
+
+AsyncDataBackend::SubmitResult SpdkAsyncDataBackend::enqueuePending(
+    const Request &request, CompletionCallback callback, void *context,
+    bool write) noexcept {
+    if (pendingCapacity_ == 0 || pendingCount_ >= pendingCapacity_) {
+        /* Bounded last resort: only a full pending queue is terminal. */
+        pendingDropped_.fetch_add(1, std::memory_order_relaxed);
+        return SubmitResult{SubmitDisposition::Rejected, ENOMEM};
+    }
+    const std::size_t index = (pendingHead_ + pendingCount_) % pendingCapacity_;
+    PendingEntry &entry = pending_[index];
+    entry.request = request;
+    entry.callback = callback;
+    entry.context = context;
+    entry.write = write;
+    ++pendingCount_;
+    return SubmitResult{SubmitDisposition::WaitingForCredit, 0};
+}
+
+void SpdkAsyncDataBackend::submitPending() noexcept {
+    while (pendingCount_ != 0) {
+        Slot *slot = acquireSlot();
+        if (slot == nullptr) {
+            return;
+        }
+        PendingEntry &entry = pending_[pendingHead_];
+        const Request request = entry.request;
+        const CompletionCallback callback = entry.callback;
+        void *const context = entry.context;
+        const bool write = entry.write;
+        pendingHead_ = (pendingHead_ + 1) % pendingCapacity_;
+        --pendingCount_;
+
+        NativeRequest native;
+        const Geometry &geometry = geometry_[request.deviceId];
+        if (!convertPlannerRequest(request, plannerBlockSize_, geometry.nativeBlockSize,
+                                   geometry.capacityBytes, native) ||
+            !runtime_.isDmaCapable(request.buffer, native.spanBytes)) {
+            (void)releaseSlot(*slot);
+            if (callback != nullptr) {
+                callback(context, request.childIndex, Status::InvalidArgument, EINVAL, 0);
+            }
+            continue;
+        }
+
+        slot->callback = callback;
+        slot->context = context;
+        slot->childIndex = request.childIndex;
+        slot->completedBytes = native.spanBytes;
+        slot->request.traceRequestId = request.requestId;
+        slot->request.traceChildIndex = request.childIndex;
+        inFlight_.fetch_add(1, std::memory_order_acq_rel);
+
+        Result<void> submitted =
+            write ? runtime_.submitDataWriteOnReactor(
+                        reactorIndex_, request.deviceId, slot->request, request.buffer,
+                        native.offsetBlocks, native.blocks,
+                        &SpdkAsyncDataBackend::onRuntimeCompletion, slot)
+                  : runtime_.submitDataReadOnReactor(
+                        reactorIndex_, request.deviceId, slot->request, request.buffer,
+                        native.offsetBlocks, native.blocks,
+                        &SpdkAsyncDataBackend::onRuntimeCompletion, slot);
+        if (!submitted.ok()) {
+            const int backendErrno = normalizeErrno(submitted);
+            (void)releaseSlot(*slot);
+            if (callback != nullptr) {
+                callback(context, request.childIndex, statusForErrno(backendErrno),
+                         backendErrno, 0);
+            }
+        }
+    }
+}
+
+void SpdkAsyncDataBackend::pump() noexcept { submitPending(); }
 
 } // namespace hfs

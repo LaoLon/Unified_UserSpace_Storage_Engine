@@ -74,7 +74,11 @@ bool CompletionNotifier::notify() noexcept {
 #if defined(__linux__)
     if (eventFd_ >= 0) {
         const std::uint64_t increment = 1;
-        const ssize_t written = ::write(eventFd_, &increment, sizeof(increment));
+        ssize_t written = -1;
+        /* Retry EINTR: otherwise a signal can lose the wake until timeout. */
+        do {
+            written = ::write(eventFd_, &increment, sizeof(increment));
+        } while (written < 0 && errno == EINTR);
         if (written == static_cast<ssize_t>(sizeof(increment))) {
             trace::event(trace::EventId::NotifyWrite, notification, 1);
             return true;
@@ -84,12 +88,6 @@ bool CompletionNotifier::notify() noexcept {
             saturated_.fetch_add(1, std::memory_order_relaxed);
             trace::event(trace::EventId::NotifyWrite, notification, 2);
             return true;
-        }
-        if (written < 0 && errno == EINTR) {
-            /* The ring remains authoritative; a later transition will retry. */
-            errors_.fetch_add(1, std::memory_order_relaxed);
-            trace::event(trace::EventId::NotifyWrite, notification, 3);
-            return false;
         }
         errors_.fetch_add(1, std::memory_order_relaxed);
         trace::event(trace::EventId::NotifyWrite, notification, 4);

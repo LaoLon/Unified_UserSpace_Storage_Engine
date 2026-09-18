@@ -154,6 +154,12 @@ if(HFS_WITH_SPDK)
     list(APPEND SPDK_STATIC_LIBS ${HFS_SPDK_ROOT}/build/lib/libspdk_${lib}.a)
   endforeach()
   file(GLOB DPDK_STATIC_LIBS ${HFS_SPDK_ROOT}/dpdk/build/lib/librte_*.a)
+  list(SORT DPDK_STATIC_LIBS)
+  if(NOT DPDK_STATIC_LIBS)
+    message(FATAL_ERROR
+      "no DPDK static libraries under ${HFS_SPDK_ROOT}/dpdk/build/lib; "
+      "build DPDK inside the VM before configuring with SPDK")
+  endif()
   set(ISAL_LIBS
     ${HFS_SPDK_ROOT}/isa-l/.libs/libisal.a
     ${HFS_SPDK_ROOT}/isa-l-crypto/.libs/libisal_crypto.a
@@ -370,6 +376,17 @@ target_include_directories(fio_completion_hub_test PRIVATE
 target_compile_options(fio_completion_hub_test PRIVATE -fno-exceptions -fno-rtti)
 target_link_libraries(fio_completion_hub_test PRIVATE Threads::Threads)
 add_test(NAME fio_completion_hub_test COMMAND fio_completion_hub_test)
+
+# FIO status/errno mapping contract used by the external engine error paths.
+add_executable(fio_status_errno_test tests/fio_status_errno_test.cpp)
+target_include_directories(fio_status_errno_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests
+)
+target_compile_options(fio_status_errno_test PRIVATE -fno-exceptions -fno-rtti)
+target_link_libraries(fio_status_errno_test PRIVATE Threads::Threads)
+add_test(NAME fio_status_errno_test COMMAND fio_status_errno_test)
 
 # Fixed-capacity requestId lookup and long-run deletion/churn test.
 add_executable(request_lookup_test tests/request_lookup_test.cpp)

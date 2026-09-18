@@ -586,14 +586,16 @@ Task<Result<void>> Engine::stop() {
             const auto asyncStats = impl.asyncService->stats();
             log::info(
                 "async closure: accepted=%llu terminal=%llu published=%llu "
-                "scheduler_wait=%llu child_submit=%llu child_complete=%llu "
-                "plan_fail=%llu dma_fail=%llu preparing=%llu",
+                "dropped=%llu scheduler_wait=%llu child_submit=%llu child_complete=%llu "
+                "child_rejected=%llu plan_fail=%llu dma_fail=%llu preparing=%llu",
                 static_cast<unsigned long long>(asyncStats.accepted),
                 static_cast<unsigned long long>(asyncStats.terminal),
                 static_cast<unsigned long long>(asyncStats.completionPublished),
+                static_cast<unsigned long long>(asyncStats.completionDropped),
                 static_cast<unsigned long long>(asyncStats.schedulerWaits),
                 static_cast<unsigned long long>(asyncStats.childSubmits),
                 static_cast<unsigned long long>(asyncStats.childCompletes),
+                static_cast<unsigned long long>(asyncStats.childSubmitRejected),
                 static_cast<unsigned long long>(asyncStats.planFailures),
                 static_cast<unsigned long long>(asyncStats.dmaFailures),
                 static_cast<unsigned long long>(asyncStats.preparing));

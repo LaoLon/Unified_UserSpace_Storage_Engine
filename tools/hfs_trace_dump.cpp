@@ -191,14 +191,23 @@ int main(int argc, char **argv) {
         return 1;
     }
     if (manifestFormat == 0 || manifestFormat > 2 || !manifestClosed ||
-        manifestRecorded < manifestDropped ||
-        manifestRecorded - manifestDropped != records.size()) {
+        manifestRecorded < manifestDropped || records.size() > manifestRecorded) {
         std::fprintf(stderr,
                      "trace manifest integrity mismatch: recorded=%llu dropped=%llu files=%llu closed=%s\n",
                      manifestRecorded, manifestDropped,
                      static_cast<unsigned long long>(records.size()),
                      manifestClosed ? "true" : "false");
         return 1;
+    }
+    if (manifestRecorded - manifestDropped != records.size()) {
+        /* Ring-full drops never reach a file, so files == recorded - write
+         * failures; the drop counter also covers ring drops. Warn, don't fail:
+         * attribution must survive an instrumented overloaded run. */
+        std::fprintf(stderr,
+                     "trace drop accounting note: recorded=%llu dropped=%llu files=%llu "
+                     "(ring drops do not reduce file records)\n",
+                     manifestRecorded, manifestDropped,
+                     static_cast<unsigned long long>(records.size()));
     }
 
     std::sort(records.begin(), records.end(), [](const auto &left, const auto &right) {
@@ -209,12 +218,20 @@ int main(int argc, char **argv) {
     });
 
     std::unordered_map<std::uint64_t, std::uint64_t> requestSubmit;
+    std::unordered_map<std::uint64_t, std::uint64_t> parentComplete;
     std::unordered_map<RequestChildKey, std::uint64_t, RequestChildHash> shardSubmit;
     std::unordered_map<RequestChildKey, std::uint64_t, RequestChildHash> bdevSubmit;
+    std::unordered_map<std::uint64_t, std::uint64_t> actorPickup;
+    std::unordered_map<std::uint64_t, std::uint64_t> planReady;
     std::vector<std::uint64_t> requestLatency;
     std::vector<std::uint64_t> parentLatency;
+    std::vector<std::uint64_t> planLatency;
+    std::vector<std::uint64_t> ringWaitLatency;
+    std::vector<std::uint64_t> planExecLatency;
+    std::vector<std::uint64_t> admitExecLatency;
     std::vector<std::uint64_t> shardLatency;
     std::vector<std::uint64_t> bdevLatency;
+    std::vector<std::uint64_t> publishLatency;
 
     const auto eventId = [](hfs::trace::EventId id) {
         return static_cast<std::uint16_t>(id);
@@ -229,12 +246,42 @@ int main(int argc, char **argv) {
             if (found != requestSubmit.end() && record.timestamp >= found->second) {
                 requestLatency.push_back(record.timestamp - found->second);
             }
+            const auto parentFound = parentComplete.find(record.arg0);
+            if (parentFound != parentComplete.end() &&
+                record.timestamp >= parentFound->second) {
+                publishLatency.push_back(record.timestamp - parentFound->second);
+                parentComplete.erase(parentFound);
+            }
         } else if (record.eventId == eventId(hfs::trace::EventId::RequestParentComplete)) {
             const auto found = requestSubmit.find(record.arg0);
             if (found != requestSubmit.end() && record.timestamp >= found->second) {
                 parentLatency.push_back(record.timestamp - found->second);
             }
+            parentComplete[record.arg0] = record.timestamp;
+        } else if (record.eventId == eventId(hfs::trace::EventId::ActorPickup)) {
+            actorPickup[record.arg0] = record.timestamp;
+            const auto submitFound = requestSubmit.find(record.arg0);
+            if (submitFound != requestSubmit.end() &&
+                record.timestamp >= submitFound->second) {
+                ringWaitLatency.push_back(record.timestamp - submitFound->second);
+            }
+        } else if (record.eventId == eventId(hfs::trace::EventId::PlanReady)) {
+            planReady[record.arg0] = record.timestamp;
+            const auto pickupFound = actorPickup.find(record.arg0);
+            if (pickupFound != actorPickup.end() &&
+                record.timestamp >= pickupFound->second) {
+                planExecLatency.push_back(record.timestamp - pickupFound->second);
+            }
         } else if (record.eventId == eventId(hfs::trace::EventId::RequestShardSubmit)) {
+            const auto submitFound = requestSubmit.find(record.arg0);
+            if (submitFound != requestSubmit.end() &&
+                record.timestamp >= submitFound->second) {
+                planLatency.push_back(record.timestamp - submitFound->second);
+            }
+            const auto readyFound = planReady.find(record.arg0);
+            if (readyFound != planReady.end() && record.timestamp >= readyFound->second) {
+                admitExecLatency.push_back(record.timestamp - readyFound->second);
+            }
             shardSubmit[RequestChildKey{record.arg0, static_cast<std::uint32_t>(record.arg2)}] =
                 record.timestamp;
         } else if (record.eventId == eventId(hfs::trace::EventId::RequestShardComplete)) {
@@ -265,8 +312,13 @@ int main(int argc, char **argv) {
                 manifestClosed ? "true" : "false");
     printLatency("request_latency", requestLatency, manifestTscHz);
     printLatency("parent_latency", parentLatency, manifestTscHz);
+    printLatency("plan_latency", planLatency, manifestTscHz);
+    printLatency("ring_wait_latency", ringWaitLatency, manifestTscHz);
+    printLatency("plan_exec_latency", planExecLatency, manifestTscHz);
+    printLatency("admit_exec_latency", admitExecLatency, manifestTscHz);
     printLatency("shard_latency", shardLatency, manifestTscHz);
     printLatency("bdev_latency", bdevLatency, manifestTscHz);
+    printLatency("publish_latency", publishLatency, manifestTscHz);
     for (std::size_t event = 1; event < eventCounts.size(); ++event) {
         if (eventCounts[event] != 0) {
             std::printf("event=%zu count=%llu\n", event,

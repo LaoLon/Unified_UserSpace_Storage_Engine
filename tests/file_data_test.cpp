@@ -104,6 +104,8 @@ int main() {
             HFS_TEST_CHECK(allocateResult.ok());
             auto allocated = file->stat();
             HFS_TEST_CHECK(allocated.ok() && allocated.value().logicalSize == 3 * kExtent);
+            auto coverage = file->allocatedBytes();
+            HFS_TEST_CHECK(coverage.ok() && coverage.value() == 3 * kExtent);
             std::vector<std::byte> zeros(3 * kExtent, std::byte{0});
             std::vector<std::byte> readZeros(3 * kExtent, std::byte{0xFF});
             HFS_TEST_CHECK(readAt(*file, readZeros, 0).ok());
@@ -176,10 +178,15 @@ int main() {
             HFS_TEST_CHECK(file->truncate(2 * kExtent).wait().value().ok());
             auto shrunk = file->stat();
             HFS_TEST_CHECK(shrunk.ok() && shrunk.value().logicalSize == 2 * kExtent);
+            auto shrunkCoverage = file->allocatedBytes();
+            HFS_TEST_CHECK(shrunkCoverage.ok() && shrunkCoverage.value() == 2 * kExtent);
             std::vector<std::byte> beyond(4096, std::byte{0xAA});
             auto eofRead = readAt(*file, beyond, 2 * kExtent);
             HFS_TEST_CHECK(eofRead.ok() && eofRead.value().bytes == 0);
             HFS_TEST_CHECK(file->truncate(4 * kExtent).wait().value().ok());
+            /* Growing the logical size must not fabricate extent coverage. */
+            auto grownCoverage = file->allocatedBytes();
+            HFS_TEST_CHECK(grownCoverage.ok() && grownCoverage.value() == 2 * kExtent);
             std::vector<std::byte> grown(4096, std::byte{0xFF});
             HFS_TEST_CHECK(readAt(*file, grown, (4 * kExtent) - 4096).ok());
             for (const std::byte byte : grown) {
@@ -219,7 +226,10 @@ int main() {
             HFS_TEST_CHECK(readAt(*file, largeRead, 0).ok());
             HFS_TEST_CHECK(checksum(largeRead) == checksum(large));
 
+            /* Drop both shared references before closing the client. */
+            fileResult.value().reset();
             file.reset();
+            HFS_TEST_CHECK(client->close().wait().value().ok());
             client.reset();
         }
 

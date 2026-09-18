@@ -151,37 +151,48 @@ void DmaArena::release(std::span<std::byte> buffer) noexcept {
     if (buffer.empty()) {
         return;
     }
-    std::size_t classIndex = kClassCount;
-    for (std::size_t i = 0; i < kClassCount; ++i) {
-        if (buffer.size() == kClassSizes[i]) {
-            classIndex = i;
-            break;
-        }
-    }
-    if (classIndex == kClassCount) {
-        Deallocator deallocator = nullptr;
-        void *allocatorCtx = nullptr;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            auto found = largeLive_.find(buffer.data());
-            if (found == largeLive_.end() || found->second != buffer.size()) return;
-            bytes_ -= found->second;
-            largeLive_.erase(found);
+    /* Look up the recorded allocation size: callers may release with the
+     * requested size instead of the rounded span size. */
+    void *pointer = buffer.data();
+    Deallocator deallocator = nullptr;
+    void *allocatorCtx = nullptr;
+    bool large = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto largeFound = largeLive_.find(pointer);
+        if (largeFound != largeLive_.end()) {
+            const std::size_t allocationSize = largeFound->second;
+            bytes_ -= allocationSize;
+            largeLive_.erase(largeFound);
             ++releases_;
             deallocator = deallocator_;
             allocatorCtx = allocatorCtx_;
+            large = true;
+        } else {
+            auto liveFound = live_.find(pointer);
+            if (liveFound == live_.end()) {
+                return; /* foreign pointer: not owned by this arena */
+            }
+            const std::size_t allocationSize = liveFound->second;
+            std::size_t classIndex = kClassCount;
+            for (std::size_t i = 0; i < kClassCount; ++i) {
+                if (kClassSizes[i] == allocationSize) {
+                    classIndex = i;
+                    break;
+                }
+            }
+            if (classIndex == kClassCount) {
+                return; /* corrupt bookkeeping: never hand out a wrong class */
+            }
+            classes_[classIndex].free.push_back(pointer);
+            live_.erase(liveFound);
+            ++releases_;
         }
-        if (deallocator != nullptr) deallocator(buffer.data(), allocatorCtx);
-        cv_.notify_one();
-        return;
     }
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto found = live_.find(buffer.data());
-        if (found == live_.end() || found->second != buffer.size()) return;
-        classes_[classIndex].free.push_back(buffer.data());
-        live_.erase(found);
-        ++releases_;
+    if (large) {
+        if (deallocator != nullptr) {
+            deallocator(pointer, allocatorCtx);
+        }
     }
     trace::event(trace::EventId::DmaRelease, buffer.size());
     cv_.notify_one();
@@ -250,12 +261,19 @@ DmaArena::~DmaArena() {
     if (deallocator_ == nullptr) {
         return;
     }
+    /* Free every block the arena still owns: cached class blocks, class
+     * allocations whose lease was never returned, and outstanding large
+     * allocations. A later lease release becomes a harmless no-op. */
     for (auto &sizeClass : classes_) {
         for (void *block : sizeClass.free) {
             deallocator_(block, allocatorCtx_);
         }
         sizeClass.free.clear();
     }
+    for (const auto &entry : live_) {
+        deallocator_(entry.first, allocatorCtx_);
+    }
+    live_.clear();
     for (const auto &entry : largeLive_) {
         deallocator_(entry.first, allocatorCtx_);
     }

@@ -16,6 +16,7 @@
 #include "core/dma_arena.hpp"
 #include "core/extent_map.hpp"
 #include "core/parent_completion.hpp"
+#include "core/request_lookup.hpp"
 #include "core/scheduler.hpp"
 #include "core/shard_ring.hpp"
 
@@ -120,6 +121,8 @@ private:
         std::uint32_t leaseIndex = kNoLease;
         Phase phase = Phase::Idle;
         bool submitted = false;
+        /* True once this child has one accepted backend submission. */
+        bool counted = false;
         std::atomic<bool> terminal{false};
         std::atomic<bool> readyQueued{false};
         std::atomic<int> completionStatus{static_cast<int>(Status::IoError)};
@@ -135,6 +138,7 @@ private:
             leaseIndex = kNoLease;
             phase = Phase::Idle;
             submitted = false;
+            counted = false;
             terminal.store(false, std::memory_order_relaxed);
             readyQueued.store(false, std::memory_order_relaxed);
             completionStatus.store(static_cast<int>(Status::IoError),
@@ -150,6 +154,8 @@ private:
         Impl *owner = nullptr;
         Operation *operation = nullptr;
         AsyncDataSink *sink = nullptr;
+        /* Keeps the frontend sink alive until the terminal publish completes. */
+        std::shared_ptr<void> sinkOwner;
         AsyncDataRequest request{};
         std::uint64_t requestId = 0;
         ExtentSnapshotMap extentSnapshot{};
@@ -187,6 +193,7 @@ private:
             owner = nullptr;
             operation = nullptr;
             sink = nullptr;
+            sinkOwner.reset();
             request = {};
             requestId = 0;
             extentSnapshot.reset();
@@ -271,7 +278,16 @@ private:
     struct ShardState {
         std::unique_ptr<ShardRing> ring;
         std::unique_ptr<ShardActor> actor;
+        /* Pool of active inode schedulers, sized by concurrent operations
+         * instead of max_inodes to keep the resident set bounded. */
         std::unique_ptr<InodeSlot[]> inodes;
+        /* O(1) fileId -> inode slot lookup; a linear scan cost ~ms per request. */
+        RequestLookupTable inodeLookup;
+        std::unique_ptr<std::uint32_t[]> freeInodeStack;
+        std::size_t freeInodeCapacity = 0;
+        std::size_t freeInodeCount = 0;
+        /* Distinct inode ids seen since mount; capped by maxInodesPerShard. */
+        std::size_t inodeCount = 0;
         std::unique_ptr<RequestState *[]> preparing;
         std::size_t preparingCapacity = 0;
         std::size_t preparingHead = 0;
@@ -305,6 +321,11 @@ public:
             return;
         }
 
+        /* Active inode slots are bounded by in-flight operations: one slot is
+         * held per file with a non-empty scheduler, never by idle inodes. */
+        const std::size_t inodePoolCapacity =
+            std::max<std::size_t>(1, std::min(config_.maxInodesPerShard,
+                                              config_.maxOperations));
         for (std::uint32_t shard = 0; shard < config_.shardCount; ++shard) {
             ShardState &state = shards_[shard];
             state.backend = backends[shard];
@@ -314,22 +335,28 @@ public:
             state.ring = std::unique_ptr<ShardRing>(new (std::nothrow)
                                                         ShardRing(config_.ringDepth));
             state.inodes = std::unique_ptr<InodeSlot[]>(
-                new (std::nothrow) InodeSlot[config_.maxInodesPerShard]);
+                new (std::nothrow) InodeSlot[inodePoolCapacity]);
             state.preparing = std::unique_ptr<RequestState *[]>(
                 new (std::nothrow) RequestState *[preparingCapacity]);
+            state.freeInodeStack = std::unique_ptr<std::uint32_t[]>(
+                new (std::nothrow) std::uint32_t[inodePoolCapacity]);
             if (state.ring == nullptr || state.inodes == nullptr ||
-                state.preparing == nullptr) {
+                state.preparing == nullptr || state.freeInodeStack == nullptr ||
+                !state.inodeLookup.initialize(inodePoolCapacity)) {
                 return;
             }
             state.preparingCapacity = preparingCapacity;
+            state.freeInodeCapacity = inodePoolCapacity;
+            state.freeInodeCount = inodePoolCapacity;
             state.actor = std::unique_ptr<ShardActor>(new (std::nothrow) ShardActor(
                 *state.ring, &Impl::actorStep, this,
                 std::max<std::size_t>(1, std::min(config_.ringDepth, std::size_t{64}))));
             if (state.actor == nullptr) {
                 return;
             }
-            for (std::size_t inode = 0; inode < config_.maxInodesPerShard; ++inode) {
+            for (std::size_t inode = 0; inode < inodePoolCapacity; ++inode) {
                 state.inodes[inode].scheduler.setAdmitCallback(&Impl::onAdmitted, this);
+                state.freeInodeStack[inode] = static_cast<std::uint32_t>(inode);
             }
         }
         valid_ = true;
@@ -340,7 +367,7 @@ public:
     bool valid() const noexcept { return valid_; }
 
     Result<IoHandle> submit(const AsyncDataRequest &request, CompletionToken token,
-                            AsyncDataSink &sink) {
+                            AsyncDataSink &sink, std::shared_ptr<void> sinkOwner) {
         const Status validation = validateRequest(request, token);
         if (validation != Status::Ok) {
             return makeError<IoHandle>(validation, "invalid asynchronous data request");
@@ -348,6 +375,10 @@ public:
         if (!valid_) {
             return makeError<IoHandle>(Status::InvalidState,
                                        "asynchronous data service is not initialized");
+        }
+        if (sinkOwner == nullptr) {
+            return makeError<IoHandle>(Status::InvalidArgument,
+                                       "sink owner is required for accepted requests");
         }
         if (!sink.tryAcquireCredit()) {
             busy_.fetch_add(1, std::memory_order_relaxed);
@@ -388,6 +419,7 @@ public:
         state->operation = operation;
         state->requestId = requestId;
         state->sink = &sink;
+        state->sinkOwner = std::move(sinkOwner);
         state->request = request;
         state->request.extentMap = &state->extentSnapshot;
         state->shard = shard;
@@ -449,6 +481,9 @@ public:
         ShardState &state = shards_[shard];
         std::size_t work = state.actor->runOnce();
         work += retryPreparing(state);
+        /* Backends that accepted WaitingForCredit requests retry them here,
+         * on the owning reactor, once slot credit has been released. */
+        state.backend->pump();
         work += drainReady(state);
         if (trace::enabled()) {
             const ShardRing::Stats ringStats = state.ring->stats();
@@ -475,12 +510,14 @@ public:
         result.busy = busy_.load(std::memory_order_relaxed);
         result.terminal = terminal_.load(std::memory_order_relaxed);
         result.completionPublished = completionPublished_.load(std::memory_order_relaxed);
+        result.completionDropped = completionDropped_.load(std::memory_order_relaxed);
         result.planFailures = planFailures_.load(std::memory_order_relaxed);
         result.dmaFailures = dmaFailures_.load(std::memory_order_relaxed);
         result.preparing = preparing_.load(std::memory_order_relaxed);
         result.schedulerWaits = schedulerWaits_.load(std::memory_order_relaxed);
         result.childSubmits = childSubmits_.load(std::memory_order_relaxed);
         result.childCompletes = childCompletes_.load(std::memory_order_relaxed);
+        result.childSubmitRejected = childSubmitRejected_.load(std::memory_order_relaxed);
         result.tokenEvents = tokenEvents_.load(std::memory_order_relaxed);
         return result;
     }
@@ -604,8 +641,12 @@ private:
         if (state == nullptr || state->sink == nullptr) {
             return;
         }
-        state->sink->publish(state->shard, event);
-        state->owner->completionPublished_.fetch_add(1, std::memory_order_relaxed);
+        if (state->sink->publish(state->shard, event)) {
+            state->owner->completionPublished_.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            /* The sink reported a fatal delivery failure; never claim closure. */
+            state->owner->completionDropped_.fetch_add(1, std::memory_order_relaxed);
+        }
         state->owner->tokenEvents_.fetch_add(1, std::memory_order_relaxed);
     }
 
@@ -633,6 +674,7 @@ private:
             finish(*state, Status::Corrupt, 0);
             return;
         }
+        trace::event(trace::EventId::ActorPickup, state->requestId);
         prepare(*state);
     }
 
@@ -655,6 +697,7 @@ private:
             state.plan = std::move(planned).value();
             state.childCount = state.plan.count;
             state.planned = true;
+            trace::event(trace::EventId::PlanReady, state.requestId);
             state.operation->asyncState().childCount = state.childCount;
             state.parent.init(state.childCount, &Impl::parentDone, &state);
             state.operation->asyncState().parent = &state.parent;
@@ -724,6 +767,11 @@ private:
                     state.request.buffer.size()) {
                 return Status::InvalidArgument;
             }
+            if (plan.kind == IoPlanner::Child::Kind::Zero) {
+                /* Hole children only memset the user buffer; a bounce lease
+                 * would consume arena budget for no device traffic. */
+                continue;
+            }
             const std::byte *userBuffer = state.request.buffer.data() + plan.bufferOffset;
             const bool needsBounce = isRmw(plan.kind) ||
                                      !arena_.ownsRange(userBuffer, plan.spanBytes);
@@ -756,35 +804,60 @@ private:
         return Status::Ok;
     }
 
+    /* Hash lookup keeps the actor path O(1); the previous linear scan walked
+     * max_inodes/shardCount slots (~5 ms with the default config) whenever
+     * the file's slot had been reclaimed. */
     InodeSlot *findInode(std::uint32_t shard, FileId fileId) noexcept {
         ShardState &state = shards_[shard];
-        InodeSlot *freeSlot = nullptr;
-        for (std::size_t index = 0; index < config_.maxInodesPerShard; ++index) {
-            InodeSlot &inode = state.inodes[index];
-            if (inode.used && inode.fileId == fileId) {
-                return &inode;
-            }
-            if (!inode.used && freeSlot == nullptr) {
-                freeSlot = &inode;
+        std::uint32_t index = 0;
+        if (state.inodeLookup.find(fileId, index)) {
+            if (index < state.freeInodeCapacity && state.inodes[index].used &&
+                state.inodes[index].fileId == fileId) {
+                return &state.inodes[index];
             }
         }
-        if (freeSlot == nullptr) {
+        /* The configured limit counts distinct inodes, not pool slots. */
+        if (state.inodeCount >= config_.maxInodesPerShard ||
+            state.freeInodeCount == 0) {
             return nullptr;
         }
-        freeSlot->used = true;
-        freeSlot->fileId = fileId;
-        return freeSlot;
+        index = state.freeInodeStack[--state.freeInodeCount];
+        InodeSlot &inode = state.inodes[index];
+        inode.used = true;
+        inode.fileId = fileId;
+        if (!state.inodeLookup.insert(fileId, index)) {
+            inode.used = false;
+            inode.fileId = 0;
+            state.freeInodeStack[state.freeInodeCount++] = index;
+            return nullptr;
+        }
+        ++state.inodeCount;
+        return &inode;
     }
 
     /* Reclaims an empty inode scheduler after its last node is completed. */
     static void reclaimInodeSlot(RequestState &state) noexcept {
-        if (state.inodeSlot == nullptr || state.scheduler == nullptr) {
+        if (state.inodeSlot == nullptr || state.scheduler == nullptr ||
+            state.shardState == nullptr) {
             return;
         }
         if (state.scheduler->activeCount() == 0 &&
             state.scheduler->pendingCount() == 0) {
+            ShardState &shard = *state.shardState;
+            if (shard.inodes == nullptr || shard.freeInodeStack == nullptr) {
+                return;
+            }
+            const std::uint32_t index = static_cast<std::uint32_t>(
+                state.inodeSlot - shard.inodes.get());
+            (void)shard.inodeLookup.erase(state.inodeSlot->fileId);
             state.inodeSlot->used = false;
             state.inodeSlot->fileId = 0;
+            if (shard.inodeCount != 0) {
+                --shard.inodeCount;
+            }
+            if (shard.freeInodeCount < shard.freeInodeCapacity) {
+                shard.freeInodeStack[shard.freeInodeCount++] = index;
+            }
         }
     }
 
@@ -922,9 +995,14 @@ private:
             completeChild(state, childIndex, status, result.backendErrno, 0);
             return;
         }
-        ++state.submittedChildren;
-        state.operation->asyncState().submittedChildren = state.submittedChildren;
-        childSubmits_.fetch_add(1, std::memory_order_relaxed);
+        if (!child.counted) {
+            /* Count each child once, regardless of how many RMW phases it needs,
+             * so the closure metric stays comparable with child completions. */
+            child.counted = true;
+            ++state.submittedChildren;
+            state.operation->asyncState().submittedChildren = state.submittedChildren;
+            childSubmits_.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 
     void handleReady(RequestState &state, std::uint32_t childIndex) noexcept {
@@ -994,7 +1072,11 @@ private:
             state.firstStatus = status;
             state.firstErrno = backendErrno;
         }
-        childCompletes_.fetch_add(1, std::memory_order_relaxed);
+        if (child.counted) {
+            childCompletes_.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            childSubmitRejected_.fetch_add(1, std::memory_order_relaxed);
+        }
         const int parentError = status == Status::Ok ? 0 : static_cast<int>(status) + 1;
         state.parent.childDone(parentError, bytes);
     }
@@ -1068,12 +1150,14 @@ private:
     std::atomic<std::uint64_t> busy_{0};
     std::atomic<std::uint64_t> terminal_{0};
     std::atomic<std::uint64_t> completionPublished_{0};
+    std::atomic<std::uint64_t> completionDropped_{0};
     std::atomic<std::uint64_t> planFailures_{0};
     std::atomic<std::uint64_t> dmaFailures_{0};
     std::atomic<std::uint64_t> preparing_{0};
     std::atomic<std::uint64_t> schedulerWaits_{0};
     std::atomic<std::uint64_t> childSubmits_{0};
     std::atomic<std::uint64_t> childCompletes_{0};
+    std::atomic<std::uint64_t> childSubmitRejected_{0};
     std::atomic<std::uint64_t> tokenEvents_{0};
 };
 
@@ -1086,11 +1170,12 @@ AsyncDataService::~AsyncDataService() = default;
 bool AsyncDataService::valid() const noexcept { return impl_ != nullptr && impl_->valid(); }
 
 Result<IoHandle> AsyncDataService::submit(const AsyncDataRequest &request,
-                                          CompletionToken token, AsyncDataSink &sink) {
+                                          CompletionToken token, AsyncDataSink &sink,
+                                          std::shared_ptr<void> sinkOwner) {
     if (impl_ == nullptr) {
         return makeError<IoHandle>(Status::InvalidState, "service has no implementation");
     }
-    return impl_->submit(request, token, sink);
+    return impl_->submit(request, token, sink, std::move(sinkOwner));
 }
 
 std::size_t AsyncDataService::pump(std::uint32_t shard) noexcept {
