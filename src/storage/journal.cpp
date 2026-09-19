@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "common/log.hpp"
+#include "common/test_hooks.hpp"
 #include "hfs/core.hpp"
 #include "hfs/crc.hpp"
 #include "hfs/superblock.hpp"
@@ -349,6 +350,7 @@ struct Journal::Impl {
         if (!write.ok()) {
             return write;
         }
+        test_hooks::crashIfRequested("checkpoint_flush");
         if (testCheckpointFlushFailureRequested()) {
             return makeError(Status::IoError, "test-injected checkpoint flush failure");
         }
@@ -928,6 +930,7 @@ Result<std::uint64_t> Journal::append(std::span<const JournalRecord> records,
     if (!commit.ok()) {
         return makeError<std::uint64_t>(commit.status(), commit.message());
     }
+    test_hooks::crashIfRequested("journal_commit");
     if (flushDevice) {
         auto flushed = impl.device->flush();
         if (!flushed.ok()) {

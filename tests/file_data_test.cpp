@@ -1,9 +1,11 @@
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <memory>
 #include <span>
 #include <string>
 #include <stop_token>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -225,6 +227,71 @@ int main() {
             std::vector<std::byte> largeRead(large.size(), std::byte{0});
             HFS_TEST_CHECK(readAt(*file, largeRead, 0).ok());
             HFS_TEST_CHECK(checksum(largeRead) == checksum(large));
+
+            /* 9. concurrent durability barriers coalesce instead of returning
+             * Busy, which RocksDB would surface as a failed WAL sync. */
+            {
+                constexpr std::size_t kSyncThreads = 4;
+                std::vector<std::shared_ptr<File>> syncFiles;
+                std::vector<std::thread> workers;
+                std::atomic<int> syncFailures{0};
+                for (std::size_t i = 0; i < kSyncThreads; ++i) {
+                    auto opened = client->open("/sync-" + std::to_string(i) + ".bin",
+                                               OpenFlags::Create)
+                                      .wait()
+                                      .value();
+                    HFS_TEST_CHECK(opened.ok());
+                    syncFiles.push_back(opened.value());
+                }
+                for (std::size_t i = 0; i < kSyncThreads; ++i) {
+                    workers.emplace_back([&, i]() {
+                        std::vector<std::byte> payload(8192);
+                        fillPattern(payload, static_cast<std::uint8_t>(0x40 + i));
+                        for (int round = 0; round < 4; ++round) {
+                            if (!writeAt(*syncFiles[i], payload,
+                                         static_cast<std::uint64_t>(round) * payload.size())
+                                     .ok()) {
+                                syncFailures.fetch_add(1);
+                                return;
+                            }
+                            if (!syncFiles[i]->sync().wait().value().ok()) {
+                                syncFailures.fetch_add(1);
+                                return;
+                            }
+                        }
+                    });
+                }
+                for (auto &worker : workers) {
+                    worker.join();
+                }
+                HFS_TEST_CHECK(syncFailures.load() == 0);
+                for (auto &syncFile : syncFiles) {
+                    syncFile.reset();
+                }
+            }
+
+            /* 10. write-driven allocation zeroes only the uncovered tail:
+             * growing the file over it must still read as zeros. */
+            {
+                auto tailResult =
+                    client->open("/tail-zero.bin", OpenFlags::Create).wait().value();
+                HFS_TEST_CHECK(tailResult.ok());
+                auto tailFile = tailResult.value();
+                std::vector<std::byte> head(100);
+                fillPattern(head, 0x3C);
+                HFS_TEST_CHECK(writeAt(*tailFile, head, 0).ok());
+                HFS_TEST_CHECK(tailFile->truncate(2 * kExtent).wait().value().ok());
+                std::vector<std::byte> tailRead(2 * kExtent, std::byte{0xFF});
+                HFS_TEST_CHECK(readAt(*tailFile, tailRead, 0).ok());
+                HFS_TEST_CHECK(std::memcmp(tailRead.data(), head.data(), head.size()) == 0);
+                for (std::size_t i = head.size(); i < tailRead.size(); ++i) {
+                    HFS_TEST_CHECK(tailRead[i] == std::byte{0});
+                }
+                auto tailCoverage = tailFile->allocatedBytes();
+                HFS_TEST_CHECK(tailCoverage.ok() && tailCoverage.value() == kExtent);
+                tailResult.value().reset();
+                tailFile.reset();
+            }
 
             /* Drop both shared references before closing the client. */
             fileResult.value().reset();

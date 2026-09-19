@@ -11,6 +11,7 @@
 #include <unistd.h>
 
 #include "common/log.hpp"
+#include "common/test_hooks.hpp"
 #include "runtime/spdk_runtime.hpp"
 
 namespace hfs {
@@ -412,6 +413,7 @@ Result<void> updateCleanShutdown(SpdkRuntime &runtime, const Config &config, boo
     }
     const std::uint64_t nextGeneration = reference.generation + 1;
     const std::uint64_t nextMountEpoch = reference.mountEpoch + 1;
+    test_hooks::crashIfRequested("clean_flag");
     if (testCleanFlagFailureRequested()) {
         return makeError(Status::IoError,
                          "test-injected clean-flag publish failure");

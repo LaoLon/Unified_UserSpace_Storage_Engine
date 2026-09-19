@@ -927,6 +927,15 @@ Task<Result<WriteResult>> File::write(std::span<const IoVec> buffers, std::uint6
                                          "write range overflows");
     }
 
+    /* The pre-write logical size marks the append frontier: device blocks at
+     * or beyond it hold no committed bytes, so the data path can skip the RMW
+     * refresh read for them. */
+    auto beforeWrite = state.namespaceState->stat(impl_->handle);
+    if (!beforeWrite.ok()) {
+        co_return makeError<WriteResult>(beforeWrite.status(), beforeWrite.message());
+    }
+    const std::uint64_t knownEof = beforeWrite.value().logicalSize;
+
     /* Allocate missing extents, zero-initialize them, then commit. Extents are
      * invisible until COMMITTED (hfs2.0.md §9.4). */
     auto reservations = state.namespaceState->reserveExtents(impl_->handle, offset, total);
@@ -934,24 +943,43 @@ Task<Result<WriteResult>> File::write(std::span<const IoVec> buffers, std::uint6
         co_return makeError<WriteResult>(reservations.status(), reservations.message());
     }
     if (!reservations.value().empty()) {
-        std::vector<metadata::ExtentDescriptor> descriptors;
-        descriptors.reserve(reservations.value().size());
+        /* Zero only the parts of the new extents that this write does not
+         * cover; fully covered extents need no zero fill at all. */
+        const std::uint64_t extentBytes = state.namespaceState->extentBytes();
         for (const metadata::ExtentAllocation &allocation : reservations.value()) {
-            metadata::ExtentDescriptor descriptor;
-            descriptor.logicalExtent = allocation.logicalExtent;
-            descriptor.physicalExtent =
-                state.namespaceState->deviceStartExtent(
-                    static_cast<std::uint32_t>(allocation.run.deviceId)) +
-                allocation.run.start;
-            descriptor.count = allocation.run.count;
-            descriptor.deviceId = static_cast<std::uint32_t>(allocation.run.deviceId);
-            descriptors.push_back(descriptor);
-        }
-        auto zeroed = state.dataPlane->zeroExtents(descriptors,
-                                                   state.namespaceState->extentBytes());
-        if (!zeroed.ok()) {
-            state.namespaceState->releaseExtents(impl_->handle, reservations.value());
-            co_return makeError<WriteResult>(zeroed.status(), zeroed.message());
+            const std::uint32_t deviceId =
+                static_cast<std::uint32_t>(allocation.run.deviceId);
+            const std::uint64_t physicalStart =
+                state.namespaceState->deviceStartExtent(deviceId) + allocation.run.start;
+            for (std::uint64_t i = 0; i < allocation.run.count; ++i) {
+                const std::uint64_t extentStart =
+                    (allocation.logicalExtent + i) * extentBytes;
+                const std::uint64_t extentEnd = extentStart + extentBytes;
+                const std::uint64_t coverStart = std::max(offset, extentStart);
+                const std::uint64_t coverEnd = std::min(offset + total, extentEnd);
+                if (coverStart > extentStart) {
+                    auto zeroed = state.dataPlane->zeroRange(
+                        deviceId, physicalStart + i, 0, coverStart - extentStart,
+                        extentBytes);
+                    if (!zeroed.ok()) {
+                        state.namespaceState->releaseExtents(impl_->handle,
+                                                             reservations.value());
+                        co_return makeError<WriteResult>(zeroed.status(),
+                                                         zeroed.message());
+                    }
+                }
+                if (coverEnd < extentEnd) {
+                    auto zeroed = state.dataPlane->zeroRange(
+                        deviceId, physicalStart + i, coverEnd - extentStart,
+                        extentEnd - coverEnd, extentBytes);
+                    if (!zeroed.ok()) {
+                        state.namespaceState->releaseExtents(impl_->handle,
+                                                             reservations.value());
+                        co_return makeError<WriteResult>(zeroed.status(),
+                                                         zeroed.message());
+                    }
+                }
+            }
         }
         auto committed =
             state.namespaceState->commitExtents(impl_->handle, reservations.value());
@@ -971,7 +999,8 @@ Task<Result<WriteResult>> File::write(std::span<const IoVec> buffers, std::uint6
             continue;
         }
         auto written = state.dataPlane->write(
-            map.value(), std::span<const std::byte>(vec.data, vec.size), cursor, vec.size);
+            map.value(), std::span<const std::byte>(vec.data, vec.size), cursor, vec.size,
+            knownEof);
         if (!written.ok()) {
             co_return makeError<WriteResult>(written.status(), written.message());
         }

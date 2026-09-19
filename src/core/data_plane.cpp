@@ -25,13 +25,36 @@ Result<void> DataPlane::zeroExtents(
                     (descriptor.physicalExtent + i) * extentBytes, descriptor.deviceId);
         }
         for (std::uint64_t i = 0; i < descriptor.count; ++i) {
-            auto written = path_.write(map, zeros, i * extentBytes, extentBytes);
+            auto written = path_.write(map, zeros, i * extentBytes, extentBytes, 0);
             if (!written.ok()) {
                 return written;
             }
         }
     }
     return Result<void>(Status::Ok);
+}
+
+/* Zeroes one byte range inside a single physical extent. Partial edge blocks
+ * take the RMW path so bytes outside the range are preserved. */
+Result<void> DataPlane::zeroRange(std::uint32_t deviceId, std::uint64_t physicalExtent,
+                                  std::uint64_t byteOffset, std::uint64_t bytes,
+                                  std::uint64_t extentBytes) {
+    if (bytes == 0) {
+        return Result<void>(Status::Ok);
+    }
+    if (extentBytes == 0 || byteOffset > extentBytes || bytes > extentBytes - byteOffset) {
+        return makeError(Status::InvalidArgument, "zero range exceeds the extent");
+    }
+    if (zeroBuffer_.size() < extentBytes) {
+        zeroBuffer_.assign(static_cast<std::size_t>(extentBytes), std::byte{0});
+    }
+    SyntheticExtentMap map;
+    map.add(byteOffset, bytes, physicalExtent * extentBytes + byteOffset, deviceId);
+    const std::span<const std::byte> zeros(zeroBuffer_.data(),
+                                           static_cast<std::size_t>(bytes));
+    /* knownEof = ~0 disables the append fast path: the zero range must merge
+     * with existing bytes instead of zero-filling whole blocks. */
+    return path_.write(map, zeros, byteOffset, bytes, ~0ULL);
 }
 
 Result<void> DataPlane::read(const metadata::InodeExtentMap &map, std::span<std::byte> buffer,
@@ -41,8 +64,8 @@ Result<void> DataPlane::read(const metadata::InodeExtentMap &map, std::span<std:
 
 Result<void> DataPlane::write(const metadata::InodeExtentMap &map,
                               std::span<const std::byte> buffer, std::uint64_t offset,
-                              std::uint64_t length) {
-    return path_.write(map, buffer, offset, length);
+                              std::uint64_t length, std::uint64_t knownEof) {
+    return path_.write(map, buffer, offset, length, knownEof);
 }
 
 } // namespace hfs

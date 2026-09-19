@@ -571,6 +571,26 @@ Bug 等级：**致命 > 严重 > 一般**。
   均在有界重试内成功停机，无崩溃。证据目录
   `/mnt/hfs-data/hfs2-teardown-check-20260918`、`/mnt/hfs-data/hfs2-postfix-gate2-20260918`。
 
+### 38. 并发 syncMetadata 返回 Busy 导致 RocksDB WAL sync 失败
+
+- **状态**：已修复
+- **等级**：严重（并发写负载随机失败）
+- **时间**：2026-09-19（RocksDB db_bench 对照测试发现）
+- **现象**：`hfs_db_bench` 8 线程 `overwrite` 的 seed 阶段 Put 报
+  `Resource busy: another durable epoch is being prepared`（进程 rc=5，基准中断）；
+  fillseq 期间并发 WAL sync 同样存在触发窗口。
+- **排查过程**：错误串来自 `Namespace::prepareDurableEpoch`（单一 prepared 槽非空即
+  Busy）；调用链为 RocksDB WAL `Fsync` → `File::sync()` → `Engine::syncMetadata`，
+  8 个 RocksDB 线程可并发进入且 `Engine::syncMetadata` 无串行化。
+- **根因**：命名空间级 durability barrier 不是串行临界区；并发 fsync/flush 调用
+  在 prepared 槽上互斥失败，Busy 被 RocksDB 当作硬错误上抛。
+- **修复**：`Engine::Impl` 增加 `syncMutex`，`Engine::syncMetadata` 全程持锁并在
+  锁内复检 `durableEpoch`，使同 epoch 的并发调用合并为幂等成功
+  （`src/core/engine.cpp`）。
+- **验证结果**：`file_data_test` 新增 4 线程并发 write+sync 回归（每线程 4 轮），
+  通过；`hfs_db_bench` 8 线程 fillseq/readrandom/overwrite/readwhilewriting 全量
+  完成、rc=0。证据目录 `/mnt/hfs-data/hfs2-rocksdb-db_bench-20260919`。
+
 ## 记录模板
 
 ### N. 简短标题

@@ -683,6 +683,20 @@ data submit → data drain → data device flush
 这明确避免“metadata transaction 写完却没有最终设备屏障”的旧问题，也保证 metadata
 不会先指向未 durable 的用户数据。
 
+写路径的四层可见性（2026-09-19，RocksDB adapter 写回缓冲）：
+
+```text
+buffered  = adapter 写回缓冲内（每文件 ≤1 MiB）；仅本进程；进程崩溃丢失
+logical   = File::write 成功（数据已提交设备、namespace 内存态更新）；同进程可见；进程崩溃丢失
+durable   = File::sync() 成功（上述 1-7 顺序完成并发布 durable epoch）；跨进程/机器崩溃保留
+recovered = mount replay 后状态；不变量 recovered ⊆ durable，无半事务
+```
+
+RocksDB 回调映射：`Append`=buffered；`Flush`=logical（**不** durable）；
+`Sync/Fsync`=durable。HFS 的 logical 层不跨进程崩溃（namespace 内存态），
+因此需要进程崩溃不丢的写入必须 `sync=1`；这与 ext4 page cache 的差异属已知
+边界（`doc/design/hfs2_rocksdb_wal_writeback_design_20260919.md` §5）。
+
 ### 10.3 Crash replay
 
 - committed transaction replay；不完整 transaction 丢弃；
@@ -731,20 +745,28 @@ Status s = DB::Open(options, db_path, &db);
 | `LockFile/UnlockFile` | 进程级 RocksDB lock lease |
 | `LinkFile` | link-count transaction；若版本/场景不支持则明确返回 NotSupported |
 | `FSSequentialFile::Skip/InvalidateCache` | 必须实现；invalidate 可为正确的 no-op |
-| `FSWritableFile::PrepareWrite/Allocate` | direct I/O 下映射 extent preallocation |
-| `PositionedAppend` | WAL/MANIFEST 单 writer 顺序 |
+| `FSWritableFile::PrepareWrite/Allocate` | `Allocate` 映射 extent preallocation；`PrepareWrite` 为 no-op |
+| `PositionedAppend` | 保留直写实现；RocksDB 8.9 写侧 `use_direct_io()==false` 时不调用 |
 
-v1 选择 `use_direct_io() == true`，因此 RocksDB preallocation hint 生效；adapter 必须
-实现对齐检查、bounce fallback、`PrepareWrite`、`Allocate`、`PositionedAppend`、
-`RangeSync`、`Sync/FSync`、`Close` 和目录 fsync。ReadAsync 的 `FSReadRequest`、iov、
-`io_handle` 必须活到 callback 返回；之后才调用 `IOHandleDeleter`。v1 不声明 `kFSBuffer`，
-不把 HFS DMA lease 借给 `fs_scratch`。
+读侧 v1 选择 `use_direct_io() == true`（`FSRandomAccessFile`）：adapter 必须实现对齐
+检查与 bounce fallback；目录 fsync 由 `FSDirectory::Fsync` 承担。ReadAsync 的
+`FSReadRequest`、iov、`io_handle` 必须活到 callback 返回；之后才调用
+`IOHandleDeleter`。v1 不声明 `kFSBuffer`，不把 HFS DMA lease 借给 `fs_scratch`。
+
+写侧 v1 选择 `use_direct_io() == false`（2026-09-19 决策 B，见
+`doc/design/hfs2_rocksdb_wal_writeback_design_20260919.md`）：**所有可写文件**
+（WAL/MANIFEST/SST）在 adapter 内做写回缓冲（每文件 ≤1 MiB）：
+`Append` 只写入缓冲；`Flush` 为 no-op（实测 RocksDB 每个写组都调用 Flush，落盘会使
+缓冲失效；Flush 不是 durability 屏障），缓冲由阈值、`Sync/Fsync`、`RangeSync`、
+`Close` 和读句柄打开强制写出；只有 `Sync/Fsync/RangeSync/Close` 调用
+`File::sync()` 触发 durable epoch；`use_direct_io_for_flush_and_compaction`
+对 HFS 无效，基准口径需声明。`PositionedAppend`/`Allocate`/`PrepareWrite` 保留实现。
 
 ### 11.3 文件类型
 
 ```text
 SST/table       → RandomAccessFile，可并发 Read/ReadAsync
-WAL             → WritableFile，单 writer，PositionedAppend + Sync
+WAL             → WritableFile，单 writer，buffered Append + Sync（§11.2 写侧语义）
 MANIFEST        → append/rename，metadata epoch
 CURRENT/OPTIONS → write/close/rename
 LOCK            → LockFile/UnlockFile lease
@@ -1017,6 +1039,10 @@ reject new attach/submit
 活跃 client/operation 未 drain 时 `stop()` 返回 Busy，除非调用显式 drain API。SIGKILL
 不保证 clean flag，下次 mount 必须 recovery。第二进程打开任一已配置 bdev 或相同 volume
 返回 Busy；fork child 所有 core API 返回 ForkedProcess。
+
+frontend（RocksDB adapter）的关闭路径必须先 flush adapter 写缓冲：`Close` 执行
+flush + `File::sync()`；未 sync 的 buffered/logical 数据在进程崩溃时丢失，由 WAL
+replay 恢复到最后一个 durable epoch（§10.2 四层语义）。
 
 Client 生命周期固定为 `Open→Closing→Closed`。Closing 后拒绝新 submit；outstanding、queued
 completion、IoHandle 或 open File 任一非零时 close 返回 Busy 但保持 Closing。operation

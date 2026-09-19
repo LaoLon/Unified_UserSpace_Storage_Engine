@@ -91,13 +91,13 @@ int main() {
 
         /* 1. zero-fill the extent so RMW reads see defined content */
         std::vector<std::byte> zeros(2ULL << 20, std::byte{0});
-        HFS_TEST_CHECK(path.write(map, zeros, 0, zeros.size()).ok());
-        HFS_TEST_CHECK(path.write(map, zeros, zeros.size(), zeros.size()).ok());
+        HFS_TEST_CHECK(path.write(map, zeros, 0, zeros.size(), ~0ULL).ok());
+        HFS_TEST_CHECK(path.write(map, zeros, zeros.size(), zeros.size(), ~0ULL).ok());
 
         /* 2. aligned write/read round-trip through bounce buffers */
         std::vector<std::byte> pattern(3 * metaBlock);
         fillPattern(pattern, 0x11);
-        HFS_TEST_CHECK(path.write(map, pattern, 0, pattern.size()).ok());
+        HFS_TEST_CHECK(path.write(map, pattern, 0, pattern.size(), ~0ULL).ok());
         std::vector<std::byte> readBack(pattern.size(), std::byte{0xFF});
         HFS_TEST_CHECK(path.read(map, readBack, 0, readBack.size()).ok());
         HFS_TEST_CHECK(readBack == pattern);
@@ -106,7 +106,7 @@ int main() {
         std::vector<std::byte> unaligned(5000);
         fillPattern(unaligned, 0x22);
         const std::uint64_t unalignedOffset = 3 * metaBlock - 1000;
-        HFS_TEST_CHECK(path.write(map, unaligned, unalignedOffset, unaligned.size()).ok());
+        HFS_TEST_CHECK(path.write(map, unaligned, unalignedOffset, unaligned.size(), ~0ULL).ok());
         std::vector<std::byte> unalignedRead(unaligned.size(), std::byte{0});
         HFS_TEST_CHECK(
             path.read(map, unalignedRead, unalignedOffset, unalignedRead.size()).ok());
@@ -131,9 +131,9 @@ int main() {
             std::vector<std::byte> secondBlock(metaBlock);
             fillPattern(firstBlock, 0x55);
             fillPattern(secondBlock, 0x66);
-            HFS_TEST_CHECK(path.write(sparse, firstBlock, 0, firstBlock.size()).ok());
+            HFS_TEST_CHECK(path.write(sparse, firstBlock, 0, firstBlock.size(), ~0ULL).ok());
             HFS_TEST_CHECK(path.write(sparse, secondBlock, 2 * metaBlock,
-                                      secondBlock.size()).ok());
+                                      secondBlock.size(), ~0ULL).ok());
             std::vector<std::byte> sparseRead(3 * metaBlock, std::byte{0xFF});
             const auto beforeSparse = path.stats();
             HFS_TEST_CHECK(path.read(sparse, sparseRead, 0, sparseRead.size()).ok());
@@ -149,6 +149,25 @@ int main() {
                             metaBlock) == 0);
         }
 
+        /* 3c. append fast path: blocks at or beyond the pre-write EOF skip the
+         * refresh read, so two children cost two submits instead of three. */
+        {
+            const std::uint64_t appendBase = physicalByte + (32ULL << 20);
+            SyntheticExtentMap appendMap;
+            appendMap.add(0, 2 * metaBlock, appendBase);
+            std::vector<std::byte> appendBytes(metaBlock + 100);
+            fillPattern(appendBytes, 0x77);
+            const auto beforeAppend = path.stats();
+            HFS_TEST_CHECK(
+                path.write(appendMap, appendBytes, 0, appendBytes.size(), 0).ok());
+            const auto afterAppend = path.stats();
+            HFS_TEST_CHECK(afterAppend.submits - beforeAppend.submits == 2);
+            HFS_TEST_CHECK(afterAppend.completes - beforeAppend.completes == 2);
+            std::vector<std::byte> appendRead(appendBytes.size(), std::byte{0});
+            HFS_TEST_CHECK(path.read(appendMap, appendRead, 0, appendRead.size()).ok());
+            HFS_TEST_CHECK(appendRead == appendBytes);
+        }
+
         /* 4. DMA-capable caller buffer takes the direct path without copies */
         auto lease = BufferLease::fromArena(arena, 1U << 20, 1000);
         HFS_TEST_CHECK(lease.ok());
@@ -158,7 +177,7 @@ int main() {
         const auto beforeDirect = path.stats();
         HFS_TEST_CHECK(path.write(map, std::span<const std::byte>(leaseSpan.data(),
                                                                   leaseSpan.size()),
-                                  0, leaseSpan.size()).ok());
+                                  0, leaseSpan.size(), ~0ULL).ok());
         HFS_TEST_CHECK(path.read(map, leaseSpan, 0, leaseSpan.size()).ok());
         const auto afterDirect = path.stats();
         HFS_TEST_CHECK(afterDirect.directChildren > beforeDirect.directChildren);
@@ -169,7 +188,7 @@ int main() {
         std::vector<std::byte> large(3U << 20);
         fillPattern(large, 0x44);
         const auto beforeLarge = path.stats();
-        HFS_TEST_CHECK(path.write(map, large, 0, large.size()).ok());
+        HFS_TEST_CHECK(path.write(map, large, 0, large.size(), ~0ULL).ok());
         const auto afterLarge = path.stats();
         HFS_TEST_CHECK(afterLarge.submits - beforeLarge.submits == 3);
         HFS_TEST_CHECK(afterLarge.completes - beforeLarge.completes == 3);

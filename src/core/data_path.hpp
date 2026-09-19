@@ -41,14 +41,17 @@ public:
 
     Result<void> read(const ExtentMap &map, std::span<std::byte> buffer,
                       std::uint64_t offset, std::uint64_t length);
+    /* knownEof is the file's logical size before this write; device blocks that
+     * start at or beyond it need no read-modify-write (append fast path). */
     Result<void> write(const ExtentMap &map, std::span<const std::byte> buffer,
-                       std::uint64_t offset, std::uint64_t length);
+                       std::uint64_t offset, std::uint64_t length,
+                       std::uint64_t knownEof);
     Stats stats() const noexcept;
 
 private:
     Result<void> execute(const ExtentMap &map, std::span<std::byte> readBuffer,
                          std::span<const std::byte> writeBuffer, std::uint64_t offset,
-                         std::uint64_t length, bool write);
+                         std::uint64_t length, bool write, std::uint64_t knownEof);
 
     SpdkRuntime &runtime_;
     DmaArena &arena_;

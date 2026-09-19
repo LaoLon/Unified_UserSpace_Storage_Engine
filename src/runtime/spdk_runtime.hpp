@@ -14,7 +14,7 @@
 namespace hfs {
 
 using DataIoCompletion = void (*)(void *, int);
-using DataReactorPoller = void (*)(void *) noexcept;
+using DataReactorPoller = int (*)(void *) noexcept;
 
 /* Caller-owned storage for one actor-local data I/O. The storage remains
  * opaque here so SPDK types never cross the internal runtime boundary. It

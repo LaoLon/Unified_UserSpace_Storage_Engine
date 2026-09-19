@@ -112,17 +112,18 @@ DataPath::DataPath(SpdkRuntime &runtime, DmaArena &arena, IoPlanner::Config plan
 
 Result<void> DataPath::read(const ExtentMap &map, std::span<std::byte> buffer,
                             std::uint64_t offset, std::uint64_t length) {
-    return execute(map, buffer, {}, offset, length, false);
+    return execute(map, buffer, {}, offset, length, false, 0);
 }
 
 Result<void> DataPath::write(const ExtentMap &map, std::span<const std::byte> buffer,
-                             std::uint64_t offset, std::uint64_t length) {
-    return execute(map, {}, buffer, offset, length, true);
+                             std::uint64_t offset, std::uint64_t length,
+                             std::uint64_t knownEof) {
+    return execute(map, {}, buffer, offset, length, true, knownEof);
 }
 
 Result<void> DataPath::execute(const ExtentMap &map, std::span<std::byte> readBuffer,
                                std::span<const std::byte> writeBuffer, std::uint64_t offset,
-                               std::uint64_t length, bool write) {
+                               std::uint64_t length, bool write, std::uint64_t knownEof) {
     auto planResult = planner_.plan(map, offset, length, write, !write);
     if (!planResult.ok()) {
         return makeError(planResult.status(), planResult.message());
@@ -208,7 +209,21 @@ Result<void> DataPath::execute(const ExtentMap &map, std::span<std::byte> readBu
         const std::uint64_t deviceOffset = child.physicalBlock * blocksPerMeta;
         const std::uint64_t deviceBlocks = child.spanBytes / deviceBlockBytes;
 
-        if (child.kind != IoPlanner::Child::Kind::Direct && write) {
+        /* A device block that starts at or beyond the pre-write EOF holds no
+         * committed bytes, so it can be written without the refresh read; the
+         * uncovered bytes are zero-filled to preserve the "written or zero"
+         * extent invariant. */
+        const std::uint64_t spanLogicalStart =
+            child.logicalOffset >= child.spanOffset ? child.logicalOffset - child.spanOffset
+                                                    : 0;
+        if (child.kind != IoPlanner::Child::Kind::Direct && write &&
+            spanLogicalStart >= knownEof) {
+            std::memset(span.data(), 0, child.spanBytes);
+            std::memcpy(span.data() + child.spanOffset,
+                        writeBuffer.data() + child.bufferOffset, child.bytes);
+            stats_.copyBytes += child.bytes;
+            trace::event(trace::EventId::CopyIn, child.bytes);
+        } else if (child.kind != IoPlanner::Child::Kind::Direct && write) {
             /* RMW: refresh the full block, merge the user bytes, then write. */
             WaitState readState;
             auto submit =

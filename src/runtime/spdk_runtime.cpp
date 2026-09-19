@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "common/log.hpp"
+#include "common/test_hooks.hpp"
 #include "common/trace.hpp"
 
 #ifdef HFS_WITH_SPDK
@@ -325,12 +326,14 @@ struct SpdkRuntime::Impl {
     }
 
     /* Invoke the registered hook without taking the registration mutex. The
-     * reader count lets clear/stop retire caller-owned context safely. */
-    void invokeDataReactorPoller(Reactor *reactor) noexcept {
+     * reader count lets clear/stop retire caller-owned context safely. Returns
+     * the callback's work count so idle detection can skip sleeping while the
+     * poller is still making progress. */
+    int invokeDataReactorPoller(Reactor *reactor) noexcept {
         for (;;) {
             std::uint64_t state = reactor->pollerState.load(std::memory_order_acquire);
             if ((state & kPollerEnabledBit) == 0) {
-                return;
+                return 0;
             }
             if (reactor->pollerState.compare_exchange_weak(
                     state, state + 1, std::memory_order_acquire,
@@ -350,13 +353,14 @@ struct SpdkRuntime::Impl {
         void *const context = reactor->pollerContext;
         if (callback == nullptr) {
             leave();
-            return;
+            return 0;
         }
         const void *previousPollerReactor = g_pollerCallbackReactor;
         g_pollerCallbackReactor = reactor;
-        callback(context);
+        const int work = callback(context);
         g_pollerCallbackReactor = previousPollerReactor;
         leave();
+        return work;
     }
 
     void closeDevicesLocked() {
@@ -714,7 +718,7 @@ struct SpdkRuntime::Impl {
             spdk_thread_poll(reactor->spdk, 0, 0);
             drainDataIoRetries(reactor);
             drainDataIoCompletions(reactor);
-            invokeDataReactorPoller(reactor);
+            (void)invokeDataReactorPoller(reactor);
             if (reactor->stop.load(std::memory_order_acquire)) {
                 const auto now = std::chrono::steady_clock::now();
                 if (!drainDeadlineSet) {
@@ -1156,6 +1160,9 @@ struct SpdkRuntime::Impl {
         if (index >= devices.size() || devices[index].desc == nullptr || reactors.empty() ||
             reactors[0]->spdk == nullptr) {
             return makeError(Status::InvalidArgument, "device index out of range");
+        }
+        if (op == ControlIo::Op::Flush) {
+            test_hooks::crashIfRequested("data_flush");
         }
         if (op == ControlIo::Op::Flush && testFlushFailureRequested(index)) {
             return makeError(Status::IoError,

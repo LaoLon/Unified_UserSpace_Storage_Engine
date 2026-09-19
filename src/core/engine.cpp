@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <fstream>
 #include <limits>
+#include <mutex>
 #include <new>
 #include <sstream>
 #include <string>
@@ -14,6 +15,7 @@
 #include <unistd.h>
 
 #include "common/log.hpp"
+#include "common/test_hooks.hpp"
 #include "common/stats.hpp"
 #include "common/trace.hpp"
 #include "core/async_data_service.hpp"
@@ -140,13 +142,18 @@ struct AsyncDataPollerContext {
     std::uint32_t shard = 0;
 };
 
-/* Runs only the owning shard actor from the data-reactor poll loop. */
-void pumpAsyncDataShard(void *context) noexcept {
+/* Runs only the owning shard actor from the data-reactor poll loop. Reports
+ * work so idle detection keeps polling while async operations are in flight. */
+int pumpAsyncDataShard(void *context) noexcept {
     auto *poller = static_cast<AsyncDataPollerContext *>(context);
     if (poller == nullptr || poller->service == nullptr) {
-        return;
+        return 0;
     }
-    (void)poller->service->pump(poller->shard);
+    const std::size_t pumped = poller->service->pump(poller->shard);
+    if (pumped != 0) {
+        return static_cast<int>(pumped);
+    }
+    return poller->service->outstanding() != 0 ? 1 : 0;
 }
 
 } // namespace
@@ -171,6 +178,9 @@ struct Engine::Impl {
     std::vector<AsyncDataPollerContext> asyncPollers;
     std::vector<std::uint8_t> asyncPollersRegistered;
     std::atomic<std::uint32_t> metadataUsers{0};
+    /* Serializes namespace-wide durability barriers: concurrent fsync/flush
+     * callers coalesce on the single prepared-epoch slot. */
+    std::mutex syncMutex;
 };
 
 Engine::Engine(Config config) : impl_(std::make_unique<Impl>()) {
@@ -643,6 +653,7 @@ Result<void> Engine::syncMetadata(std::uint64_t epoch) {
     if (epoch > impl_->namespaceState->logicalEpoch()) {
         return makeError(Status::InvalidArgument, "sync epoch is ahead of logical epoch");
     }
+    std::lock_guard<std::mutex> syncLock(impl_->syncMutex);
     /* A repeated barrier for an already durable epoch needs no checkpoint or
      * metadata write; this keeps sync idempotent without fixed checkpoint cost. */
     if (epoch <= impl_->namespaceState->durableEpoch()) {
@@ -657,6 +668,7 @@ Result<void> Engine::syncMetadata(std::uint64_t epoch) {
             return flushed;
         }
     }
+    test_hooks::crashIfRequested("metadata_commit");
     if (testMetadataCommitFailureRequested()) {
         return makeError(Status::IoError,
                          "test-injected metadata commit boundary failure");

@@ -3,10 +3,13 @@
 #include "rocksdb/hfs_filesystem.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cerrno>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <exception>
 #include <fcntl.h>
 #include <functional>
@@ -16,6 +19,7 @@
 #include <thread>
 #include <sys/file.h>
 #include <unistd.h>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -27,6 +31,44 @@
 namespace hfs::rocksdb_adapter {
 
 namespace {
+
+/* Temporary P0 call-pattern counters (env HFS_ROCKSDB_IO_STATS=1). */
+std::atomic<std::uint64_t> gAppendCalls{0};
+std::atomic<std::uint64_t> gAppendBytes{0};
+std::atomic<std::uint64_t> gFlushCalls{0};
+std::atomic<std::uint64_t> gSyncCalls{0};
+std::atomic<std::uint64_t> gBufferFlushes{0};
+std::atomic<std::uint64_t> gWriteThroughs{0};
+std::atomic<std::uint64_t> gReadCalls{0};
+std::atomic<std::uint64_t> gMultiReadCalls{0};
+std::atomic<std::uint64_t> gMultiReadRequests{0};
+std::atomic<std::uint64_t> gReadAsyncCalls{0};
+bool ioStatsEnabled() {
+    static const bool enabled = std::getenv("HFS_ROCKSDB_IO_STATS") != nullptr;
+    return enabled;
+}
+void reportIoStats() {
+    if (!ioStatsEnabled()) return;
+    std::fprintf(stderr,
+                 "hfs-rocksdb io stats: append_calls=%llu append_bytes=%llu flush_calls=%llu "
+                 "sync_calls=%llu buffer_flushes=%llu write_throughs=%llu "
+                 "read_calls=%llu multiread_calls=%llu multiread_requests=%llu "
+                 "readasync_calls=%llu\n",
+                 (unsigned long long)gAppendCalls.load(),
+                 (unsigned long long)gAppendBytes.load(),
+                 (unsigned long long)gFlushCalls.load(),
+                 (unsigned long long)gSyncCalls.load(),
+                 (unsigned long long)gBufferFlushes.load(),
+                 (unsigned long long)gWriteThroughs.load(),
+                 (unsigned long long)gReadCalls.load(),
+                 (unsigned long long)gMultiReadCalls.load(),
+                 (unsigned long long)gMultiReadRequests.load(),
+                 (unsigned long long)gReadAsyncCalls.load());
+}
+struct IoStatsReporter {
+    ~IoStatsReporter() { reportIoStats(); }
+};
+const IoStatsReporter gIoStatsReporter;
 
 /* Maps an HFS status into the status vocabulary expected by RocksDB. */
 template <typename T>
@@ -91,9 +133,22 @@ std::string hostLockPath(const std::string &path) {
     return "/var/tmp/hfs-rocksdb-lock-" + std::to_string(hash);
 }
 
+class HfsWritableFile;
+
+/* One adapter-side write-back buffer entry (design §7 pending registry). */
+struct PendingEntry {
+    HfsWritableFile *owner = nullptr;
+    std::size_t bytes = 0;           /* buffered bytes not yet in the HFS core */
+    std::uint64_t logicalOffset = 0; /* HFS logical offset of the pending bytes */
+};
+
 struct HfsContext {
     std::shared_ptr<hfs::Engine> engine;
     std::shared_ptr<hfs::Client> client;
+    /* Lets reads and size queries observe appended bytes before they reach
+     * the HFS core; guarded by pendingMutex. */
+    std::mutex pendingMutex;
+    std::unordered_map<std::string, PendingEntry> pending;
 
     /* Release the frontend lease before cleanly stopping the owned engine. */
     ~HfsContext() {
@@ -174,6 +229,7 @@ public:
         if (scratch == nullptr && n != 0) {
             return rocksdb::IOStatus::InvalidArgument("null positioned read buffer");
         }
+        if (ioStatsEnabled()) gReadCalls.fetch_add(1, std::memory_order_relaxed);
         hfs::IoVec buffer{reinterpret_cast<std::byte *>(scratch), n};
         auto read = file_->read(std::span<hfs::IoVec>(&buffer, 1), offset).wait();
         if (!read.ok()) return toIoStatus(read);
@@ -357,6 +413,10 @@ public:
         if (requests == nullptr && count != 0) {
             return rocksdb::IOStatus::InvalidArgument("null multi-read requests");
         }
+        if (ioStatsEnabled()) {
+            gMultiReadCalls.fetch_add(1, std::memory_order_relaxed);
+            gMultiReadRequests.fetch_add(count, std::memory_order_relaxed);
+        }
         rocksdb::IOStatus firstError = rocksdb::IOStatus::OK();
         for (size_t index = 0; index < count; ++index) {
             auto &request = requests[index];
@@ -387,6 +447,7 @@ public:
         if (request.scratch == nullptr && request.len != 0) {
             return rocksdb::IOStatus::InvalidArgument("null async read buffer");
         }
+        if (ioStatsEnabled()) gReadAsyncCalls.fetch_add(1, std::memory_order_relaxed);
         *ioHandle = nullptr;
         *deleter = {};
         try {
@@ -412,59 +473,143 @@ private:
     std::shared_ptr<hfs::File> file_;
 };
 
+/* Buffers appends in adapter memory and flushes them to the HFS core in
+ * batches (2026-09-19 design, decision B). Flush crosses only the HFS logical
+ * layer; Sync/Fsync/Close cross the durable-epoch boundary. */
 class HfsWritableFile final : public rocksdb::FSWritableFile {
 public:
-    HfsWritableFile(std::shared_ptr<hfs::File> file) : file_(std::move(file)) {}
+    HfsWritableFile(std::shared_ptr<hfs::File> file, std::shared_ptr<HfsContext> context,
+                    std::string path)
+        : file_(std::move(file)), context_(std::move(context)), path_(std::move(path)) {
+        if (file_ != nullptr) {
+            auto stat = file_->stat();
+            if (stat.ok()) {
+                logicalOffset_ = stat.value().logicalSize;
+            }
+        }
+        registerPending();
+    }
 
-    /* Appends buffered-mode bytes at the current HFS logical EOF. */
+    ~HfsWritableFile() override {
+        /* A close failure must not silently drop buffered bytes. */
+        if (file_ != nullptr) {
+            auto flushed = flushPendingBuffer();
+            if (!flushed.ok()) {
+                std::fprintf(stderr,
+                             "hfs-rocksdb: dropping %zu buffered bytes for %s\n",
+                             buffer_.size(), path_.c_str());
+            }
+            auto synced = file_->sync().wait();
+            if (!synced.ok() || !synced.value().ok()) {
+                std::fprintf(stderr, "hfs-rocksdb: final sync failed for %s\n",
+                             path_.c_str());
+            }
+        }
+        unregisterPending();
+    }
+
+    /* Copies small appends into the pending buffer; large appends are written
+     * through after the buffer is flushed to preserve byte order. */
     rocksdb::IOStatus Append(const rocksdb::Slice &data, const rocksdb::IOOptions &,
                              rocksdb::IODebugContext *) override {
-        hfs::IoVec buffer{reinterpret_cast<std::byte *>(const_cast<char *>(data.data())),
-                          data.size()};
-        auto written = file_->append(std::span<const hfs::IoVec>(&buffer, 1)).wait();
+        if (file_ == nullptr) {
+            return rocksdb::IOStatus::InvalidArgument("writable file is closed");
+        }
+        if (data.empty()) {
+            return rocksdb::IOStatus::OK();
+        }
+        if (ioStatsEnabled()) gAppendCalls.fetch_add(1, std::memory_order_relaxed);
+        if (ioStatsEnabled()) gAppendBytes.fetch_add(data.size(), std::memory_order_relaxed);
+        if (data.size() >= kFlushThreshold) {
+            auto flushed = flushPendingBuffer();
+            if (!flushed.ok()) {
+                return flushed;
+            }
+            return writeThrough(data.data(), data.size(), logicalOffset_);
+        }
+        buffer_.insert(buffer_.end(), data.data(), data.data() + data.size());
+        updatePending();
+        if (buffer_.size() >= kFlushThreshold) {
+            return flushPendingBuffer();
+        }
+        return rocksdb::IOStatus::OK();
+    }
+
+    /* Flushes pending bytes into the HFS logical layer without a durability
+     * barrier; retries are idempotent (same bytes at the same offsets). */
+    rocksdb::IOStatus flushPendingBuffer() {
+        if (file_ == nullptr || buffer_.empty()) {
+            return rocksdb::IOStatus::OK();
+        }
+        if (ioStatsEnabled()) gBufferFlushes.fetch_add(1, std::memory_order_relaxed);
+        hfs::IoVec buffer{reinterpret_cast<std::byte *>(buffer_.data()), buffer_.size()};
+        auto written =
+            file_->write(std::span<const hfs::IoVec>(&buffer, 1), logicalOffset_).wait();
         if (!written.ok()) {
             return toIoStatus(written);
         }
         auto value = std::move(written).value();
-        return value.ok() ? rocksdb::IOStatus::OK() : toIoStatus(value);
+        if (!value.ok()) {
+            return toIoStatus(value);
+        }
+        logicalOffset_ += buffer_.size();
+        buffer_.clear();
+        updatePending();
+        return rocksdb::IOStatus::OK();
     }
 
     /* Flushes the final RocksDB metadata before releasing the HFS handle. */
     rocksdb::IOStatus Close(const rocksdb::IOOptions &, rocksdb::IODebugContext *) override {
-        if (file_ != nullptr) {
-            auto synced = file_->sync().wait();
-            if (!synced.ok()) return toIoStatus(synced);
-            auto value = std::move(synced).value();
-            if (!value.ok()) return toIoStatus(value);
+        if (file_ == nullptr) {
+            return rocksdb::IOStatus::InvalidArgument("writable file is closed");
+        }
+        auto flushed = flushPendingBuffer();
+        if (!flushed.ok()) {
+            return flushed;
+        }
+        auto synced = file_->sync().wait();
+        if (!synced.ok()) {
+            return toIoStatus(synced);
+        }
+        auto value = std::move(synced).value();
+        if (!value.ok()) {
+            return toIoStatus(value);
         }
         file_.reset();
+        unregisterPending();
         return rocksdb::IOStatus::OK();
     }
 
-    /* Makes buffered RocksDB metadata visible across process reopen. */
+    /* RocksDB 8.9 calls Flush after every write group (measured: flush_calls
+     * equals append_calls). Honoring it with a device write would defeat the
+     * write-back buffer, and Flush is not a durability barrier, so bytes stay
+     * buffered; visibility is provided by the pending registry and the buffer
+     * is forced out by the threshold, Sync/Fsync, RangeSync, Close and read
+     * handle opens. */
     rocksdb::IOStatus Flush(const rocksdb::IOOptions &, rocksdb::IODebugContext *) override {
-        auto synced = file_->sync().wait();
-        if (!synced.ok()) return toIoStatus(synced);
-        return toIoStatus(std::move(synced).value());
+        if (ioStatsEnabled()) gFlushCalls.fetch_add(1, std::memory_order_relaxed);
+        return rocksdb::IOStatus::OK();
     }
 
     /* Writes at an explicit offset for RocksDB preallocation and manifests. */
     rocksdb::IOStatus PositionedAppend(const rocksdb::Slice &data, uint64_t offset,
                                         const rocksdb::IOOptions &,
                                         rocksdb::IODebugContext *) override {
-        hfs::IoVec buffer{reinterpret_cast<std::byte *>(const_cast<char *>(data.data())),
-                          data.size()};
-        auto written = file_->write(std::span<const hfs::IoVec>(&buffer, 1), offset).wait();
-        if (!written.ok()) return toIoStatus(written);
-        auto value = std::move(written).value();
-        return value.ok() ? rocksdb::IOStatus::OK() : toIoStatus(value);
+        if (file_ == nullptr) {
+            return rocksdb::IOStatus::InvalidArgument("writable file is closed");
+        }
+        return writeThrough(data.data(), data.size(), offset);
     }
 
     /* Reserves and zero-initializes the requested HFS logical range. */
     rocksdb::IOStatus Allocate(uint64_t offset, uint64_t length,
                                const rocksdb::IOOptions &, rocksdb::IODebugContext *) override {
+        if (file_ == nullptr) {
+            return rocksdb::IOStatus::InvalidArgument("writable file is closed");
+        }
         auto allocated = file_->allocate(offset, length).wait();
-        return allocated.ok() ? toIoStatus(std::move(allocated).value()) : toIoStatus(allocated);
+        return allocated.ok() ? toIoStatus(std::move(allocated).value())
+                              : toIoStatus(allocated);
     }
 
     /* Buffered HFS writes have no separate range cache; sync the file safely. */
@@ -479,13 +624,118 @@ public:
 
     /* Persists user data and file metadata through the HFS durable epoch path. */
     rocksdb::IOStatus Sync(const rocksdb::IOOptions &, rocksdb::IODebugContext *) override {
+        if (file_ == nullptr) {
+            return rocksdb::IOStatus::InvalidArgument("writable file is closed");
+        }
+        if (ioStatsEnabled()) gSyncCalls.fetch_add(1, std::memory_order_relaxed);
+        auto flushed = flushPendingBuffer();
+        if (!flushed.ok()) {
+            return flushed;
+        }
         auto synced = file_->sync().wait();
         return synced.ok() ? toIoStatus(std::move(synced).value()) : toIoStatus(synced);
     }
 
 private:
+    /* Writes one contiguous range through the HFS core. */
+    rocksdb::IOStatus writeThrough(const char *data, std::size_t size, std::uint64_t offset) {
+        if (ioStatsEnabled()) gWriteThroughs.fetch_add(1, std::memory_order_relaxed);
+        hfs::IoVec buffer{reinterpret_cast<std::byte *>(const_cast<char *>(data)), size};
+        auto written = file_->write(std::span<const hfs::IoVec>(&buffer, 1), offset).wait();
+        if (!written.ok()) {
+            return toIoStatus(written);
+        }
+        auto value = std::move(written).value();
+        if (!value.ok()) {
+            return toIoStatus(value);
+        }
+        if (offset == logicalOffset_) {
+            logicalOffset_ += size;
+            updatePending();
+        }
+        return rocksdb::IOStatus::OK();
+    }
+
+    void registerPending() {
+        if (context_ == nullptr) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(context_->pendingMutex);
+        PendingEntry entry;
+        entry.owner = this;
+        entry.bytes = 0;
+        entry.logicalOffset = logicalOffset_;
+        context_->pending[path_] = entry;
+    }
+
+    void updatePending() {
+        if (context_ == nullptr) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(context_->pendingMutex);
+        auto entry = context_->pending.find(path_);
+        if (entry != context_->pending.end()) {
+            entry->second.bytes = buffer_.size();
+            entry->second.logicalOffset = logicalOffset_;
+        }
+    }
+
+    void unregisterPending() {
+        if (context_ == nullptr) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(context_->pendingMutex);
+        auto entry = context_->pending.find(path_);
+        if (entry != context_->pending.end() && entry->second.owner == this) {
+            context_->pending.erase(entry);
+        }
+    }
+
     std::shared_ptr<hfs::File> file_;
+    std::shared_ptr<HfsContext> context_;
+    std::string path_;
+    std::vector<char> buffer_;
+    std::uint64_t logicalOffset_ = 0;
+    static constexpr std::size_t kFlushThreshold = 1u << 20; /* 1 MiB */
 };
+
+/* Flushes any pending adapter buffer for path so read handles observe it. */
+rocksdb::IOStatus flushPendingForPath(const std::shared_ptr<HfsContext> &context,
+                                      const std::string &path) {
+    if (context == nullptr) {
+        return rocksdb::IOStatus::OK();
+    }
+    HfsWritableFile *owner = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(context->pendingMutex);
+        auto entry = context->pending.find(path);
+        if (entry != context->pending.end()) {
+            owner = entry->second.owner;
+        }
+    }
+    return owner == nullptr ? rocksdb::IOStatus::OK() : owner->flushPendingBuffer();
+}
+
+/* Reports buffered bytes for size queries without forcing a flush. */
+std::size_t pendingBytesForPath(const std::shared_ptr<HfsContext> &context,
+                                const std::string &path) {
+    if (context == nullptr) {
+        return 0;
+    }
+    std::lock_guard<std::mutex> lock(context->pendingMutex);
+    auto entry = context->pending.find(path);
+    return entry == context->pending.end() ? 0 : entry->second.bytes;
+}
+
+/* Drops the pending entry after the file was removed or renamed away. */
+void dropPendingForPath(const std::shared_ptr<HfsContext> &context,
+                        const std::string &path) {
+    if (context == nullptr) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(context->pendingMutex);
+    context->pending.erase(path);
+}
 
 class HfsDirectory final : public rocksdb::FSDirectory {
 public:
@@ -568,7 +818,8 @@ public:
         return rocksdb::IOStatus::OK();
     }
 
-    /* Opens an existing HFS regular file for sequential reads. */
+    /* Opens an existing HFS regular file for sequential reads. Pending adapter
+     * bytes are flushed first so reads observe prior appends. */
     rocksdb::IOStatus NewSequentialFile(const std::string &fname,
                                          const rocksdb::FileOptions &,
                                          std::unique_ptr<rocksdb::FSSequentialFile> *result,
@@ -576,6 +827,8 @@ public:
         if (result == nullptr) {
             return rocksdb::IOStatus::InvalidArgument("null sequential file output");
         }
+        auto flushed = flushPendingForPath(context_, hfsPath(fname));
+        if (!flushed.ok()) return flushed;
         std::shared_ptr<hfs::File> file;
         auto status = openFile(context_, fname, hfs::OpenFlags::None, &file);
         if (!status.ok()) return status;
@@ -591,6 +844,8 @@ public:
         if (result == nullptr) {
             return rocksdb::IOStatus::InvalidArgument("null random file output");
         }
+        auto flushed = flushPendingForPath(context_, hfsPath(fname));
+        if (!flushed.ok()) return flushed;
         std::shared_ptr<hfs::File> file;
         auto status = openFile(context_, fname, hfs::OpenFlags::None, &file);
         if (!status.ok()) return status;
@@ -610,7 +865,8 @@ public:
         auto status = openFile(context_, fname,
                                hfs::OpenFlags::Create | hfs::OpenFlags::Truncate, &file);
         if (!status.ok()) return status;
-        *result = std::make_unique<HfsWritableFile>(std::move(file));
+        *result = std::make_unique<HfsWritableFile>(std::move(file), context_,
+                                                    hfsPath(fname));
         return rocksdb::IOStatus::OK();
     }
 
@@ -655,11 +911,20 @@ public:
         return rocksdb::IOStatus::OK();
     }
 
-    /* Removes a regular HFS namespace entry. */
+    /* Removes a regular HFS namespace entry and drops any pending adapter
+     * buffer for it (the file is gone; buffered bytes are discarded). */
     rocksdb::IOStatus DeleteFile(const std::string &fname, const rocksdb::IOOptions &,
                                  rocksdb::IODebugContext *) override {
         auto removed = context_->client->remove(hfsPath(fname)).wait();
-        return removed.ok() ? toIoStatus(std::move(removed).value()) : toIoStatus(removed);
+        if (!removed.ok()) {
+            return toIoStatus(removed);
+        }
+        auto status = std::move(removed).value();
+        if (!status.ok()) {
+            return toIoStatus(status);
+        }
+        dropPendingForPath(context_, hfsPath(fname));
+        return rocksdb::IOStatus::OK();
     }
 
     /* Creates one HFS directory entry and rejects an existing name. */
@@ -705,7 +970,7 @@ public:
         if (!status.ok()) return status;
         auto stat = file->stat();
         if (!stat.ok()) return toIoStatus(stat);
-        *fileSize = stat.value().logicalSize;
+        *fileSize = stat.value().logicalSize + pendingBytesForPath(context_, hfsPath(fname));
         return rocksdb::IOStatus::OK();
     }
 
@@ -725,9 +990,14 @@ public:
         return rocksdb::IOStatus::OK();
     }
 
-    /* Performs an atomic HFS namespace rename. */
+    /* Performs an atomic HFS namespace rename. Pending adapter bytes for the
+     * source are flushed first so the target observes the full content. */
     rocksdb::IOStatus RenameFile(const std::string &src, const std::string &target,
                                  const rocksdb::IOOptions &, rocksdb::IODebugContext *) override {
+        auto flushedSource = flushPendingForPath(context_, hfsPath(src));
+        if (!flushedSource.ok()) return flushedSource;
+        auto flushedTarget = flushPendingForPath(context_, hfsPath(target));
+        if (!flushedTarget.ok()) return flushedTarget;
         auto renamed = context_->client->rename(hfsPath(src), hfsPath(target)).wait();
         if (!renamed.ok()) return toIoStatus(renamed);
         auto renameStatus = std::move(renamed).value();
@@ -744,6 +1014,8 @@ public:
     /* Creates a native HFS hard link without duplicating file contents. */
     rocksdb::IOStatus LinkFile(const std::string &src, const std::string &target,
                                const rocksdb::IOOptions &, rocksdb::IODebugContext *) override {
+        auto flushed = flushPendingForPath(context_, hfsPath(src));
+        if (!flushed.ok()) return flushed;
         auto linked = context_->client->link(hfsPath(src), hfsPath(target)).wait();
         return linked.ok() ? toIoStatus(std::move(linked).value()) : toIoStatus(linked);
     }
