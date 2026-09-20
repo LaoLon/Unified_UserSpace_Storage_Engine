@@ -110,13 +110,15 @@ const std::vector<SectionSpec> kSections = {
       "extent_mb", "prealloc_extents", "max_extents_per_file"}},
     {"runtime",
      {"data_reactors", "max_data_reactors", "metadata_cpu", "data_cpus", "ring_depth",
-      "client_depth"}},
+      "metadata_cpus", "frontend_cpus", "ring_depth", "client_depth"}},
+    {"numa", {"policy", "device_numa", "dma_numa", "frontend_numa",
+               "allow_remote_dma", "remote_fallback", "polling"}},
     {"limits",
      {"dma_arena_mb", "operation_pool", "coroutine_frame_pool", "metadata_wait_timeout_ms",
       "backend_retry_limit"}},
     {"metadata",
      {"max_inodes", "max_namespace_bytes", "checkpoint_trigger_percent",
-      "checkpoint_force_percent"}},
+      "checkpoint_force_percent", "max_group_commit_wait_us"}},
     {"observability", {"trace", "trace_sample", "trace_dir", "stats"}},
 };
 
@@ -222,6 +224,42 @@ public:
         return true;
     }
 
+    bool optionalString(const std::string &fullKey, std::string &out) const {
+        const Entry *entry = find(fullKey);
+        if (entry == nullptr) {
+            return false;
+        }
+        out = entry->value;
+        return true;
+    }
+
+    bool optionalBool(const std::string &fullKey, bool &out, std::string &error) const {
+        const Entry *entry = find(fullKey);
+        if (entry == nullptr) {
+            return true;
+        }
+        if (!parseBool(entry->value, out)) {
+            error = "key '" + fullKey + "' must be true or false at line " +
+                    std::to_string(entry->line);
+            return false;
+        }
+        return true;
+    }
+
+    bool optionalUint32(const std::string &fullKey, std::uint32_t &out,
+                       std::string &error) const {
+        const Entry *entry = find(fullKey);
+        if (entry == nullptr) {
+            return true;
+        }
+        if (!parseUint32(entry->value, out)) {
+            error = "key '" + fullKey + "' must be an unsigned 32-bit integer at line " +
+                    std::to_string(entry->line);
+            return false;
+        }
+        return true;
+    }
+
 private:
     std::map<std::string, Entry> entries_;
 };
@@ -239,6 +277,14 @@ bool isAutoOrCpuList(const std::string &text) {
         }
     }
     return true;
+}
+
+bool isAutoOrNode(const std::string &text) {
+    if (text == "auto") {
+        return true;
+    }
+    std::uint32_t node = 0;
+    return parseUint32(text, node);
 }
 
 } // namespace
@@ -405,6 +451,19 @@ Result<Config> parseConfig(const std::string &text, const std::string &origin) {
         return fail(error);
     }
     config.dataCpus = dataCpus;
+    store.optionalString("runtime.metadata_cpus", config.metadataCpus);
+    store.optionalString("runtime.frontend_cpus", config.frontendCpus);
+
+    /* [numa] is optional for schema-version-1 configurations. */
+    store.optionalString("numa.policy", config.numa.policy);
+    store.optionalString("numa.device_numa", config.numa.deviceNuma);
+    store.optionalString("numa.dma_numa", config.numa.dmaNuma);
+    store.optionalString("numa.frontend_numa", config.numa.frontendNuma);
+    store.optionalString("numa.remote_fallback", config.numa.remoteFallback);
+    store.optionalString("numa.polling", config.numa.polling);
+    if (!store.optionalBool("numa.allow_remote_dma", config.numa.allowRemoteDma, error)) {
+        return fail(error);
+    }
 
     /* [limits] */
     if (!store.requireUint64("limits.dma_arena_mb", config.dmaArenaMb, error) ||
@@ -424,6 +483,10 @@ Result<Config> parseConfig(const std::string &text, const std::string &origin) {
                              config.checkpointTriggerPercent, error) ||
         !store.requireUint32("metadata.checkpoint_force_percent",
                              config.checkpointForcePercent, error)) {
+        return fail(error);
+    }
+    if (!store.optionalUint32("metadata.max_group_commit_wait_us",
+                             config.maxGroupCommitWaitUs, error)) {
         return fail(error);
     }
 
@@ -597,8 +660,65 @@ Result<void> validateConfig(const Config &config) {
     if (!isAutoOrCpuList(config.dataCpus)) {
         return invalid("data_cpus must be 'auto' or a comma-separated CPU list");
     }
+    if (!isAutoOrCpuList(config.metadataCpus) || !isAutoOrCpuList(config.frontendCpus)) {
+        return invalid("metadata_cpus and frontend_cpus must be 'auto' or CPU lists");
+    }
+    /* Reject explicit role overlap before runtime threads are created. Auto
+     * placement is intentionally left to the topology-aware runtime. */
+    std::set<std::uint32_t> reservedCpus;
+    if (config.metadataCpus.empty() || config.metadataCpus == "auto") {
+        reservedCpus.insert(config.metadataCpu);
+    } else {
+        for (const auto &item : splitList(config.metadataCpus)) {
+            std::uint32_t cpu = 0;
+            if (!parseUint32(item, cpu) || !reservedCpus.insert(cpu).second) {
+                return invalid("metadata_cpus contains a duplicate or invalid CPU");
+            }
+        }
+    }
+    auto addRoleCpus = [&](const std::string &text, const char *role,
+                           bool rejectReserved) -> Result<void> {
+        if (text.empty() || text == "auto") {
+            return Result<void>(Status::Ok);
+        }
+        for (const auto &item : splitList(text)) {
+            std::uint32_t cpu = 0;
+            if (!parseUint32(item, cpu)) {
+                return invalid(std::string(role) + " contains an invalid CPU");
+            }
+            if (rejectReserved && !reservedCpus.insert(cpu).second) {
+                return invalid(std::string(role) + " overlaps metadata/data CPU " +
+                               std::to_string(cpu));
+            }
+        }
+        return Result<void>(Status::Ok);
+    };
+    auto dataCpuCheck = addRoleCpus(config.dataCpus, "data_cpus", true);
+    if (!dataCpuCheck.ok()) return dataCpuCheck;
+    auto frontendCpuCheck = addRoleCpus(config.frontendCpus, "frontend_cpus", true);
+    if (!frontendCpuCheck.ok()) return frontendCpuCheck;
     if (config.ringDepth == 0 || config.clientDepth == 0) {
         return invalid("ring_depth and client_depth must be greater than zero");
+    }
+
+    if (config.numa.policy != "local-first" && config.numa.policy != "local-only") {
+        return invalid("numa.policy must be 'local-first' or 'local-only'");
+    }
+    if (!isAutoOrNode(config.numa.deviceNuma) || !isAutoOrNode(config.numa.dmaNuma)) {
+        return invalid("numa.device_numa and numa.dma_numa must be 'auto' or a NUMA node");
+    }
+    if (config.numa.frontendNuma != "auto" &&
+        config.numa.frontendNuma != "device-local" &&
+        !isAutoOrNode(config.numa.frontendNuma)) {
+        return invalid("numa.frontend_numa must be 'auto', 'device-local' or a NUMA node");
+    }
+    if (config.numa.remoteFallback != "bounded" &&
+        config.numa.remoteFallback != "disabled") {
+        return invalid("numa.remote_fallback must be 'bounded' or 'disabled'");
+    }
+    if (config.numa.polling != "active" && config.numa.polling != "hybrid" &&
+        config.numa.polling != "interrupt") {
+        return invalid("numa.polling must be 'active', 'hybrid' or 'interrupt'");
     }
 
     if (config.dmaArenaMb == 0) {
@@ -621,6 +741,9 @@ Result<void> validateConfig(const Config &config) {
         config.checkpointTriggerPercent >= config.checkpointForcePercent ||
         config.checkpointForcePercent > 100) {
         return invalid("checkpoint thresholds must satisfy 0 < trigger < force <= 100");
+    }
+    if (config.maxGroupCommitWaitUs > 1'000'000) {
+        return invalid("max_group_commit_wait_us must be at most one second");
     }
 
     if (config.traceSample == 0) {

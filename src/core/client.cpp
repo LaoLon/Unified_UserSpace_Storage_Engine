@@ -590,6 +590,25 @@ Task<Result<void>> Client::close() {
     co_return Result<void>(Status::Ok);
 }
 
+Result<void> Client::bindFrontendThread() {
+    auto &state = *impl_->state;
+    auto valid = validateClient(state);
+    if (!valid.ok()) {
+        return valid;
+    }
+    if (!state.asyncInitialized) {
+        return makeError(Status::InvalidState, "client async resources are unavailable");
+    }
+    if (state.outstandingCount.load(std::memory_order_acquire) != 0 ||
+        state.handleCount.load(std::memory_order_acquire) != 0 ||
+        queuedCompletions(state) != 0) {
+        return makeError(Status::Busy,
+                         "client frontend ownership cannot move with active requests");
+    }
+    state.frontendThread = std::this_thread::get_id();
+    return Result<void>(Status::Ok);
+}
+
 Result<IoHandle> Client::submitRead(const std::shared_ptr<File> &file, IoVec buffer,
                                     std::uint64_t offset, CompletionToken token) {
     auto &state = *impl_->state;

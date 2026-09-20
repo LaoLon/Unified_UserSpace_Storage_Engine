@@ -66,6 +66,7 @@ inline std::string validConfigText(const std::string &lockPath,
            "max_namespace_bytes = 1073741824\n"
            "checkpoint_trigger_percent = 50\n"
            "checkpoint_force_percent = 80\n"
+           "max_group_commit_wait_us = 200\n"
            "\n"
            "[observability]\n"
            "trace = false\n"

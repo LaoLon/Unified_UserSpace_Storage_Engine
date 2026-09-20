@@ -40,8 +40,13 @@ int main() {
         HFS_TEST_CHECK(config.preallocExtents == 64);
         HFS_TEST_CHECK(config.maxExtentsPerFile == 65536);
         HFS_TEST_CHECK(config.checkpointTriggerPercent == 50);
+        HFS_TEST_CHECK(config.maxGroupCommitWaitUs == 200);
         HFS_TEST_CHECK(config.traceSample == 1);
         HFS_TEST_CHECK(config.processLockPath == "/tmp/hfs2-parser-test.lock");
+        HFS_TEST_CHECK(config.numa.policy == "local-first");
+        HFS_TEST_CHECK(config.numa.deviceNuma == "auto");
+        HFS_TEST_CHECK(config.numa.dmaNuma == "auto");
+        HFS_TEST_CHECK(!config.numa.allowRemoteDma);
     }
 
     /* 2. the shipped single-disk baseline parses */
@@ -182,6 +187,50 @@ int main() {
                 "weight = 1\n"
                 "required = true\n";
         HFS_TEST_CHECK(expectInvalid(text, "duplicate-pci-bdf") == 0);
+    }
+
+    /* 18. NUMA policy is optional but validates explicit placement strategy. */
+    {
+        std::string text = base +
+                           "\n[numa]\n"
+                           "policy = local-only\n"
+                           "device_numa = 1\n"
+                           "dma_numa = 1\n"
+                           "frontend_numa = device-local\n"
+                           "allow_remote_dma = false\n"
+                           "remote_fallback = disabled\n"
+                           "polling = interrupt\n";
+        auto parsed = hfs::parseConfig(text, "numa-policy");
+        HFS_TEST_CHECK(parsed.ok());
+        HFS_TEST_CHECK(parsed.value().numa.policy == "local-only");
+        HFS_TEST_CHECK(parsed.value().numa.deviceNuma == "1");
+        HFS_TEST_CHECK(parsed.value().numa.polling == "interrupt");
+    }
+
+    /* 19. NUMA policy typos fail closed instead of changing placement silently. */
+    {
+        std::string text = base + "\n[numa]\npolicy = remote\n";
+        HFS_TEST_CHECK(expectInvalid(text, "numa-policy") == 0);
+    }
+
+    /* 20. Explicit role CPU overlap is rejected before runtime startup. */
+    {
+        std::string text = base;
+        HFS_TEST_CHECK(replaceAll(text, "data_cpus = auto", "data_cpus = 1\n"
+                                                       "frontend_cpus = 1"));
+        HFS_TEST_CHECK(expectInvalid(text, "cpu-role-overlap") == 0);
+    }
+
+    /* 21. Optional metadata/frontend CPU lists are retained by the parser. */
+    {
+        std::string text = base;
+        HFS_TEST_CHECK(replaceAll(text, "data_cpus = auto", "data_cpus = 1\n"
+                                                       "metadata_cpus = 0\n"
+                                                       "frontend_cpus = auto"));
+        auto parsed = hfs::parseConfig(text, "cpu-role-lists");
+        HFS_TEST_CHECK(parsed.ok());
+        HFS_TEST_CHECK(parsed.value().metadataCpus == "0");
+        HFS_TEST_CHECK(parsed.value().frontendCpus == "auto");
     }
 
     std::printf("config_parser_test: ok\n");

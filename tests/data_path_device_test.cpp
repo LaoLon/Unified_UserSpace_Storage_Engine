@@ -1,4 +1,5 @@
 #include <cstdio>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -106,7 +107,16 @@ int main() {
         std::vector<std::byte> unaligned(5000);
         fillPattern(unaligned, 0x22);
         const std::uint64_t unalignedOffset = 3 * metaBlock - 1000;
-        HFS_TEST_CHECK(path.write(map, unaligned, unalignedOffset, unaligned.size(), ~0ULL).ok());
+        HFS_TEST_CHECK(::setenv("HFS_TEST_DATA_IO_WRITE_DELAY_MS", "25", 1) == 0);
+        const auto delayedWriteStart = std::chrono::steady_clock::now();
+        const auto delayedWrite =
+            path.write(map, unaligned, unalignedOffset, unaligned.size(), ~0ULL);
+        const auto delayedWriteElapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - delayedWriteStart);
+        HFS_TEST_CHECK(::unsetenv("HFS_TEST_DATA_IO_WRITE_DELAY_MS") == 0);
+        HFS_TEST_CHECK(delayedWrite.ok());
+        /* The second RMW phase must be fully reaped before DataPath returns. */
+        HFS_TEST_CHECK(delayedWriteElapsed.count() >= 20);
         std::vector<std::byte> unalignedRead(unaligned.size(), std::byte{0});
         HFS_TEST_CHECK(
             path.read(map, unalignedRead, unalignedOffset, unalignedRead.size()).ok());

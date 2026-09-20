@@ -58,6 +58,9 @@ public:
     /* Control-path doorbell onto a data reactor (spdk_thread_send_msg). */
     Result<void> postToDataReactor(std::uint32_t index, std::function<void()> fn);
     std::uint64_t dataReactorThreadId(std::uint32_t index) const;
+    /* Returns the reactor selected for a device's NUMA domain. */
+    std::uint32_t dataReactorForDevice(std::size_t deviceIndex) const noexcept;
+    std::int32_t dataReactorNumaNode(std::uint32_t index) const noexcept;
 
     /* Installs one reactor-local poller called after SPDK completion and retry
      * queues are drained. Registration is synchronized with callback entry. */

@@ -53,6 +53,7 @@ set(HFS_CORE_SRC
   src/metadata/inode_map.cpp
   src/metadata/namespace.cpp
   src/runtime/spdk_runtime.cpp
+  src/runtime/numa_topology.cpp
   src/storage/journal.cpp
   src/storage/superblock.cpp
   src/storage/volume.cpp
@@ -232,6 +233,19 @@ target_include_directories(spdk_async_backend_test PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/tests
 )
 add_test(NAME spdk_async_backend_test COMMAND spdk_async_backend_test)
+
+# NUMA list parsing and unavailable-sysfs fallback are platform-neutral tests.
+add_executable(numa_topology_test
+  tests/numa_topology_test.cpp
+  src/runtime/numa_topology.cpp
+)
+target_include_directories(numa_topology_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_compile_options(numa_topology_test PRIVATE -fno-exceptions -fno-rtti)
+target_link_libraries(numa_topology_test PRIVATE Threads::Threads)
+add_test(NAME numa_topology_test COMMAND numa_topology_test)
 
 # The data-plane structure test compiles the internal core sources directly so
 # it can run with ASAN/TSAN and without SPDK.

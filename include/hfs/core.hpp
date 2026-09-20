@@ -156,6 +156,9 @@ public:
 
     Task<Result<void>> close();
 
+    /* Transfers async frontend ownership once before any request is active. */
+    Result<void> bindFrontendThread();
+
     /* Submits one contiguous asynchronous read or fixed-size overwrite. */
     Result<IoHandle> submitRead(const std::shared_ptr<File> &file, IoVec buffer,
                                 std::uint64_t offset, CompletionToken token);

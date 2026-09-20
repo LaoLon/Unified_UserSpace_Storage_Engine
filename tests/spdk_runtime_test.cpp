@@ -27,7 +27,10 @@ void recordCompletion(void *ctx, int rc) {
 }
 
 /* Conflicting registration probe must never replace the engine actor pump. */
-void conflictingPoller(void *ctx) noexcept { (void)ctx; }
+int conflictingPoller(void *ctx) noexcept {
+    (void)ctx;
+    return 0;
+}
 
 } // namespace
 

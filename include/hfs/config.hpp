@@ -20,6 +20,17 @@ struct DeviceConfig {
     bool required = true;
 };
 
+/* NUMA placement policy. A single-node VM keeps the pre-NUMA behavior. */
+struct NumaConfig {
+    std::string policy = "local-first";
+    std::string deviceNuma = "auto";
+    std::string dmaNuma = "auto";
+    std::string frontendNuma = "device-local";
+    bool allowRemoteDma = false;
+    std::string remoteFallback = "bounded";
+    std::string polling = "hybrid";
+};
+
 /* Parsed HFS 2.0 `.conf` configuration (schema_version 1). */
 struct Config {
     /* [hfs] */
@@ -48,8 +59,12 @@ struct Config {
     std::uint32_t maxDataReactors = 0;
     std::uint32_t metadataCpu = 0;
     std::string dataCpus; /* "auto" or comma list */
+    std::string metadataCpus; /* optional comma list; metadataCpu remains the fallback */
+    std::string frontendCpus; /* optional comma list for frontend affinity evidence */
     std::uint32_t ringDepth = 0;
     std::uint32_t clientDepth = 0;
+    /* [numa] */
+    NumaConfig numa;
     /* [limits] */
     std::uint64_t dmaArenaMb = 0;
     std::uint32_t operationPool = 0;
@@ -61,6 +76,8 @@ struct Config {
     std::uint64_t maxNamespaceBytes = 0;
     std::uint32_t checkpointTriggerPercent = 0;
     std::uint32_t checkpointForcePercent = 0;
+    /* Coalescing window for concurrent full-snapshot durability barriers. */
+    std::uint32_t maxGroupCommitWaitUs = 0;
     /* [observability] */
     bool trace = false;
     std::uint32_t traceSample = 1;

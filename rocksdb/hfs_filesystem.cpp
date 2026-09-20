@@ -3,6 +3,7 @@
 #include "rocksdb/hfs_filesystem.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cerrno>
@@ -10,9 +11,11 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <deque>
 #include <exception>
 #include <fcntl.h>
 #include <functional>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -134,6 +137,7 @@ std::string hostLockPath(const std::string &path) {
 }
 
 class HfsWritableFile;
+class AsyncReadDispatcher;
 
 /* One adapter-side write-back buffer entry (design §7 pending registry). */
 struct PendingEntry {
@@ -145,22 +149,14 @@ struct PendingEntry {
 struct HfsContext {
     std::shared_ptr<hfs::Engine> engine;
     std::shared_ptr<hfs::Client> client;
+    std::unique_ptr<AsyncReadDispatcher> asyncDispatcher;
     /* Lets reads and size queries observe appended bytes before they reach
      * the HFS core; guarded by pendingMutex. */
     std::mutex pendingMutex;
     std::unordered_map<std::string, PendingEntry> pending;
 
-    /* Release the frontend lease before cleanly stopping the owned engine. */
-    ~HfsContext() {
-        if (client != nullptr) {
-            client->close().wait();
-            client.reset();
-        }
-        if (engine != nullptr) {
-            engine->stop().wait();
-            engine.reset();
-        }
-    }
+    /* Stop the frontend owner before cleanly stopping the owned engine. */
+    ~HfsContext();
 };
 
 /* Opens one HFS file and returns the nested coroutine result consistently. */
@@ -259,154 +255,429 @@ struct AsyncReadState {
     void *callbackArg = nullptr;
     std::mutex mutex;
     std::condition_variable condition;
-    bool completed = false;
+    AsyncReadDispatcher *dispatcher = nullptr;
+    hfs::IoHandle ioHandle;
+    std::uint64_t requestId = 0;
+    hfs::CompletionToken token{};
+    bool submitted = false;
+    bool callbackDone = false;
+    bool terminal = false;
     bool aborted = false;
     bool callbackStarted = false;
-    bool ioCompleted = false;
-    rocksdb::IOStatus ioStatus = rocksdb::IOStatus::IOError("async read failed");
-    rocksdb::Slice ioResult;
-    std::thread worker;
-    std::thread ioWorker;
+    std::chrono::steady_clock::time_point deadline{};
+    std::chrono::steady_clock::time_point notBefore{};
 
-    /* Joins the worker before the opaque handle is reclaimed. */
+    /* A handle may be deleted after a timeout callback but before core drain. */
     ~AsyncReadState() {
-        if (worker.joinable()) {
-            worker.join();
-        }
-        if (ioWorker.joinable()) {
-            ioWorker.join();
-        }
+        std::unique_lock<std::mutex> lock(mutex);
+        condition.wait(lock, [this] { return terminal; });
     }
 };
 
-/* Runs the backend read and retains its completion until the handle is freed. */
-void executeAsyncReadIo(AsyncReadState *state) {
-    rocksdb::IOStatus status = rocksdb::IOStatus::IOError("async read failed");
-    try {
-        /* Test-only delay makes timeout and pre-callback cancellation deterministic. */
-        const char *delayText = std::getenv("HFS_TEST_ASYNC_READ_DELAY_MS");
-        if (delayText != nullptr && *delayText != '\0') {
-            char *end = nullptr;
-            const unsigned long delay = std::strtoul(delayText, &end, 10);
-            if (end != delayText && *end == '\0' && delay <= 60000) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+/* One bounded frontend owner replaces the old per-request blocking workers. */
+class AsyncReadDispatcher {
+public:
+    explicit AsyncReadDispatcher(std::size_t queueCapacity = 1024)
+        : queueCapacity_(std::max<std::size_t>(1, queueCapacity)) {}
+
+    AsyncReadDispatcher(const AsyncReadDispatcher &) = delete;
+    AsyncReadDispatcher &operator=(const AsyncReadDispatcher &) = delete;
+
+    void setClient(std::shared_ptr<hfs::Client> client) noexcept {
+        client_ = std::move(client);
+    }
+
+    static void wake(void *context) noexcept {
+        auto *dispatcher = static_cast<AsyncReadDispatcher *>(context);
+        if (dispatcher == nullptr) {
+            return;
+        }
+        dispatcher->wakeEpoch_.fetch_add(1, std::memory_order_release);
+        dispatcher->condition_.notify_one();
+    }
+
+    hfs::Result<void> start() {
+        if (client_ == nullptr) {
+            return hfs::makeError(hfs::Status::InvalidState,
+                                  "RocksDB frontend dispatcher has no Client");
+        }
+        std::promise<std::string> ready;
+        auto future = ready.get_future();
+        try {
+            thread_ = std::thread([this, ready = std::move(ready)]() mutable {
+                auto bound = client_->bindFrontendThread();
+                if (!bound.ok()) {
+                    ready.set_value(bound.message());
+                    return;
+                }
+                ready.set_value({});
+                run();
+            });
+        } catch (...) {
+            return hfs::makeError(hfs::Status::NoMemory,
+                                  "cannot start RocksDB frontend dispatcher");
+        }
+        const std::string error = future.get();
+        if (!error.empty()) {
+            if (thread_.joinable()) {
+                thread_.join();
+            }
+            return hfs::makeError(hfs::Status::InvalidState, error);
+        }
+        return hfs::Result<void>(hfs::Status::Ok);
+    }
+
+    bool enqueue(AsyncReadState *state) noexcept {
+        if (state == nullptr) {
+            return false;
+        }
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (stopping_ || queue_.size() >= queueCapacity_) {
+                return false;
+            }
+            queue_.push_back(state);
+        }
+        condition_.notify_one();
+        return true;
+    }
+
+    rocksdb::IOStatus poll(const std::vector<void *> &handles,
+                           std::size_t minCompletions) noexcept {
+        const std::size_t required = std::min(minCompletions, handles.size());
+        if (required == 0) {
+            return rocksdb::IOStatus::OK();
+        }
+        while (true) {
+            std::size_t completed = 0;
+            AsyncReadState *waitState = nullptr;
+            for (void *handle : handles) {
+                if (handle == nullptr) {
+                    continue;
+                }
+                auto *state = static_cast<AsyncReadState *>(handle);
+                std::lock_guard<std::mutex> lock(state->mutex);
+                if (state->callbackDone) {
+                    ++completed;
+                } else if (waitState == nullptr) {
+                    waitState = state;
+                }
+            }
+            if (completed >= required) {
+                return rocksdb::IOStatus::OK();
+            }
+            if (waitState == nullptr) {
+                return rocksdb::IOStatus::IOError("async read handle is invalid");
+            }
+            std::unique_lock<std::mutex> lock(waitState->mutex);
+            waitState->condition.wait(lock, [waitState] {
+                return waitState->callbackDone;
+            });
+        }
+    }
+
+    void stop() noexcept {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stopping_ = true;
+        }
+        condition_.notify_all();
+        if (thread_.joinable()) {
+            thread_.join();
+        }
+    }
+
+private:
+    void run() noexcept {
+        while (true) {
+            const std::uint64_t observedWake = wakeEpoch_.load(std::memory_order_acquire);
+            processCompletions();
+            processTimeouts();
+            processSubmissions();
+
+            bool shouldStop = false;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                shouldStop = stopping_ && queue_.empty() && active_.empty();
+            }
+            if (shouldStop) {
+                break;
+            }
+
+            std::unique_lock<std::mutex> lock(mutex_);
+            bool timedWork = !queue_.empty();
+            if (!timedWork) {
+                for (const auto &entry : active_) {
+                    if (entry.second->deadline !=
+                        std::chrono::steady_clock::time_point{}) {
+                        timedWork = true;
+                        break;
+                    }
+                }
+            }
+            if (timedWork) {
+                condition_.wait_for(lock, std::chrono::microseconds(100));
+            } else {
+                condition_.wait(lock, [this, observedWake] {
+                    return stopping_ || !queue_.empty() ||
+                           wakeEpoch_.load(std::memory_order_acquire) != observedWake;
+                });
             }
         }
-        hfs::IoVec buffer{reinterpret_cast<std::byte *>(state->request->scratch),
-                          state->request->len};
-        auto read = state->file->read(std::span<hfs::IoVec>(&buffer, 1),
-                                      state->request->offset).wait();
-        if (!read.ok()) {
-            status = toIoStatus(read);
-        } else {
-            auto value = std::move(read).value();
-            if (!value.ok()) {
-                status = toIoStatus(value);
-            } else {
-                state->ioResult = rocksdb::Slice(state->request->scratch,
-                                                 value.value().bytes);
+
+        auto closed = client_->close().wait();
+        if (!closed.ok() || !closed.value().ok()) {
+            std::fprintf(stderr, "hfs-rocksdb: frontend dispatcher close failed\n");
+        }
+    }
+
+    void processSubmissions() noexcept {
+        std::deque<AsyncReadState *> pending;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            pending.swap(queue_);
+        }
+        while (!pending.empty()) {
+            AsyncReadState *state = pending.front();
+            pending.pop_front();
+            if (state == nullptr) {
+                continue;
+            }
+
+            bool aborted = false;
+            {
+                std::lock_guard<std::mutex> lock(state->mutex);
+                aborted = state->aborted;
+            }
+            if (aborted) {
+                completeWithoutIo(state);
+                continue;
+            }
+            const auto now = std::chrono::steady_clock::now();
+            if (state->deadline != std::chrono::steady_clock::time_point{} &&
+                now >= state->deadline) {
+                completeWithoutIo(state, rocksdb::IOStatus::TimedOut(
+                                           "async read timed out"));
+                continue;
+            }
+            if (state->notBefore != std::chrono::steady_clock::time_point{} &&
+                now < state->notBefore) {
+                std::lock_guard<std::mutex> lock(mutex_);
+                queue_.push_front(state);
+                while (!pending.empty()) {
+                    queue_.push_back(pending.front());
+                    pending.pop_front();
+                }
+                return;
+            }
+            if (client_->outstanding() >= client_->maxOutstanding()) {
+                std::lock_guard<std::mutex> lock(mutex_);
+                queue_.push_front(state);
+                while (!pending.empty()) {
+                    queue_.push_back(pending.front());
+                    pending.pop_front();
+                }
+                return;
+            }
+
+            if (state->request->len == 0) {
+                state->request->result = rocksdb::Slice(state->request->scratch, 0);
+                completeWithoutIo(state, rocksdb::IOStatus::OK());
+                continue;
+            }
+
+            const std::size_t slots = std::max<std::size_t>(1, client_->maxOutstanding());
+            const std::uint64_t sequence = nextToken_++;
+            state->token.slot = static_cast<std::uint32_t>(sequence % slots);
+            state->token.generation = static_cast<std::uint32_t>(sequence / slots + 1);
+            hfs::IoVec buffer{reinterpret_cast<std::byte *>(state->request->scratch),
+                              state->request->len};
+            auto submitted = client_->submitRead(state->file, buffer,
+                                                  state->request->offset, state->token);
+            if (!submitted.ok()) {
+                if (submitted.status() == hfs::Status::Busy ||
+                    submitted.status() == hfs::Status::TryAgain) {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    queue_.push_front(state);
+                    while (!pending.empty()) {
+                        queue_.push_back(pending.front());
+                        pending.pop_front();
+                    }
+                    return;
+                }
+                completeWithoutIo(state, toIoStatus(submitted));
+                continue;
+            }
+            state->ioHandle = std::move(submitted).value();
+            state->requestId = state->ioHandle.requestId();
+            state->submitted = true;
+            active_.emplace(state->requestId, state);
+        }
+    }
+
+    void processCompletions() noexcept {
+        std::array<hfs::CompletionEvent, 64> events{};
+        auto polled = client_->poll(events, 0, events.size(), std::chrono::microseconds(0));
+        if (polled.status != hfs::Status::Ok) {
+            return;
+        }
+        for (std::size_t index = 0; index < polled.count; ++index) {
+            const hfs::CompletionEvent &event = events[index];
+            auto found = active_.find(event.requestId);
+            if (found == active_.end()) {
+                continue;
+            }
+            AsyncReadState *state = found->second;
+            rocksdb::IOStatus status = toIoStatus(hfs::Result<void>(event.status, "HFS async read"));
+            if (event.status == hfs::Status::Ok) {
                 status = rocksdb::IOStatus::OK();
             }
-        }
-    } catch (const std::exception &error) {
-        status = rocksdb::IOStatus::IOError(
-            std::string("async read worker failed: ") + error.what());
-    } catch (...) {
-        status = rocksdb::IOStatus::IOError("async read worker failed");
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(state->mutex);
-        state->ioStatus = status;
-        state->ioCompleted = true;
-    }
-    state->condition.notify_all();
-}
-
-/* Waits for backend completion, or publishes a frontend timeout safely. */
-void executeAsyncRead(AsyncReadState *state) {
-    try {
-        state->ioWorker = std::thread(executeAsyncReadIo, state);
-    } catch (...) {
-        std::lock_guard<std::mutex> lock(state->mutex);
-        state->ioStatus = rocksdb::IOStatus::IOError("async read worker start failed");
-        state->ioCompleted = true;
-    }
-
-    rocksdb::IOStatus status;
-    {
-        std::unique_lock<std::mutex> lock(state->mutex);
-        const auto timeout = state->options.timeout;
-        const auto ready = [state]() { return state->ioCompleted; };
-        const bool finished = timeout.count() > 0
-                                  ? state->condition.wait_for(lock, timeout, ready)
-                                  : (state->condition.wait(lock, ready), true);
-        status = finished ? state->ioStatus
-                          : rocksdb::IOStatus::TimedOut("async read timed out");
-    }
-
-    bool invokeCallback = false;
-    {
-        std::lock_guard<std::mutex> lock(state->mutex);
-        if (!state->aborted) {
-            if (status.ok()) {
-                state->request->result = state->ioResult;
+            publishCallback(state, status, true, event.status == hfs::Status::Ok,
+                            event.completedBytes);
+            state->ioHandle.reset();
+            {
+                std::lock_guard<std::mutex> lock(state->mutex);
+                state->terminal = true;
             }
-            state->request->status = status;
-            /* Establish the cancellation boundary before releasing the lock;
-             * AbortIO after this point cannot rewrite callback-visible state. */
-            state->callbackStarted = true;
-            invokeCallback = true;
+            state->condition.notify_all();
+            active_.erase(found);
         }
     }
-    /* Invoke user code outside the state lock so callbacks may re-enter Poll/AbortIO. */
-    if (invokeCallback) {
-        try {
-            state->callback(*state->request, state->callbackArg);
-        } catch (...) {
-            /* RocksDB callbacks must not escape the worker thread. */
-        }
-    }
-    {
-        std::lock_guard<std::mutex> lock(state->mutex);
-        state->completed = true;
-    }
-    state->condition.notify_all();
-}
 
-/* Deletes a submitted async request only after its worker has stopped. */
+    void processTimeouts() noexcept {
+        const auto now = std::chrono::steady_clock::now();
+        for (const auto &entry : active_) {
+            AsyncReadState *state = entry.second;
+            bool expired = false;
+            {
+                std::lock_guard<std::mutex> lock(state->mutex);
+                expired = state->deadline != std::chrono::steady_clock::time_point{} &&
+                          now >= state->deadline && !state->callbackStarted &&
+                          !state->aborted;
+            }
+            if (expired) {
+                publishCallback(state, rocksdb::IOStatus::TimedOut("async read timed out"),
+                                false, false, 0);
+            }
+        }
+    }
+
+    void completeWithoutIo(AsyncReadState *state,
+                           rocksdb::IOStatus status = rocksdb::IOStatus::Aborted(
+                               "async read aborted")) noexcept {
+        publishCallback(state, status, true, false, 0);
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            state->terminal = true;
+        }
+        state->condition.notify_all();
+    }
+
+    void publishCallback(AsyncReadState *state, const rocksdb::IOStatus &status,
+                         bool terminal, bool successful, std::size_t completedBytes) noexcept {
+        bool invoke = false;
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            if (!state->aborted && !state->callbackStarted) {
+                if (successful) {
+                    state->request->result = rocksdb::Slice(state->request->scratch,
+                                                             completedBytes);
+                }
+                state->request->status = status;
+                state->callbackStarted = true;
+                invoke = true;
+            }
+        }
+        if (invoke) {
+            try {
+                state->callback(*state->request, state->callbackArg);
+            } catch (...) {
+                /* RocksDB callbacks must not escape the dispatcher thread. */
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            if (terminal) {
+                state->callbackDone = true;
+            }
+        }
+        if (terminal) {
+            state->condition.notify_all();
+        }
+    }
+
+    std::shared_ptr<hfs::Client> client_;
+    const std::size_t queueCapacity_;
+    std::mutex mutex_;
+    std::condition_variable condition_;
+    std::deque<AsyncReadState *> queue_;
+    std::unordered_map<std::uint64_t, AsyncReadState *> active_;
+    std::thread thread_;
+    bool stopping_ = false;
+    std::uint64_t nextToken_ = 0;
+    std::atomic<std::uint64_t> wakeEpoch_{0};
+};
+
+/* Deletes a request only after the dispatcher has drained core completion. */
 void deleteAsyncReadHandle(void *handle) {
     delete static_cast<AsyncReadState *>(handle);
 }
 
+HfsContext::~HfsContext() {
+    if (asyncDispatcher != nullptr) {
+        asyncDispatcher->stop();
+    }
+    if (client != nullptr) {
+        client->close().wait();
+    }
+    asyncDispatcher.reset();
+    client.reset();
+    if (engine != nullptr) {
+        engine->stop().wait();
+        engine.reset();
+    }
+}
+
 class HfsRandomAccessFile final : public rocksdb::FSRandomAccessFile {
 public:
-    HfsRandomAccessFile(std::shared_ptr<hfs::File> file) : file_(std::move(file)) {}
+    HfsRandomAccessFile(std::shared_ptr<hfs::File> file,
+                        std::shared_ptr<HfsContext> context)
+        : file_(std::move(file)), context_(std::move(context)) {}
 
-    /* Performs a buffered random read through the HFS File API. */
-    rocksdb::IOStatus Read(uint64_t offset, size_t n, const rocksdb::IOOptions &,
+    /* Performs a synchronous facade over the shared asynchronous read path. */
+    rocksdb::IOStatus Read(uint64_t offset, size_t n, const rocksdb::IOOptions &options,
                            rocksdb::Slice *result, char *scratch,
-                           rocksdb::IODebugContext *) const override {
+                           rocksdb::IODebugContext *debug) const override {
         if (result == nullptr) {
             return rocksdb::IOStatus::InvalidArgument("null random read result");
         }
         if (scratch == nullptr && n != 0) {
             return rocksdb::IOStatus::InvalidArgument("null random read buffer");
         }
-        hfs::IoVec buffer{reinterpret_cast<std::byte *>(scratch), n};
-        auto read = file_->read(std::span<hfs::IoVec>(&buffer, 1), offset).wait();
-        if (!read.ok()) {
-            return toIoStatus(read);
+        if (ioStatsEnabled()) gReadCalls.fetch_add(1, std::memory_order_relaxed);
+        rocksdb::FSReadRequest request;
+        request.offset = offset;
+        request.len = n;
+        request.scratch = scratch;
+        void *handle = nullptr;
+        rocksdb::IOHandleDeleter deleter = {};
+        auto submitted = const_cast<HfsRandomAccessFile *>(this)->ReadAsync(
+            request, options, [](const rocksdb::FSReadRequest &, void *) {}, nullptr,
+            &handle, &deleter, debug);
+        if (!submitted.ok()) {
+            return submitted;
         }
-        auto value = std::move(read).value();
-        if (!value.ok()) {
-            return toIoStatus(value);
+        std::vector<void *> handles{handle};
+        auto polled = context_->asyncDispatcher->poll(handles, 1);
+        deleteAsyncReadHandle(handle);
+        if (!polled.ok()) {
+            return polled;
         }
-        *result = rocksdb::Slice(scratch, value.value().bytes);
-        return rocksdb::IOStatus::OK();
+        *result = request.result;
+        return request.status;
     }
 
-    /* Processes a batch of non-overlapping reads while preserving per-request status. */
+    /* Processes a batch through the shared dispatcher while preserving status. */
     rocksdb::IOStatus MultiRead(rocksdb::FSReadRequest *requests, size_t count,
                                 const rocksdb::IOOptions &options,
                                 rocksdb::IODebugContext *debug) override {
@@ -417,13 +688,32 @@ public:
             gMultiReadCalls.fetch_add(1, std::memory_order_relaxed);
             gMultiReadRequests.fetch_add(count, std::memory_order_relaxed);
         }
-        rocksdb::IOStatus firstError = rocksdb::IOStatus::OK();
+        std::vector<void *> handles;
+        handles.reserve(count);
         for (size_t index = 0; index < count; ++index) {
             auto &request = requests[index];
-            request.status = Read(request.offset, request.len, options,
-                                  &request.result, request.scratch, debug);
-            if (!request.status.ok() && firstError.ok()) {
-                firstError = request.status;
+            void *handle = nullptr;
+            rocksdb::IOHandleDeleter deleter = {};
+            auto status = ReadAsync(
+                request, options,
+                [](const rocksdb::FSReadRequest &, void *) {}, nullptr,
+                &handle, &deleter, debug);
+            if (!status.ok()) {
+                request.status = status;
+                continue;
+            }
+            handles.push_back(handle);
+        }
+        auto firstError = rocksdb::IOStatus::OK();
+        if (!handles.empty()) {
+            firstError = context_->asyncDispatcher->poll(handles, count);
+        }
+        for (void *handle : handles) {
+            deleteAsyncReadHandle(handle);
+        }
+        for (size_t index = 0; index < count; ++index) {
+            if (!requests[index].status.ok() && firstError.ok()) {
+                firstError = requests[index].status;
             }
         }
         return firstError;
@@ -450,6 +740,10 @@ public:
         if (ioStatsEnabled()) gReadAsyncCalls.fetch_add(1, std::memory_order_relaxed);
         *ioHandle = nullptr;
         *deleter = {};
+        if (context_ == nullptr || context_->asyncDispatcher == nullptr) {
+            return rocksdb::IOStatus::InvalidArgument(
+                "HFS async frontend dispatcher is unavailable");
+        }
         try {
             auto state = std::make_unique<AsyncReadState>();
             state->file = file_;
@@ -457,7 +751,28 @@ public:
             state->options = options;
             state->callback = std::move(callback);
             state->callbackArg = callbackArg;
-            state->worker = std::thread(executeAsyncRead, state.get());
+            state->dispatcher = context_->asyncDispatcher.get();
+            if (options.timeout.count() > 0) {
+                state->deadline = std::chrono::steady_clock::now() + options.timeout;
+            }
+            const char *delayText = std::getenv("HFS_TEST_ASYNC_READ_DELAY_MS");
+            if (delayText != nullptr && *delayText != '\0') {
+                char *end = nullptr;
+                const unsigned long delay = std::strtoul(delayText, &end, 10);
+                if (end != delayText && *end == '\0' && delay <= 60000) {
+                    state->notBefore = std::chrono::steady_clock::now() +
+                                       std::chrono::milliseconds(delay);
+                }
+            }
+            if (!context_->asyncDispatcher->enqueue(state.get())) {
+                {
+                    std::lock_guard<std::mutex> lock(state->mutex);
+                    state->callbackDone = true;
+                    state->terminal = true;
+                }
+                state->condition.notify_all();
+                return rocksdb::IOStatus::Busy("HFS async frontend queue is full");
+            }
             *ioHandle = state.release();
             *deleter = deleteAsyncReadHandle;
             return rocksdb::IOStatus::OK();
@@ -471,6 +786,7 @@ public:
 
 private:
     std::shared_ptr<hfs::File> file_;
+    std::shared_ptr<HfsContext> context_;
 };
 
 /* Buffers appends in adapter memory and flushes them to the HFS core in
@@ -778,29 +1094,11 @@ public:
     /* Waits until the requested number of submitted reads have completed. */
     rocksdb::IOStatus Poll(std::vector<void *> &ioHandles,
                            size_t minCompletions) override {
-        const size_t required = std::min(minCompletions, ioHandles.size());
-        if (required == 0) return rocksdb::IOStatus::OK();
-        while (true) {
-            size_t completed = 0;
-            AsyncReadState *waitState = nullptr;
-            for (void *handle : ioHandles) {
-                if (handle == nullptr) continue;
-                auto *state = static_cast<AsyncReadState *>(handle);
-                std::lock_guard<std::mutex> lock(state->mutex);
-                if (state->completed) {
-                    ++completed;
-                } else if (waitState == nullptr) {
-                    waitState = state;
-                }
-            }
-            if (completed >= required) return rocksdb::IOStatus::OK();
-            if (waitState == nullptr) return rocksdb::IOStatus::IOError(
-                "async read completion handle is invalid");
-            std::unique_lock<std::mutex> lock(waitState->mutex);
-            waitState->condition.wait(lock, [waitState] {
-                return waitState->completed;
-            });
+        if (context_ == nullptr || context_->asyncDispatcher == nullptr) {
+            return rocksdb::IOStatus::InvalidArgument(
+                "HFS async frontend dispatcher is unavailable");
         }
+        return context_->asyncDispatcher->poll(ioHandles, minCompletions);
     }
 
     /* Cancels pending reads and suppresses callbacks for reads not yet completed. */
@@ -809,7 +1107,7 @@ public:
             if (handle == nullptr) continue;
             auto *state = static_cast<AsyncReadState *>(handle);
             std::lock_guard<std::mutex> lock(state->mutex);
-            if (!state->completed && !state->callbackStarted) {
+            if (!state->callbackDone && !state->callbackStarted) {
                 state->aborted = true;
                 state->request->status = rocksdb::IOStatus::Aborted(
                     "async read aborted");
@@ -849,7 +1147,7 @@ public:
         std::shared_ptr<hfs::File> file;
         auto status = openFile(context_, fname, hfs::OpenFlags::None, &file);
         if (!status.ok()) return status;
-        *result = std::make_unique<HfsRandomAccessFile>(std::move(file));
+        *result = std::make_unique<HfsRandomAccessFile>(std::move(file), context_);
         return rocksdb::IOStatus::OK();
     }
 
@@ -1158,11 +1456,20 @@ createFileSystem(const std::string &configPath) {
     auto owned = std::shared_ptr<hfs::Engine>(std::move(engine).value());
     auto mounted = owned->mount().wait();
     if (!mounted.ok() || !mounted.value().ok()) return nullptr;
-    auto client = hfs::Client::create(*owned);
-    if (!client.ok()) return nullptr;
     auto context = std::make_shared<HfsContext>();
-    context->engine = std::move(owned);
+    context->engine = owned;
+    context->asyncDispatcher = std::make_unique<AsyncReadDispatcher>();
+    hfs::ClientOptions clientOptions;
+    clientOptions.completionWake = &AsyncReadDispatcher::wake;
+    clientOptions.completionWakeContext = context->asyncDispatcher.get();
+    auto client = hfs::Client::create(*owned, clientOptions);
+    if (!client.ok()) return nullptr;
     context->client = std::move(client).value();
+    context->asyncDispatcher->setClient(context->client);
+    auto dispatcherStarted = context->asyncDispatcher->start();
+    if (!dispatcherStarted.ok()) {
+        return nullptr;
+    }
     return std::make_shared<HfsFileSystem>(std::move(context));
 }
 

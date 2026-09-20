@@ -591,6 +591,26 @@ Bug 等级：**致命 > 严重 > 一般**。
   通过；`hfs_db_bench` 8 线程 fillseq/readrandom/overwrite/readwhilewriting 全量
   完成、rc=0。证据目录 `/mnt/hfs-data/hfs2-rocksdb-db_bench-20260919`。
 
+### 39. RMW 第二阶段复用已完成 wait state 导致写入提前返回
+
+- **状态**：已修复
+- **等级**：致命（可能产生 SST checksum mismatch）
+- **时间**：2026-09-20（RocksDB sync=1 回归发现）
+- **现象**：真实 NVMe 上 `hfs_db_bench --sync=1` 在 `CompactRange` 期间报
+  `Corruption: block checksum mismatch`；`hfs_ldb checkconsistency` 可稳定复现同一 SST
+  block 校验错误。
+- **排查过程**：检查 `DataPath::execute` 的 partial-block RMW 流程，发现首阶段
+  `ReadOld` 完成后将同一个 `WaitState` 留在 `done=true`，随后提交 `WriteMerged` 却没有
+  清除完成状态；调用方会立即从第二次 `waitForChild` 返回，并在设备写完成前释放 bounce/DMA
+  lease。既有 `submits==completes` 计数在 wait 返回后才递增，不能捕获该生命周期错误。
+- **根因**：RMW 两阶段之间缺少 wait state re-arm，导致 completion、buffer lifetime 和
+  parent completion 顺序失真。
+- **修复**：第二阶段提交前重新设置 `done=false/status=0`，并在 write phase 使用独立的
+  可控测试延迟；新增回归断言要求带 25ms 写延迟的非对齐 RMW 调用至少等待该阶段完成。
+- **验证结果**：VM Release CTest `26/26` 通过；真实 `Nvme0n1` 上 RocksDB smoke 通过；
+  sync=1 fillseq/readrandom/overwrite/readwhilewriting 全量 rc=0，`hfs_ldb checkconsistency`
+  报告 `entries=80000`，`hfsctl check` 报告 `corruption=none`。
+
 ## 记录模板
 
 ### N. 简短标题

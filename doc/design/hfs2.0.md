@@ -311,6 +311,14 @@ operation 的 frontend intrusive ref；completion 使用 `slot + generation + re
 token、sink 和按请求裁剪的 extent snapshot 复制到 bounded operation state，不能在
 frontend 返回后访问调用栈上的临时 span。
 
+RocksDB adapter 不得让每个 worker 线程直接调用 `Client::submitRead`、`poll`、`AbortIO`
+或 `close`。一个 `HfsContext` 只能有一个 frontend dispatcher 拥有该 Client；RocksDB
+worker 只向 bounded MPSC submit queue 投递请求，dispatcher 在自己的 owner thread 上
+完成 submit、poll、reap 和 callback handoff。dispatcher 关闭顺序为停止 ingress、取消未
+提交请求、等待已提交请求 terminal、reap completion，最后在 owner thread 调用 `close`。
+为支持这一生命周期，Client 允许在没有 outstanding request、IoHandle 或 open File 时
+一次性转移 frontend owner；转移后禁止多个线程共享同一个 Client 的 async facade。
+
 ## 6. Runtime、reactor 和所有权
 
 ### 6.1 Runtime 启停
@@ -342,8 +350,12 @@ R = min(4, max(2,nproc/4))    nproc > 8
 ```
 
 `R` 是 data shard 数，另有一个 metadata actor。默认 metadata CPU0、data CPU1..R，
-frontend 不由 HFS 绑定。配置文件可显式指定 `data_reactors` 和 `data_cpus`，但上限
-不能超过 `max_data_reactors`。默认不恢复旧的 `HFS_REACTOR_PIN` 环境变量。
+frontend 不由 HFS 强制绑定。配置文件可显式指定 `data_reactors`、`data_cpus`、
+`metadata_cpus` 和 `frontend_cpus`；当前正式开发口径以单 NUMA node 为准，runtime
+保留 topology-aware 选择和确定性 fallback，但多 NUMA node 的本地 DMA/跨 node 性能
+验证暂缓，不作为单节点功能验收门槛。`data_reactors` 上限不能超过
+`max_data_reactors`；默认不恢复旧的 `HFS_REACTOR_PIN` 环境变量。data reactor 的
+polling policy 由 `[numa].polling` 控制，默认 hybrid。
 
 `std::jthread` 的 `stop_token` 只用于控制线程停止；停止前必须关闭 ingress、drain
 SPDK callback 和持久化 metadata，不能用 stop request 直接释放仍被 callback 使用的对象。
@@ -682,6 +694,12 @@ data submit → data drain → data device flush
 
 这明确避免“metadata transaction 写完却没有最终设备屏障”的旧问题，也保证 metadata
 不会先指向未 durable 的用户数据。
+
+并发 `sync/fsync` 使用 full-snapshot group commit：第一个 waiter 成为 leader，在
+`metadata.max_group_commit_wait_us` 窗口内合并更高目标 epoch；窗口结束后只执行一次
+全设备 data flush、namespace checkpoint 和 superblock publish，所有不超过冻结目标的
+waiter 共享同一个成功或失败结果。该窗口只用于合并请求，不是 durability timeout；
+增量 dirty-object checkpoint 仍未改变当前 on-disk format，留待后续格式版本。
 
 写路径的四层可见性（2026-09-19，RocksDB adapter 写回缓冲）：
 
@@ -1106,8 +1124,19 @@ data_reactors = 0
 max_data_reactors = 4
 metadata_cpu = 0
 data_cpus = auto
+metadata_cpus = 0
+frontend_cpus = auto
 ring_depth = 1024
 client_depth = 32
+
+[numa]
+policy = local-first
+device_numa = auto
+dma_numa = auto
+frontend_numa = device-local
+allow_remote_dma = false
+remote_fallback = bounded
+polling = hybrid
 
 [limits]
 dma_arena_mb = 512
@@ -1121,6 +1150,7 @@ max_inodes = 1000000
 max_namespace_bytes = 1073741824
 checkpoint_trigger_percent = 50
 checkpoint_force_percent = 80
+max_group_commit_wait_us = 200
 
 [observability]
 trace = false
@@ -1136,9 +1166,17 @@ baseline 的配置文件为 `config/hfs_nvme.conf`，设备为 `Nvme0n1`、PCI B
 engine 用 `[device.*] pci_bdf` 生成 SPDK/DPDK allowlist 并写入 `spdk_env_opts`；`[spdk]`
 只描述 env 驱动和 hugepage 预算，不通过环境变量注入。
 
-后续 HFS 配置统一按 section namespace 添加到该 `.conf` 并提升 `schema_version`，例如
-`[recovery]`、`[cache]`、`[frontend.rocksdb]` 和 `[frontend.fio]`；不得另建第二个配置
-文件来绕过 schema 校验。`data_reactors=0` 使用 nproc 规则，`data_cpus` 必须匹配 R。
+`[numa]` 是当前实现的可选兼容 section；缺省时等价于 `local-first`、`auto` 拓扑、禁止
+静默 remote DMA、bounded fallback 和 hybrid polling。当前阶段已在 SPDK runtime 启动时
+读取 Linux sysfs 的 online node/CPU、CPU→node placement 和 PCI device NUMA node，输出
+topology snapshot；可解析 device node 时按本地 CPU 选择 data reactor，无法解析时使用
+确定性的 device-index fallback；data loop 已支持 `active`/`hybrid`/`interrupt` 三种
+polling policy。`local-only` 在拓扑不可读或 device node 未解析时 fail closed。尚未宣称
+已经完成 per-node hugepage/DMA 分配、remote-bytes 采样或多 node 证据；多 NUMA gate
+暂缓，不阻塞当前单节点功能和性能开发。后续 HFS 配置统一按 section namespace
+添加到该 `.conf` 并提升 `schema_version`，例如 `[recovery]`、`[cache]`、
+`[frontend.rocksdb]` 和 `[frontend.fio]`；不得另建第二个配置文件来绕过 schema 校验。
+`data_reactors=0` 使用 nproc 规则，`data_cpus` 必须匹配 R。
 
 ### 15.2 C++ ABI
 

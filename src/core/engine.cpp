@@ -12,6 +12,8 @@
 #include <sstream>
 #include <string>
 #include <sys/file.h>
+#include <condition_variable>
+#include <thread>
 #include <unistd.h>
 
 #include "common/log.hpp"
@@ -159,6 +161,15 @@ int pumpAsyncDataShard(void *context) noexcept {
 } // namespace
 
 struct Engine::Impl {
+    struct SyncBatch {
+        std::uint64_t targetEpoch = 0;
+        std::uint64_t frozenTargetEpoch = 0;
+        Status status = Status::Ok;
+        std::string message;
+        bool completed = false;
+        std::condition_variable condition;
+    };
+
     Config config;
     int lockFd = -1;
     bool mounted = false;
@@ -178,9 +189,10 @@ struct Engine::Impl {
     std::vector<AsyncDataPollerContext> asyncPollers;
     std::vector<std::uint8_t> asyncPollersRegistered;
     std::atomic<std::uint32_t> metadataUsers{0};
-    /* Serializes namespace-wide durability barriers: concurrent fsync/flush
-     * callers coalesce on the single prepared-epoch slot. */
+    /* Coordinates full-snapshot durability barriers without holding the
+     * namespace lock while device I/O and checkpoint writes are in flight. */
     std::mutex syncMutex;
+    std::shared_ptr<SyncBatch> syncBatch;
 };
 
 Engine::Engine(Config config) : impl_(std::make_unique<Impl>()) {
@@ -653,40 +665,93 @@ Result<void> Engine::syncMetadata(std::uint64_t epoch) {
     if (epoch > impl_->namespaceState->logicalEpoch()) {
         return makeError(Status::InvalidArgument, "sync epoch is ahead of logical epoch");
     }
-    std::lock_guard<std::mutex> syncLock(impl_->syncMutex);
-    /* A repeated barrier for an already durable epoch needs no checkpoint or
-     * metadata write; this keeps sync idempotent without fixed checkpoint cost. */
-    if (epoch <= impl_->namespaceState->durableEpoch()) {
-        return Result<void>(Status::Ok);
-    }
-
-    /* DataPath operations are synchronous at this boundary, so device flush
-     * closes the user-data and extent-initialization phase before metadata. */
-    for (std::size_t i = 0; i < impl_->config.devices.size(); ++i) {
-        auto flushed = flushDevice(i);
-        if (!flushed.ok()) {
-            return flushed;
+    while (true) {
+        std::shared_ptr<Impl::SyncBatch> batch;
+        bool leader = false;
+        {
+            std::unique_lock<std::mutex> syncLock(impl_->syncMutex);
+            /* A repeated barrier for an already durable epoch needs no
+             * checkpoint or metadata write. */
+            if (epoch <= impl_->namespaceState->durableEpoch()) {
+                return Result<void>(Status::Ok);
+            }
+            if (impl_->syncBatch != nullptr && !impl_->syncBatch->completed) {
+                batch = impl_->syncBatch;
+                batch->targetEpoch = std::max(batch->targetEpoch, epoch);
+            } else {
+                batch = std::make_shared<Impl::SyncBatch>();
+                batch->targetEpoch = epoch;
+                impl_->syncBatch = batch;
+                leader = true;
+            }
         }
+
+        if (!leader) {
+            std::unique_lock<std::mutex> syncLock(impl_->syncMutex);
+            batch->condition.wait(syncLock, [&batch] { return batch->completed; });
+            if (epoch <= batch->frozenTargetEpoch) {
+                return Result<void>(batch->status, batch->message);
+            }
+            /* This waiter arrived after the batch target was frozen. It must
+             * become the next leader rather than being reported durable early. */
+            continue;
+        }
+
+        /* Let concurrent sync callers join the same full-snapshot transaction.
+         * This is a coalescing window, never a durability timeout. */
+        if (impl_->config.maxGroupCommitWaitUs != 0) {
+            std::this_thread::sleep_for(std::chrono::microseconds(
+                impl_->config.maxGroupCommitWaitUs));
+        }
+        std::uint64_t targetEpoch = epoch;
+        {
+            std::lock_guard<std::mutex> syncLock(impl_->syncMutex);
+            targetEpoch = batch->targetEpoch;
+            batch->frozenTargetEpoch = targetEpoch;
+        }
+
+        Result<void> result(Status::Ok);
+        /* DataPath operations are synchronous at this boundary, so device
+         * flush closes the user-data and extent-initialization phase first. */
+        for (std::size_t i = 0; i < impl_->config.devices.size(); ++i) {
+            result = flushDevice(i);
+            if (!result.ok()) {
+                break;
+            }
+        }
+        if (result.ok()) {
+            test_hooks::crashIfRequested("metadata_commit");
+            if (testMetadataCommitFailureRequested()) {
+                result = makeError(Status::IoError,
+                                   "test-injected metadata commit boundary failure");
+            }
+        }
+        if (result.ok()) {
+            auto prepared = impl_->namespaceState->prepareDurableEpoch(targetEpoch);
+            if (!prepared.ok()) {
+                result = prepared;
+            }
+        }
+        if (result.ok()) {
+            auto checkpoint = impl_->journal->checkpoint();
+            if (!checkpoint.ok()) {
+                impl_->namespaceState->rollbackPreparedDurableEpoch();
+                result = checkpoint;
+            }
+        }
+        if (result.ok()) {
+            result = impl_->namespaceState->publishDurableEpoch(targetEpoch);
+        }
+
+        {
+            std::lock_guard<std::mutex> syncLock(impl_->syncMutex);
+            batch->status = result.status();
+            batch->message = result.message();
+            batch->completed = true;
+        }
+        batch->condition.notify_all();
+        return result;
     }
-    test_hooks::crashIfRequested("metadata_commit");
-    if (testMetadataCommitFailureRequested()) {
-        return makeError(Status::IoError,
-                         "test-injected metadata commit boundary failure");
-    }
-    auto prepared = impl_->namespaceState->prepareDurableEpoch(epoch);
-    if (!prepared.ok()) {
-        return prepared;
-    }
-    auto checkpoint = impl_->journal->checkpoint();
-    if (!checkpoint.ok()) {
-        impl_->namespaceState->rollbackPreparedDurableEpoch();
-        return checkpoint;
-    }
-    auto published = impl_->namespaceState->publishDurableEpoch(epoch);
-    if (!published.ok()) {
-        return published;
-    }
-    return Result<void>(Status::Ok);
 }
 
 Result<std::vector<MetadataJournalScan>> Engine::scanMetadataJournals() {

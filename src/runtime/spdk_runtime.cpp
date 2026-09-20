@@ -24,6 +24,7 @@
 #include "common/log.hpp"
 #include "common/test_hooks.hpp"
 #include "common/trace.hpp"
+#include "runtime/numa_topology.hpp"
 
 #ifdef HFS_WITH_SPDK
 #include <spdk/bdev.h>
@@ -242,6 +243,10 @@ struct SpdkRuntime::Impl {
         /* The high bit closes admission before registration data is retired. */
         std::atomic<std::uint64_t> pollerState{0};
         bool pollerStopping = false;
+        std::int32_t numaNode = -1;
+        std::uint32_t cpu = 0;
+        std::uint32_t idlePolls = 0;
+        std::uint64_t pollSleeps = 0;
     };
 
     struct DeviceState {
@@ -257,6 +262,7 @@ struct SpdkRuntime::Impl {
     Config config;
     std::vector<DeviceState> devices;
     std::vector<std::shared_ptr<Reactor>> reactors; /* [0] metadata, [1..R] data */
+    std::vector<std::uint32_t> deviceReactors;
     std::atomic<bool> activeFlag{false};
     std::atomic<bool> stoppingFlag{false};
     std::atomic<std::uint32_t> reactorCount{0};
@@ -674,11 +680,50 @@ struct SpdkRuntime::Impl {
         return static_cast<int>(config.metadataCpu + dataIndex);
     }
 
+    /* Select a CPU-local reactor for a device, falling back deterministically
+     * when the host exposes no usable NUMA CPU mapping. */
+    void configureReactorPlacement(const NumaTopologySnapshot &topology,
+                                   std::uint32_t dataReactors) {
+        deviceReactors.assign(devices.size(), 0);
+        for (std::size_t deviceIndex = 0; deviceIndex < devices.size(); ++deviceIndex) {
+            std::int32_t deviceNode = -1;
+            if (deviceIndex < topology.devices.size()) {
+                deviceNode = topology.devices[deviceIndex].node;
+            }
+            std::uint32_t selected = static_cast<std::uint32_t>(deviceIndex % dataReactors);
+            for (std::uint32_t reactorIndex = 0; reactorIndex < dataReactors;
+                 ++reactorIndex) {
+                const int cpu = dataCpuFor(reactorIndex + 1);
+                for (const auto &placement : topology.cpuPlacements) {
+                    if (placement.cpu == static_cast<std::uint32_t>(cpu) &&
+                        placement.node >= 0 && placement.node == deviceNode) {
+                        selected = reactorIndex;
+                        reactorIndex = dataReactors;
+                        break;
+                    }
+                }
+            }
+            deviceReactors[deviceIndex] = selected;
+        }
+        for (std::uint32_t reactorIndex = 0; reactorIndex < dataReactors;
+             ++reactorIndex) {
+            Reactor *reactor = reactors[reactorIndex + 1].get();
+            reactor->cpu = static_cast<std::uint32_t>(dataCpuFor(reactorIndex + 1));
+            for (const auto &placement : topology.cpuPlacements) {
+                if (placement.cpu == reactor->cpu) {
+                    reactor->numaNode = placement.node;
+                    break;
+                }
+            }
+        }
+    }
+
     void dataMain(std::size_t dataIndex) {
         auto *reactor = reactorAt(dataIndex);
         reactor->osTid.store(static_cast<std::uint64_t>(::syscall(SYS_gettid)),
                              std::memory_order_release);
-        pinToCpu(static_cast<unsigned int>(dataCpuFor(dataIndex)));
+        pinToCpu(reactor->cpu == 0 ? static_cast<unsigned int>(dataCpuFor(dataIndex))
+                                   : reactor->cpu);
 
         const std::string name = "hfs2-data" + std::to_string(dataIndex - 1);
         reactor->spdk = spdk_thread_create(name.c_str(), nullptr);
@@ -715,10 +760,33 @@ struct SpdkRuntime::Impl {
         while (!reactor->stop.load(std::memory_order_acquire) ||
                reactor->activeHead != nullptr || reactor->retryHead != nullptr ||
                reactor->completionHead != nullptr) {
-            spdk_thread_poll(reactor->spdk, 0, 0);
+            const int polled = spdk_thread_poll(reactor->spdk, 0, 0);
             drainDataIoRetries(reactor);
             drainDataIoCompletions(reactor);
-            (void)invokeDataReactorPoller(reactor);
+            const int pumped = invokeDataReactorPoller(reactor);
+            const bool hasWork = polled != 0 || pumped != 0 ||
+                                 reactor->activeHead != nullptr ||
+                                 reactor->retryHead != nullptr ||
+                                 reactor->completionHead != nullptr;
+            if (hasWork || config.numa.polling == "active") {
+                reactor->idlePolls = 0;
+            } else if (config.numa.polling == "interrupt") {
+                ++reactor->pollSleeps;
+                std::this_thread::sleep_for(std::chrono::microseconds(100));
+            } else {
+                /* Hybrid polling preserves a short active window for bursty
+                 * I/O, then yields instead of burning a full core at idle. */
+                if (reactor->idlePolls < 128) {
+                    ++reactor->idlePolls;
+                } else {
+                    ++reactor->pollSleeps;
+                    const std::uint32_t idle = reactor->idlePolls;
+                    const auto delay = std::min<std::uint32_t>(100, 1U <<
+                                                               std::min<std::uint32_t>(
+                                                                   6, idle / 256));
+                    std::this_thread::sleep_for(std::chrono::microseconds(delay));
+                }
+            }
             if (reactor->stop.load(std::memory_order_acquire)) {
                 const auto now = std::chrono::steady_clock::now();
                 if (!drainDeadlineSet) {
@@ -1252,6 +1320,38 @@ Result<void> SpdkRuntime::start(const Config &config) {
         return makeError(Status::ForkedProcess, "SPDK runtime belongs to another process");
     }
 
+    const NumaTopologySnapshot topology = snapshotNumaTopology(config);
+    log::info("numa topology snapshot: %s", topology.summary().c_str());
+    if (config.numa.policy == "local-only") {
+        if (!topology.available) {
+            return makeError(Status::InvalidState,
+                             "local-only NUMA policy requires readable sysfs topology");
+        }
+        for (const auto &device : topology.devices) {
+            if (device.node < 0 ||
+                std::find(topology.onlineNodes.begin(), topology.onlineNodes.end(),
+                          static_cast<std::uint32_t>(device.node)) == topology.onlineNodes.end()) {
+                return makeError(Status::InvalidState,
+                                 "local-only NUMA policy cannot resolve device '" +
+                                     device.id + "' NUMA node");
+            }
+        }
+    }
+    if (config.numa.deviceNuma != "auto") {
+        auto requested = parseNumaIdList(config.numa.deviceNuma);
+        if (!requested.ok() || requested.value().size() != 1 || !topology.available) {
+            return makeError(Status::InvalidState,
+                             "explicit device_numa requires a readable NUMA topology");
+        }
+        const std::uint32_t requestedNode = requested.value().front();
+        for (const auto &device : topology.devices) {
+            if (device.node != static_cast<std::int32_t>(requestedNode)) {
+                return makeError(Status::InvalidState,
+                                 "device '" + device.id + "' is not on requested NUMA node");
+            }
+        }
+    }
+
     /* The device set is fixed for the process lifetime once initialized. */
     if (impl.envReady) {
         if (impl.devices.size() != config.devices.size()) {
@@ -1288,6 +1388,7 @@ Result<void> SpdkRuntime::start(const Config &config) {
     for (std::uint32_t i = 0; i < dataReactors; ++i) {
         impl.reactors.push_back(std::make_shared<Impl::Reactor>());
     }
+    impl.configureReactorPlacement(topology, dataReactors);
 
     impl.reactors[0]->thread = std::jthread([&impl]() { impl.metadataMain(); });
 
@@ -1391,6 +1492,22 @@ std::uint64_t SpdkRuntime::dataReactorThreadId(std::uint32_t index) const {
         return 0;
     }
     return impl_->reactors[index + 1]->osTid.load(std::memory_order_acquire);
+}
+
+std::uint32_t SpdkRuntime::dataReactorForDevice(std::size_t deviceIndex) const noexcept {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (deviceIndex >= impl_->deviceReactors.size()) {
+        return 0;
+    }
+    return impl_->deviceReactors[deviceIndex];
+}
+
+std::int32_t SpdkRuntime::dataReactorNumaNode(std::uint32_t index) const noexcept {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (index + 1 >= impl_->reactors.size() || impl_->reactors[index + 1] == nullptr) {
+        return -1;
+    }
+    return impl_->reactors[index + 1]->numaNode;
 }
 
 Result<void> SpdkRuntime::setDataReactorPoller(std::uint32_t index,
@@ -1660,6 +1777,14 @@ Result<void> SpdkRuntime::postToDataReactor(std::uint32_t index, std::function<v
 std::uint64_t SpdkRuntime::dataReactorThreadId(std::uint32_t index) const {
     (void)index;
     return 0;
+}
+std::uint32_t SpdkRuntime::dataReactorForDevice(std::size_t index) const noexcept {
+    (void)index;
+    return 0;
+}
+std::int32_t SpdkRuntime::dataReactorNumaNode(std::uint32_t index) const noexcept {
+    (void)index;
+    return -1;
 }
 Result<void> SpdkRuntime::setDataReactorPoller(std::uint32_t index,
                                                DataReactorPoller callback,
