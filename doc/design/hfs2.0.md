@@ -311,13 +311,43 @@ operation 的 frontend intrusive ref；completion 使用 `slot + generation + re
 token、sink 和按请求裁剪的 extent snapshot 复制到 bounded operation state，不能在
 frontend 返回后访问调用栈上的临时 span。
 
-RocksDB adapter 不得让每个 worker 线程直接调用 `Client::submitRead`、`poll`、`AbortIO`
-或 `close`。一个 `HfsContext` 只能有一个 frontend dispatcher 拥有该 Client；RocksDB
-worker 只向 bounded MPSC submit queue 投递请求，dispatcher 在自己的 owner thread 上
-完成 submit、poll、reap 和 callback handoff。dispatcher 关闭顺序为停止 ingress、取消未
-提交请求、等待已提交请求 terminal、reap completion，最后在 owner thread 调用 `close`。
+RocksDB adapter 提供两种 frontend 消费方式，同一 `HfsContext` 同时只能启用其中一种，
+由 `[rocksdb] worker_direct_reads` 控制（默认 `true`）：
+
+1. worker-owned frontend channel（默认）：每个 worker 线程最多拥有一个 Client，
+   frontend owner 就是该线程；该线程自行 `submitRead`/`poll`/`close`，直接发布到
+   data-reactor ring，不经过共享 dispatcher。该模式的性能证据、生命周期修复和验收
+   记录见 `doc/review/hfs2_rocksdb_read_latency_optimization_20260923.md`。
+2. 共享 dispatcher（回落路径，`worker_direct_reads = false`）：RocksDB worker 只向
+   bounded MPSC submit queue 投递请求，dispatcher 在自己的 owner thread 上完成
+   submit、poll、reap 和 callback handoff。dispatcher 关闭顺序为停止 ingress、取消
+   未提交请求、等待已提交请求 terminal、reap completion，最后在 owner thread 调用
+   `close`。direct channel 建链失败时也必须回落到该路径。
+
+`worker_direct_reads` 只作用于 RocksDB adapter 的随机读；诊断时可用环境变量
+`HFS_ROCKSDB_DIRECT_WORKER_READS=0/1` 做进程级覆盖（env 优先于配置文件）。
+
+completion wake 只是低延迟提示而不是正确性条件；只要存在已提交但未完成的 I/O，
+消费者必须以有界短周期继续 poll，避免唤醒合并/丢失时让 RocksDB worker 永久睡眠。
 为支持这一生命周期，Client 允许在没有 outstanding request、IoHandle 或 open File 时
 一次性转移 frontend owner；转移后禁止多个线程共享同一个 Client 的 async facade。
+共享 dispatcher 的 per-request 等待状态（含 completion condition variable）只能由
+dispatcher 线程释放；worker 必须通过 deferred retire 交还 handle，禁止在 dispatcher
+可能仍在执行 completion notify 时释放 state，否则会破坏 condvar 内部状态并造成永久挂死。
+
+worker-owned channel 必须遵守以下生命周期规则，否则不得进入正式构建：
+
+- channel 条目只能持有 `HfsContext`/`Engine` 的非拥有引用，不得用 `shared_ptr` 把
+  engine 生命周期延长到 thread-local 析构；HFS context 的销毁必须发生在 RocksDB
+  后台线程静默之后的主线程上，且不得在后台线程上执行 `Engine::stop()`。
+- adapter 维护 direct channel registry；`HfsContext` 析构（主线程）先关闭 registry，
+  再在 engine 存活时 retire 全部 channel（销毁 client、open File 和 metadata lease），
+  然后停止 dispatcher，最后 `Engine::stop()`。registry 关闭后新建链必须回落共享
+  dispatcher，并记录计数和日志。
+- 拥有线程退出时在自己的线程上 close 自己的 channel；被 context 抢先 retire 的
+  thread-local 析构必须是 no-op，不得再访问 engine/namespace。
+- retire 时仍有 outstanding request 或未关闭 File 属于契约违例：必须记录错误并
+  失败关闭，不得无界等待。
 
 ## 6. Runtime、reactor 和所有权
 
@@ -349,9 +379,10 @@ R = 2                         2 <= nproc <= 8
 R = min(4, max(2,nproc/4))    nproc > 8
 ```
 
-`R` 是 data shard 数，另有一个 metadata actor。默认 metadata CPU0、data CPU1..R，
-frontend 不由 HFS 强制绑定。配置文件可显式指定 `data_reactors`、`data_cpus`、
-`metadata_cpus` 和 `frontend_cpus`；当前正式开发口径以单 NUMA node 为准，runtime
+`R` 是 data shard 数，另有一个 metadata actor。`metadata_cpus` 是必填的显式 CPU 列表，
+首元素用于 metadata reactor pin、EAL main core 和 `data_cpus=auto` 时的 CPU 基准；
+`data_reactors`、`data_cpus` 和 `frontend_cpus` 可显式指定或 auto，frontend 不由 HFS
+强制绑定。当前正式开发口径以单 NUMA node 为准，runtime
 保留 topology-aware 选择和确定性 fallback，但多 NUMA node 的本地 DMA/跨 node 性能
 验证暂缓，不作为单节点功能验收门槛。`data_reactors` 上限不能超过
 `max_data_reactors`；默认不恢复旧的 `HFS_REACTOR_PIN` 环境变量。data reactor 的
@@ -372,6 +403,28 @@ data ring 是固定槽位 MPSC producer / single actor consumer：
 - ring 满返回 bounded `TryAgain/Busy`，不创建无界等待队列；
 - actor 清空 ring 后再次检查 tail，再清 armed 位，避免 lost wake；
 - shutdown 关闭 producer 后等待 ring、credit、operation 和 coroutine frame 全部闭合。
+
+data reactor 的空闲等待（hybrid/interrupt）必须可被 doorbell 唤醒，不得使用无唤醒源的
+`sleep_for`：
+
+- 每个 data reactor 持有一个 nonblocking `eventfd`；空闲路径先清 eventfd、置 idle 标记、
+  重查 poller/ring，再用 `ppoll` 做有界等待；
+- producer 只在 ring `empty→non-empty` 且该 reactor 处于 idle 等待时写一次 eventfd；
+  reactor 未睡时不产生每请求 syscall；
+- doorbell 只是唤醒提示，`ppoll` 超时兜底仍是正确性边界；等待期间 stop 请求和 SPDK
+  thread message 的处理延迟不超过该超时；
+- reactor 醒来后重新进入完整 poll 循环（`spdk_thread_poll`、retry/completion drain、
+  poller pump），doorbell 不改变 ring 的 MPSC 事实源地位。
+
+metadata reactor 使用同一 eventfd 等待协议，语义是 control-path：
+
+- 只在没有 SPDK 事件、没有在途 control I/O 时进入有界等待（hybrid 1 ms、interrupt
+  100 µs、active 不休眠）；
+- 任何线程向 metadata reactor `spdk_thread_send_msg` 后必须写它的 eventfd；
+- 在途 control I/O（journal/checkpoint/format 读写）期间不得休眠，保证 control 提交
+  不被等待延迟；
+- 等待不改变 control I/O 的阻塞语义：调用者仍在自己的 condition variable 上等待完成；
+- 找不到唤醒源时 1 ms 超时兜底，不允许无界等待。
 
 SPDK callback 不直接 `scheduler.complete`，也不在 callback 栈中递归提交 RMW 下一阶段或
 下一笔 operation。callback 只释放 `spdk_bdev_io`、记录 child status，并把内嵌 ready node
@@ -828,6 +881,10 @@ engine 直接调用 C++ `Engine/Client/File`，不通过 POSIX open/read/write�
   报错，不做半量 fallback；不使用 `iomem_alloc` 的普通 FIO buffer 按 ≤1 MiB child bounce
   并计入 copy 统计；`io_u->xfer_buf` 是 allocation interior pointer 时用
   `ownsRange(ptr,len)` 校验，不能只匹配 allocation base；
+- FIO engine 必须声明 `FIO_RAWIO | FIO_NODISKUTIL | FIO_DISKLESSIO`，因为 `filename`
+  是 HFS namespace 路径而不是宿主机文件；setup 阶段强制 `thread=1`，避免 fork 后复用
+  process-shared Engine。FIO 可能在 engine `init` 前调用 `get_file_size`，该阶段只能使用
+  显式 `size` 或安全返回，不能访问尚未建立的 Client；
 - `queue()` 三态返回：成功 `FIO_Q_QUEUED`、临时资源不足 `FIO_Q_BUSY`、参数或永久错误
   `FIO_Q_COMPLETED` + `io_u->error`；只有 client credit、operation pool 或 ring reservation
   在 publish 前失败才能返回 `FIO_Q_BUSY`。publish 后 planner/DMA/backend/metadata 错误必须
@@ -1120,14 +1177,16 @@ weight = 1
 required = true
 
 [runtime]
+metadata_cpus = 0
 data_reactors = 0
 max_data_reactors = 4
-metadata_cpu = 0
 data_cpus = auto
-metadata_cpus = 0
 frontend_cpus = auto
 ring_depth = 1024
 client_depth = 32
+
+[rocksdb]
+worker_direct_reads = true
 
 [numa]
 policy = local-first
@@ -1240,8 +1299,8 @@ bs:      4K, 16K, 64K, 1M
 shared-file、randrw 50/50、4K/8K/16K/32K/64K、合计 QD=32（HFS 8 jobs × iodepth 4，
 raw 1 job × iodepth 32）、10 秒、5-run median、trace/stats off。2026-09-18 优化复测前
 的 32 jobs × iodepth 1 口径保留为历史对比，不再作为主 gate 形状。HFS 正式 `.conf`
-的 reactor/CPU 必须与测试 cpuset 对齐（`config/hfs_nvme.conf`：`data_reactors=1`、
-`metadata_cpu=2`、`data_cpus=3`），避免越界 pin 覆盖 `taskset`。raw 对照使用同一设备
+的 reactor/CPU 必须与测试 cpuset 对齐（`config/hfs_nvme.conf`：`metadata_cpus=2`、
+`data_reactors=1`、`data_cpus=3`），避免越界 pin 覆盖 `taskset`。raw 对照使用同一设备
 的 SPDK bdevperf 或官方 fio SPDK plugin，固定相同 bs/iodepth/jobs。报告 HFS/raw、
 read/write p50/p99、CPU%、RSS、errors、submit/complete、journal bytes/op。
 
@@ -1266,6 +1325,11 @@ hfs_db_bench --hfs-config=config/hfs_nvme.conf \
 hfs_ldb --hfs-config=config/hfs_nvme.conf \
   checkconsistency --db=/hfs2/rocksdb
 ```
+
+`hfs_db_bench` prints a compact RocksDB-style result line by default and suppresses
+routine HFS lifecycle/checkpoint messages; pass `--verbose` when detailed runtime
+diagnostics are required. `HFS_LOG_LEVEL=error` can also be used to keep the
+benchmark output quiet in scripted runs.
 
 必须覆盖 create/write/close/reopen、SST read、WAL sync、flush/compact、rename/delete、
 normal restart、SIGKILL recovery、跨进程顺序 reopen 和 checkconsistency。Stock db_bench
@@ -1428,6 +1492,9 @@ checkpoint region 必须容纳 namespace/inode/extent map/各 device allocator b
 | queue/backpressure | 有界 ring、FIO busy、RocksDB Busy、有限 retry |
 | recovery 错误 | A/B、CRC、commit marker、crash matrix、hfsctl check |
 | 旧功能回流 | 新库名、新 magic、新 source tree，不编译 frozen src |
+| worker-owned channel 生命周期 | §5.3 非拥有引用 + registry 主线程 retire；单测覆盖线程退出、context 析构与建链回落 |
+| shared frontend 偶发丢唤醒 | 有界 poll + 压力重复回归；真实 NVMe 复现时按 bug 记录 |
+| 跨会话性能环境漂移 | 同会话交错 A/B、native 首尾校准；跨会话数字不得直接比较 |
 
 ### 17.3 立即停止条件
 

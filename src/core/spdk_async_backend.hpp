@@ -19,7 +19,8 @@ public:
         std::uint32_t spanBytes = 0;
     };
 
-    /* Converts planner-block coordinates into one native-device request. */
+    /* Converts planner-block or explicit byte coordinates into one
+     * native-device request. */
     static bool convertPlannerRequest(const Request &request,
                                       std::uint32_t plannerBlockSize,
                                       std::uint32_t nativeBlockSize,
@@ -45,6 +46,8 @@ public:
                              void *context) noexcept override;
     /* Submits queued requests once slot credit frees; actor thread only. */
     void pump() noexcept override;
+    /* Wakes the owning data reactor after a ring doorbell; any thread. */
+    void wake() noexcept override;
 
     std::size_t pending() const noexcept {
         return pendingCount_;

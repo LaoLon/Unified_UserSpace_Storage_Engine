@@ -23,6 +23,8 @@ public:
         bool write = false;
         bool rmw = false;
         std::uint64_t physicalBlock = 0;
+        std::uint64_t physicalByte = 0;
+        bool physicalByteValid = false;
         std::uint32_t deviceId = 0;
         std::uint32_t bytes = 0;
         std::uint32_t spanBytes = 0;
@@ -59,6 +61,10 @@ public:
     /* Actor-local retry pump for backends that accept requests while their
      * internal credit is exhausted (SubmitDisposition::WaitingForCredit). */
     virtual void pump() noexcept {}
+
+    /* Reactor wake hint after a ring publish armed the shard doorbell. Called
+     * from the publishing thread; must be nonblocking and coalescing. */
+    virtual void wake() noexcept {}
 };
 
 /* Credit and completion sink owned by the frontend client. */
@@ -76,6 +82,17 @@ public:
      * Returns false when the event could not be delivered (queue overflow or
      * invalid shard); the sink must then fail closed with its own fatal state. */
     virtual bool publish(std::uint32_t shard, const CompletionEvent &event) noexcept = 0;
+
+    /* Batched delivery for one shard; default keeps per-event semantics. */
+    virtual bool publishBatch(std::uint32_t shard, const CompletionEvent *events,
+                              std::size_t count) noexcept {
+        for (std::size_t index = 0; index < count; ++index) {
+            if (!publish(shard, events[index])) {
+                return false;
+            }
+        }
+        return true;
+    }
 };
 
 /* One contiguous read or fixed-size preallocated overwrite request. */
@@ -98,6 +115,8 @@ struct AsyncDataServiceConfig {
     std::size_t maxOperations = 64;
     std::size_t maxInodesPerShard = 64;
     std::size_t maxPreparingPerShard = 0;
+    /* Native device sector used only by the read planner. */
+    std::uint32_t nativeReadBlockSize = 0;
     IoPlanner::Config planner{};
 };
 

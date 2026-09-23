@@ -39,18 +39,21 @@ bool SpdkAsyncDataBackend::convertPlannerRequest(const Request &request,
     if (plannerBlockSize == 0 || nativeBlockSize == 0 || capacityBytes == 0 ||
         request.buffer == nullptr || request.bytes == 0 || request.spanBytes == 0 ||
         request.bufferBytes < request.spanBytes ||
-        request.spanBytes % plannerBlockSize != 0 ||
         request.spanOffset > request.spanBytes ||
         request.bytes > request.spanBytes - request.spanOffset) {
         return false;
     }
 
-    if (request.physicalBlock >
-        std::numeric_limits<std::uint64_t>::max() / plannerBlockSize) {
-        return false;
+    std::uint64_t physicalByte = request.physicalByte;
+    if (!request.physicalByteValid) {
+        if (request.spanBytes % plannerBlockSize != 0 ||
+            request.physicalBlock >
+                std::numeric_limits<std::uint64_t>::max() / plannerBlockSize) {
+            return false;
+        }
+        physicalByte =
+            request.physicalBlock * static_cast<std::uint64_t>(plannerBlockSize);
     }
-    const std::uint64_t physicalByte =
-        request.physicalBlock * static_cast<std::uint64_t>(plannerBlockSize);
     const std::uint64_t spanBytes = request.spanBytes;
     if (physicalByte > capacityBytes || spanBytes > capacityBytes - physicalByte ||
         physicalByte % nativeBlockSize != 0 || spanBytes % nativeBlockSize != 0) {
@@ -333,5 +336,11 @@ void SpdkAsyncDataBackend::submitPending() noexcept {
 }
 
 void SpdkAsyncDataBackend::pump() noexcept { submitPending(); }
+
+void SpdkAsyncDataBackend::wake() noexcept {
+    /* The reactor only needs a wake when it is idle-waiting; the runtime
+     * coalesces and ignores the result (timeout remains the fallback). */
+    (void)runtime_.wakeDataReactor(reactorIndex_);
+}
 
 } // namespace hfs

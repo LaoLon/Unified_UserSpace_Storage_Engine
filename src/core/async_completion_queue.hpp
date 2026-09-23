@@ -93,6 +93,14 @@ public:
     /* Returns whether this push changed the producer wake-arm state. */
     PushResult pushWithWakeHint(const CompletionEvent &event) noexcept;
 
+    struct BatchResult {
+        std::size_t pushed = 0;
+        bool notify = false;
+    };
+    /* Publishes a batch with one wake-arm update; returns pushed==0 when the
+     * ring lacks capacity so the caller can fall back to per-event pushes. */
+    BatchResult pushBatch(const CompletionEvent *events, std::size_t count) noexcept;
+
     bool pop(CompletionEvent &event) noexcept;
     std::size_t drain(std::span<CompletionEvent> output) noexcept;
 
@@ -153,6 +161,10 @@ public:
 
     /* Returns whether this push changed the queue wake-arm state. */
     PushResult pushWithWakeHint(std::size_t shard, const CompletionEvent &event) noexcept;
+
+    /* Batched variant used for one shard; notifies the frontend once. */
+    PushResult pushBatch(std::size_t shard, const CompletionEvent *events,
+                         std::size_t count) noexcept;
 
     /* Nonblocking drain across all shards. */
     std::size_t drain(std::span<CompletionEvent> output, std::size_t max) noexcept;

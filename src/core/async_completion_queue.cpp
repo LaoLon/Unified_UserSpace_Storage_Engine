@@ -263,6 +263,47 @@ bool AsyncCompletionRing::push(const CompletionEvent &event) noexcept {
     return pushWithWakeHint(event).accepted;
 }
 
+AsyncCompletionRing::BatchResult
+AsyncCompletionRing::pushBatch(const CompletionEvent *events, std::size_t count) noexcept {
+    BatchResult result;
+    if (!valid() || events == nullptr || count == 0) {
+        return result;
+    }
+    const std::uint64_t head = head_.load(std::memory_order_relaxed);
+    const std::uint64_t tail = tail_.load(std::memory_order_acquire);
+    const std::uint64_t capacity = static_cast<std::uint64_t>(capacity_);
+    const std::uint64_t usedBefore = head - tail;
+    if (usedBefore >= capacity ||
+        static_cast<std::uint64_t>(count) > capacity - usedBefore) {
+        overflow_.fetch_add(1, std::memory_order_relaxed);
+        return result;
+    }
+    for (std::size_t index = 0; index < count; ++index) {
+        storage_[static_cast<std::size_t>((head + index) % capacity_)] = events[index];
+    }
+    head_.store(head + count, std::memory_order_release);
+    pushed_.fetch_add(count, std::memory_order_relaxed);
+
+    /* One high-watermark update and one wake-arm transition per batch. */
+    const std::uint64_t usedCount = (head + count) - tail;
+    const std::size_t used = static_cast<std::size_t>(
+        std::min<std::uint64_t>(usedCount, capacity));
+    std::size_t high = highWatermark_.load(std::memory_order_relaxed);
+    while (used > high &&
+           !highWatermark_.compare_exchange_weak(high, used, std::memory_order_relaxed,
+                                                 std::memory_order_relaxed)) {
+    }
+    bool expected = false;
+    result.notify = wakeArmed_.compare_exchange_strong(expected, true,
+                                                       std::memory_order_acq_rel,
+                                                       std::memory_order_acquire);
+    if (result.notify) {
+        wakeTransitions_.fetch_add(1, std::memory_order_relaxed);
+    }
+    result.pushed = count;
+    return result;
+}
+
 bool AsyncCompletionRing::pop(CompletionEvent &event) noexcept {
     if (!valid()) {
         return false;
@@ -399,6 +440,29 @@ AsyncCompletionQueue::pushWithWakeHint(std::size_t shard,
 bool AsyncCompletionQueue::push(std::size_t shard, const CompletionEvent &event) noexcept {
     const PushResult result = pushWithWakeHint(shard, event);
     return result.accepted;
+}
+
+AsyncCompletionQueue::PushResult
+AsyncCompletionQueue::pushBatch(std::size_t shard, const CompletionEvent *events,
+                                std::size_t count) noexcept {
+    PushResult result;
+    if (!valid() || shard >= shardCount_) {
+        invalidShard_.fetch_add(1, std::memory_order_relaxed);
+        return result;
+    }
+    const auto ring = rings_[shard].pushBatch(events, count);
+    if (ring.pushed == 0) {
+        return result;
+    }
+    if (ring.notify) {
+        notifier_.notify();
+    }
+    trace::event(trace::EventId::CqPush, events[0].requestId,
+                 static_cast<std::uint64_t>(shard), events[0].completedBytes,
+                 static_cast<std::uint64_t>(events[0].status));
+    result.accepted = true;
+    result.notify = ring.notify;
+    return result;
 }
 
 std::size_t AsyncCompletionQueue::drainAvailable(std::span<CompletionEvent> output,

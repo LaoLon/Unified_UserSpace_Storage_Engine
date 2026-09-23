@@ -57,6 +57,9 @@ public:
 
     /* Control-path doorbell onto a data reactor (spdk_thread_send_msg). */
     Result<void> postToDataReactor(std::uint32_t index, std::function<void()> fn);
+    /* Data-path doorbell: wakes one idle-waiting data reactor. Nonblocking,
+     * coalescing, and safe from any thread; a timeout remains the fallback. */
+    Result<void> wakeDataReactor(std::uint32_t index) noexcept;
     std::uint64_t dataReactorThreadId(std::uint32_t index) const;
     /* Returns the reactor selected for a device's NUMA domain. */
     std::uint32_t dataReactorForDevice(std::size_t deviceIndex) const noexcept;

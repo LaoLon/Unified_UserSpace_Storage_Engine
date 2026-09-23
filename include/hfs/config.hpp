@@ -57,12 +57,16 @@ struct Config {
     /* [runtime] */
     std::uint32_t dataReactors = 0; /* 0 = auto */
     std::uint32_t maxDataReactors = 0;
+    /* Derived by the parser from the first metadata_cpus entry; not a config
+     * key. EAL main core, metadata reactor pin and auto data CPU base use it. */
     std::uint32_t metadataCpu = 0;
     std::string dataCpus; /* "auto" or comma list */
-    std::string metadataCpus; /* optional comma list; metadataCpu remains the fallback */
+    std::string metadataCpus; /* required explicit CPU list; first entry is metadataCpu */
     std::string frontendCpus; /* optional comma list for frontend affinity evidence */
     std::uint32_t ringDepth = 0;
     std::uint32_t clientDepth = 0;
+    /* [rocksdb] */
+    bool rocksdbWorkerDirectReads = true;
     /* [numa] */
     NumaConfig numa;
     /* [limits] */

@@ -33,7 +33,9 @@ public:
 
     /* Reserve a producer slot; invalid when the ring is full (Busy). */
     Reservation reserve() noexcept;
-    void publish(Reservation reservation, Operation *operation) noexcept;
+    /* Publishes one operation; returns true when this publish armed the
+     * doorbell (ring transitioned empty->non-empty). */
+    bool publish(Reservation reservation, Operation *operation) noexcept;
 
     /* Actor side: move up to `max` published operations out of the ring. */
     std::size_t drain(Operation **out, std::size_t max) noexcept;

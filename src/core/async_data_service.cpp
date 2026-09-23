@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <chrono>
 #include <limits>
 #include <memory>
 #include <new>
@@ -19,12 +20,14 @@
 #include "core/request_lookup.hpp"
 #include "core/scheduler.hpp"
 #include "core/shard_ring.hpp"
+#include "hfs/diagnostics.hpp"
 
 namespace hfs {
 
 class AsyncDataService::Impl {
 private:
     static constexpr std::uint32_t kNoLease = std::numeric_limits<std::uint32_t>::max();
+    static constexpr std::size_t kReusableReadLeaseBytes = 16384;
 
     struct RequestState;
     struct ShardState;
@@ -168,6 +171,8 @@ private:
         std::array<ChildState, IoPlanner::Plan::kMaxChildren> children{};
         std::array<std::size_t, IoPlanner::Plan::kMaxChildren> leaseSizes{};
         std::array<BufferLease, IoPlanner::Plan::kMaxChildren> leases{};
+        /* Reused DMA storage for the common single-child random-read case. */
+        BufferLease reusableReadLease;
         ParentCompletion parent;
         std::uint32_t childCount = 0;
         std::uint32_t leaseCount = 0;
@@ -175,6 +180,7 @@ private:
         std::uint32_t drainedChildren = 0;
         std::atomic<bool> inUse{false};
         bool planned = false;
+        bool bufferPlanRecorded = false;
         bool parked = false;
         bool startingChildren = false;
         bool allChildrenDone = false;
@@ -209,6 +215,7 @@ private:
             submittedChildren = 0;
             drainedChildren = 0;
             planned = false;
+            bufferPlanRecorded = false;
             parked = false;
             startingChildren = false;
             allChildrenDone = false;
@@ -275,7 +282,18 @@ private:
         InodeDependencyScheduler scheduler;
     };
 
+    /* Bounded per-shard completion batch: one ring publish and one wake per
+     * drain instead of one per request (reactor-thread private). */
+    static constexpr std::size_t kPendingCompletionBatch = 32;
+    struct PendingCompletion {
+        AsyncDataSink *sink = nullptr;
+        std::size_t count = 0;
+        std::array<CompletionEvent, kPendingCompletionBatch> events{};
+    };
+
     struct ShardState {
+        std::uint32_t index = 0;
+        PendingCompletion pending;
         std::unique_ptr<ShardRing> ring;
         std::unique_ptr<ShardActor> actor;
         /* Pool of active inode schedulers, sized by concurrent operations
@@ -328,6 +346,7 @@ public:
                                               config_.maxOperations));
         for (std::uint32_t shard = 0; shard < config_.shardCount; ++shard) {
             ShardState &state = shards_[shard];
+            state.index = shard;
             state.backend = backends[shard];
             if (state.backend == nullptr) {
                 return;
@@ -466,7 +485,12 @@ public:
 
         operation->state.store(OperationState::Enqueued, std::memory_order_release);
         active_.fetch_add(1, std::memory_order_acq_rel);
-        shardState.ring->publish(reservation, operation);
+        /* Wake the owning reactor only on the empty->non-empty transition so
+         * an already-polling reactor pays no per-request syscall. */
+        const bool wakeReactor = shardState.ring->publish(reservation, operation);
+        if (wakeReactor) {
+            shardState.backend->wake();
+        }
 
         /* The ring's actor reference is now the sole non-frontend owner. */
         operation->release();
@@ -485,6 +509,7 @@ public:
          * on the owning reactor, once slot credit has been released. */
         state.backend->pump();
         work += drainReady(state);
+        flushPending(state);
         if (trace::enabled()) {
             const ShardRing::Stats ringStats = state.ring->stats();
             trace::event(trace::EventId::ShardPump, shard, work,
@@ -635,19 +660,44 @@ private:
             head, node, std::memory_order_release, std::memory_order_acquire));
     }
 
+    /* Appends to the shard's pending completion batch; flushed at pump end. */
     static void publishOperationCompletion(void *context,
                                            const CompletionEvent &event) noexcept {
         auto *state = static_cast<RequestState *>(context);
-        if (state == nullptr || state->sink == nullptr) {
+        if (state == nullptr || state->sink == nullptr || state->owner == nullptr ||
+            state->shardState == nullptr) {
             return;
         }
-        if (state->sink->publish(state->shard, event)) {
-            state->owner->completionPublished_.fetch_add(1, std::memory_order_relaxed);
+        Impl *owner = state->owner;
+        ShardState &shard = *state->shardState;
+        PendingCompletion &pending = shard.pending;
+        if (pending.count == kPendingCompletionBatch ||
+            (pending.count != 0 && pending.sink != state->sink)) {
+            owner->flushPending(shard);
+        }
+        pending.sink = state->sink;
+        pending.events[pending.count++] = event;
+        owner->tokenEvents_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    /* Delivers the shard batch with one sink call; reactor-thread only. */
+    void flushPending(ShardState &shard) noexcept {
+        PendingCompletion &pending = shard.pending;
+        if (pending.count == 0) {
+            return;
+        }
+        const std::size_t count = pending.count;
+        AsyncDataSink *sink = pending.sink;
+        pending.sink = nullptr;
+        pending.count = 0;
+        const bool delivered =
+            sink != nullptr && sink->publishBatch(shard.index, pending.events.data(), count);
+        if (delivered) {
+            completionPublished_.fetch_add(count, std::memory_order_relaxed);
         } else {
             /* The sink reported a fatal delivery failure; never claim closure. */
-            state->owner->completionDropped_.fetch_add(1, std::memory_order_relaxed);
+            completionDropped_.fetch_add(count, std::memory_order_relaxed);
         }
-        state->owner->tokenEvents_.fetch_add(1, std::memory_order_relaxed);
     }
 
     static void parentDone(void *context, int, std::uint64_t) noexcept {
@@ -688,13 +738,57 @@ private:
             }
             auto planned = planner_.plan(state.extentSnapshot, state.request.offset,
                                          state.request.length, state.request.write,
-                                         !state.request.write);
+                                         !state.request.write,
+                                         state.request.write ? 0U
+                                                              : config_.nativeReadBlockSize);
             if (!planned.ok()) {
                 planFailures_.fetch_add(1, std::memory_order_relaxed);
                 finish(state, planned.status(), 0);
                 return;
             }
             state.plan = std::move(planned).value();
+            if (!state.request.write) {
+                std::uint64_t childBytes = 0;
+                std::uint64_t spanBytes = 0;
+                std::uint64_t directChildren = 0;
+                std::uint64_t headRmwChildren = 0;
+                std::uint64_t tailRmwChildren = 0;
+                std::uint64_t zeroChildren = 0;
+                std::uint64_t span4kChildren = 0;
+                std::uint64_t span8kChildren = 0;
+                std::uint64_t spanOtherChildren = 0;
+                for (std::uint32_t index = 0; index < state.plan.count; ++index) {
+                    const auto &child = state.plan.children[index];
+                    childBytes += child.bytes;
+                    spanBytes += child.spanBytes;
+                    if (child.spanBytes == 4096) {
+                        ++span4kChildren;
+                    } else if (child.spanBytes == 8192) {
+                        ++span8kChildren;
+                    } else {
+                        ++spanOtherChildren;
+                    }
+                    switch (child.kind) {
+                    case IoPlanner::Child::Kind::Direct:
+                        ++directChildren;
+                        break;
+                    case IoPlanner::Child::Kind::HeadRmw:
+                        ++headRmwChildren;
+                        break;
+                    case IoPlanner::Child::Kind::TailRmw:
+                        ++tailRmwChildren;
+                        break;
+                    case IoPlanner::Child::Kind::Zero:
+                        ++zeroChildren;
+                        break;
+                    }
+                }
+                diagnostics::recordDataReadPlan(
+                    state.request.length, childBytes, spanBytes, directChildren,
+                    state.plan.coalescedChildren,
+                    headRmwChildren, tailRmwChildren, zeroChildren, span4kChildren,
+                    span8kChildren, spanOtherChildren);
+            }
             state.childCount = state.plan.count;
             state.planned = true;
             trace::event(trace::EventId::PlanReady, state.requestId);
@@ -757,6 +851,10 @@ private:
     Status acquireLeases(RequestState &state) noexcept {
         state.leaseCount = 0;
         state.leaseSizes.fill(0);
+        std::uint64_t bounceChildren = 0;
+        std::uint64_t bounceBytes = 0;
+        std::uint64_t directUserChildren = 0;
+        std::uint64_t directUserBytes = 0;
         for (std::uint32_t index = 0; index < state.childCount; ++index) {
             ChildState &child = state.children[index];
             child.lease = nullptr;
@@ -776,13 +874,47 @@ private:
             const bool needsBounce = isRmw(plan.kind) ||
                                      !arena_.ownsRange(userBuffer, plan.spanBytes);
             if (!needsBounce) {
+                if (!state.request.write) {
+                    ++directUserChildren;
+                    directUserBytes += plan.spanBytes;
+                }
                 continue;
+            }
+            if (!state.request.write) {
+                ++bounceChildren;
+                bounceBytes += plan.spanBytes;
+            }
+            /* A reusable lease is safe only for a single-child request.  A
+             * coalesced request may submit several children concurrently, so
+             * sharing one DMA buffer between those children would let a later
+             * completion overwrite data before the earlier child copies it
+             * out. */
+            if (!state.request.write && state.childCount == 1 &&
+                plan.spanBytes <= kReusableReadLeaseBytes) {
+                if (state.reusableReadLease.span().size() < plan.spanBytes) {
+                    auto reusable = BufferLease::fromArena(arena_,
+                                                           kReusableReadLeaseBytes, 0);
+                    if (reusable.ok()) {
+                        state.reusableReadLease = std::move(reusable).value();
+                    }
+                }
+                if (state.reusableReadLease.span().size() >= plan.spanBytes) {
+                    child.lease = &state.reusableReadLease;
+                    continue;
+                }
             }
             if (state.leaseCount >= state.leases.size()) {
                 return Status::NoMemory;
             }
             child.leaseIndex = state.leaseCount;
             state.leaseSizes[state.leaseCount++] = plan.spanBytes;
+        }
+
+        if (!state.request.write && !state.bufferPlanRecorded &&
+            diagnostics::profilingEnabled()) {
+            diagnostics::recordReadBufferPlan(bounceChildren, bounceBytes,
+                                              directUserChildren, directUserBytes);
+            state.bufferPlanRecorded = true;
         }
 
         if (state.leaseCount == 0) {
@@ -942,6 +1074,9 @@ private:
         request.rmw = isRmw(child.plan.kind);
         request.requestId = state.requestId;
         request.physicalBlock = child.plan.physicalBlock;
+        request.physicalByte = child.plan.physicalByte;
+        request.physicalByteValid =
+            !state.request.write && state.owner->config_.nativeReadBlockSize != 0;
         request.deviceId = child.plan.deviceId;
         request.bytes = child.plan.bytes;
         request.spanBytes = child.plan.spanBytes;
@@ -1037,6 +1172,9 @@ private:
         }
 
         if (child.lease != nullptr && !state.request.write) {
+            const bool profile = diagnostics::profilingEnabled();
+            const auto copyStart = profile ? std::chrono::steady_clock::now()
+                                           : std::chrono::steady_clock::time_point{};
             const auto source = child.lease->span().first(child.plan.spanBytes);
             if (child.plan.spanOffset + child.plan.bytes > source.size()) {
                 completeChild(state, childIndex, Status::InvalidArgument, EINVAL, 0);
@@ -1046,6 +1184,15 @@ private:
                                                              child.plan.bytes);
             std::memcpy(destination.data(), source.data() + child.plan.spanOffset,
                         destination.size());
+            const std::uint64_t copyNs = profile
+                                             ? static_cast<std::uint64_t>(
+                                                   std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                       std::chrono::steady_clock::now() - copyStart)
+                                                       .count())
+                                             : 0;
+            if (profile) {
+                diagnostics::recordReadCopyOut(destination.size(), copyNs);
+            }
         }
         if (child.lease != nullptr && !isRmw(child.plan.kind) && state.request.write) {
             /* The write copy was performed before submit; no copy-out is needed. */

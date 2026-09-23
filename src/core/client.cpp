@@ -189,6 +189,28 @@ struct ClientState final : AsyncDataSink {
         return true;
     }
 
+    /* One ring publish and one wake callback for the whole batch. */
+    bool publishBatch(std::uint32_t shard, const CompletionEvent *events,
+                      std::size_t count) noexcept override {
+        if (count == 0 || events == nullptr) {
+            return true;
+        }
+        const auto result = completionQueue.pushBatch(shard, events, count);
+        if (!result.accepted) {
+            /* Ring lacked capacity: preserve the per-event overflow semantics. */
+            for (std::size_t index = 0; index < count; ++index) {
+                if (!publish(shard, events[index])) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        if (result.notify && options.completionWake != nullptr) {
+            options.completionWake(options.completionWakeContext);
+        }
+        return true;
+    }
+
     void releaseSlot(std::size_t index) noexcept {
         if (index >= maxOutstandingValue || requestSlots == nullptr ||
             freeSlotStack == nullptr) {

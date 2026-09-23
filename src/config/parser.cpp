@@ -109,8 +109,9 @@ const std::vector<SectionSpec> kSections = {
       "require_all_devices", "metadata_block_size", "journal_mb", "checkpoint_mb",
       "extent_mb", "prealloc_extents", "max_extents_per_file"}},
     {"runtime",
-     {"data_reactors", "max_data_reactors", "metadata_cpu", "data_cpus", "ring_depth",
-      "metadata_cpus", "frontend_cpus", "ring_depth", "client_depth"}},
+     {"metadata_cpus", "data_reactors", "max_data_reactors", "data_cpus",
+      "frontend_cpus", "ring_depth", "client_depth"}},
+    {"rocksdb", {"worker_direct_reads"}},
     {"numa", {"policy", "device_numa", "dma_numa", "frontend_numa",
                "allow_remote_dma", "remote_fallback", "polling"}},
     {"limits",
@@ -442,17 +443,33 @@ Result<Config> parseConfig(const std::string &text, const std::string &origin) {
 
     /* [runtime] */
     std::string dataCpus;
+    std::string metadataCpus;
     if (!store.requireUint32("runtime.data_reactors", config.dataReactors, error) ||
         !store.requireUint32("runtime.max_data_reactors", config.maxDataReactors, error) ||
-        !store.requireUint32("runtime.metadata_cpu", config.metadataCpu, error) ||
         !store.requireString("runtime.data_cpus", dataCpus, error) ||
+        !store.requireString("runtime.metadata_cpus", metadataCpus, error) ||
         !store.requireUint32("runtime.ring_depth", config.ringDepth, error) ||
         !store.requireUint32("runtime.client_depth", config.clientDepth, error)) {
         return fail(error);
     }
     config.dataCpus = dataCpus;
-    store.optionalString("runtime.metadata_cpus", config.metadataCpus);
+    config.metadataCpus = metadataCpus;
     store.optionalString("runtime.frontend_cpus", config.frontendCpus);
+    /* [rocksdb] is optional; worker-owned read channels default on. */
+    if (!store.optionalBool("rocksdb.worker_direct_reads",
+                            config.rocksdbWorkerDirectReads, error)) {
+        return fail(error);
+    }
+    /* metadata_cpus is the single source of the metadata CPU; its first entry
+     * drives the EAL main core, the metadata reactor pin and the auto data CPU
+     * base. Validation rejects empty, auto, duplicate or overlapping lists. */
+    const auto metadataCpuItems = splitList(config.metadataCpus);
+    if (!metadataCpuItems.empty()) {
+        std::uint32_t primaryMetadataCpu = 0;
+        if (parseUint32(metadataCpuItems.front(), primaryMetadataCpu)) {
+            config.metadataCpu = primaryMetadataCpu;
+        }
+    }
 
     /* [numa] is optional for schema-version-1 configurations. */
     store.optionalString("numa.policy", config.numa.policy);
@@ -657,23 +674,21 @@ Result<void> validateConfig(const Config &config) {
     if (config.dataReactors > config.maxDataReactors) {
         return invalid("data_reactors must not exceed max_data_reactors");
     }
-    if (!isAutoOrCpuList(config.dataCpus)) {
-        return invalid("data_cpus must be 'auto' or a comma-separated CPU list");
+    if (!isAutoOrCpuList(config.dataCpus) || !isAutoOrCpuList(config.frontendCpus)) {
+        return invalid("data_cpus and frontend_cpus must be 'auto' or CPU lists");
     }
-    if (!isAutoOrCpuList(config.metadataCpus) || !isAutoOrCpuList(config.frontendCpus)) {
-        return invalid("metadata_cpus and frontend_cpus must be 'auto' or CPU lists");
+    /* metadata_cpus is the single source of the metadata CPU and must be an
+     * explicit list so EAL main core and pin targets are deterministic. */
+    if (config.metadataCpus.empty() || config.metadataCpus == "auto") {
+        return invalid("metadata_cpus must be an explicit CPU list");
     }
     /* Reject explicit role overlap before runtime threads are created. Auto
      * placement is intentionally left to the topology-aware runtime. */
     std::set<std::uint32_t> reservedCpus;
-    if (config.metadataCpus.empty() || config.metadataCpus == "auto") {
-        reservedCpus.insert(config.metadataCpu);
-    } else {
-        for (const auto &item : splitList(config.metadataCpus)) {
-            std::uint32_t cpu = 0;
-            if (!parseUint32(item, cpu) || !reservedCpus.insert(cpu).second) {
-                return invalid("metadata_cpus contains a duplicate or invalid CPU");
-            }
+    for (const auto &item : splitList(config.metadataCpus)) {
+        std::uint32_t cpu = 0;
+        if (!parseUint32(item, cpu) || !reservedCpus.insert(cpu).second) {
+            return invalid("metadata_cpus contains a duplicate or invalid CPU");
         }
     }
     auto addRoleCpus = [&](const std::string &text, const char *role,

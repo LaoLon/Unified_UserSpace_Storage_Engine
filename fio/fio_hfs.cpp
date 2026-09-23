@@ -127,6 +127,8 @@ struct DmaBufferOwner {
 };
 std::unordered_map<void *, DmaBufferOwner> dmaBufferOwners;
 
+void fioLog(const char *message);
+
 /* Preserve the parsed engine configuration for fio worker clones. */
 int fioHfsConfigOption(void *, const char *value) {
     if (value == nullptr || value[0] == '\0') {
@@ -134,6 +136,15 @@ int fioHfsConfigOption(void *, const char *value) {
     }
     std::lock_guard<std::mutex> lock(processMutex);
     processConfigPath = value;
+    return 0;
+}
+
+/* HFS filenames belong to the HFS namespace; fio must not probe the host path. */
+int fioHfsSetup(struct thread_data *td) {
+    if (td == nullptr || td->o.use_thread == 0) {
+        fioLog("fio-hfs: thread=1 is required for the process-shared engine\n");
+        return 1;
+    }
     return 0;
 }
 
@@ -230,6 +241,14 @@ int fioHfsIomemAlloc(struct thread_data *td, size_t totalMem) {
         return 1;
     }
     td->orig_buffer = reinterpret_cast<char *>(acquired.value().data());
+    if (td->orig_buffer == nullptr || acquired.value().size() < totalMem) {
+        fioLog("fio-hfs: DMA arena returned an invalid buffer\n");
+        engine->releaseDmaBuffer(td->orig_buffer, acquired.value().size());
+        td->orig_buffer = nullptr;
+        std::lock_guard<std::mutex> lock(processMutex);
+        processDmaBytesReserved -= bytes;
+        return 1;
+    }
     {
         std::lock_guard<std::mutex> lock(dmaBufferMutex);
         const auto inserted = dmaBufferOwners.emplace(
@@ -967,8 +986,6 @@ int fioHfsGetFileSize(struct thread_data *td, struct fio_file *fioFile) {
         } else {
             fioLog("fio-hfs: get_file_size open failed\n");
         }
-    } else {
-        fioLog("fio-hfs: get_file_size has no client state\n");
     }
     fioFile->real_file_size = requestedSize;
     return 0;
@@ -1203,7 +1220,8 @@ struct io_u *fioHfsEvent(struct thread_data *td, int event) {
 extern "C" struct ioengine_ops ioengine = {
     .name = "hfs",
     .version = FIO_IOOPS_VERSION,
-    .flags = FIO_NOEXTEND | FIO_MEMALIGN,
+    .flags = FIO_RAWIO | FIO_NOEXTEND | FIO_NODISKUTIL | FIO_MEMALIGN | FIO_DISKLESSIO,
+    .setup = fioHfsSetup,
     .init = fioHfsInit,
     .queue = fioHfsQueue,
     .getevents = fioHfsGetevents,

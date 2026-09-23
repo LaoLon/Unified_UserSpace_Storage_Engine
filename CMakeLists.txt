@@ -127,6 +127,12 @@ if(EXISTS ${ROCKSDB_ROOT}/include/rocksdb/file_system.h)
     ${CMAKE_CURRENT_SOURCE_DIR}/include
   )
   target_link_libraries(hfs_db_bench PRIVATE hfs_rocksdb ${ROCKSDB_LIBRARY})
+  add_executable(rocksdb_readrandom_observer rocksdb/rocksdb_readrandom_observer.cpp)
+  target_include_directories(rocksdb_readrandom_observer PRIVATE
+    ${ROCKSDB_ROOT}/include ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+  )
+  target_link_libraries(rocksdb_readrandom_observer PRIVATE hfs_rocksdb hfs_core ${ROCKSDB_LIBRARY})
   add_executable(hfs_ldb rocksdb/hfs_ldb.cpp)
   target_include_directories(hfs_ldb PRIVATE
     ${ROCKSDB_ROOT}/include ${CMAKE_CURRENT_SOURCE_DIR}

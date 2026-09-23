@@ -45,8 +45,31 @@ Bug 等级：**致命 > 严重 > 一般**。
 - 34：已修复（Shard-81，trace TSC 校准与 stop/producer 竞争）。
 - 35：已修复（Shard-81，异步路径杂项收口）。
 - 36：已修复（Shard-81，shard inode 槽位线性扫描导致每 I/O ~5ms 延迟）。
+- 37：已修复（RocksDB async dispatcher 在活动 I/O 时可能丢唤醒并永久休眠）。
 
 ## Bug 记录
+
+### 37. RocksDB async dispatcher 在活动 I/O 时可能丢唤醒并永久休眠
+
+- **状态**：已修复，真实 NVMe 回归待 VM 卷几何恢复后补测
+- **等级**：严重（`readrandom` worker 永久阻塞，benchmark 无法结束）
+- **时间**：2026-09-21
+- **现象**：`hfs_db_bench` 完成前置阶段后停在 `readrandom`；主线程等待
+  `pthread_join`，多个 RocksDB worker 阻塞于 `AsyncReadDispatcher::poll`，dispatcher
+  自身睡在 condition variable，SPDK metadata reactor 仍持续占用 CPU。
+- **排查过程**：抓取 PID 17111 的全线程栈，确认 4 个 worker 都在等待
+  `callbackDone`；dispatcher 没有继续调用 `Client::poll`；SPDK completion reactor
+  位于 `nvme_pcie_qpair_process_completions`。检查 dispatcher 主循环发现提交后的
+  `active_` 请求不参与 `timedWork` 判断。
+- **根因**：completion wake 只是提示，唤醒存在合并/竞态窗口；当 dispatcher 在
+  `active_` 非空时进入无限条件变量等待，completion 即使已进入 core queue，也没有
+  前端线程去 poll/reap，造成所有读线程永久等待。
+- **修复**：只要 `queue_` 或 `active_` 非空，dispatcher 采用 100 微秒有界等待并继续
+  poll；保留 completion wake 作为正常低延迟路径，不再把它当作正确性条件。同步更新
+  HFS 2.0 async frontend 生命周期约束。
+- **验证结果**：VM 重新编译 `hfs_rocksdb`/`hfs_db_bench` 成功，CTest 26/26 通过。
+  真实 NVMe 小回归暂未进入读路径，当前 VM 盘上存储 geometry 与配置设备不匹配，
+  `createFileSystem` 在 mount 阶段失败；未执行破坏性的重新 format。
 
 ### 21. RocksDB LockFile 将 HFS namespace 路径误当宿主机路径
 
@@ -610,6 +633,27 @@ Bug 等级：**致命 > 严重 > 一般**。
 - **验证结果**：VM Release CTest `26/26` 通过；真实 `Nvme0n1` 上 RocksDB smoke 通过；
   sync=1 fillseq/readrandom/overwrite/readwhilewriting 全量 rc=0，`hfs_ldb checkconsistency`
   报告 `entries=80000`，`hfsctl check` 报告 `corruption=none`。
+
+### 40. FIO HFS namespace job 启动阶段 SIGSEGV
+
+- **状态**：已修复
+- **等级**：致命（FIO 外部 engine 启动崩溃）
+- **时间**：2026-09-21
+- **现象**：使用系统 `/usr/local/bin/fio` 加载 HFS external engine 时，HFS mount
+  成功后在 FIO `init_io_u()` 的随机填充阶段以 `Segmentation fault` 退出；FIO 的
+  `orig_buffer` 在回调侧有效，但主程序内部看到的 buffer 为空。
+- **排查过程**：gdb 确认崩溃点为 `__fill_random_buf(b=0)`。用 `/root/code/fio-3.42/fio`
+  与同一源码目录编译的 `fio-hfs.so` 复现时，`orig_buffer` 和 `io_u->buf` 均有效，
+  崩溃消失。另发现 HFS namespace 没有预创建 `/fio` 父目录，使用 `/fio/...` 会被
+  HFS 正确拒绝；FIO 的 diskless engine 不应依赖宿主机目录创建。
+- **根因**：FIO 主程序与 external engine 不是同一份 FIO 源码/头文件构建产物，导致
+  `thread_data`/iomem 回调 ABI 布局不一致；同时测试路径依赖不存在的 namespace 父目录。
+- **修复**：保持 `FIO_RAWIO | FIO_NODISKUTIL | FIO_DISKLESSIO` 和 `thread=1` 约束，
+  加入 DMA 返回值的 all-or-nothing 校验并移除调试级 per-run 输出；正式命令固定使用
+  与插件相同源码树生成的 `/root/code/fio-3.42/fio`，并将测试文件放在 namespace 根目录。
+- **验证结果**：VM 使用真实 `Nvme0n1` 完成 source-matched FIO 3.42、`numjobs=2`、
+  `iodepth=4`、4K randrw、3 秒 smoke，退出码 0、`err=0`，读写各约 111 MiB/s，
+  `queued=264006`、`reaped=264006`、`outstanding=0`；未再出现 SIGSEGV。
 
 ## 记录模板
 

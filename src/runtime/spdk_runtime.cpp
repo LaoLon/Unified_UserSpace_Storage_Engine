@@ -7,6 +7,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -14,6 +15,7 @@
 #include <mutex>
 #include <new>
 #include <pthread.h>
+#include <sched.h>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -22,17 +24,20 @@
 #include <vector>
 
 #include "common/log.hpp"
+#include "common/stats.hpp"
 #include "common/test_hooks.hpp"
 #include "common/trace.hpp"
 #include "runtime/numa_topology.hpp"
 
 #ifdef HFS_WITH_SPDK
+#include <poll.h>
 #include <spdk/bdev.h>
 #include <spdk/env.h>
 #include <spdk/init.h>
 #include <spdk/log.h>
 #include <spdk/rpc.h>
 #include <spdk/thread.h>
+#include <sys/eventfd.h>
 #include <sys/syscall.h>
 #endif
 
@@ -64,9 +69,8 @@ std::uint32_t reactorCountFor(const Config &config, std::uint32_t cpuCount) {
 
 namespace {
 
-/* Fast ownership markers set once on each SPDK data-reactor thread. */
-thread_local const void *g_dataReactorMarker = nullptr;
-thread_local const void *g_pollerCallbackReactor = nullptr;
+/* Reactor-thread identity is derived from spdk_get_thread(); TLS markers were
+ * removed from the hot path (__tls_get_addr showed up at ~1.7% reactor CPU). */
 
 constexpr std::uint64_t kPollerEnabledBit = std::uint64_t{1} << 63;
 constexpr std::uint64_t kPollerReaderMask = ~kPollerEnabledBit;
@@ -199,10 +203,19 @@ int failControlIo(const std::shared_ptr<ControlIo> &io, int rc) {
     return rc;
 }
 
-/* Completion runs on the metadata reactor; the holder keeps the I/O alive. */
+/* Completion runs on the metadata reactor; the holder keeps the I/O alive and
+ * releases the reactor's in-flight control-I/O credit. */
+struct ControlCompletion {
+    std::shared_ptr<ControlIo> io;
+    std::atomic<std::size_t> *inFlight = nullptr;
+};
+
 void controlIoDone(struct spdk_bdev_io *bdev_io, bool success, void *arg) {
-    auto *holder = static_cast<std::shared_ptr<ControlIo> *>(arg);
-    std::shared_ptr<ControlIo> io = *holder;
+    auto *holder = static_cast<ControlCompletion *>(arg);
+    std::shared_ptr<ControlIo> io = std::move(holder->io);
+    if (holder->inFlight != nullptr) {
+        holder->inFlight->fetch_sub(1, std::memory_order_acq_rel);
+    }
     delete holder;
     spdk_bdev_free_io(bdev_io);
 
@@ -247,6 +260,21 @@ struct SpdkRuntime::Impl {
         std::uint32_t cpu = 0;
         std::uint32_t idlePolls = 0;
         std::uint64_t pollSleeps = 0;
+        /* Doorbell: producers write this eventfd only while idleWait is set. */
+        int wakeFd = -1;
+        std::atomic<bool> idleWait{false};
+        std::uint64_t doorbellWakes = 0;
+        std::uint64_t doorbellTimeouts = 0;
+        /* Metadata reactor only: in-flight control I/O keeps it awake. */
+        std::atomic<std::size_t> controlInFlight{0};
+
+        /* Safety net for failure paths that clear reactors before a close. */
+        ~Reactor() {
+            if (wakeFd >= 0) {
+                ::close(wakeFd);
+                wakeFd = -1;
+            }
+        }
     };
 
     struct DeviceState {
@@ -313,7 +341,7 @@ struct SpdkRuntime::Impl {
             const std::uint64_t previousState = reactor->pollerState.fetch_and(
                 kPollerReaderMask, std::memory_order_acq_rel);
             if ((previousState & kPollerReaderMask) != 0 &&
-                g_pollerCallbackReactor == reactor) {
+                spdk_get_thread() == reactor->spdk) {
                 /* The current callback owns its local copy and will release
                  * the reader after this function returns. */
             } else {
@@ -361,12 +389,102 @@ struct SpdkRuntime::Impl {
             leave();
             return 0;
         }
-        const void *previousPollerReactor = g_pollerCallbackReactor;
-        g_pollerCallbackReactor = reactor;
         const int work = callback(context);
-        g_pollerCallbackReactor = previousPollerReactor;
         leave();
         return work;
+    }
+
+    /* Clears a pending doorbell, re-checks the actor, then waits up to delayUs.
+     * Producers only write the eventfd while idleWait is set, so a publish
+     * that misses the flag is always caught by the re-check. */
+    void waitDataReactorIdle(Reactor *reactor, std::uint32_t delayUs) noexcept {
+        if (reactor->wakeFd < 0) {
+            std::this_thread::sleep_for(std::chrono::microseconds(delayUs));
+            return;
+        }
+        std::uint64_t value = 0;
+        ssize_t drained = -1;
+        do {
+            drained = ::read(reactor->wakeFd, &value, sizeof(value));
+        } while (drained < 0 && errno == EINTR);
+        (void)drained;
+        reactor->idleWait.store(true, std::memory_order_release);
+        if (invokeDataReactorPoller(reactor) != 0) {
+            reactor->idleWait.store(false, std::memory_order_release);
+            return;
+        }
+        pollfd descriptor{};
+        descriptor.fd = reactor->wakeFd;
+        descriptor.events = POLLIN;
+        timespec timeout{};
+        timeout.tv_sec = static_cast<time_t>(delayUs / 1000000);
+        timeout.tv_nsec = static_cast<long>(delayUs % 1000000) * 1000;
+        const int rc = ::ppoll(&descriptor, 1, &timeout, nullptr);
+        reactor->idleWait.store(false, std::memory_order_release);
+        if (rc > 0) {
+            ++reactor->doorbellWakes;
+        } else {
+            ++reactor->doorbellTimeouts;
+        }
+    }
+
+    /* Wakes one idle-waiting reactor; safe from any thread. */
+    void wakeReactor(Reactor *reactor) noexcept {
+        if (reactor == nullptr || reactor->wakeFd < 0 ||
+            !reactor->idleWait.load(std::memory_order_acquire)) {
+            return;
+        }
+        const std::uint64_t one = 1;
+        ssize_t written = -1;
+        do {
+            written = ::write(reactor->wakeFd, &one, sizeof(one));
+        } while (written < 0 && errno == EINTR);
+        /* EAGAIN means a wake is already pending. */
+        (void)written;
+    }
+
+    /* Wakes the target data reactor only while it is idle-waiting. */
+    Result<void> wakeDataReactor(std::uint32_t index) noexcept {
+        std::shared_ptr<Reactor> reactor;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (index + 1 >= reactors.size() || reactors[index + 1] == nullptr) {
+                return makeError(Status::InvalidArgument,
+                                 "data reactor index out of range");
+            }
+            reactor = reactors[index + 1];
+        }
+        wakeReactor(reactor.get());
+        return Result<void>(Status::Ok);
+    }
+
+    /* Metadata reactor idle wait: same doorbell protocol, but the re-check
+     * also keeps the reactor awake while control I/O is in flight. */
+    void waitMetadataReactorIdle(Reactor *metadata, std::uint32_t delayUs) noexcept {
+        if (metadata == nullptr || metadata->wakeFd < 0) {
+            std::this_thread::sleep_for(std::chrono::microseconds(delayUs));
+            return;
+        }
+        std::uint64_t value = 0;
+        ssize_t drained = -1;
+        do {
+            drained = ::read(metadata->wakeFd, &value, sizeof(value));
+        } while (drained < 0 && errno == EINTR);
+        (void)drained;
+        metadata->idleWait.store(true, std::memory_order_release);
+        if (spdk_thread_poll(metadata->spdk, 0, 0) != 0 ||
+            metadata->controlInFlight.load(std::memory_order_acquire) != 0) {
+            metadata->idleWait.store(false, std::memory_order_release);
+            return;
+        }
+        pollfd descriptor{};
+        descriptor.fd = metadata->wakeFd;
+        descriptor.events = POLLIN;
+        timespec timeout{};
+        timeout.tv_sec = static_cast<time_t>(delayUs / 1000000);
+        timeout.tv_nsec = static_cast<long>(delayUs % 1000000) * 1000;
+        (void)::ppoll(&descriptor, 1, &timeout, nullptr);
+        metadata->idleWait.store(false, std::memory_order_release);
     }
 
     void closeDevicesLocked() {
@@ -412,6 +530,18 @@ struct SpdkRuntime::Impl {
         spdk_env_opts_init(&opts);
         opts.name = "hfs2";
         opts.opts_size = sizeof(opts);
+        /* Keep DPDK's EAL main lcore on the configured metadata CPU. */
+        opts.main_core = static_cast<int>(config.metadataCpu);
+        if (config.metadataCpu >= 64) {
+            log::error("metadata_cpus %u cannot be represented by the SPDK core mask",
+                       config.metadataCpu);
+            return -EINVAL;
+        }
+        const std::uint64_t ealCoreMask = std::uint64_t{1} << config.metadataCpu;
+        std::ostringstream ealCoreMaskText;
+        ealCoreMaskText << "0x" << std::hex << ealCoreMask;
+        const std::string ealCoreMaskString = ealCoreMaskText.str();
+        opts.core_mask = ealCoreMaskString.c_str();
         std::vector<struct spdk_pci_addr> allowlist(devices.size());
         for (std::size_t i = 0; i < devices.size(); ++i) {
             if (spdk_pci_addr_parse(&allowlist[i], config.devices[i].pciBdf.c_str()) != 0) {
@@ -499,7 +629,7 @@ struct SpdkRuntime::Impl {
         }
         spdk_bdev_desc *desc = devices[index].desc;
         spdk_io_channel *channel = reactors[0]->channels[index];
-        auto *holder = new std::shared_ptr<ControlIo>(io);
+        auto *holder = new ControlCompletion{io, &reactors[0]->controlInFlight};
         int rc = 0;
         switch (io->op) {
         case ControlIo::Op::Read:
@@ -519,7 +649,9 @@ struct SpdkRuntime::Impl {
         if (rc != 0) {
             delete holder;
             failControlIo(io, rc);
+            return;
         }
+        reactors[0]->controlInFlight.fetch_add(1, std::memory_order_acq_rel);
     }
 
     /* bdev_nvme attach completes asynchronously after the config load
@@ -560,7 +692,6 @@ struct SpdkRuntime::Impl {
         auto *metadata = reactorAt(0);
         metadata->osTid.store(static_cast<std::uint64_t>(::syscall(SYS_gettid)),
                               std::memory_order_release);
-        pinToCpu(config.metadataCpu);
 
         int rc = 0;
         if (!envInited) {
@@ -571,16 +702,32 @@ struct SpdkRuntime::Impl {
             }
             envInited = true;
         }
+        /* EAL may replace the caller affinity during initialization; apply
+         * the configured metadata CPU again after EAL is fully initialized. */
+        pinToCpu(config.metadataCpu);
+        std::fprintf(stderr, "[CPU MAP] metadata reactor: tid=%llu configured_cpu=%u "
+                             "actual_cpu=%d\n",
+                     static_cast<unsigned long long>(metadata->osTid.load(
+                         std::memory_order_relaxed)),
+                     config.metadataCpu, sched_getcpu());
         metadata->spdk = spdk_thread_create("hfs2-meta", nullptr);
         if (metadata->spdk == nullptr) {
             publishStartDone(-ENOMEM);
             return;
         }
         spdk_set_thread(metadata->spdk);
+        metadata->wakeFd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+        const auto closeMetadataWakeFd = [metadata]() {
+            if (metadata->wakeFd >= 0) {
+                ::close(metadata->wakeFd);
+                metadata->wakeFd = -1;
+            }
+        };
 
         if (!subsystemsReady) {
             rc = initSubsystems(metadata);
             if (rc != 0) {
+                closeMetadataWakeFd();
                 spdk_set_thread(nullptr);
                 spdk_thread_destroy(metadata->spdk);
                 metadata->spdk = nullptr;
@@ -596,6 +743,7 @@ struct SpdkRuntime::Impl {
         rc = waitForDevices(metadata, deviceWaitMs);
         if (rc != 0) {
             closeDevicesLocked();
+            closeMetadataWakeFd();
             spdk_set_thread(nullptr);
             spdk_thread_destroy(metadata->spdk);
             metadata->spdk = nullptr;
@@ -605,6 +753,7 @@ struct SpdkRuntime::Impl {
         rc = openDevices();
         if (rc != 0) {
             closeDevicesLocked();
+            closeMetadataWakeFd();
             spdk_set_thread(nullptr);
             spdk_thread_destroy(metadata->spdk);
             metadata->spdk = nullptr;
@@ -629,6 +778,7 @@ struct SpdkRuntime::Impl {
             drainThreadMessages(metadata->spdk);
             closeDevicesLocked();
             drainThreadMessages(metadata->spdk);
+            closeMetadataWakeFd();
             spdk_set_thread(nullptr);
             spdk_thread_destroy(metadata->spdk);
             metadata->spdk = nullptr;
@@ -640,8 +790,24 @@ struct SpdkRuntime::Impl {
         publishStartDone(0);
         log::info("spdk runtime ready: devices=%zu", devices.size());
 
+        const bool metadataPollingActive = config.numa.polling == "active";
+        const bool metadataPollingInterrupt = config.numa.polling == "interrupt";
         while (!metadata->stop.load(std::memory_order_acquire)) {
-            spdk_thread_poll(metadata->spdk, 0, 0);
+            const int polled = spdk_thread_poll(metadata->spdk, 0, 0);
+            const bool hasWork =
+                polled != 0 ||
+                metadata->controlInFlight.load(std::memory_order_acquire) != 0;
+            if (hasWork || metadataPollingActive) {
+                metadata->idlePolls = 0;
+            } else if (metadataPollingInterrupt) {
+                ++metadata->pollSleeps;
+                waitMetadataReactorIdle(metadata, 100);
+            } else {
+                /* Control-path reactor: 1 ms bounded wait; every cross-thread
+                 * post wakes the eventfd, so submissions are not delayed. */
+                ++metadata->pollSleeps;
+                waitMetadataReactorIdle(metadata, 1000);
+            }
         }
 
         for (auto *channel : metadata->channels) {
@@ -651,6 +817,7 @@ struct SpdkRuntime::Impl {
         drainThreadMessages(metadata->spdk);
         closeDevicesLocked();
         drainThreadMessages(metadata->spdk);
+        closeMetadataWakeFd();
         spdk_set_thread(nullptr);
         spdk_thread_destroy(metadata->spdk);
         metadata->spdk = nullptr;
@@ -724,6 +891,14 @@ struct SpdkRuntime::Impl {
                              std::memory_order_release);
         pinToCpu(reactor->cpu == 0 ? static_cast<unsigned int>(dataCpuFor(dataIndex))
                                    : reactor->cpu);
+        std::fprintf(stderr, "[CPU MAP] data reactor %zu: tid=%llu configured_cpu=%u "
+                             "actual_cpu=%d\n",
+                     dataIndex - 1,
+                     static_cast<unsigned long long>(reactor->osTid.load(
+                         std::memory_order_relaxed)),
+                     reactor->cpu == 0 ? static_cast<unsigned int>(dataCpuFor(dataIndex))
+                                       : reactor->cpu,
+                     sched_getcpu());
 
         const std::string name = "hfs2-data" + std::to_string(dataIndex - 1);
         reactor->spdk = spdk_thread_create(name.c_str(), nullptr);
@@ -735,7 +910,7 @@ struct SpdkRuntime::Impl {
             return;
         }
         spdk_set_thread(reactor->spdk);
-        g_dataReactorMarker = reactor;
+        reactor->wakeFd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
 
         int rc = 0;
         for (auto &device : devices) {
@@ -757,25 +932,33 @@ struct SpdkRuntime::Impl {
          * stranded io-wait entry (device removal or a lost completion). */
         bool drainDeadlineSet = false;
         std::chrono::steady_clock::time_point drainDeadline{};
+        /* The polling policy never changes while the reactor runs; hoist the
+         * string comparisons out of the hot loop. */
+        const bool pollingActive = config.numa.polling == "active";
+        const bool pollingInterrupt = config.numa.polling == "interrupt";
         while (!reactor->stop.load(std::memory_order_acquire) ||
                reactor->activeHead != nullptr || reactor->retryHead != nullptr ||
                reactor->completionHead != nullptr) {
             const int polled = spdk_thread_poll(reactor->spdk, 0, 0);
-            drainDataIoRetries(reactor);
-            drainDataIoCompletions(reactor);
+            if (reactor->retryHead != nullptr) {
+                drainDataIoRetries(reactor);
+            }
+            if (reactor->completionHead != nullptr) {
+                drainDataIoCompletions(reactor);
+            }
             const int pumped = invokeDataReactorPoller(reactor);
             const bool hasWork = polled != 0 || pumped != 0 ||
                                  reactor->activeHead != nullptr ||
                                  reactor->retryHead != nullptr ||
                                  reactor->completionHead != nullptr;
-            if (hasWork || config.numa.polling == "active") {
+            if (hasWork || pollingActive) {
                 reactor->idlePolls = 0;
-            } else if (config.numa.polling == "interrupt") {
+            } else if (pollingInterrupt) {
                 ++reactor->pollSleeps;
-                std::this_thread::sleep_for(std::chrono::microseconds(100));
+                waitDataReactorIdle(reactor, 100);
             } else {
                 /* Hybrid polling preserves a short active window for bursty
-                 * I/O, then yields instead of burning a full core at idle. */
+                 * I/O, then waits on the doorbell instead of burning a core. */
                 if (reactor->idlePolls < 128) {
                     ++reactor->idlePolls;
                 } else {
@@ -784,7 +967,7 @@ struct SpdkRuntime::Impl {
                     const auto delay = std::min<std::uint32_t>(100, 1U <<
                                                                std::min<std::uint32_t>(
                                                                    6, idle / 256));
-                    std::this_thread::sleep_for(std::chrono::microseconds(delay));
+                    waitDataReactorIdle(reactor, delay);
                 }
             }
             if (reactor->stop.load(std::memory_order_acquire)) {
@@ -806,7 +989,10 @@ struct SpdkRuntime::Impl {
         }
         reactor->channels.clear();
         drainThreadMessages(reactor->spdk);
-        g_dataReactorMarker = nullptr;
+        if (reactor->wakeFd >= 0) {
+            ::close(reactor->wakeFd);
+            reactor->wakeFd = -1;
+        }
         spdk_set_thread(nullptr);
         spdk_thread_destroy(reactor->spdk);
         reactor->spdk = nullptr;
@@ -936,6 +1122,7 @@ struct SpdkRuntime::Impl {
         std::uint64_t offsetBlocks = 0;
         std::uint64_t blocks = 0;
         std::size_t bytes = 0;
+        std::uint32_t blockSize = 0;
         struct iovec iov{};
         bool write = false;
         DataIoCompletion cb = nullptr;
@@ -1092,6 +1279,14 @@ struct SpdkRuntime::Impl {
         auto *state = static_cast<DataIoState *>(arg);
         const int rc = success ? 0 : dataIoCompletionErrno(bdevIo);
         spdk_bdev_free_io(bdevIo);
+        if (state->write && stats::enabled()) {
+            stats::counters().bdevDataWriteOps.fetch_add(1, std::memory_order_relaxed);
+            stats::counters().bdevDataWriteBytes.fetch_add(state->bytes,
+                                                            std::memory_order_relaxed);
+        } else if (!state->write && stats::enabled()) {
+            stats::counters().dataReactorReadComplete.fetch_add(1,
+                                                                 std::memory_order_relaxed);
+        }
         /* Do not invoke the caller from the SPDK callback stack. */
         state->impl->enqueueDataIoCompletion(state, rc);
     }
@@ -1116,6 +1311,35 @@ struct SpdkRuntime::Impl {
                                                         state->offsetBlocks, state->blocks,
                                                         actorDataIoDone, state);
             if (rc == 0) {
+                if (state->write && stats::enabled()) {
+                    stats::counters().bdevDataWriteOps.fetch_add(
+                        1, std::memory_order_relaxed);
+                    stats::counters().bdevDataWriteBytes.fetch_add(
+                        state->bytes, std::memory_order_relaxed);
+                } else if (!state->write && stats::enabled()) {
+                    stats::counters().dataReactorReadSubmit.fetch_add(
+                        1, std::memory_order_relaxed);
+                    stats::counters().bdevDataBlockBytes.store(
+                        state->blockSize, std::memory_order_relaxed);
+                    stats::counters().bdevDataReadOps.fetch_add(
+                        1, std::memory_order_relaxed);
+                    stats::counters().bdevDataReadBytes.fetch_add(
+                        state->bytes, std::memory_order_relaxed);
+                    std::uint64_t depth = 0;
+                    for (auto *active = state->reactor->activeHead; active != nullptr;
+                         active = active->activeNext) {
+                        ++depth;
+                    }
+                    stats::counters().dataReactorQueueDepthSum.fetch_add(
+                        depth, std::memory_order_relaxed);
+                    auto &maximum = stats::counters().dataReactorQueueDepthMax;
+                    auto previous = maximum.load(std::memory_order_relaxed);
+                    while (previous < depth &&
+                           !maximum.compare_exchange_weak(previous, depth,
+                                                          std::memory_order_relaxed,
+                                                          std::memory_order_relaxed)) {
+                    }
+                }
                 return;
             }
             if (rc != -ENOMEM) {
@@ -1166,8 +1390,7 @@ struct SpdkRuntime::Impl {
             return makeError(Status::InvalidArgument, "data reactor index out of range");
         }
         Reactor *reactor = reactors[reactorIndex + 1].get();
-        if (reactor->spdk == nullptr ||
-            spdk_get_thread() != reactor->spdk || g_dataReactorMarker != reactor) {
+        if (reactor->spdk == nullptr || spdk_get_thread() != reactor->spdk) {
             return makeError(Status::InvalidState,
                              "actor-local data I/O called from the wrong reactor");
         }
@@ -1209,6 +1432,7 @@ struct SpdkRuntime::Impl {
         state->offsetBlocks = offsetBlocks;
         state->blocks = blocks;
         state->bytes = static_cast<std::size_t>(blocks) * device.blockSize;
+        state->blockSize = device.blockSize;
         state->write = write;
         state->cb = cb;
         state->cbCtx = cbCtx;
@@ -1280,6 +1504,7 @@ struct SpdkRuntime::Impl {
             }
             return makeError(Status::Busy, "spdk_thread_send_msg failed");
         }
+        wakeReactor(reactors[0].get());
 
         std::unique_lock<std::mutex> lock(io->mutex);
         const auto timeout = std::chrono::milliseconds(config.metadataWaitTimeoutMs);
@@ -1483,7 +1708,15 @@ Result<void> SpdkRuntime::postToDataReactor(std::uint32_t index, std::function<v
         delete call;
         return makeError(Status::Busy, "spdk_thread_send_msg failed");
     }
+    (void)impl.wakeDataReactor(index);
     return Result<void>(Status::Ok);
+}
+
+Result<void> SpdkRuntime::wakeDataReactor(std::uint32_t index) noexcept {
+    if (impl_ == nullptr) {
+        return makeError(Status::InvalidState, "SPDK runtime is unavailable");
+    }
+    return impl_->wakeDataReactor(index);
 }
 
 std::uint64_t SpdkRuntime::dataReactorThreadId(std::uint32_t index) const {
@@ -1544,7 +1777,7 @@ Result<void> SpdkRuntime::setDataReactorPoller(std::uint32_t index,
         return makeError(Status::Busy, "data reactor poller is already registered");
     }
     if ((reactor->pollerState.load(std::memory_order_acquire) & kPollerReaderMask) != 0 &&
-        g_pollerCallbackReactor != reactor.get()) {
+        spdk_get_thread() != reactor->spdk) {
         for (;;) {
             const std::uint64_t state =
                 reactor->pollerState.load(std::memory_order_acquire);
@@ -1584,7 +1817,7 @@ Result<void> SpdkRuntime::clearDataReactorPoller(std::uint32_t index, void *cont
     const std::uint64_t previousState = reactor->pollerState.fetch_and(
         kPollerReaderMask, std::memory_order_acq_rel);
     if ((previousState & kPollerReaderMask) != 0 &&
-        g_pollerCallbackReactor != reactor.get()) {
+        spdk_get_thread() != reactor->spdk) {
         for (;;) {
             const std::uint64_t state =
                 reactor->pollerState.load(std::memory_order_acquire);
@@ -1675,6 +1908,7 @@ Result<void> SpdkRuntime::submitDataRead(std::uint32_t reactorIndex,
         delete call;
         return makeError(Status::Busy, "spdk_thread_send_msg failed");
     }
+    (void)impl.wakeDataReactor(reactorIndex);
     return Result<void>(Status::Ok);
 }
 
@@ -1711,6 +1945,7 @@ Result<void> SpdkRuntime::submitDataWrite(std::uint32_t reactorIndex,
         delete call;
         return makeError(Status::Busy, "spdk_thread_send_msg failed");
     }
+    (void)impl.wakeDataReactor(reactorIndex);
     return Result<void>(Status::Ok);
 }
 
@@ -1773,6 +2008,11 @@ Result<void> SpdkRuntime::postToDataReactor(std::uint32_t index, std::function<v
     (void)index;
     (void)fn;
     return makeError(Status::NotSupported, "core built without SPDK support");
+}
+
+Result<void> SpdkRuntime::wakeDataReactor(std::uint32_t index) noexcept {
+    (void)index;
+    return Result<void>(Status::Ok);
 }
 std::uint64_t SpdkRuntime::dataReactorThreadId(std::uint32_t index) const {
     (void)index;

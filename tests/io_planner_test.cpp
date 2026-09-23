@@ -96,6 +96,40 @@ int main() {
         HFS_TEST_CHECK(child.bufferOffset == 0 && child.spanOffset == 0);
     }
 
+    /* Native-sector reads accept lengths that are not metadata-block sized. */
+    {
+        SyntheticExtentMap map;
+        map.add(0, 16384, 8192);
+        IoPlanner planner(plannerConfig());
+        auto planned = planner.plan(map, 0, 4608, false, false, 512);
+        HFS_TEST_CHECK(planned.ok() && planned.value().count == 1);
+        const auto &child = planned.value().children[0];
+        HFS_TEST_CHECK(child.kind == IoPlanner::Child::Kind::Direct);
+        HFS_TEST_CHECK(child.physicalByte == 8192 && child.physicalBlock == 16);
+        HFS_TEST_CHECK(child.bytes == 4608 && child.spanBytes == 4608);
+        HFS_TEST_CHECK(child.spanOffset == 0);
+
+        SyntheticExtentMap unaligned;
+        unaligned.add(0, 4096, 8256);
+        auto edge = planner.plan(unaligned, 0, 100, false, false, 512);
+        HFS_TEST_CHECK(edge.ok() && edge.value().count == 1);
+        const auto &edgeChild = edge.value().children[0];
+        HFS_TEST_CHECK(edgeChild.kind == IoPlanner::Child::Kind::HeadRmw);
+        HFS_TEST_CHECK(edgeChild.physicalByte == 8192 && edgeChild.spanBytes == 512);
+        HFS_TEST_CHECK(edgeChild.spanOffset == 64 && edgeChild.bytes == 100);
+
+        SyntheticExtentMap contiguous;
+        contiguous.add(0, 4096, 16384);
+        contiguous.add(4096, 4096, 20480);
+        auto merged = planner.plan(contiguous, 0, 8192, false, false, 512);
+        HFS_TEST_CHECK(merged.ok() && merged.value().count == 1);
+        HFS_TEST_CHECK(merged.value().coalescedChildren == 1);
+        const auto &mergedChild = merged.value().children[0];
+        HFS_TEST_CHECK(mergedChild.kind == IoPlanner::Child::Kind::Direct);
+        HFS_TEST_CHECK(mergedChild.physicalByte == 16384 &&
+                       mergedChild.spanBytes == 8192 && mergedChild.bytes == 8192);
+    }
+
     /* 3. unaligned I/O splits into head/tail RMW children */
     {
         SyntheticExtentMap map;

@@ -48,6 +48,23 @@ int main() {
     HFS_TEST_CHECK(native.offsetBlocks == 3);
     HFS_TEST_CHECK(native.blocks == 2);
 
+    /* Native-sector reads carry an explicit byte address and may be 512-byte
+     * aligned without being a multiple of the 4 KiB planner block. */
+    request = makeRequest(buffer.data(), buffer.size());
+    request.physicalByteValid = true;
+    request.physicalByte = 4608;
+    request.bytes = 4608;
+    request.spanBytes = 4608;
+    HFS_TEST_CHECK(hfs::SpdkAsyncDataBackend::convertPlannerRequest(
+        request, 4096, 512, 1U << 20, native));
+    HFS_TEST_CHECK(native.offsetBlocks == 9);
+    HFS_TEST_CHECK(native.blocks == 9);
+
+    request.physicalByte = 4609;
+    HFS_TEST_CHECK(!hfs::SpdkAsyncDataBackend::convertPlannerRequest(
+        request, 4096, 512, 1U << 20, native));
+
+    request = makeRequest(buffer.data(), buffer.size());
     request.spanBytes = 4096;
     request.bytes = 1024;
     request.spanOffset = 2048;

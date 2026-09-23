@@ -23,6 +23,7 @@ public:
         Kind kind = Kind::Direct;
         std::uint64_t logicalOffset = 0; /* user offset of the child */
         std::uint64_t physicalBlock = 0; /* device block of the aligned span */
+        std::uint64_t physicalByte = 0; /* absolute byte offset of the span */
         std::uint32_t deviceId = 0;
         std::uint32_t bytes = 0;        /* user bytes covered by the child */
         std::uint32_t spanBytes = 0;    /* aligned device bytes to move */
@@ -34,15 +35,18 @@ public:
         static constexpr std::size_t kMaxChildren = 64;
         std::array<Child, kMaxChildren> children{};
         std::uint32_t count = 0;
+        std::uint32_t coalescedChildren = 0;
         std::uint64_t coveredBytes = 0;
     };
 
     explicit IoPlanner(Config config);
 
     /* Splits a logical I/O into device-local children. With allowHoles (reads)
-     * unmapped ranges become Zero children instead of NotFound. */
+     * unmapped ranges become Zero children instead of NotFound. A non-zero
+     * blockSizeOverride is a read-only native-sector planning override. */
     Result<Plan> plan(const ExtentMap &map, std::uint64_t offset, std::uint64_t length,
-                      bool write, bool allowHoles = false) const;
+                      bool write, bool allowHoles = false,
+                      std::uint32_t blockSizeOverride = 0) const;
 
 private:
     Config config_;

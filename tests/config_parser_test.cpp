@@ -221,16 +221,39 @@ int main() {
         HFS_TEST_CHECK(expectInvalid(text, "cpu-role-overlap") == 0);
     }
 
-    /* 21. Optional metadata/frontend CPU lists are retained by the parser. */
+    /* 21. metadata_cpus is required; its first entry derives metadataCpu. */
     {
         std::string text = base;
-        HFS_TEST_CHECK(replaceAll(text, "data_cpus = auto", "data_cpus = 1\n"
-                                                       "metadata_cpus = 0\n"
-                                                       "frontend_cpus = auto"));
+        HFS_TEST_CHECK(replaceAll(text, "data_cpus = auto",
+                                  "data_cpus = 1\nfrontend_cpus = auto"));
         auto parsed = hfs::parseConfig(text, "cpu-role-lists");
         HFS_TEST_CHECK(parsed.ok());
         HFS_TEST_CHECK(parsed.value().metadataCpus == "0");
+        HFS_TEST_CHECK(parsed.value().metadataCpu == 0);
         HFS_TEST_CHECK(parsed.value().frontendCpus == "auto");
+    }
+
+    /* 22. worker_direct_reads defaults on and can be disabled explicitly. */
+    {
+        auto defaulted = hfs::parseConfig(base, "rocksdb-default");
+        HFS_TEST_CHECK(defaulted.ok());
+        HFS_TEST_CHECK(defaulted.value().rocksdbWorkerDirectReads);
+
+        std::string text = base + "\n[rocksdb]\nworker_direct_reads = false\n";
+        auto parsed = hfs::parseConfig(text, "rocksdb-off");
+        HFS_TEST_CHECK(parsed.ok());
+        HFS_TEST_CHECK(!parsed.value().rocksdbWorkerDirectReads);
+    }
+
+    /* 23. Missing or auto metadata_cpus is rejected (no scalar fallback). */
+    {
+        std::string missing = base;
+        HFS_TEST_CHECK(replaceAll(missing, "metadata_cpus = 0\n", ""));
+        HFS_TEST_CHECK(expectInvalid(missing, "metadata-cpus-missing") == 0);
+
+        std::string autoList = base;
+        HFS_TEST_CHECK(replaceAll(autoList, "metadata_cpus = 0", "metadata_cpus = auto"));
+        HFS_TEST_CHECK(expectInvalid(autoList, "metadata-cpus-auto") == 0);
     }
 
     std::printf("config_parser_test: ok\n");

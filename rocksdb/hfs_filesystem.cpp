@@ -18,16 +18,23 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <span>
 #include <string>
 #include <thread>
+#include <pthread.h>
+#include <sched.h>
 #include <sys/file.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
 #include "hfs/config.hpp"
 #include "hfs/core.hpp"
+#include "hfs/diagnostics.hpp"
 #include "hfs/file.hpp"
 #include "rocksdb/file_system.h"
 
@@ -138,6 +145,38 @@ std::string hostLockPath(const std::string &path) {
 
 class HfsWritableFile;
 class AsyncReadDispatcher;
+struct DirectWorkerEntry;
+
+/* Selects the first explicitly configured frontend CPU; auto leaves affinity
+ * to the process launcher so existing deployments remain unchanged. */
+std::optional<unsigned int> configuredFrontendCpu(const std::string &value) {
+    if (value.empty() || value == "auto") {
+        return std::nullopt;
+    }
+    const std::size_t comma = value.find(',');
+    const std::string item = value.substr(0, comma);
+    char *end = nullptr;
+    const unsigned long parsed = std::strtoul(item.c_str(), &end, 10);
+    if (end == item.c_str() || *end != '\0' || parsed >= CPU_SETSIZE) {
+        return std::nullopt;
+    }
+    return static_cast<unsigned int>(parsed);
+}
+
+/* Pins only within the inherited cpuset; this prevents a config typo from
+ * widening a taskset/cgroup restriction. */
+bool pinFrontendToCpu(unsigned int cpu) noexcept {
+    cpu_set_t allowed;
+    CPU_ZERO(&allowed);
+    if (pthread_getaffinity_np(pthread_self(), sizeof(allowed), &allowed) != 0 ||
+        !CPU_ISSET(cpu, &allowed)) {
+        return false;
+    }
+    cpu_set_t selected;
+    CPU_ZERO(&selected);
+    CPU_SET(cpu, &selected);
+    return pthread_setaffinity_np(pthread_self(), sizeof(selected), &selected) == 0;
+}
 
 /* One adapter-side write-back buffer entry (design §7 pending registry). */
 struct PendingEntry {
@@ -150,12 +189,27 @@ struct HfsContext {
     std::shared_ptr<hfs::Engine> engine;
     std::shared_ptr<hfs::Client> client;
     std::unique_ptr<AsyncReadDispatcher> asyncDispatcher;
+    /* [rocksdb].worker_direct_reads, env-overridable for diagnostics. */
+    bool workerDirectReads = true;
     /* Lets reads and size queries observe appended bytes before they reach
      * the HFS core; guarded by pendingMutex. */
     std::mutex pendingMutex;
     std::unordered_map<std::string, PendingEntry> pending;
+    /* Direct worker channel registry. Entries hold non-owning context refs;
+     * HfsContext must retire all of them before stopping the engine. The
+     * registry keeps shared ownership so teardown never touches a freed entry. */
+    std::mutex directMutex;
+    std::unordered_map<DirectWorkerEntry *, std::shared_ptr<DirectWorkerEntry>>
+        directEntries;
+    bool directShutdown = false;
 
-    /* Stop the frontend owner before cleanly stopping the owned engine. */
+    /* Registers one direct worker channel; fails after shutdown starts. */
+    bool registerDirectEntry(const std::shared_ptr<DirectWorkerEntry> &entry) noexcept;
+    void unregisterDirectEntry(DirectWorkerEntry *entry) noexcept;
+    /* Retires every live channel on the calling thread while engine is alive. */
+    void retireAllDirectEntries() noexcept;
+
+    /* Retire worker channels, then stop the frontend owner and the engine. */
     ~HfsContext();
 };
 
@@ -238,7 +292,7 @@ public:
     /* HFS exposes aligned SPDK buffers for direct sequential reads. */
     bool use_direct_io() const override { return true; }
 
-    /* Matches the SPDK DMA alignment used by the HFS data path. */
+    /* Sequential file I/O keeps the existing HFS DMA alignment contract. */
     size_t GetRequiredBufferAlignment() const override { return 4096; }
 
 private:
@@ -266,6 +320,11 @@ struct AsyncReadState {
     bool callbackStarted = false;
     std::chrono::steady_clock::time_point deadline{};
     std::chrono::steady_clock::time_point notBefore{};
+    std::chrono::steady_clock::time_point enqueuedAt{};
+    std::chrono::steady_clock::time_point submittedAt{};
+    DirectWorkerEntry *directEntry = nullptr;
+    std::shared_ptr<hfs::Client> directClient;
+    std::shared_ptr<hfs::File> directFile;
 
     /* A handle may be deleted after a timeout callback but before core drain. */
     ~AsyncReadState() {
@@ -274,11 +333,192 @@ struct AsyncReadState {
     }
 };
 
+/* Owns the Client and completion table for one RocksDB worker thread.  The
+ * Client API is frontend-thread-owned, so this object is deliberately kept in
+ * thread-local storage rather than shared between RocksDB workers.  The
+ * context reference is non-owning: thread-local storage must never extend the
+ * HFS engine lifetime into a background thread's destructor. */
+struct DirectWorkerEntry {
+    HfsContext *context = nullptr;
+    std::shared_ptr<hfs::Client> client;
+    std::unordered_map<std::string, std::shared_ptr<hfs::File>> files;
+    std::unordered_map<std::uint64_t, AsyncReadState *> active;
+    std::uint64_t nextToken = 0;
+    mutable std::mutex mutex;
+    bool retired = false;
+
+    bool isRetired() const noexcept {
+        std::lock_guard<std::mutex> lock(mutex);
+        return retired;
+    }
+
+    /* Closes this channel once; callable from the owner thread or from the
+     * context teardown on the main thread. */
+    void retire(bool fromOwnerThread) noexcept;
+
+    ~DirectWorkerEntry() { retire(true); }
+};
+
+thread_local std::unordered_map<HfsContext *, std::shared_ptr<DirectWorkerEntry>>
+    gDirectWorkerEntries;
+
+bool HfsContext::registerDirectEntry(
+    const std::shared_ptr<DirectWorkerEntry> &entry) noexcept {
+    std::lock_guard<std::mutex> lock(directMutex);
+    if (directShutdown || entry == nullptr) {
+        return false;
+    }
+    directEntries.emplace(entry.get(), entry);
+    return true;
+}
+
+void HfsContext::unregisterDirectEntry(DirectWorkerEntry *entry) noexcept {
+    std::lock_guard<std::mutex> lock(directMutex);
+    directEntries.erase(entry);
+}
+
+/* Moves channel resources out under the entry lock, then releases them while
+ * the engine is still alive.  Active reads at retire time are a contract
+ * violation: leaking them is safer than waiting forever on a lost completion. */
+void DirectWorkerEntry::retire(bool fromOwnerThread) noexcept {
+    std::shared_ptr<hfs::Client> ownedClient;
+    std::unordered_map<std::string, std::shared_ptr<hfs::File>> ownedFiles;
+    std::unordered_map<std::uint64_t, AsyncReadState *> ownedActive;
+    HfsContext *owner = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (retired) {
+            return;
+        }
+        retired = true;
+        owner = context;
+        context = nullptr;
+        ownedClient = std::move(client);
+        ownedFiles = std::move(files);
+        ownedActive = std::move(active);
+    }
+    if (owner != nullptr) {
+        owner->unregisterDirectEntry(this);
+    }
+    if (!ownedActive.empty()) {
+        std::fprintf(stderr, "hfs-rocksdb: direct channel retired with %zu active reads\n",
+                     ownedActive.size());
+    }
+    /* Close namespace handles before the client so openFiles drains first. */
+    ownedFiles.clear();
+    if (ownedClient != nullptr) {
+        if (fromOwnerThread) {
+            auto closed = ownedClient->close().wait();
+            if (!closed.ok() || !closed.value().ok()) {
+                std::fprintf(stderr, "hfs-rocksdb: direct channel close failed\n");
+            }
+        }
+        ownedClient.reset();
+    }
+}
+
+void HfsContext::retireAllDirectEntries() noexcept {
+    std::vector<std::shared_ptr<DirectWorkerEntry>> entries;
+    {
+        std::lock_guard<std::mutex> lock(directMutex);
+        directShutdown = true;
+        entries.reserve(directEntries.size());
+        for (const auto &item : directEntries) {
+            entries.push_back(item.second);
+        }
+    }
+    for (const auto &entry : entries) {
+        if (entry != nullptr) {
+            entry->retire(false);
+        }
+    }
+}
+
+/* Worker-owned read channels are the configured default; the environment
+ * variable stays as a process-level override for diagnostics and A/B runs. */
+bool configuredWorkerDirectReads(const hfs::Config &config) noexcept {
+    const char *value = std::getenv("HFS_ROCKSDB_DIRECT_WORKER_READS");
+    if (value != nullptr) {
+        return std::string(value) == "1";
+    }
+    return config.rocksdbWorkerDirectReads;
+}
+
+/* Parses the completion batch bound used by the shared frontend experiment. */
+std::size_t configuredCompletionBatch() noexcept {
+    static const std::size_t batch = [] {
+        const char *value = std::getenv("HFS_ROCKSDB_COMPLETION_BATCH");
+        if (value == nullptr || *value == '\0') return std::size_t{64};
+        char *end = nullptr;
+        const unsigned long parsed = std::strtoul(value, &end, 10);
+        if (end == value || *end != '\0') return std::size_t{64};
+        return std::clamp<std::size_t>(parsed, 1, 64);
+    }();
+    return batch;
+}
+
+/* Creates one direct Client on the calling RocksDB worker thread.  Returns
+ * null after the context starts shutting down so callers fall back to the
+ * shared dispatcher. */
+DirectWorkerEntry *directWorkerEntry(const std::shared_ptr<HfsContext> &context) {
+    if (context == nullptr || context->engine == nullptr) return nullptr;
+    auto found = gDirectWorkerEntries.find(context.get());
+    if (found != gDirectWorkerEntries.end()) {
+        if (!found->second->isRetired()) {
+            return found->second.get();
+        }
+        /* A retired entry is empty; replace it for a later context at the
+         * same address in this thread. */
+        gDirectWorkerEntries.erase(found);
+    }
+
+    auto entry = std::make_shared<DirectWorkerEntry>();
+    hfs::ClientOptions options;
+    options.maxOutstanding = 32;
+    auto client = hfs::Client::create(*context->engine, options);
+    if (!client.ok()) return nullptr;
+    entry->client = std::move(client).value();
+    if (!context->registerDirectEntry(entry)) {
+        std::lock_guard<std::mutex> lock(entry->mutex);
+        entry->retired = true;
+        entry->client.reset();
+        return nullptr;
+    }
+    entry->context = context.get();
+    auto *raw = entry.get();
+    gDirectWorkerEntries.emplace(context.get(), std::move(entry));
+    return raw;
+}
+
+/* Opens a file through the worker-owned Client so its async File handle is
+ * valid for submissions made directly by that same worker. */
+std::shared_ptr<hfs::File> directWorkerFile(DirectWorkerEntry *entry,
+                                            const std::string &path) {
+    if (entry == nullptr) return nullptr;
+    std::lock_guard<std::mutex> lock(entry->mutex);
+    if (entry->retired || entry->client == nullptr) return nullptr;
+    auto found = entry->files.find(path);
+    if (found != entry->files.end()) return found->second;
+    auto outer = entry->client->open(path).wait();
+    if (!outer.ok()) return nullptr;
+    auto inner = std::move(outer).value();
+    if (!inner.ok()) return nullptr;
+    auto file = std::move(inner).value();
+    entry->files.emplace(path, file);
+    return file;
+}
+
 /* One bounded frontend owner replaces the old per-request blocking workers. */
 class AsyncReadDispatcher {
 public:
-    explicit AsyncReadDispatcher(std::size_t queueCapacity = 1024)
-        : queueCapacity_(std::max<std::size_t>(1, queueCapacity)) {}
+    explicit AsyncReadDispatcher(std::size_t queueCapacity = 1024,
+                                 std::optional<unsigned int> frontendCpu = std::nullopt,
+                                 std::size_t completionBatch = 64,
+                                 bool workerDirectReads = true)
+        : queueCapacity_(std::max<std::size_t>(1, queueCapacity)),
+          frontendCpu_(frontendCpu),
+          completionBatch_(std::clamp<std::size_t>(completionBatch, 1, 64)),
+          workerDirectReads_(workerDirectReads) {}
 
     AsyncReadDispatcher(const AsyncReadDispatcher &) = delete;
     AsyncReadDispatcher &operator=(const AsyncReadDispatcher &) = delete;
@@ -305,6 +545,17 @@ public:
         auto future = ready.get_future();
         try {
             thread_ = std::thread([this, ready = std::move(ready)]() mutable {
+                const auto tid = static_cast<unsigned long long>(::syscall(SYS_gettid));
+                const bool pinned = frontendCpu_.has_value() &&
+                                    pinFrontendToCpu(*frontendCpu_);
+                std::fprintf(stderr,
+                             "[CPU MAP] frontend dispatcher: tid=%llu configured_cpu=%s "
+                             "actual_cpu=%d pin=%s completion_batch=%zu direct_worker=%s\n",
+                             tid, frontendCpu_.has_value()
+                                       ? std::to_string(*frontendCpu_).c_str()
+                                       : "auto",
+                             sched_getcpu(), pinned ? "ok" : "inherited", completionBatch_,
+                             workerDirectReads_ ? "enabled" : "disabled");
                 auto bound = client_->bindFrontendThread();
                 if (!bound.ok()) {
                     ready.set_value(bound.message());
@@ -331,14 +582,18 @@ public:
         if (state == nullptr) {
             return false;
         }
+        bool notify = false;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (stopping_ || queue_.size() >= queueCapacity_) {
                 return false;
             }
+            notify = queue_.empty();
             queue_.push_back(state);
         }
-        condition_.notify_one();
+        if (notify) {
+            condition_.notify_one();
+        }
         return true;
     }
 
@@ -347,6 +602,17 @@ public:
         const std::size_t required = std::min(minCompletions, handles.size());
         if (required == 0) {
             return rocksdb::IOStatus::OK();
+        }
+        std::vector<DirectWorkerEntry *> directEntries;
+        directEntries.reserve(handles.size());
+        for (void *handle : handles) {
+            if (handle == nullptr) continue;
+            auto *state = static_cast<AsyncReadState *>(handle);
+            if (state->directEntry == nullptr) continue;
+            if (std::find(directEntries.begin(), directEntries.end(),
+                          state->directEntry) == directEntries.end()) {
+                directEntries.push_back(state->directEntry);
+            }
         }
         while (true) {
             std::size_t completed = 0;
@@ -369,11 +635,58 @@ public:
             if (waitState == nullptr) {
                 return rocksdb::IOStatus::IOError("async read handle is invalid");
             }
+            if (waitState->directEntry != nullptr &&
+                waitState->directEntry->isRetired()) {
+                /* The channel was retired by context teardown; fail this state
+                 * instead of spinning on a completion that will never arrive. */
+                publishCallback(waitState,
+                                rocksdb::IOStatus::Aborted("direct channel retired"),
+                                true, false, 0);
+                continue;
+            }
+            if (!directEntries.empty()) {
+                const bool waitForDirect = waitState->directEntry != nullptr;
+                const auto directStatus = processDirectCompletions(
+                    directEntries, waitForDirect);
+                if (directStatus.status != hfs::Status::Ok) {
+                    return toIoStatus(hfs::Result<void>(
+                        directStatus.status, "worker direct completion poll"));
+                }
+                if (directStatus.count != 0) {
+                    continue;
+                }
+                if (waitForDirect) {
+                    continue;
+                }
+            }
+            hfs::diagnostics::recordCompletionWait();
+            const bool profile = hfs::diagnostics::profilingEnabled();
+            const auto waitStart = profile ? std::chrono::steady_clock::now()
+                                           : std::chrono::steady_clock::time_point{};
             std::unique_lock<std::mutex> lock(waitState->mutex);
             waitState->condition.wait(lock, [waitState] {
                 return waitState->callbackDone;
             });
+            if (profile) {
+                hfs::diagnostics::recordCompletionWaitNs(
+                    static_cast<std::uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - waitStart)
+                            .count()));
+            }
         }
+    }
+
+    /* Workers return their handles through this deferred list so the
+     * dispatcher thread is the only one that frees shared-path state.  Freeing
+     * from the worker can race with an in-flight notify_all() on the state's
+     * condition variable and corrupt the glibc condvar group state. */
+    void retireHandle(AsyncReadState *state) noexcept {
+        if (state == nullptr) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(retiredMutex_);
+        retired_.push_back(state);
     }
 
     void stop() noexcept {
@@ -385,6 +698,8 @@ public:
         if (thread_.joinable()) {
             thread_.join();
         }
+        /* Free everything the workers retired before the loop exited. */
+        drainRetired();
     }
 
 private:
@@ -394,6 +709,7 @@ private:
             processCompletions();
             processTimeouts();
             processSubmissions();
+            drainRetired();
 
             bool shouldStop = false;
             {
@@ -405,7 +721,17 @@ private:
             }
 
             std::unique_lock<std::mutex> lock(mutex_);
-            bool timedWork = !queue_.empty();
+            /*
+             * Keep polling while an I/O is outstanding.  The completion wake
+             * is only a hint: a producer can arm the queue before the
+             * dispatcher enters its condition-variable wait, and the wake
+             * can then be coalesced or lost across the adapter/core boundary.
+             * Sleeping indefinitely with active requests leaves every RocksDB
+             * reader blocked in poll() even though the SPDK reactor is still
+             * making progress.  A short bounded poll closes that race and
+             * keeps the normal wake path low-latency.
+             */
+            bool timedWork = !queue_.empty() || !active_.empty();
             if (!timedWork) {
                 for (const auto &entry : active_) {
                     if (entry.second->deadline !=
@@ -511,13 +837,70 @@ private:
             state->ioHandle = std::move(submitted).value();
             state->requestId = state->ioHandle.requestId();
             state->submitted = true;
+            const bool profile = hfs::diagnostics::profilingEnabled();
+            state->submittedAt = profile ? std::chrono::steady_clock::now()
+                                         : std::chrono::steady_clock::time_point{};
+            if (profile && state->enqueuedAt != std::chrono::steady_clock::time_point{}) {
+                hfs::diagnostics::recordFrontendQueueWaitNs(
+                    static_cast<std::uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            state->submittedAt - state->enqueuedAt)
+                            .count()));
+            }
+            hfs::diagnostics::recordFrontendSubmit();
             active_.emplace(state->requestId, state);
         }
     }
 
+    /* Polls worker-owned clients on the submitting worker.  Client::poll is
+     * frontend-thread-owned, which is exactly why each RocksDB worker gets a
+     * separate Client in the direct-ring experiment. */
+    hfs::PollResult processDirectCompletions(
+        const std::vector<DirectWorkerEntry *> &entries, bool wait) noexcept {
+        hfs::PollResult result;
+        bool first = true;
+        for (DirectWorkerEntry *entry : entries) {
+            if (entry == nullptr) continue;
+            std::lock_guard<std::mutex> entryLock(entry->mutex);
+            if (entry->retired || entry->client == nullptr) continue;
+            std::array<hfs::CompletionEvent, 64> events{};
+            const std::size_t maxEvents = completionBatch_;
+            auto polled = entry->client->poll(
+                std::span<hfs::CompletionEvent>(events.data(), maxEvents),
+                wait && first ? 1 : 0, maxEvents,
+                wait && first ? std::chrono::microseconds(1000)
+                              : std::chrono::microseconds(0));
+            if (polled.status != hfs::Status::Ok) return polled;
+            result.count += polled.count;
+            first = false;
+            for (std::size_t index = 0; index < polled.count; ++index) {
+                const hfs::CompletionEvent &event = events[index];
+                auto found = entry->active.find(event.requestId);
+                if (found == entry->active.end()) continue;
+                AsyncReadState *state = found->second;
+                rocksdb::IOStatus status =
+                    toIoStatus(hfs::Result<void>(event.status, "HFS async read"));
+                if (event.status == hfs::Status::Ok) status = rocksdb::IOStatus::OK();
+                publishCallback(state, status, true,
+                                event.status == hfs::Status::Ok,
+                                event.completedBytes);
+                state->ioHandle.reset();
+                {
+                    std::lock_guard<std::mutex> lock(state->mutex);
+                    state->terminal = true;
+                }
+                state->condition.notify_all();
+                entry->active.erase(found);
+                hfs::diagnostics::recordDirectWorkerCompletion();
+            }
+        }
+        return result;
+    }
+
     void processCompletions() noexcept {
         std::array<hfs::CompletionEvent, 64> events{};
-        auto polled = client_->poll(events, 0, events.size(), std::chrono::microseconds(0));
+        auto polled = client_->poll(events, 0, completionBatch_,
+                                    std::chrono::microseconds(0));
         if (polled.status != hfs::Status::Ok) {
             return;
         }
@@ -528,6 +911,14 @@ private:
                 continue;
             }
             AsyncReadState *state = found->second;
+            if (hfs::diagnostics::profilingEnabled() &&
+                state->submittedAt != std::chrono::steady_clock::time_point{}) {
+                hfs::diagnostics::recordFrontendIoNs(
+                    static_cast<std::uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - state->submittedAt)
+                            .count()));
+            }
             rocksdb::IOStatus status = toIoStatus(hfs::Result<void>(event.status, "HFS async read"));
             if (event.status == hfs::Status::Ok) {
                 status = rocksdb::IOStatus::OK();
@@ -541,6 +932,38 @@ private:
             }
             state->condition.notify_all();
             active_.erase(found);
+        }
+    }
+
+    /* Frees worker-retired shared states once the dispatcher no longer touches
+     * them; requeues states still present in active_. */
+    void drainRetired() noexcept {
+        std::vector<AsyncReadState *> retired;
+        {
+            std::lock_guard<std::mutex> lock(retiredMutex_);
+            retired.swap(retired_);
+        }
+        for (AsyncReadState *state : retired) {
+            if (state == nullptr) {
+                continue;
+            }
+            if (active_.find(state->requestId) != active_.end()) {
+                std::lock_guard<std::mutex> lock(retiredMutex_);
+                retired_.push_back(state);
+                continue;
+            }
+            bool terminal = false;
+            {
+                std::lock_guard<std::mutex> lock(state->mutex);
+                terminal = state->terminal;
+            }
+            if (!terminal) {
+                /* Contract violation: leak instead of blocking the dispatcher. */
+                std::fprintf(stderr,
+                             "hfs-rocksdb: retiring non-terminal async state\n");
+                continue;
+            }
+            delete state;
         }
     }
 
@@ -602,12 +1025,16 @@ private:
             }
         }
         if (terminal) {
+            hfs::diagnostics::recordCompletion();
             state->condition.notify_all();
         }
     }
 
     std::shared_ptr<hfs::Client> client_;
     const std::size_t queueCapacity_;
+    const std::optional<unsigned int> frontendCpu_;
+    const std::size_t completionBatch_;
+    const bool workerDirectReads_;
     std::mutex mutex_;
     std::condition_variable condition_;
     std::deque<AsyncReadState *> queue_;
@@ -616,14 +1043,29 @@ private:
     bool stopping_ = false;
     std::uint64_t nextToken_ = 0;
     std::atomic<std::uint64_t> wakeEpoch_{0};
+    std::mutex retiredMutex_;
+    std::vector<AsyncReadState *> retired_;
 };
 
-/* Deletes a request only after the dispatcher has drained core completion. */
+/* Deletes a request only after the dispatcher has drained core completion.
+ * Shared-path states are freed by the dispatcher thread so a worker can never
+ * free memory while the dispatcher is still inside a completion wake. */
 void deleteAsyncReadHandle(void *handle) {
-    delete static_cast<AsyncReadState *>(handle);
+    auto *state = static_cast<AsyncReadState *>(handle);
+    if (state == nullptr) {
+        return;
+    }
+    if (state->directEntry == nullptr && state->dispatcher != nullptr) {
+        state->dispatcher->retireHandle(state);
+        return;
+    }
+    delete state;
 }
 
 HfsContext::~HfsContext() {
+    /* Worker channels must release client/file/lease resources while the
+     * engine is still alive; never let a background thread do this. */
+    retireAllDirectEntries();
     if (asyncDispatcher != nullptr) {
         asyncDispatcher->stop();
     }
@@ -641,8 +1083,9 @@ HfsContext::~HfsContext() {
 class HfsRandomAccessFile final : public rocksdb::FSRandomAccessFile {
 public:
     HfsRandomAccessFile(std::shared_ptr<hfs::File> file,
-                        std::shared_ptr<HfsContext> context)
-        : file_(std::move(file)), context_(std::move(context)) {}
+                        std::shared_ptr<HfsContext> context,
+                        std::string path)
+        : file_(std::move(file)), context_(std::move(context)), path_(std::move(path)) {}
 
     /* Performs a synchronous facade over the shared asynchronous read path. */
     rocksdb::IOStatus Read(uint64_t offset, size_t n, const rocksdb::IOOptions &options,
@@ -722,8 +1165,9 @@ public:
     /* HFS requires aligned offsets, lengths, and scratch buffers for direct I/O. */
     bool use_direct_io() const override { return true; }
 
-    /* Matches the SPDK DMA alignment used by the HFS data path. */
-    size_t GetRequiredBufferAlignment() const override { return 4096; }
+    /* Expose the NVMe sector granularity for random direct reads; the HFS
+     * read planner still keeps 4 KiB layout geometry for writes and metadata. */
+    size_t GetRequiredBufferAlignment() const override { return 512; }
 
     /* Submits a real background read and returns before the HFS coroutine completes. */
     rocksdb::IOStatus ReadAsync(
@@ -752,6 +1196,9 @@ public:
             state->callback = std::move(callback);
             state->callbackArg = callbackArg;
             state->dispatcher = context_->asyncDispatcher.get();
+            if (hfs::diagnostics::profilingEnabled()) {
+                state->enqueuedAt = std::chrono::steady_clock::now();
+            }
             if (options.timeout.count() > 0) {
                 state->deadline = std::chrono::steady_clock::now() + options.timeout;
             }
@@ -764,6 +1211,53 @@ public:
                                        std::chrono::milliseconds(delay);
                 }
             }
+
+            /* Experimental fast path: submit from the RocksDB worker itself so
+             * Client::submitRead publishes directly to a data-reactor ring.
+             * A failed direct setup falls back to the production dispatcher. */
+            if (request.len != 0 && context_->workerDirectReads) {
+                DirectWorkerEntry *entry = directWorkerEntry(context_);
+                auto directFile = directWorkerFile(entry, path_);
+                if (entry != nullptr && directFile != nullptr) {
+                    bool submittedDirect = false;
+                    {
+                        std::lock_guard<std::mutex> entryLock(entry->mutex);
+                        if (!entry->retired && entry->client != nullptr) {
+                            const std::size_t slots =
+                                std::max<std::size_t>(1, entry->client->maxOutstanding());
+                            const std::uint64_t sequence = entry->nextToken++;
+                            state->token.slot = static_cast<std::uint32_t>(sequence % slots);
+                            state->token.generation =
+                                static_cast<std::uint32_t>(sequence / slots + 1);
+                            hfs::IoVec buffer{
+                                reinterpret_cast<std::byte *>(request.scratch),
+                                request.len};
+                            auto submitted = entry->client->submitRead(
+                                directFile, buffer, request.offset, state->token);
+                            if (submitted.ok()) {
+                                state->directEntry = entry;
+                                state->directClient = entry->client;
+                                state->directFile = std::move(directFile);
+                                state->ioHandle = std::move(submitted).value();
+                                state->requestId = state->ioHandle.requestId();
+                                state->submitted = true;
+                                entry->active.emplace(state->requestId, state.get());
+                                submittedDirect = true;
+                            }
+                        }
+                    }
+                    if (submittedDirect) {
+                        hfs::diagnostics::recordDirectWorkerRead(request.len);
+                        *ioHandle = state.release();
+                        *deleter = deleteAsyncReadHandle;
+                        return rocksdb::IOStatus::OK();
+                    }
+                }
+            }
+
+            /* HFS 2.0 has no adapter read cache; every shared-path read is a
+             * miss.  Direct-worker reads are accounted separately above. */
+            hfs::diagnostics::recordFrontendRead(false, request.len);
             if (!context_->asyncDispatcher->enqueue(state.get())) {
                 {
                     std::lock_guard<std::mutex> lock(state->mutex);
@@ -787,6 +1281,7 @@ public:
 private:
     std::shared_ptr<hfs::File> file_;
     std::shared_ptr<HfsContext> context_;
+    std::string path_;
 };
 
 /* Buffers appends in adapter memory and flushes them to the HFS core in
@@ -1147,7 +1642,8 @@ public:
         std::shared_ptr<hfs::File> file;
         auto status = openFile(context_, fname, hfs::OpenFlags::None, &file);
         if (!status.ok()) return status;
-        *result = std::make_unique<HfsRandomAccessFile>(std::move(file), context_);
+        *result = std::make_unique<HfsRandomAccessFile>(
+            std::move(file), context_, hfsPath(fname));
         return rocksdb::IOStatus::OK();
     }
 
@@ -1456,9 +1952,13 @@ createFileSystem(const std::string &configPath) {
     auto owned = std::shared_ptr<hfs::Engine>(std::move(engine).value());
     auto mounted = owned->mount().wait();
     if (!mounted.ok() || !mounted.value().ok()) return nullptr;
+    const bool workerDirectReads = configuredWorkerDirectReads(config.value());
     auto context = std::make_shared<HfsContext>();
     context->engine = owned;
-    context->asyncDispatcher = std::make_unique<AsyncReadDispatcher>();
+    context->workerDirectReads = workerDirectReads;
+    context->asyncDispatcher = std::make_unique<AsyncReadDispatcher>(
+        1024, configuredFrontendCpu(config.value().frontendCpus),
+        configuredCompletionBatch(), workerDirectReads);
     hfs::ClientOptions clientOptions;
     clientOptions.completionWake = &AsyncReadDispatcher::wake;
     clientOptions.completionWakeContext = context->asyncDispatcher.get();

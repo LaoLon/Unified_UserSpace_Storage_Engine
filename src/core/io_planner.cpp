@@ -11,7 +11,8 @@ IoPlanner::IoPlanner(Config config) : config_(config) {}
 
 Result<IoPlanner::Plan> IoPlanner::plan(const ExtentMap &map, std::uint64_t offset,
                                         std::uint64_t length, bool write,
-                                        bool allowHoles) const {
+                                        bool allowHoles,
+                                        std::uint32_t blockSizeOverride) const {
     (void)write;
     if (length == 0) {
         return makeError<Plan>(Status::InvalidArgument, "zero-length I/O");
@@ -19,7 +20,9 @@ Result<IoPlanner::Plan> IoPlanner::plan(const ExtentMap &map, std::uint64_t offs
     if (offset > std::numeric_limits<std::uint64_t>::max() - length) {
         return makeError<Plan>(Status::InvalidArgument, "I/O range overflows");
     }
-    if (config_.blockSize == 0 || config_.maxChildBytes < config_.blockSize ||
+    const std::uint32_t blockSizeValue = blockSizeOverride == 0 ? config_.blockSize
+                                                                  : blockSizeOverride;
+    if (blockSizeValue == 0 || config_.maxChildBytes < blockSizeValue ||
         config_.maxChildren == 0 || config_.maxChildren > Plan::kMaxChildren) {
         return makeError<Plan>(Status::InvalidArgument, "invalid planner config");
     }
@@ -33,9 +36,34 @@ Result<IoPlanner::Plan> IoPlanner::plan(const ExtentMap &map, std::uint64_t offs
     Plan plan;
     std::uint64_t cursor = offset;
     const std::uint64_t end = offset + length;
-    const std::uint64_t blockSize = config_.blockSize;
+    const std::uint64_t blockSize = blockSizeValue;
+    const bool usePhysicalAlignment = !write && blockSizeOverride != 0;
 
     auto pushChild = [&](Child child) -> Result<void> {
+        if (usePhysicalAlignment && child.kind == Child::Kind::Direct && plan.count != 0) {
+            Child &previous = plan.children[plan.count - 1];
+            const std::uint64_t previousLogicalEnd =
+                previous.logicalOffset + previous.bytes;
+            const std::uint64_t previousPhysicalEnd =
+                previous.physicalByte + previous.spanBytes;
+            const std::uint64_t previousBufferEnd =
+                static_cast<std::uint64_t>(previous.bufferOffset) + previous.bytes;
+            const std::uint64_t combinedSpan =
+                static_cast<std::uint64_t>(previous.spanBytes) + child.spanBytes;
+            if (previous.kind == Child::Kind::Direct && previous.spanOffset == 0 &&
+                child.spanOffset == 0 && previous.deviceId == child.deviceId &&
+                previousLogicalEnd == child.logicalOffset &&
+                previousPhysicalEnd == child.physicalByte &&
+                previousBufferEnd == child.bufferOffset &&
+                combinedSpan <= config_.maxChildBytes && combinedSpan <=
+                                                   std::numeric_limits<std::uint32_t>::max()) {
+                previous.bytes = static_cast<std::uint32_t>(
+                    static_cast<std::uint64_t>(previous.bytes) + child.bytes);
+                previous.spanBytes = static_cast<std::uint32_t>(combinedSpan);
+                ++plan.coalescedChildren;
+                return Result<void>(Status::Ok);
+            }
+        }
         if (plan.count >= config_.maxChildren) {
             return makeError(Status::NoMemory, "I/O plan exceeds the child limit");
         }
@@ -66,15 +94,17 @@ Result<IoPlanner::Plan> IoPlanner::plan(const ExtentMap &map, std::uint64_t offs
         std::uint64_t remaining = extent.logicalOffset + extent.length - cursor;
 
         while (remaining > 0) {
-            const std::uint64_t blockOffset = cursor % blockSize;
             const std::uint64_t physicalByte =
                 extent.physicalByte + (cursor - extent.logicalOffset);
+            const std::uint64_t blockOffset =
+                usePhysicalAlignment ? physicalByte % blockSize : cursor % blockSize;
             if (blockOffset != 0) {
                 const std::uint64_t span = std::min(blockSize - blockOffset, remaining);
                 Child child;
                 child.kind = Child::Kind::HeadRmw;
                 child.logicalOffset = cursor;
                 child.physicalBlock = (physicalByte - blockOffset) / blockSize;
+                child.physicalByte = physicalByte - blockOffset;
                 child.deviceId = extent.deviceId;
                 child.bytes = static_cast<std::uint32_t>(span);
                 child.spanBytes = static_cast<std::uint32_t>(blockSize);
@@ -99,6 +129,7 @@ Result<IoPlanner::Plan> IoPlanner::plan(const ExtentMap &map, std::uint64_t offs
                 child.kind = Child::Kind::Direct;
                 child.logicalOffset = cursor;
                 child.physicalBlock = physicalByte / blockSize;
+                child.physicalByte = physicalByte;
                 child.deviceId = extent.deviceId;
                 child.bytes = static_cast<std::uint32_t>(chunk);
                 child.spanBytes = static_cast<std::uint32_t>(chunk);
@@ -117,6 +148,7 @@ Result<IoPlanner::Plan> IoPlanner::plan(const ExtentMap &map, std::uint64_t offs
             child.kind = Child::Kind::TailRmw;
             child.logicalOffset = cursor;
             child.physicalBlock = physicalByte / blockSize;
+            child.physicalByte = physicalByte;
             child.deviceId = extent.deviceId;
             child.bytes = static_cast<std::uint32_t>(remaining);
             child.spanBytes = static_cast<std::uint32_t>(blockSize);

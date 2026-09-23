@@ -43,7 +43,9 @@ ShardRing::Reservation ShardRing::reserve() noexcept {
         if (sequence < head) {
             /* full: this slot still holds data from the previous lap */
             busy_.fetch_add(1, std::memory_order_relaxed);
-            stats::counters().busyReject.fetch_add(1, std::memory_order_relaxed);
+            if (stats::enabled()) {
+                stats::counters().busyReject.fetch_add(1, std::memory_order_relaxed);
+            }
             trace::event(trace::EventId::RingBusy, head);
             return Reservation{};
         }
@@ -51,9 +53,9 @@ ShardRing::Reservation ShardRing::reserve() noexcept {
     }
 }
 
-void ShardRing::publish(Reservation reservation, Operation *operation) noexcept {
+bool ShardRing::publish(Reservation reservation, Operation *operation) noexcept {
     if (!reservation.valid()) {
-        return;
+        return false;
     }
     *reservation.slot = operation;
     Slot &slot = slots_[reservation.sequence & mask_];
@@ -72,7 +74,9 @@ void ShardRing::publish(Reservation reservation, Operation *operation) noexcept 
     if (!armed_.exchange(true, std::memory_order_acq_rel)) {
         doorbells_.fetch_add(1, std::memory_order_relaxed);
         trace::event(trace::EventId::RingDoorbell, reservation.sequence);
+        return true;
     }
+    return false;
 }
 
 std::size_t ShardRing::drain(Operation **out, std::size_t max) noexcept {

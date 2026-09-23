@@ -5,10 +5,12 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <sys/mman.h>
 #include <unistd.h>
 #include <vector>
 
 #include <spdk/env.h>
+#include <spdk/memory.h>
 
 #include "core/data_path.hpp"
 #include "core/dma_arena.hpp"
@@ -193,6 +195,47 @@ int main() {
         HFS_TEST_CHECK(afterDirect.directChildren > beforeDirect.directChildren);
         HFS_TEST_CHECK(afterDirect.copyBytes == beforeDirect.copyBytes);
         lease.value().reset();
+
+        /* 4b. capability probe: can plain (non-hugepage) heap memory be
+         * registered for device DMA under the active env driver? */
+        {
+            void *heap = nullptr;
+            if (::posix_memalign(&heap, metaBlock, metaBlock) == 0 && heap != nullptr) {
+                std::memset(heap, 0, metaBlock);
+                const int mlockRc = ::mlock(heap, metaBlock);
+                const int registerRc = spdk_mem_register(heap, metaBlock);
+                std::uint64_t translated = metaBlock;
+                const std::uint64_t physical = spdk_vtophys(heap, &translated);
+                const bool dmaCapable = physical != SPDK_VTOPHYS_ERROR;
+                std::printf("dma-register probe: mlock=%d register=%d vtophys_ok=%d\n",
+                            mlockRc, registerRc, dmaCapable ? 1 : 0);
+                if (registerRc == 0 && dmaCapable) {
+                    const std::uint64_t probeOffset = (4ULL << 20) - metaBlock;
+                    std::vector<std::byte> probePattern(metaBlock);
+                    fillPattern(probePattern, 0x9B);
+                    std::span<std::byte> heapSpan(static_cast<std::byte *>(heap), metaBlock);
+                    HFS_TEST_CHECK(path.write(map, std::span<const std::byte>(probePattern),
+                                              probeOffset, metaBlock, ~0ULL)
+                                       .ok());
+                    const auto beforeHeap = path.stats();
+                    HFS_TEST_CHECK(path.read(map, heapSpan, probeOffset, metaBlock).ok());
+                    const auto afterHeap = path.stats();
+                    std::printf("dma-register probe: direct_delta=%llu copy_delta=%llu\n",
+                                static_cast<unsigned long long>(afterHeap.directChildren -
+                                                                beforeHeap.directChildren),
+                                static_cast<unsigned long long>(afterHeap.copyBytes -
+                                                                beforeHeap.copyBytes));
+                    HFS_TEST_CHECK(std::memcmp(heap, probePattern.data(), metaBlock) == 0);
+                }
+                if (registerRc == 0) {
+                    spdk_mem_unregister(heap, metaBlock);
+                }
+                if (mlockRc == 0) {
+                    ::munlock(heap, metaBlock);
+                }
+                ::free(heap);
+            }
+        }
 
         /* 5. large I/O is chunked into at most maxChildBytes children */
         std::vector<std::byte> large(3U << 20);

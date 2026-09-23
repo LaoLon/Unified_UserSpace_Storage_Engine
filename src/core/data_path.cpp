@@ -12,6 +12,7 @@
 
 #include "common/trace.hpp"
 #include "core/parent_completion.hpp"
+#include "hfs/diagnostics.hpp"
 #include "runtime/spdk_runtime.hpp"
 
 namespace hfs {
@@ -161,6 +162,47 @@ Result<void> DataPath::execute(const ExtentMap &map, std::span<std::byte> readBu
         return makeError(planResult.status(), planResult.message());
     }
     const auto &plan = planResult.value();
+    if (!write) {
+        std::uint64_t childBytes = 0;
+        std::uint64_t spanBytes = 0;
+        std::uint64_t directChildren = 0;
+        std::uint64_t headRmwChildren = 0;
+        std::uint64_t tailRmwChildren = 0;
+        std::uint64_t zeroChildren = 0;
+        std::uint64_t span4kChildren = 0;
+        std::uint64_t span8kChildren = 0;
+        std::uint64_t spanOtherChildren = 0;
+        for (std::uint32_t index = 0; index < plan.count; ++index) {
+            const auto &child = plan.children[index];
+            childBytes += child.bytes;
+            spanBytes += child.spanBytes;
+            if (child.spanBytes == 4096) {
+                ++span4kChildren;
+            } else if (child.spanBytes == 8192) {
+                ++span8kChildren;
+            } else {
+                ++spanOtherChildren;
+            }
+            switch (child.kind) {
+            case IoPlanner::Child::Kind::Direct:
+                ++directChildren;
+                break;
+            case IoPlanner::Child::Kind::HeadRmw:
+                ++headRmwChildren;
+                break;
+            case IoPlanner::Child::Kind::TailRmw:
+                ++tailRmwChildren;
+                break;
+            case IoPlanner::Child::Kind::Zero:
+                ++zeroChildren;
+                break;
+            }
+        }
+        diagnostics::recordDataReadPlan(length, childBytes, spanBytes, directChildren,
+                                        plan.coalescedChildren,
+                                        headRmwChildren, tailRmwChildren, zeroChildren,
+                                        span4kChildren, span8kChildren, spanOtherChildren);
+    }
     ParentCompletion parent;
     parent.init(plan.count, nullptr, nullptr);
     int firstError = 0;
