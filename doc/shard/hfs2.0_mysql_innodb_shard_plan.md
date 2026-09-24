@@ -2,7 +2,7 @@
 
 > 日期：2026-09-24
 >
-> 状态：执行中；Shard-99/100/101/101B 已完成（2026-09-24），进入 Shard-102
+> 状态：执行中；Shard-99/100/101/101B/102 已完成（2026-09-24），进入 Shard-103
 >
 > 事实源：`doc/design/hfs2.0.md`（Phase 7 范围、契约与禁用项以更新后的设计为准）
 >
@@ -224,6 +224,23 @@ InnoDB 与 server 层文件均在 HFS；L1–L3 无回退。
 **不做**：性能结论、AIO bridge。
 
 ### Shard-102：绕过点修复 + 写/恢复路径
+
+> 状态：已完成（2026-09-24，核心验收）。修复 7 处绕过点：`fil0fil.cc` posix_fallocate
+> ×2 → `hfs_vfs::setSize`；`fsp0file.cc` fstat → `hfs_vfs::fstatHandle`；`row0log.cc`
+> ftruncate ×2 → `hfs_vfs::truncate`；`buf0dump.cc` stdio/unlink/rename →
+> `my_fopen/my_delete/my_rename`；`srv0start.cc` monitor unlink → `my_delete`；
+> `ddl0ddl.cc` posix_fadvise → HFS 句柄 no-op。`pathIsHfs` 增加前缀预判，工具进程
+> 不再因环境变量触发挂载尝试。
+>
+> 验收（真实 NVMe）：initialize rc=0；SQL CRUD/DDL（CREATE DATABASE/TABLE、INSERT、
+> ALTER ADD COLUMN、UPDATE、DELETE、SELECT）rc=0 且结果正确；干净停机；重启后数据
+> 持久（COUNT 正确）；写负载中 kill -9 后重启恢复、`hfsctl check` rc=0
+> `corruption=none`；datadir 全在 HFS；`posix_fallocate` 告警清零；L1 CTest 26/26 +
+> `file_api_test`、L2 FIO verify/plain smoke `error=0`、L3 readrandom A/B
+> HFS 70.1–72.0K vs native 68.5–69.7K 无回退。证据：
+> `/mnt/hfs-data/hfs2-mysql-baseline-20260924/shard102/`。
+> 遗留：双写 torn page / 并发 online DDL 日志回收的深水区崩溃矩阵未专门构造
+> （补丁已在位），并入 Shard-104 功能矩阵补测。
 
 **目标**：关闭审计 §4 的全部绕过点，并让 redo/doublewrite/undo 写入与恢复闭环。
 

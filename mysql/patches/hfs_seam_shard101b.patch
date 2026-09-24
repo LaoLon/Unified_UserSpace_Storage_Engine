@@ -665,6 +665,135 @@ index 926a3672..2df12804 100644
  
  # On linux: /usr/include/stdio.h:#define BUFSIZ 8192
  # On Solaris: /usr/include/iso/stdio_iso.h:#define    BUFSIZ  1024
+diff --git a/storage/innobase/buf/buf0dump.cc b/storage/innobase/buf/buf0dump.cc
+index d0c0cd64..e836a593 100644
+--- a/storage/innobase/buf/buf0dump.cc
++++ b/storage/innobase/buf/buf0dump.cc
+@@ -246,7 +246,7 @@ static void buf_dump(bool obey_shutdown) {
+ 
+   buf_dump_status(STATUS_INFO, "Dumping buffer pool(s) to %s", full_filename);
+ 
+-  f = fopen(tmp_filename, "w");
++  f = my_fopen(tmp_filename, O_WRONLY | O_CREAT | O_TRUNC, MYF(MY_WME));
+   if (f == nullptr) {
+     buf_dump_status(STATUS_ERR, "Cannot open '%s' for writing: %s",
+                     tmp_filename, strerror(errno));
+@@ -339,7 +339,7 @@ static void buf_dump(bool obey_shutdown) {
+   }
+   /* else */
+ 
+-  ret = unlink(full_filename);
++  ret = my_delete(full_filename, MYF(0));
+   if (ret != 0 && errno != ENOENT) {
+     buf_dump_status(STATUS_ERR, "Cannot delete '%s': %s", full_filename,
+                     strerror(errno));
+@@ -348,7 +348,7 @@ static void buf_dump(bool obey_shutdown) {
+   }
+   /* else */
+ 
+-  ret = rename(tmp_filename, full_filename);
++  ret = my_rename(tmp_filename, full_filename, MYF(MY_WME));
+   if (ret != 0) {
+     buf_dump_status(STATUS_ERR, "Cannot rename '%s' to '%s': %s", tmp_filename,
+                     full_filename, strerror(errno));
+@@ -451,7 +451,7 @@ static void buf_load() {
+ 
+   buf_load_status(STATUS_INFO, "Loading buffer pool(s) from %s", full_filename);
+ 
+-  f = fopen(full_filename, "r");
++  f = my_fopen(full_filename, O_RDONLY, MYF(0));
+   if (f == nullptr) {
+     buf_load_status(STATUS_ERR, "Cannot open '%s' for reading: %s",
+                     full_filename, strerror(errno));
+diff --git a/storage/innobase/ddl/ddl0ddl.cc b/storage/innobase/ddl/ddl0ddl.cc
+index 701aedfa..49dc0268 100644
+--- a/storage/innobase/ddl/ddl0ddl.cc
++++ b/storage/innobase/ddl/ddl0ddl.cc
+@@ -30,6 +30,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
+ Created 2020-11-01 by Sunny Bains. */
+ 
+ #include "btr0load.h"
++#include "os/hfs_vfs.h"
+ #include "ddl0fts.h"
+ #include "ddl0impl-cursor.h"
+ #include "ddl0impl-merge.h"
+@@ -102,7 +103,9 @@ dberr_t pread(os_fd_t fd, void *ptr, size_t len, os_offset_t offset) noexcept {
+ 
+ #ifdef POSIX_FADV_DONTNEED
+   /* Each block is read exactly once.  Free up the file cache. */
+-  posix_fadvise(fd, offset, len, POSIX_FADV_DONTNEED);
++  if (!hfs_vfs::isHfsHandle(fd)) {
++    posix_fadvise(fd, offset, len, POSIX_FADV_DONTNEED);
++  }
+ #endif /* POSIX_FADV_DONTNEED */
+ 
+   return err;
+diff --git a/storage/innobase/fil/fil0fil.cc b/storage/innobase/fil/fil0fil.cc
+index b4c323c3..fa526c6f 100644
+--- a/storage/innobase/fil/fil0fil.cc
++++ b/storage/innobase/fil/fil0fil.cc
+@@ -29,6 +29,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
+ The tablespace memory cache */
+ 
+ #include <fil0fil.h>
++#include "os/hfs_vfs.h"
+ #include "my_config.h"
+ 
+ #include "detail/fil/open_files_limit.h"
+@@ -5493,7 +5494,11 @@ dberr_t fil_write_initial_pages(pfs_os_file_t file, const char *path,
+     if (ret == 0)
+ #endif /* UNIV_DEBUG */
+     {
+-      ret = posix_fallocate(file.m_file, 0, sz);
++      if (hfs_vfs::isHfsHandle(file.m_file)) {
++        ret = hfs_vfs::setSize(file.m_file, sz, false) == 0 ? 0 : EINVAL;
++      } else {
++        ret = posix_fallocate(file.m_file, 0, sz);
++      }
+     }
+ 
+     if (ret == 0) {
+@@ -6677,7 +6682,14 @@ bool Fil_shard::space_extend(fil_space_t *space, page_no_t size) {
+ #if !defined(NO_FALLOCATE) && defined(UNIV_LINUX)
+     /* This is required by FusionIO HW/Firmware */
+ 
+-    int ret = posix_fallocate(file->handle.m_file, node_start, len);
++    int ret;
++    if (hfs_vfs::isHfsHandle(file->handle.m_file)) {
++      ret = hfs_vfs::setSize(file->handle.m_file, node_start + len, false) == 0
++                ? 0
++                : EINVAL;
++    } else {
++      ret = posix_fallocate(file->handle.m_file, node_start, len);
++    }
+ 
+     DBUG_EXECUTE_IF("ib_posix_fallocate_fail_eintr", ret = EINTR;);
+ 
+diff --git a/storage/innobase/fsp/fsp0file.cc b/storage/innobase/fsp/fsp0file.cc
+index 9838df61..7331ca33 100644
+--- a/storage/innobase/fsp/fsp0file.cc
++++ b/storage/innobase/fsp/fsp0file.cc
+@@ -32,6 +32,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
+  *******************************************************/
+ 
+ #include "ha_prototypes.h"
++#include "os/hfs_vfs.h"
+ 
+ #include "dict0dd.h"
+ #include "fil0fil.h"
+@@ -178,7 +179,11 @@ void Datafile::init_file_info() {
+ #ifdef _WIN32
+   GetFileInformationByHandle(m_handle.m_file, &m_file_info);
+ #else
+-  fstat(m_handle.m_file, &m_file_info);
++  if (hfs_vfs::isHfsHandle(m_handle.m_file)) {
++    hfs_vfs::fstatHandle(m_handle.m_file, &m_file_info);
++  } else {
++    fstat(m_handle.m_file, &m_file_info);
++  }
+ #endif /* WIN32 */
+ }
+ 
 diff --git a/storage/innobase/handler/ha_innodb.cc b/storage/innobase/handler/ha_innodb.cc
 index aa6af051..7953d90f 100644
 --- a/storage/innobase/handler/ha_innodb.cc
@@ -697,10 +826,10 @@ index aa6af051..7953d90f 100644
    handlerton *innobase_hton = (handlerton *)p;
 diff --git a/storage/innobase/os/hfs_vfs.cc b/storage/innobase/os/hfs_vfs.cc
 new file mode 100644
-index 00000000..1b2983b6
+index 00000000..ddb8bce1
 --- /dev/null
 +++ b/storage/innobase/os/hfs_vfs.cc
-@@ -0,0 +1,1073 @@
+@@ -0,0 +1,1096 @@
 +/* HFS-backed InnoDB os_file seam implementation (Phase 7, Shard-101). */
 +#include "hfs_vfs.h"
 +
@@ -1046,6 +1175,29 @@ index 00000000..1b2983b6
 +}
 +
 +bool pathIsHfs(const char *path) {
++  /* Check the configured prefix first so non-HFS paths (and tools that merely
++   * link mysys) never trigger an engine mount attempt. */
++  const char *config = std::getenv("HFS_MYSQL_CONFIG");
++  if (config == nullptr || *config == '\0') {
++    return false;
++  }
++  const char *prefixEnv = std::getenv("HFS_MYSQL_PREFIX");
++  std::string prefix = (prefixEnv != nullptr && *prefixEnv != '\0') ? prefixEnv
++                                                                    : "/hfs";
++  while (prefix.size() > 1 && prefix.back() == '/') {
++    prefix.pop_back();
++  }
++  std::string norm;
++  if (!normalizeHostPath(path, norm)) {
++    return false;
++  }
++  const std::string_view p(prefix);
++  const bool matches =
++      norm.size() >= p.size() && norm.compare(0, p.size(), p) == 0 &&
++      (norm.size() == p.size() || norm[p.size()] == '/');
++  if (!matches) {
++    return false;
++  }
 +  if (!init()) {
 +    return false;
 +  }
@@ -2274,3 +2426,46 @@ index 1983c72d..cc7662fe 100644
    ut_a(len > 0);
  
    /* Extend at most 1M at a time */
+diff --git a/storage/innobase/row/row0log.cc b/storage/innobase/row/row0log.cc
+index 6c8d74b1..fdc34aeb 100644
+--- a/storage/innobase/row/row0log.cc
++++ b/storage/innobase/row/row0log.cc
+@@ -32,6 +32,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
+  *******************************************************/
+ 
+ #include "row0log.h"
++#include "os/hfs_vfs.h"
+ 
+ #include "my_config.h"
+ 
+@@ -2807,9 +2808,14 @@ next_block:
+     if (index->online_log->head.blocks) {
+ #ifdef HAVE_FTRUNCATE
+       /* Truncate the file in order to save space. */
+-      if (index->online_log->file.is_open() &&
+-          ftruncate(index->online_log->file.get(), 0) == -1) {
+-        perror("ftruncate");
++      if (index->online_log->file.is_open()) {
++        const os_file_t hfsLogFile = index->online_log->file.get();
++        const int hfsTruncRc = hfs_vfs::isHfsHandle(hfsLogFile)
++                                   ? hfs_vfs::truncate(hfsLogFile, 0)
++                                   : ftruncate(hfsLogFile, 0);
++        if (hfsTruncRc == -1) {
++          perror("ftruncate");
++        }
+       }
+ #endif /* HAVE_FTRUNCATE */
+       index->online_log->head.blocks = index->online_log->tail.blocks = 0;
+diff --git a/storage/innobase/srv/srv0start.cc b/storage/innobase/srv/srv0start.cc
+index 073daebf..fdfde8e3 100644
+--- a/storage/innobase/srv/srv0start.cc
++++ b/storage/innobase/srv/srv0start.cc
+@@ -3052,7 +3052,7 @@ void srv_shutdown() {
+   if (srv_monitor_file) {
+     srv_monitor_file = nullptr;
+     if (srv_monitor_file_name) {
+-      unlink(srv_monitor_file_name);
++      my_delete(srv_monitor_file_name, MYF(0));
+       ut::free(srv_monitor_file_name);
+     }
+     mutex_free(&srv_monitor_file_mutex);
