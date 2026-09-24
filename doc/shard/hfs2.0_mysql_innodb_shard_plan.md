@@ -200,10 +200,14 @@ HFS 是单进程、单 engine、bdev 独占；MySQL 与 RocksDB 不会同进程/
 > 链接），C++20 编译 + 全局 `libhfs_core` 链接与 build rpath；`my_setwd` 记录逻辑
 > HFS cwd 供相对路径解析。构建 `build_rc=0`；datadir 宿主目录不再被创建（路由生效），
 > `Failed to set datadir` 已消除。
-> 当前阻塞：`--initialize` 在 HFS 挂载后于 auto.cnf UUID 读取/写入处失败
-> （`MY-010076`，`/mnt/hfs-data/hfs2-mysql-baseline-20260924/shard101/init3.*`）；
-> 下一步定位 auto.cnf 的 `my_stat/my_open/my_read/my_write` 组合语义，随后执行
-> start/stop 与第二实例 Busy 验收。
+> 当前进度（2026-09-24 迭代）：`Failed to set datadir`（chdir）已消除；auto.cnf
+> UUID 路径已打通（`my_load_defaults` 的 stdio 读取改为 `fopencookie`，`my_read/
+> my_write` 补齐 `MY_NABP` 语义，`my_chmod` 修正返回语义）；datadir 宿主目录不再
+> 创建。当前阻塞：SSL 私钥写入（`filecr`/`My_file_ostream` 的写模式 stdio）仍报
+> `Could not write private key file: private_key.pem`（`MY-010301`），已加入写模式
+> `fopencookie` 但未生效，下一步定位 `filecr`/`fopen("w")` 的实际写路径。
+> 证据：`/mnt/hfs-data/hfs2-mysql-baseline-20260924/shard101/init5.*`。
+> 调试用 HFSDBG 插桩仍在 fork 内，收口前需清理。
 > 补丁：`mysql/patches/hfs_seam_shard101b.patch`（累积，含 Shard-101 与 101B）。
 
 **目标**：让 mysys 文件 API 对 HFS 前缀路径路由到同一 `hfs_vfs`，使 `mysqld`
