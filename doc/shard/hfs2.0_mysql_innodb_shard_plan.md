@@ -2,7 +2,8 @@
 
 > 日期：2026-09-24
 >
-> 状态：执行中；Shard-99/100 已完成（2026-09-24）、Shard-101 进行中（实现已落地并构建通过）
+> 状态：执行中；Shard-99/100 已完成（2026-09-24）、Shard-101 实现完成但收尾被
+> server 层 `my_*` 路由阻塞（2026-09-24，见下）
 >
 > 事实源：`doc/design/hfs2.0.md`（Phase 7 范围、契约与禁用项以更新后的设计为准）
 >
@@ -84,8 +85,9 @@ HFS 是单进程、单 engine、bdev 独占；MySQL 与 RocksDB 不会同进程/
 |---|---|---|---|---|---|
 | 99 | 7 | 设计更新、MySQL fork 基座、构建与基线固化 | M | - | 设计文档更新 + fork 可编译 + 基线记录 |
 | 100 | 7 | HFS 侧 API 补齐（path stat、mkdir-p、statvfs、锁） | S | 99 | 新增单测 + L1–L3 |
-| 101 | 7 | InnoDB os_file seam 与路径路由（读路径闭环） | L | 100 | `--initialize` + 启停 + 无宿主落盘 + L1–L3 |
-| 102 | 7 | 绕过点修复 + 写/恢复路径（redo/doublewrite/undo） | L | 101 | crash matrix + `hfsctl check` + L1–L3 |
+| 101 | 7 | InnoDB os_file seam 与路径路由（读路径闭环） | L | 100 | `--initialize` + 无宿主落盘 + L1–L3 |
+| 101B | 7 | server 层 `my_*` 路由（mysys open/stat/access/read/write/sync/delete/rename/mkdir/dir） | L | 101 | 启停 + 第二实例 Busy + 无宿主落盘 + L1–L3 |
+| 102 | 7 | 绕过点修复 + 写/恢复路径（redo/doublewrite/undo） | L | 101B | crash matrix + `hfsctl check` + L1–L3 |
 | 103 | 7 | 线程/生命周期（per-thread Client registry、停机顺序） | M | 101 | 并发负载 + clean shutdown + L1–L3 |
 | 104 | 7 | 功能验收矩阵（SQL/DDL/事务/跨进程） | M | 102/103 | 功能矩阵全过 + L1–L3 |
 | 105 | 7 | 性能与 durability（group commit、datasync 评估） | M | 104 | 性能目标 + L4（含 RocksDB gate） |
@@ -149,12 +151,24 @@ HFS 是单进程、单 engine、bdev 独占；MySQL 与 RocksDB 不会同进程/
 > （engine 生命周期、路径路由含相对路径/CWD 归一化、handle 表、同步门面），
 > `os0file.cc` 24 处 dispatch + `Dir_Walker::walk_posix` 递归扫描路由，innobase CMake
 > 加入 C++20 编译与 `libhfs_core` 链接，`innodb_init`/`innodb_shutdown` 生命周期钩子；
-> `mysqld` 构建通过，`--initialize` 在 HFS datadir 上执行，InnoDB 文件（ibdata1/
-> mysql.ibd/undo/dblwr/#innodb_redo）不再落宿主，host datadir 仅剩 server 层
-> `auto.cnf`/证书/空目录。补丁：`mysql/patches/hfs_seam_shard101.patch`（+240 行，
-> 另含两个新文件）。待办：确认 initialize 干净退出码、mysqld start/stop、第二实例
-> Busy、L1–L3 回归；已知边界：`posix_fallocate` 告警（Shard-102）、server 层文件落
-> 宿主（Shard-102）、TLS client "destroyed with live work" 告警（Shard-103）。
+> `mysqld` 构建通过，`--initialize` 在 HFS datadir 上执行且 `initialize_rc=0`，
+> InnoDB 文件（ibdata1/mysql.ibd/undo/dblwr/#innodb_redo）不再落宿主，host datadir
+> 仅剩 server 层 `auto.cnf`/证书/空目录。补丁：`mysql/patches/hfs_seam_shard101.patch`
+> （+240 行，另含两个新文件）。
+>
+> **新发现（阻塞 start/stop）**：`mysqld` 正常启动时 server 层（mysys `my_*`）用宿主
+> syscall 校验 DD 文件，strace 证据 `access(".//mysql.ibd", F_OK) = -1 ENOENT` →
+> `Failed to find valid data directory`。审计只覆盖了 `storage/innobase`，server 层
+> `my_*`（`my_open/my_stat/my_access/my_read/my_write/my_sync/my_close/my_delete/
+> my_rename/my_mkdir/my_rmdir/dir_*/my_realpath`）也必须对 HFS 前缀路径路由，否则
+> `--initialize` 之后的正常启动无法完成。该工作新增为 **Shard-101B（server 层 my_* 路由）**，
+> 完成后才能执行 start/stop 与第二实例 Busy 验收。
+>
+> 待办：Shard-101B（mysys 路由）→ initialize rc（已确认）/start-stop/第二实例 Busy →
+> L1–L3 回归；已知边界：`posix_fallocate` 告警（Shard-102）、server 层文件落宿主
+> （Shard-102/101B）、TLS client "destroyed with live work" 告警（Shard-103）。
+> 证据：`/mnt/hfs-data/hfs2-mysql-baseline-20260924/shard101/`（init3/4、server1-3、
+> start_strace.log）。
 
 **目标**：让 InnoDB 的 open/read/size/status/dir 全部经过 HFS，形成最小可启动闭环。
 
@@ -173,6 +187,27 @@ HFS 是单进程、单 engine、bdev 独占；MySQL 与 RocksDB 不会同进程/
 文件不落宿主；第二实例返回 `Busy`；L1–L3 无回退。
 
 **不做**：写路径持久化结论、性能结论、AIO bridge。
+
+### Shard-101B：server 层 `my_*` 路由（mysys）
+
+> 来源：Shard-101 收尾时发现 server 层 DD 校验走宿主 syscall
+> （`access(".//mysql.ibd", F_OK)` → ENOENT），`--initialize` 后无法正常启动。
+
+**目标**：让 mysys 文件 API 对 HFS 前缀路径路由到同一 `hfs_vfs`，使 `mysqld`
+正常启停、第二实例 Busy、datadir 不再出现 server 层宿主文件。
+
+**交付物**
+
+- mysys dispatch：`my_open/my_create/my_close/my_read/my_write/my_pread/my_pwrite/
+  my_sync/my_fsync/my_stat/my_fstat/my_access/my_delete/my_rename/my_mkdir/my_rmdir/
+  my_realpath/dir_*`（仅当路径/句柄属于 HFS 前缀时路由，其余走宿主）；
+- `hfs_vfs` 补齐 mysys 需要的包装（`MY_STAT` 合成、FILE-like 语义、错误码映射）；
+- server 层生命周期：日志/socket/pid/binlog 明确使用宿主绝对路径（不路由）。
+
+**验收**：`--initialize` 后 `mysqld` 正常启动/停止；第二实例返回 Busy；datadir 中
+InnoDB 与 server 层文件均在 HFS；L1–L3 无回退。
+
+**不做**：性能结论、AIO bridge。
 
 ### Shard-102：绕过点修复 + 写/恢复路径
 
