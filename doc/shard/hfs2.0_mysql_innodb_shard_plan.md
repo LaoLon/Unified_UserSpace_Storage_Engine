@@ -26,9 +26,8 @@
    - §3.2 将 `MySQL/MariaDB/InnoDB native backend：v1 不做`（`:119`）改为"Phase 7 经
      os_file seam 实现"，并明确禁用项（native AIO、punch hole/页压缩、clone、
      MyISAM/Aria、`--daemonize`、`--innodb-directories` 指向宿主）；
-   - 新增 MySQL/InnoDB frontend 契约章节（建议置于 §12 FIO adapter 之后，具体编号
-     在设计编辑时确定）：handle 表、路径路由、同步门面、线程 registry、停机顺序、
-     回落/失败关闭；
+   - 新增 §20 MySQL/InnoDB frontend 契约章节：handle 表、路径路由、同步门面、线程
+     registry、停机顺序、回落/失败关闭；
    - §17 增补风险：`File::sync` 无 data-only barrier、`struct stat` 合成、上游 rebase。
 2. **基座冻结**：MySQL 8.0.46（审计版本）在 VM 内通过 Git 获取并维护，不从 Windows
    同步 MySQL 源码；补丁以独立 patch 目录/分支管理，禁止散落修改。
@@ -102,7 +101,7 @@ HFS 是单进程、单 engine、bdev 独占；MySQL 与 RocksDB 不会同进程/
 
 **交付物**
 
-- `hfs2.0.md` §3.1/§3.2/§17 更新与新增 frontend 契约章节（§0.1）；
+- `hfs2.0.md` §3.1/§3.2/§17 更新与新增 §20 frontend 契约章节（§0.1）；
 - MySQL 8.0.46 fork（VM 内 Git + patch 目录）与可重复构建脚本，产出 `mysqld`；
 - `config/hfs_mysql.conf`（datadir namespace、device set、路径前缀映射；与
   `config/hfs_nvme.conf` 隔离）；
@@ -253,7 +252,7 @@ datadir 文件落到宿主、RocksDB L4 回退 >5%、MySQL 路径出现 data mis
 ## 4. 证据与文档产物
 
 - 审计：`doc/review/hfs2_mysql_innodb_audit_20260924.md`；
-- 设计：`doc/design/hfs2.0.md`（§3/§17 更新与新增 frontend 章节后为准）；
+- 设计：`doc/design/hfs2.0.md`（§3/§17/§20）；
 - 每个 shard 的结果报告：`doc/task_result/`（按 AGENTS.md 任务规则）或
   `doc/performance/`、`doc/review/` 归档；
 - 大体积证据：VM `/mnt/hfs-data`；

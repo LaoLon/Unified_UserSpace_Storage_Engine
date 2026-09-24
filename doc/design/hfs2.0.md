@@ -5,6 +5,11 @@
 > 评审输入：`doc/review/hfs2.0_design_review_20260916.md`
 >
 > 当前事实基线：clean-break 迁移后的工作区。本文描述的是新目标，不表示新 core 已实现。
+>
+> 2026-09-24：新增 Phase 7（MySQL 8.0.46 InnoDB frontend，§20）；只做加法，不改变
+> §11/§12 的 RocksDB/FIO 契约、默认值和正式性能口径。审计依据
+> `doc/review/hfs2_mysql_innodb_audit_20260924.md`，执行计划
+> `doc/shard/hfs2.0_mysql_innodb_shard_plan.md`。
 
 ## 1. 设计决策
 
@@ -12,9 +17,9 @@ HFS 2.0 不再是当前 HFS 的 C/Blobstore/POSIX 增量版本，而是从空的
 全新 C++20 存储引擎：
 
 ```text
-RocksDB 8.9.1 FileSystem adapter ─┐
-                                   ├─ libhfs_core.so ─ SPDK bdev set ─ NVMe pool
-FIO 3.42 external ioengine ───────┘
+RocksDB 8.9.1 FileSystem adapter ──┐
+FIO 3.42 external ioengine ────────┼─ libhfs_core.so ─ SPDK bdev set ─ NVMe pool
+MySQL 8.0.46 InnoDB os_file seam ──┘   （Phase 7，§20）
 ```
 
 核心运行模型：
@@ -101,6 +106,7 @@ HFS 2.0                 ─ 新 raw-bdev 镜像 ─ C++20 core/FIO/RocksDB adapt
 - C++20 coroutine-first core API；
 - RocksDB 8.9.1 `FileSystem` adapter；
 - FIO 3.42 external ioengine；
+- MySQL 8.0.46 InnoDB frontend（Phase 7，经 fork 的 `os_file` seam，见 §20）；
 - 直接 SPDK bdev/NVMe 访问；
 - 文件 namespace、目录、rename、delete、extent allocation、sync 和 crash recovery；
 - direct buffer 和 bounded bounce buffer 两条数据路径；
@@ -116,7 +122,8 @@ HFS 2.0                 ─ 新 raw-bdev 镜像 ─ C++20 core/FIO/RocksDB adapt
 - `HFS_POSIX_DIRECT_ASYNC`、`HFS_POSIX_QUEUE`、`HFS_POSIX_TICKET` 等旧开关；
 - 多进程同时挂载同一 bdev、daemon、shared-memory IPC、跨进程锁和故障转移；
 - 为通用 POSIX 重叠写、fd offset 或目录语义保留的 ticket/range compatibility path；
-- MySQL/MariaDB/InnoDB native backend：v1 不做，数据库支持范围只有 RocksDB 8.9.1。
+- MySQL/MariaDB/InnoDB 的 POSIX 兼容层（`LD_PRELOAD`/FUSE/fd wrapper、Aria/MyISAM
+  数据路径）：不提供；MySQL 8.0.46 只能经 fork 的 `os_file` seam 接入（Phase 7，§20）。
 
 fork 保护仍可作为 core 的进程安全措施，但不再模拟 POSIX preload 行为：fork child
 调用 core 直接得到 `ForkedProcess` 错误。
@@ -1495,6 +1502,9 @@ checkpoint region 必须容纳 namespace/inode/extent map/各 device allocator b
 | worker-owned channel 生命周期 | §5.3 非拥有引用 + registry 主线程 retire；单测覆盖线程退出、context 析构与建链回落 |
 | shared frontend 偶发丢唤醒 | 有界 poll + 压力重复回归；真实 NVMe 复现时按 bug 记录 |
 | 跨会话性能环境漂移 | 同会话交错 A/B、native 首尾校准；跨会话数字不得直接比较 |
+| MySQL `os_file` seam 遗漏绕过点 | 审计清单 + 每 shard strace 校验；datadir 文件必须落 HFS |
+| `File::sync` 无 data-only barrier | 组提交先行；任何 core 改动必须通过 RocksDB L4 无回退门禁 |
+| MySQL frontend 回归影响 RocksDB | shard 出口 L1–L4 门禁；默认值/ABI 冻结，MySQL 独立 `.conf` |
 
 ### 17.3 立即停止条件
 
@@ -1505,6 +1515,8 @@ checkpoint region 必须容纳 namespace/inode/extent map/各 device allocator b
 - parent/child、coroutine frame、DMA lease、ring slot 泄漏或 double resume；
 - `spdk_submit != spdk_complete`、backend errno 丢失、NVMe 无法释放；
 - RocksDB/FIO error mapping、cancel、AbortIO、directory fsync 不完整；
+- MySQL datadir 文件落到宿主 OS、MySQL 路径 data mismatch 或崩溃恢复失败；
+- RocksDB/FIO 正式口径回退超过 5%（Phase 7 shard 门禁失败）；
 - 旧 Blobstore、POSIX fd 或 preload 代码重新进入 HFS 2.0 build。
 
 ## 18. 实施顺序
@@ -1677,6 +1689,17 @@ checkpoint region 必须容纳 namespace/inode/extent map/各 device allocator b
 - 更新架构索引、性能基线、支持边界和迁移说明；
 - HFS 2.0 才能作为正式产品线，旧 HFS 1.x 只保留归档 artifact。
 
+### Phase 7：MySQL 8.0.46 InnoDB frontend（Shard-99 起）
+
+- 设计前置：本文 §3.1/§3.2/§17/§20 更新完成后才能动代码；
+- 基座：VM 内 MySQL 8.0.46 fork + 独立 `config/hfs_mysql.conf`；先固化 RocksDB/FIO
+  基线作为回归对照；
+- InnoDB `os_file` seam（handle 表、路径路由、同步门面）、审计的 7 处绕过点、
+  模拟 AIO（native AIO 关闭）；
+- per-thread Client registry 与停机顺序、功能矩阵、性能与 durability 评估、收口；
+- 每个 shard 出口执行 RocksDB L1–L4 无回退门禁；执行计划见
+  `doc/shard/hfs2.0_mysql_innodb_shard_plan.md`。
+
 ## 19. 最终定位
 
 > HFS 2.0 是一个 C++20 coroutine-first、运行在应用进程内、直接管理 SPDK bdev/NVMe
@@ -1685,6 +1708,90 @@ checkpoint region 必须容纳 namespace/inode/extent map/各 device allocator b
 > 8.9.1 和 FIO 3.42 提供明确的异步文件契约。它不是通用 POSIX 文件系统，不使用
 > Blobstore，也不兼容 HFS 1.x 的 src、镜像、fd ABI 或 preload 路径。
 
+2026-09-24 起，Phase 7 在同一 core 上增加 MySQL 8.0.46 InnoDB frontend（§20）：它以
+fork 的 `os_file` seam 接入，不提供 POSIX 兼容层，也不改变 RocksDB/FIO 的契约与
+性能口径。
+
 HFS 2.0 的第一条实现原则是：旧代码可以冻结，但不能以兼容性名义继续污染新架构；
 第二条原则是：coroutine 只用于表达非阻塞状态机，所有资源、错误、恢复和完成边界都
 必须可计数、可回放、可验证。
+
+## 20. MySQL 8.0.46 InnoDB frontend（Phase 7）
+
+> 审计依据：`doc/review/hfs2_mysql_innodb_audit_20260924.md`；
+> 执行计划：`doc/shard/hfs2.0_mysql_innodb_shard_plan.md`。
+> 本节只定义 Phase 7 的接入边界与契约，不修改 §11/§12 的 RocksDB/FIO 契约、默认值、
+> 配置 schema 与性能口径。
+
+### 20.1 定位与范围
+
+- MySQL 8.0.46 的 InnoDB 以 HFS 作为 datadir 存储，接入方式为 fork MySQL 并在
+  InnoDB `os_file` 文件层实现 HFS backend；不是 POSIX 兼容层，core 不新增
+  POSIX `read/write/pread/pwrite` 入口；
+- 单进程、单 engine、bdev 独占语义与 §14.3 相同：第二实例、跨进程或同盘共享返回
+  `Busy`；fork child 返回 `ForkedProcess`，`--daemonize` 被禁止；
+- RocksDB/FIO 路径、`config/hfs_nvme.conf` 与默认值不被修改；MySQL 使用独立
+  `config/hfs_mysql.conf`。
+
+### 20.2 os_file seam 契约
+
+seam 位于 `storage/innobase/os/os0file.cc`（审计 §5.1）：
+
+- `os_file_t`/`pfs_os_file_t` 由 fd 改为 handle 索引，映射到 `hfs::File`；不使用
+  host fd，`OS_FILE_CLOSED` 由 handle 表表示；
+- 路径路由：`--datadir`/`Fil_path` 前缀 → HFS namespace；socket、pid、error log、
+  slow log、`--tmpdir`、binlog 使用宿主绝对路径，不进入 HFS；
+- 必须覆盖的 seam 组：create/close/read/write/pread/pwrite/fsync/flush/get_size/
+  set_size/truncate/exists/status/delete/rename/create_directory/scan_directory/lock/
+  copy/`SyncFileIO::execute`；
+- `os_file_set_nocache` 与 `posix_fadvise` 为 no-op（HFS 已是 direct、无 host 缓存）；
+  `os_file_punch_hole` 不支持，必须 fail closed；
+- `os_file_get_status` 返回合成的 size/mode/mtime；HFS 无权限模型；
+- 审计列出的 7 处直接 I/O 绕过点必须在 Phase 7 内关闭，不得把 datadir 文件静默
+  落到宿主 OS；
+- native AIO（`AIO::linux_dispatch`/`os_aio_linux_handler`）在 v1 关闭
+  （`innodb_use_native_aio=OFF`），模拟 AIO 统一收敛到 seam；AIO bridge 属二期。
+
+### 20.3 Durability 契约
+
+- `os_file_fsync`/`os_file_flush` → `File::sync`；HFS 当前 `sync` 与 `datasync` 同为
+  namespace 级 durable epoch（强于 per-file fsync）；
+- redo/doublewrite/undo 的提交顺序依赖 fsync 语义；HFS epoch barrier 必须保证
+  write→fsync→崩溃后已提交数据可见；
+- data-only `datasync` 是评估项：若实施，必须保持 `File::sync` 行为与 ABI 不变，
+  并同时通过 RocksDB L4 无回退门禁；否则维持 namespace barrier；
+- 恢复：HFS journal replay 与 InnoDB redo 双层恢复；kill -9 断点后 datadir 的
+  namespace/extent/size 必须守恒，`hfsctl check` 无 corruption。
+
+### 20.4 线程与生命周期
+
+- InnoDB 后台线程（page cleaner、log writer、AIO handler、purge、DDL 等）使用
+  per-thread `hfs::Client`：拥有线程自建自关；被 context 抢先 retire 的 thread-local
+  析构必须为 no-op；
+- 停机顺序：停新提交 → drain outstanding → close Client → 停 dispatcher →
+  `Engine::stop()`；任一层失败 fail-closed，不半量回落；
+- 资源上限：线程数 × `maxOutstanding` × 队列容量按配置校验；建链失败回落共享
+  dispatcher 并计数/日志；
+- `Engine::stop()` 在仍有 client/open file/outstanding 时返回 `Busy`，由 adapter
+  有界重试。
+
+### 20.5 配置与构建
+
+- MySQL 使用独立 `.conf`（`config/hfs_mysql.conf`），不得修改
+  `config/hfs_nvme.conf` 的正式口径；
+- MySQL fork 在 VM 内通过 Git 获取与维护；HFS core 不引用 MySQL 源码，fork 不反向
+  依赖 HFS 内部头文件；补丁集中在 seam 与 §20.2 的绕过点；
+- ABI：Phase 7 只做加法；破坏性变更升 `coreAbiMajor` 并单独评审。
+
+### 20.6 禁用项（fail-closed）
+
+native AIO、页压缩/punch hole、clone、MyISAM/Aria 数据路径、`--daemonize`、
+`--innodb-directories` 指向宿主、多实例共享 datadir、把 MySQL 数据文件落到宿主 OS。
+
+### 20.7 验收
+
+- MySQL：initialize/bootstrap、启停、SQL/事务/DDL（含 online）、binlog、逻辑备份、
+  跨进程 reopen、kill -9 恢复、`mysqlcheck`；
+- HFS：`hfsctl check`、closure（submit==complete）、无 handle/frame/lease 泄漏；
+- 回归：RocksDB/FIO L1–L4 无回退门禁（CTest、FIO smoke、readrandom 同会话 A/B <5%、
+  正式 8j4 gate）；具体矩阵见 shard 计划 §0.3/§2。
