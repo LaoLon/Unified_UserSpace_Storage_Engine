@@ -2,7 +2,7 @@
 
 > 日期：2026-09-24
 >
-> 状态：计划稿（未实施）；实施前必须完成本计划 §0.1 的设计更新前置
+> 状态：执行中；Shard-99 已完成（2026-09-24），进入 Shard-100
 >
 > 事实源：`doc/design/hfs2.0.md`（Phase 7 范围、契约与禁用项以更新后的设计为准）
 >
@@ -96,6 +96,13 @@ HFS 是单进程、单 engine、bdev 独占；MySQL 与 RocksDB 不会同进程/
 ## 2. Phase 7：MySQL/InnoDB frontend
 
 ### Shard-99：设计更新、MySQL fork 基座与基线固化
+
+> 状态：已完成（2026-09-24）。设计更新（`hfs2.0.md` §3.1/§3.2/§17/§18/§19/§20）已落地；
+> MySQL 8.0.46 fork 基座在 VM `/mnt/hfs-data/mysql-fork`，`mysqld` 构建成功；
+> `config/hfs_mysql.conf` 与 `mysql/build_mysql_vm.sh` 入库；RocksDB/FIO 基线固化完成
+> （CTest 26/26、FIO smoke err=0、readrandom A/B HFS≈native、8j4 gate raw 115.9K /
+> HFS 81.7K = 70.51%、p99 ratio 0.861、errors=0）。基线报告见
+> `doc/performance/hfs2_mysql_phase7_baseline_20260924.md`。
 
 **目标**：冻结范围、基座与对照基线，避免后续用 MySQL 收益掩盖 RocksDB 回退。
 
