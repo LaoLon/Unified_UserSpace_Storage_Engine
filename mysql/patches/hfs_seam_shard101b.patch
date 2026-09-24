@@ -84,36 +84,26 @@ index 9bf43714..e4bf65fa 100644
 +  TARGET_LINK_LIBRARIES(mysys ${HFS_CORE_LIB})
 +ENDIF()
 diff --git a/mysys/mf_iocache.cc b/mysys/mf_iocache.cc
-index a3d04b2a..3318f6e2 100644
+index a3d04b2a..3f8cecb1 100644
 --- a/mysys/mf_iocache.cc
 +++ b/mysys/mf_iocache.cc
-@@ -1440,7 +1440,10 @@ int my_b_flush_io_cache(IO_CACHE *info, int need_append_buffer_lock) {
+@@ -1440,7 +1440,9 @@ int my_b_flush_io_cache(IO_CACHE *info, int need_append_buffer_lock) {
  
    if (info->type == WRITE_CACHE || append_cache) {
      if (info->file == -1) {
 -      if (real_open_cached_file(info)) return (info->error = -1);
 +      if (real_open_cached_file(info)) {
-+        fprintf(stderr, "HFSDBG flush real_open_cached_file failed\n");
 +        return (info->error = -1);
 +      }
      }
      LOCK_APPEND_BUFFER;
  
-@@ -1461,6 +1464,7 @@ int my_b_flush_io_cache(IO_CACHE *info, int need_append_buffer_lock) {
-       if (!append_cache && info->seek_not_done) { /* File touched, do seek */
-         if (mysql_encryption_file_seek(info, pos_in_file, MY_SEEK_SET,
-                                        MYF(0)) == MY_FILEPOS_ERROR) {
-+          fprintf(stderr, "HFSDBG flush seek failed errno=%d\n", errno);
-           UNLOCK_APPEND_BUFFER;
-           return (info->error = -1);
-         }
-@@ -1471,10 +1475,12 @@ int my_b_flush_io_cache(IO_CACHE *info, int need_append_buffer_lock) {
+@@ -1471,10 +1473,11 @@ int my_b_flush_io_cache(IO_CACHE *info, int need_append_buffer_lock) {
                           ((pos_in_file + length) & (IO_SIZE - 1)));
  
        if (mysql_encryption_file_write(info, info->write_buffer, length,
 -                                      info->myflags | MY_NABP))
 +                                      info->myflags | MY_NABP)) {
-+        fprintf(stderr, "HFSDBG flush write failed errno=%d\n", errno);
          info->error = -1;
 -      else
 +      } else {
@@ -171,7 +161,7 @@ index 2fa23026..06058ffd 100644
    DBUG_TRACE;
  
 diff --git a/mysys/my_create.cc b/mysys/my_create.cc
-index b50ecf6b..c74746ba 100644
+index b50ecf6b..8d0115d3 100644
 --- a/mysys/my_create.cc
 +++ b/mysys/my_create.cc
 @@ -31,6 +31,7 @@
@@ -182,7 +172,7 @@ index b50ecf6b..c74746ba 100644
  
  #include "my_sys.h"
  #if defined(_WIN32)
-@@ -63,6 +64,15 @@
+@@ -63,6 +64,14 @@
  
  File my_create(const char *FileName, int CreateFlags, int AccessFlags,
                 myf MyFlags) {
@@ -190,7 +180,6 @@ index b50ecf6b..c74746ba 100644
 +    File hfsFd =
 +        hfs_vfs::openPath(FileName, O_RDWR | O_CREAT | O_EXCL, AccessFlags);
 +    if (hfsFd < 0) {
-+      fprintf(stderr, "HFSDBG my_create fail %s errno=%d\n", FileName, errno);
 +      set_my_errno(errno);
 +    }
 +    return (hfsFd);
@@ -456,7 +445,7 @@ index 289b324d..c537f3d3 100644
    DBUG_TRACE;
    DBUG_PRINT("my", ("from %s to %s MyFlags %d", from, to, MyFlags));
 diff --git a/mysys/my_seek.cc b/mysys/my_seek.cc
-index 57bdbcb0..65038f7d 100644
+index 57bdbcb0..079c6b6f 100644
 --- a/mysys/my_seek.cc
 +++ b/mysys/my_seek.cc
 @@ -31,6 +31,7 @@
@@ -467,15 +456,13 @@ index 57bdbcb0..65038f7d 100644
  
  #include <errno.h>
  #ifdef HAVE_UNISTD_H
-@@ -67,6 +68,16 @@
+@@ -67,6 +68,14 @@
  */
  
  my_off_t my_seek(File fd, my_off_t pos, int whence, myf MyFlags) {
 +  if (hfs_vfs::isHfsHandle(fd)) {
 +    std::uint64_t hfsPosition = 0;
 +    if (hfs_vfs::seekHandle(fd, pos, whence, &hfsPosition) != 0) {
-+      fprintf(stderr, "HFSDBG my_seek fail fd=%d pos=%lld whence=%d errno=%d\n",
-+              fd, (long long)pos, whence, errno);
 +      set_my_errno(errno);
 +      return (MY_FILE_ERROR);
 +    }
@@ -533,7 +520,7 @@ index 552f9cab..6a516fbe 100644
    DBUG_TRACE;
    DBUG_PRINT("my", ("Fd: %d  my_flags: %d", fd, my_flags));
 diff --git a/mysys/my_write.cc b/mysys/my_write.cc
-index 79f34593..41d2e9bb 100644
+index 79f34593..324d7bf4 100644
 --- a/mysys/my_write.cc
 +++ b/mysys/my_write.cc
 @@ -31,6 +31,7 @@
@@ -544,7 +531,7 @@ index 79f34593..41d2e9bb 100644
  
  #include <errno.h>
  #include <stddef.h>
-@@ -77,6 +78,19 @@ ssize_t (*mock_write)(int fd, const void *buf, size_t count) = nullptr;
+@@ -77,6 +78,17 @@ ssize_t (*mock_write)(int fd, const void *buf, size_t count) = nullptr;
      On failure, (size_t)-1 == MY_FILE_ERROR
  */
  size_t my_write(File Filedes, const uchar *Buffer, size_t Count, myf MyFlags) {
@@ -552,8 +539,6 @@ index 79f34593..41d2e9bb 100644
 +    std::size_t hfsDone = 0;
 +    const int hfsRc = hfs_vfs::writeHandle(Filedes, Buffer, Count, &hfsDone);
 +    if (hfsRc != 0 || hfsDone != Count) {
-+      fprintf(stderr, "HFSDBG my_write fail fd=%d rc=%d done=%zu want=%zu errno=%d\n",
-+              Filedes, hfsRc, hfsDone, Count, errno);
 +      if (hfsRc == 0) errno = EIO;
 +      set_my_errno(errno);
 +      return (MY_FILE_ERROR);
@@ -565,10 +550,20 @@ index 79f34593..41d2e9bb 100644
    uint errors = 0;
    const size_t initial_count = Count;
 diff --git a/sql/auth/sql_authentication.cc b/sql/auth/sql_authentication.cc
-index 9ea4f535..9b8da728 100644
+index 9ea4f535..5914918b 100644
 --- a/sql/auth/sql_authentication.cc
 +++ b/sql/auth/sql_authentication.cc
-@@ -5805,10 +5805,12 @@ bool create_RSA_key_pair(RSA_generator_func &rsa_gen,
+@@ -1215,7 +1215,8 @@ bool Rsa_authentication_keys::read_key_file(RSA **key_ptr, bool is_priv_key,
+   /*
+      Check for existence of private key/public key file.
+   */
+-  if ((key_file = fopen(key_file_path.c_ptr(), "rb")) == nullptr) {
++  if ((key_file = my_fopen(key_file_path.c_ptr(), O_RDONLY, MYF(0))) ==
++      nullptr) {
+     LogErr(WARNING_LEVEL, ER_AUTH_RSA_CANT_FIND, key_type,
+            key_file_path.c_ptr());
+   } else {
+@@ -5805,10 +5806,12 @@ bool create_RSA_key_pair(RSA_generator_func &rsa_gen,
    }
    DBUG_EXECUTE_IF("valid_key_temp_files", DBUG_SUICIDE(););
  
@@ -584,10 +579,10 @@ index 9ea4f535..9b8da728 100644
  
  end:
 diff --git a/sql/mysqld.cc b/sql/mysqld.cc
-index c8a7d00b..0b1a8094 100644
+index c8a7d00b..fe9967f5 100644
 --- a/sql/mysqld.cc
 +++ b/sql/mysqld.cc
-@@ -5562,7 +5562,15 @@ static int flush_auto_options(const char *fname) {
+@@ -5562,7 +5562,13 @@ static int flush_auto_options(const char *fname) {
    my_b_printf(&io_cache, "%s\n", "[auto]");
    my_b_printf(&io_cache, "server-uuid=%s\n", server_uuid);
  
@@ -596,60 +591,52 @@ index c8a7d00b..0b1a8094 100644
 +    const int hfsFlush = flush_io_cache(&io_cache);
 +    const int hfsSync = hfsFlush ? 0 : my_sync(fd, MYF(MY_WME));
 +    if (hfsFlush || hfsSync) {
-+      fprintf(stderr, "HFSDBG flush_auto flush=%d sync=%d myerrno=%d\n",
-+              hfsFlush, hfsSync, my_errno());
 +      result = 1;
 +    }
 +  }
  
    my_close(fd, MYF(MY_WME));
    end_io_cache(&io_cache);
-@@ -5617,10 +5625,15 @@ static int init_server_auto_options() {
+@@ -5617,10 +5623,13 @@ static int init_server_auto_options() {
  
    /* load all options in 'auto.cnf'. */
    MEM_ROOT alloc{PSI_NOT_INSTRUMENTED, 512};
 -  if (my_load_defaults(fname, groups, &argc, &argv, &alloc, nullptr)) return 1;
 +  if (my_load_defaults(fname, groups, &argc, &argv, &alloc, nullptr)) {
-+    fprintf(stderr, "HFSDBG my_load_defaults failed\n");
 +    return 1;
 +  }
  
 -  if (handle_options(&argc, &argv, auto_options, mysqld_get_one_option))
 +  if (handle_options(&argc, &argv, auto_options, mysqld_get_one_option)) {
-+    fprintf(stderr, "HFSDBG handle_options failed\n");
      return 1;
 +  }
  
    DBUG_PRINT("info", ("uuid=%p=%s server_uuid=%s", uuid, uuid, server_uuid));
    if (uuid) {
-@@ -5647,7 +5660,10 @@ static int init_server_auto_options() {
+@@ -5647,7 +5656,9 @@ static int init_server_auto_options() {
      DBUG_PRINT("info", ("generating server_uuid"));
      flush = true;
      /* server_uuid will be set in the function */
 -    if (generate_server_uuid()) goto err;
 +    if (generate_server_uuid()) {
-+      fprintf(stderr, "HFSDBG generate_server_uuid failed\n");
 +      goto err;
 +    }
      DBUG_PRINT("info", ("generated server_uuid=%s", server_uuid));
      if (opt_initialize || opt_initialize_insecure) {
        LogErr(INFORMATION_LEVEL, ER_CREATING_NEW_UUID_FIRST_START, server_uuid);
-@@ -5657,9 +5673,14 @@ static int init_server_auto_options() {
+@@ -5657,7 +5668,11 @@ static int init_server_auto_options() {
      }
    }
  
 -  if (flush) return flush_auto_options(fname);
 +  if (flush) {
 +    const int hfsRc = flush_auto_options(fname);
-+    if (hfsRc != 0) fprintf(stderr, "HFSDBG flush_auto_options failed\n");
++    if (hfsRc != 0)
 +    return hfsRc;
 +  }
    return 0;
  err:
-+  fprintf(stderr, "HFSDBG err label reached\n");
    return 1;
- }
- 
 diff --git a/storage/innobase/CMakeLists.txt b/storage/innobase/CMakeLists.txt
 index 926a3672..2df12804 100644
 --- a/storage/innobase/CMakeLists.txt
@@ -710,10 +697,10 @@ index aa6af051..7953d90f 100644
    handlerton *innobase_hton = (handlerton *)p;
 diff --git a/storage/innobase/os/hfs_vfs.cc b/storage/innobase/os/hfs_vfs.cc
 new file mode 100644
-index 00000000..96af4f2c
+index 00000000..1b2983b6
 --- /dev/null
 +++ b/storage/innobase/os/hfs_vfs.cc
-@@ -0,0 +1,1053 @@
+@@ -0,0 +1,1073 @@
 +/* HFS-backed InnoDB os_file seam implementation (Phase 7, Shard-101). */
 +#include "hfs_vfs.h"
 +
@@ -1717,6 +1704,16 @@ index 00000000..96af4f2c
 +    delete self;
 +    return 0;
 +  };
++  io.seek = [](void *context, off64_t *offset, int whence) -> int {
++    Cookie *self = static_cast<Cookie *>(context);
++    std::uint64_t position = 0;
++    if (seekHandle(self->handle, static_cast<std::int64_t>(*offset), whence,
++                   &position) != 0) {
++      return -1;
++    }
++    *offset = static_cast<off64_t>(position);
++    return 0;
++  };
 +  FILE *stream = ::fopencookie(cookie, "r", io);
 +  if (stream == nullptr) {
 +    close(handle);
@@ -1756,6 +1753,16 @@ index 00000000..96af4f2c
 +    flush(self->handle);
 +    close(self->handle);
 +    delete self;
++    return 0;
++  };
++  io.seek = [](void *context, off64_t *offset, int whence) -> int {
++    Cookie *self = static_cast<Cookie *>(context);
++    std::uint64_t position = 0;
++    if (seekHandle(self->handle, static_cast<std::int64_t>(*offset), whence,
++                   &position) != 0) {
++      return -1;
++    }
++    *offset = static_cast<off64_t>(position);
 +    return 0;
 +  };
 +  FILE *stream = ::fopencookie(cookie, "w", io);

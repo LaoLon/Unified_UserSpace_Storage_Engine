@@ -2,8 +2,7 @@
 
 > 日期：2026-09-24
 >
-> 状态：执行中；Shard-99/100 已完成（2026-09-24）、Shard-101 实现完成但收尾被
-> server 层 `my_*` 路由阻塞（2026-09-24，见下）
+> 状态：执行中；Shard-99/100/101/101B 已完成（2026-09-24），进入 Shard-102
 >
 > 事实源：`doc/design/hfs2.0.md`（Phase 7 范围、契约与禁用项以更新后的设计为准）
 >
@@ -164,11 +163,9 @@ HFS 是单进程、单 engine、bdev 独占；MySQL 与 RocksDB 不会同进程/
 > `--initialize` 之后的正常启动无法完成。该工作新增为 **Shard-101B（server 层 my_* 路由）**，
 > 完成后才能执行 start/stop 与第二实例 Busy 验收。
 >
-> 待办：Shard-101B（mysys 路由）→ initialize rc（已确认）/start-stop/第二实例 Busy →
-> L1–L3 回归；已知边界：`posix_fallocate` 告警（Shard-102）、server 层文件落宿主
-> （Shard-102/101B）、TLS client "destroyed with live work" 告警（Shard-103）。
-> 证据：`/mnt/hfs-data/hfs2-mysql-baseline-20260924/shard101/`（init3/4、server1-3、
-> start_strace.log）。
+> 待办（已由 Shard-101B 完成）：mysys 路由补齐后，`--initialize` rc=0、启停、
+> 第二实例 Busy 与 L1–L3 回归均已通过；已知边界：`posix_fallocate` 告警属 Shard-102。
+> 证据：`/mnt/hfs-data/hfs2-mysql-baseline-20260924/shard101/`。
 
 **目标**：让 InnoDB 的 open/read/size/status/dir 全部经过 HFS，形成最小可启动闭环。
 
@@ -193,20 +190,22 @@ HFS 是单进程、单 engine、bdev 独占；MySQL 与 RocksDB 不会同进程/
 > 来源：Shard-101 收尾时发现 server 层 DD 校验走宿主 syscall
 > （`access(".//mysql.ibd", F_OK)` → ENOENT），`--initialize` 后无法正常启动。
 >
-> 状态：进行中（2026-09-24）。已实现：mysys 路由（`my_open/my_create/my_close/
-> my_read/my_write/my_sync/my_seek/my_chsize/my_stat/my_fstat/my_access/my_realpath/
-> my_delete/my_rename/my_mkdir/my_setwd/my_chmod/my_fopen`）；`my_access` 在 POSIX 上
-> 从宏改为真实函数；`hfs_vfs` 迁入 mysys 编译，C++20 + 全局 `libhfs_core` 链接与
-> build rpath；`fopencookie` 读写流覆盖 stdio 路径；`MY_NABP` 语义补齐。
+> 状态：已完成（2026-09-24）。mysys 路由覆盖 `my_open/my_create/my_close/my_read/
+> my_write/my_sync/my_seek/my_chsize/my_stat/my_fstat/my_access/my_realpath/my_delete/
+> my_rename/my_mkdir/my_setwd/my_chmod/my_fopen`；POSIX `my_access` 宏改为实函数；
+> `fopencookie` 读写/seek 流覆盖 stdio 路径；`MY_NABP` 语义补齐；`hfs_vfs` 迁入 mysys
+> 编译（C++20 + 全局 `libhfs_core` 链接与 build rpath）；SSL 密钥 `rename` 改为
+> `my_rename`、RSA 密钥读取 `fopen` 改为 `my_fopen`。
 >
-> **验收进展（2026-09-24）**：`mysqld --initialize` 在 HFS datadir 上 **rc=0**；
-> 正常启动到达 `ready for connections`（datadir 全在 HFS，宿主 `/hfs/mysql` 不存在）；
-> SIGTERM 后进程正常退出；第二实例被 HFS 进程锁拒绝
-> （`another engine already holds '/tmp/hfs2.lock'`，失败关闭）。
-> 遗留：启动日志有 `RSA private/public key file not found` 警告（key 生成阶段的
-> `rename` 已改为 `my_rename`，但最终文件疑似未落到 HFS，待查）；fork 内仍有 HFSDBG
-> 调试插桩，收口前清理；L1–L3 回归未跑。
-> 补丁：`mysql/patches/hfs_seam_shard101b.patch`（累积，2269 行 / 27 文件）。
+> 验收（2026-09-24，全部通过）：`mysqld --initialize` rc=0；正常启动到达
+> `ready for connections`；SIGTERM 正常退出；第二实例被 HFS 进程锁拒绝
+> （`another engine already holds '/tmp/hfs2.lock'`，失败关闭）；datadir 全在 HFS
+> （宿主 `/hfs/mysql` 不存在）；RSA 密钥警告消除。回归：L1 CTest 26/26 +
+> `file_api_test`、L2 FIO verify/plain smoke `error=0` 且 closure 闭合、
+> L3 readrandom A/B HFS 70.8–72.3K vs native 69.0–69.5K（无回退）。
+> 遗留（Shard-102）：InnoDB `posix_fallocate` 告警（有 `os_file_set_size` 回退，
+> 非致命）；server 层其余裸 syscall 审计。补丁：
+> `mysql/patches/hfs_seam_shard101b.patch`（2276 行 / 27 文件，无调试插桩）。
 
 **目标**：让 mysys 文件 API 对 HFS 前缀路径路由到同一 `hfs_vfs`，使 `mysqld`
 正常启停、第二实例 Busy、datadir 不再出现 server 层宿主文件。
