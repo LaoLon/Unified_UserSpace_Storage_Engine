@@ -2,7 +2,7 @@
 
 > 日期：2026-09-24
 >
-> 状态：执行中；Shard-99/100/101/101B/102 已完成（2026-09-24），进入 Shard-103
+> 状态：执行中；Shard-99/100/101/101B/102/103 已完成（2026-09-24），进入 Shard-104
 >
 > 事实源：`doc/design/hfs2.0.md`（Phase 7 范围、契约与禁用项以更新后的设计为准）
 >
@@ -262,6 +262,29 @@ L1–L3 无回退。
 
 ### Shard-103：线程与生命周期
 
+> 状态：已完成（2026-09-24）。`hfs_vfs` 增加 per-thread `hfs::Client` registry
+> （TLS holder 线程退出自关、`weak_ptr` 注册、`kMaxThreadClients=256` 超限回落共享
+> client 并计数）、进程级 `fileOwnerClient`（所有打开的 `File` 由同一 client 持有，
+> 线程退出时不再持有文件）、`std::atomic stopping` 停机栅栏与 `shutdown()` 关闭顺序
+> （本线程 client → 注册 client → 共享/文件 client → handle 表 → engine stop）。
+>
+> **新发现（SIGTERM 失效，Shard-103 内修复）**：SPDK/DPDK 线程以空信号掩码运行
+> （`SigBlk=0`），进程级 SIGTERM/SIGINT/SIGHUP/SIGQUIT 会被投递到这些线程并按默认
+> 动作杀死 mysqld（退出码 143，跳过 InnoDB/engine 停机），而 mysqld 依赖被阻塞的
+> `sig_handler` 线程 `sigwait` 收信号。修复：`hfs_vfs::installSignalForwarding()`
+> 在 `start_signal_handler()` 之后安装转发 handler（`my_init_signals` 会把
+> SIGHUP/SIGTERM/SIGUSR1 重置为 SIG_DFL，因此不能在 plugin init 时安装），把信号
+> `pthread_kill` 转发给 `signal_thread_id`（weak 引用；非 server 二进制为 0 时跳过）。
+>
+> 验收（真实 NVMe，2026-09-24）：5 轮 8 并发 mysql 写负载 + SIGTERM 全部
+> `shutdown complete`、`live_work=0`、`close failed=0`；SIGKILL 后重启恢复
+> （COUNT=12548）、`hfsctl check` `corruption=none`；SIGTERM 退出码 0 且
+> `hfs: engine stopped`；L1 CTest 26/26 + `file_api_test`、L2 FIO verify/plain smoke
+> `error=0` 且 closure 闭合、L3 readrandom A/B HFS 69.9–72.8K vs native 68.4–69.5K
+> 无回退。证据：`/mnt/hfs-data/hfs2-mysql-baseline-20260924/shard103/`。
+> 补丁：`mysql/patches/hfs_seam_shard101b.patch`（2662 行 / 33 文件，含 `mysqld.cc`
+> 信号转发钩子）。
+
 **目标**：让 InnoDB 多后台线程（page cleaner、log writer、AIO handler、purge、DDL）
 在 HFS 上有确定的生命周期。
 
@@ -332,6 +355,7 @@ namespace barrier；不得以 MySQL 收益换取 RocksDB 回退。
 | `File::sync` 无 data-only barrier | redo per-commit 延迟 | Shard-105 组提交先行；core 改动必须过 L4 |
 | 绕过点遗漏 | datadir 文件落宿主/失败 | 审计清单 + 运行期 strace 校验（每 shard） |
 | 线程/停机顺序缺陷 | 挂起/UAF | Shard-103 registry + ASAN/TSAN |
+| SPDK 线程空信号掩码 | SIGTERM 默认动作杀死 mysqld、跳过停机 | Shard-103 转发到 `sig_handler`（已实现） |
 | 上游 rebase 冲突 | 维护成本 | 改动限定 seam + 7 绕过点 + 独立 patch 目录 |
 | fork/初始化顺序 | bootstrap 失败 | install/initialize 与 server 串行；禁 `--daemonize` |
 | GPLv2 fork | 对外分发合规 | 内部使用可接受；对外需合规评审 |

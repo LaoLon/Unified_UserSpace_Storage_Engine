@@ -1775,12 +1775,18 @@ seam 位于 `storage/innobase/os/os0file.cc`（审计 §5.1）：
 - InnoDB 后台线程（page cleaner、log writer、AIO handler、purge、DDL 等）使用
   per-thread `hfs::Client`：拥有线程自建自关；被 context 抢先 retire 的 thread-local
   析构必须为 no-op；
+- 打开的 `File` 由进程级 owner client 持有，线程退出时不携带打开文件，保证
+  per-thread client 可干净 retire；
 - 停机顺序：停新提交 → drain outstanding → close Client → 停 dispatcher →
   `Engine::stop()`；任一层失败 fail-closed，不半量回落；
 - 资源上限：线程数 × `maxOutstanding` × 队列容量按配置校验；建链失败回落共享
   dispatcher 并计数/日志；
 - `Engine::stop()` 在仍有 client/open file/outstanding 时返回 `Busy`，由 adapter
-  有界重试。
+  有界重试；
+- 信号：SPDK/DPDK 线程以空信号掩码运行，进程级 SIGTERM/SIGINT/SIGHUP/SIGQUIT
+  会被投递到这些线程；seam 必须在 mysqld 的 `start_signal_handler()` 之后安装转发
+  handler（`my_init_signals` 会重置 SIGHUP/SIGTERM/SIGUSR1），把信号
+  `pthread_kill` 到 `sig_handler` 线程，使 mysqld 的 `sigwait` 路径触发正常停机。
 
 ### 20.5 配置与构建
 

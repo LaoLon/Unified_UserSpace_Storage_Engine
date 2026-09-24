@@ -579,10 +579,22 @@ index 9ea4f535..5914918b 100644
  
  end:
 diff --git a/sql/mysqld.cc b/sql/mysqld.cc
-index c8a7d00b..fe9967f5 100644
+index c8a7d00b..ce5157d5 100644
 --- a/sql/mysqld.cc
 +++ b/sql/mysqld.cc
-@@ -5562,7 +5562,13 @@ static int flush_auto_options(const char *fname) {
+@@ -1591,6 +1591,11 @@ mysql_mutex_t LOCK_log_throttle_qni;
+ mysql_rwlock_t LOCK_sys_init_connect, LOCK_sys_init_replica;
+ mysql_rwlock_t LOCK_system_variables_hash;
+ my_thread_handle signal_thread_id;
++#ifndef _WIN32
++namespace hfs_vfs {
++void installSignalForwarding();
++}  // namespace hfs_vfs
++#endif
+ sigset_t mysqld_signal_mask;
+ my_thread_attr_t connection_attrib;
+ mysql_mutex_t LOCK_server_started;
+@@ -5562,7 +5567,13 @@ static int flush_auto_options(const char *fname) {
    my_b_printf(&io_cache, "%s\n", "[auto]");
    my_b_printf(&io_cache, "server-uuid=%s\n", server_uuid);
  
@@ -597,7 +609,7 @@ index c8a7d00b..fe9967f5 100644
  
    my_close(fd, MYF(MY_WME));
    end_io_cache(&io_cache);
-@@ -5617,10 +5623,13 @@ static int init_server_auto_options() {
+@@ -5617,10 +5628,13 @@ static int init_server_auto_options() {
  
    /* load all options in 'auto.cnf'. */
    MEM_ROOT alloc{PSI_NOT_INSTRUMENTED, 512};
@@ -613,7 +625,7 @@ index c8a7d00b..fe9967f5 100644
  
    DBUG_PRINT("info", ("uuid=%p=%s server_uuid=%s", uuid, uuid, server_uuid));
    if (uuid) {
-@@ -5647,7 +5656,9 @@ static int init_server_auto_options() {
+@@ -5647,7 +5661,9 @@ static int init_server_auto_options() {
      DBUG_PRINT("info", ("generating server_uuid"));
      flush = true;
      /* server_uuid will be set in the function */
@@ -624,7 +636,7 @@ index c8a7d00b..fe9967f5 100644
      DBUG_PRINT("info", ("generated server_uuid=%s", server_uuid));
      if (opt_initialize || opt_initialize_insecure) {
        LogErr(INFORMATION_LEVEL, ER_CREATING_NEW_UUID_FIRST_START, server_uuid);
-@@ -5657,7 +5668,11 @@ static int init_server_auto_options() {
+@@ -5657,7 +5673,11 @@ static int init_server_auto_options() {
      }
    }
  
@@ -637,6 +649,14 @@ index c8a7d00b..fe9967f5 100644
    return 0;
  err:
    return 1;
+@@ -8173,6 +8193,7 @@ int mysqld_main(int argc, char **argv)
+ #ifndef _WIN32
+   //  Start signal handler thread.
+   start_signal_handler();
++  hfs_vfs::installSignalForwarding();
+ #endif
+   if (opt_authentication_policy &&
+       validate_authentication_policy(opt_authentication_policy)) {
 diff --git a/storage/innobase/CMakeLists.txt b/storage/innobase/CMakeLists.txt
 index 926a3672..2df12804 100644
 --- a/storage/innobase/CMakeLists.txt
@@ -826,20 +846,23 @@ index aa6af051..7953d90f 100644
    handlerton *innobase_hton = (handlerton *)p;
 diff --git a/storage/innobase/os/hfs_vfs.cc b/storage/innobase/os/hfs_vfs.cc
 new file mode 100644
-index 00000000..ddb8bce1
+index 00000000..92527555
 --- /dev/null
 +++ b/storage/innobase/os/hfs_vfs.cc
-@@ -0,0 +1,1096 @@
+@@ -0,0 +1,1263 @@
 +/* HFS-backed InnoDB os_file seam implementation (Phase 7, Shard-101). */
 +#include "hfs_vfs.h"
 +
++#include <atomic>
 +#include <cerrno>
++#include <csignal>
 +#include <cstdio>
 +#include <cstdlib>
 +#include <cstring>
 +#include <fcntl.h>
 +#include <memory>
 +#include <mutex>
++#include <pthread.h>
 +#include <string>
 +#include <string_view>
 +#include <unistd.h>
@@ -848,6 +871,11 @@ index 00000000..ddb8bce1
 +#include "hfs/config.hpp"
 +#include "hfs/core.hpp"
 +#include "hfs/file.hpp"
++#include "my_thread.h"
++
++/* mysqld defines this in sql/mysqld.cc; the weak reference keeps non-server
++ * binaries (mysql, mysqladmin, ...) linkable. */
++extern my_thread_handle signal_thread_id __attribute__((weak));
 +
 +namespace hfs_vfs {
 +namespace {
@@ -878,6 +906,16 @@ index 00000000..ddb8bce1
 +  std::unique_ptr<hfs::Engine> engine;
 +  std::once_flag initOnce;
 +  std::mutex mutex;
++  /* Thread-client registry and shutdown fence (Shard-103). */
++  std::atomic<bool> stopping{false};
++  std::mutex clientsMutex;
++  std::vector<std::weak_ptr<hfs::Client>> clients;
++  std::shared_ptr<hfs::Client> sharedClient;
++  /* Owns every opened File so a thread can exit without open files. */
++  std::shared_ptr<hfs::Client> fileClient;
++  std::mutex fileClientMutex;
++  std::atomic<std::uint64_t> threadClients{0};
++  std::atomic<std::uint64_t> fallbackClients{0};
 +  struct Entry {
 +    std::shared_ptr<hfs::File> file;
 +    std::uint64_t position = 0;
@@ -886,12 +924,31 @@ index 00000000..ddb8bce1
 +  std::vector<int> freeHandles;
 +};
 +
++/* Leaked on purpose: thread-local destructors may run after static teardown. */
 +BridgeState &state() {
-+  static BridgeState bridge;
-+  return bridge;
++  static BridgeState *bridge = new BridgeState();
++  return *bridge;
 +}
 +
-+thread_local std::shared_ptr<hfs::Client> t_client;
++/* Upper bound on per-thread clients; beyond it threads share one client. */
++constexpr std::uint64_t kMaxThreadClients = 256;
++
++/* Owns one thread's client and closes it when the thread exits. */
++struct ThreadClientHolder {
++  std::shared_ptr<hfs::Client> client;
++
++  ~ThreadClientHolder() {
++    if (client && !state().stopping.load(std::memory_order_acquire)) {
++      auto result = client->close().wait().value();
++      if (!result.ok()) {
++        std::fprintf(stderr, "hfs_vfs: thread client close failed: %s\n",
++                     result.message().c_str());
++      }
++    }
++  }
++};
++
++thread_local std::unique_ptr<ThreadClientHolder> t_holder;
 +
 +void setErrno(hfs::Status status) {
 +  switch (status) {
@@ -1008,20 +1065,64 @@ index 00000000..ddb8bce1
 +  return true;
 +}
 +
++/* One process-wide owner for opened File handles: files stay alive across the
++ * opening thread and are closed at shutdown, so per-thread clients can always
++ * retire cleanly. */
++std::shared_ptr<hfs::Client> fileOwnerClient() {
++  BridgeState &bridge = state();
++  if (!bridge.enabled || bridge.stopping.load(std::memory_order_acquire)) {
++    return nullptr;
++  }
++  std::lock_guard<std::mutex> lock(bridge.fileClientMutex);
++  if (bridge.fileClient == nullptr) {
++    auto created = hfs::Client::create(*bridge.engine, hfs::ClientOptions{});
++    if (!created.ok()) {
++      return nullptr;
++    }
++    bridge.fileClient = created.value();
++  }
++  return bridge.fileClient;
++}
++
 +std::shared_ptr<hfs::Client> threadClient() {
-+  if (t_client) {
-+    return t_client;
++  if (t_holder && t_holder->client) {
++    return t_holder->client;
 +  }
 +  BridgeState &bridge = state();
-+  if (!bridge.enabled || bridge.engine == nullptr) {
++  if (!bridge.enabled || bridge.engine == nullptr ||
++      bridge.stopping.load(std::memory_order_acquire)) {
 +    return nullptr;
++  }
++  if (bridge.threadClients.load(std::memory_order_relaxed) >=
++      kMaxThreadClients) {
++    /* Resource bound: share one client instead of unbounded per-thread ones. */
++    std::lock_guard<std::mutex> lock(bridge.clientsMutex);
++    if (bridge.sharedClient == nullptr) {
++      auto created = hfs::Client::create(*bridge.engine, hfs::ClientOptions{});
++      if (!created.ok()) {
++        return nullptr;
++      }
++      bridge.sharedClient = created.value();
++      std::fprintf(
++          stderr,
++          "hfs_vfs: thread client limit %llu reached, sharing one client\n",
++          static_cast<unsigned long long>(kMaxThreadClients));
++    }
++    bridge.fallbackClients.fetch_add(1, std::memory_order_relaxed);
++    return bridge.sharedClient;
 +  }
 +  auto created = hfs::Client::create(*bridge.engine, hfs::ClientOptions{});
 +  if (!created.ok()) {
 +    return nullptr;
 +  }
-+  t_client = created.value();
-+  return t_client;
++  {
++    std::lock_guard<std::mutex> lock(bridge.clientsMutex);
++    bridge.clients.push_back(created.value());
++  }
++  bridge.threadClients.fetch_add(1, std::memory_order_relaxed);
++  t_holder = std::make_unique<ThreadClientHolder>();
++  t_holder->client = created.value();
++  return created.value();
 +}
 +
 +int registerHandle(const std::shared_ptr<hfs::File> &file) {
@@ -1101,9 +1202,53 @@ index 00000000..ddb8bce1
 +  return path.substr(0, slash);
 +}
 +
++/* SPDK/DPDK threads run with an empty signal mask, so a process-directed
++ * SIGTERM/SIGINT/SIGHUP/SIGQUIT would kill mysqld via the default action
++ * instead of reaching mysqld's sigwait() handler thread. Forward such signals
++ * to that thread, where they stay pending until sigwait() consumes them. */
++void forwardTerminationSignal(int signum) {
++  if (&signal_thread_id == nullptr) {
++    return; /* not a mysqld process */
++  }
++  const my_thread_t target = signal_thread_id.thread;
++  if (target == 0) {
++    /* mysqld's signal thread is not up yet: behave like the default action. */
++    struct sigaction action;
++    std::memset(&action, 0, sizeof(action));
++    action.sa_handler = SIG_DFL;
++    (void)sigaction(signum, &action, nullptr);
++    (void)raise(signum);
++    return;
++  }
++  if (pthread_self() == target) {
++    return; /* already on the signal thread; sigwait() owns delivery */
++  }
++  (void)pthread_kill(target, signum);
++}
++
 +} // namespace
 +
 +bool isHfsHandle(int handle) { return handle >= kHandleBase; }
++
++/* Installs forwarding handlers when running inside mysqld. Called after
++ * mysqld's own signal setup, which resets SIGHUP/SIGTERM/SIGUSR1 to SIG_DFL. */
++void installSignalForwarding() {
++  if (&signal_thread_id == nullptr) {
++    return;
++  }
++  struct sigaction action;
++  std::memset(&action, 0, sizeof(action));
++  action.sa_handler = forwardTerminationSignal;
++  sigemptyset(&action.sa_mask);
++  action.sa_flags = SA_RESTART;
++  const int signals[] = {SIGHUP,  SIGINT,  SIGQUIT, SIGTERM,
++                         SIGUSR1, SIGUSR2, SIGTSTP};
++  for (const int signum : signals) {
++    (void)sigaction(signum, &action, nullptr);
++  }
++  std::fprintf(stderr,
++               "hfs_vfs: termination signals forwarded to sig_handler\n");
++}
 +
 +bool init() {
 +  std::call_once(state().initOnce, [] {
@@ -1155,9 +1300,45 @@ index 00000000..ddb8bce1
 +  if (!bridge.enabled || bridge.engine == nullptr) {
 +    return;
 +  }
-+  if (t_client) {
-+    t_client->close().wait();
-+    t_client.reset();
++  /* Fence new submissions and per-thread client creation first. */
++  bridge.stopping.store(true, std::memory_order_release);
++  if (t_holder && t_holder->client) {
++    auto result = t_holder->client->close().wait().value();
++    if (!result.ok()) {
++      std::fprintf(stderr, "hfs_vfs: shutdown close failed: %s\n",
++                   result.message().c_str());
++    }
++    t_holder->client.reset();
++  }
++  {
++    std::lock_guard<std::mutex> lock(bridge.clientsMutex);
++    for (const std::weak_ptr<hfs::Client> &weak : bridge.clients) {
++      std::shared_ptr<hfs::Client> client = weak.lock();
++      if (client == nullptr) {
++        continue;
++      }
++      auto result = client->close().wait().value();
++      if (!result.ok()) {
++        std::fprintf(stderr, "hfs_vfs: shutdown client close failed: %s\n",
++                     result.message().c_str());
++      }
++    }
++    bridge.clients.clear();
++    if (bridge.sharedClient != nullptr) {
++      bridge.sharedClient->close().wait();
++      bridge.sharedClient.reset();
++    }
++  }
++  {
++    std::lock_guard<std::mutex> lock(bridge.fileClientMutex);
++    if (bridge.fileClient != nullptr) {
++      auto result = bridge.fileClient->close().wait().value();
++      if (!result.ok()) {
++        std::fprintf(stderr, "hfs_vfs: shutdown file client close failed: %s\n",
++                     result.message().c_str());
++      }
++      bridge.fileClient.reset();
++    }
 +  }
 +  {
 +    std::lock_guard<std::mutex> lock(bridge.mutex);
@@ -1170,6 +1351,12 @@ index 00000000..ddb8bce1
 +                 stopped.message().c_str());
 +  }
 +  bridge.enabled = false;
++  std::fprintf(
++      stderr, "hfs_vfs: shutdown complete (thread_clients=%llu fallback=%llu)\n",
++      static_cast<unsigned long long>(
++          bridge.threadClients.load(std::memory_order_relaxed)),
++      static_cast<unsigned long long>(
++          bridge.fallbackClients.load(std::memory_order_relaxed)));
 +  /* The engine object is intentionally kept alive until process exit so that
 +   * late thread-local client destructors never observe a freed engine. */
 +}
@@ -1236,7 +1423,7 @@ index 00000000..ddb8bce1
 +    errno = ENOENT;
 +    return -1;
 +  }
-+  auto client = threadClient();
++  auto client = fileOwnerClient();
 +  if (!client) {
 +    errno = EIO;
 +    return -1;
@@ -1645,7 +1832,7 @@ index 00000000..ddb8bce1
 +    errno = ENOENT;
 +    return -1;
 +  }
-+  auto client = threadClient();
++  auto client = fileOwnerClient();
 +  if (!client) {
 +    errno = EIO;
 +    return -1;
@@ -1928,10 +2115,10 @@ index 00000000..ddb8bce1
 +} // namespace hfs_vfs
 diff --git a/storage/innobase/os/hfs_vfs.h b/storage/innobase/os/hfs_vfs.h
 new file mode 100644
-index 00000000..c377628e
+index 00000000..554926c1
 --- /dev/null
 +++ b/storage/innobase/os/hfs_vfs.h
-@@ -0,0 +1,84 @@
+@@ -0,0 +1,88 @@
 +/* HFS-backed InnoDB os_file seam (Phase 7, Shard-101).
 + *
 + * Standalone bridge between MySQL's os_file layer and the HFS C++ core. The
@@ -1956,6 +2143,10 @@ index 00000000..c377628e
 + * Returns true when the bridge is enabled. */
 +bool init();
 +void shutdown();
++
++/* Re-installs termination signal forwarding after mysqld's own signal setup
++ * (my_init_signals/start_signal_handler reset SIGHUP/SIGTERM/SIGUSR1). */
++void installSignalForwarding();
 +
 +/* True when the bridge is enabled and the host path is below HFS_MYSQL_PREFIX
 + * (default "/hfs"); the HFS namespace path is the prefix-stripped remainder. */
