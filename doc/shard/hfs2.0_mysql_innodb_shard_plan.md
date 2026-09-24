@@ -192,6 +192,19 @@ HFS 是单进程、单 engine、bdev 独占；MySQL 与 RocksDB 不会同进程/
 
 > 来源：Shard-101 收尾时发现 server 层 DD 校验走宿主 syscall
 > （`access(".//mysql.ibd", F_OK)` → ENOENT），`--initialize` 后无法正常启动。
+>
+> 状态：进行中（2026-09-24）。已实现：mysys 路由（`my_open/my_create/my_close/
+> my_read/my_write/my_sync/my_seek/my_chsize/my_stat/my_fstat/my_access/my_realpath/
+> my_delete/my_rename/my_mkdir/my_setwd`）；`my_access` 在 POSIX 上从宏改为真实函数
+> （`mysys/my_hfs_access.cc`）；`hfs_vfs` 迁入 mysys 编译（修复 `comp_err` 等工具链
+> 链接），C++20 编译 + 全局 `libhfs_core` 链接与 build rpath；`my_setwd` 记录逻辑
+> HFS cwd 供相对路径解析。构建 `build_rc=0`；datadir 宿主目录不再被创建（路由生效），
+> `Failed to set datadir` 已消除。
+> 当前阻塞：`--initialize` 在 HFS 挂载后于 auto.cnf UUID 读取/写入处失败
+> （`MY-010076`，`/mnt/hfs-data/hfs2-mysql-baseline-20260924/shard101/init3.*`）；
+> 下一步定位 auto.cnf 的 `my_stat/my_open/my_read/my_write` 组合语义，随后执行
+> start/stop 与第二实例 Busy 验收。
+> 补丁：`mysql/patches/hfs_seam_shard101b.patch`（累积，含 Shard-101 与 101B）。
 
 **目标**：让 mysys 文件 API 对 HFS 前缀路径路由到同一 `hfs_vfs`，使 `mysqld`
 正常启停、第二实例 Busy、datadir 不再出现 server 层宿主文件。
