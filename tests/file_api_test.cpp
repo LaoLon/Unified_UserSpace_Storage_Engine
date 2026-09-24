@@ -71,6 +71,41 @@ int main() {
             auto dirOk = client->open("/db", OpenFlags::Directory).wait().value();
             HFS_TEST_CHECK(dirOk.ok());
 
+            /* 2b. path stat and recursive mkdir (Phase 7 Shard-100) */
+            auto missingStat = client->stat("/db/none").wait().value();
+            HFS_TEST_CHECK(!missingStat.ok() &&
+                           missingStat.status() == Status::NotFound);
+            auto filePathStat = client->stat("/db/FILE-000001").wait().value();
+            HFS_TEST_CHECK(filePathStat.ok() && !filePathStat.value().directory);
+            auto dirPathStat = client->stat("/db").wait().value();
+            HFS_TEST_CHECK(dirPathStat.ok() && dirPathStat.value().directory);
+            auto rootPathStat = client->stat("/").wait().value();
+            HFS_TEST_CHECK(rootPathStat.ok() && rootPathStat.value().directory);
+
+            HFS_TEST_CHECK(client->createDirectories("/a/b/c").wait().value().ok());
+            HFS_TEST_CHECK(client->createDirectories("/a/b/c").wait().value().ok());
+            auto nestedStat = client->stat("/a/b/c").wait().value();
+            HFS_TEST_CHECK(nestedStat.ok() && nestedStat.value().directory);
+            auto nestedChildren = client->getChildren("/a/b", "", 8).wait().value();
+            HFS_TEST_CHECK(nestedChildren.ok() &&
+                           nestedChildren.value().entries.size() == 1);
+            HFS_TEST_CHECK(nestedChildren.value().entries[0].name == "c");
+            HFS_TEST_CHECK(client->createDirectories("/").wait().value().ok());
+            auto relativeMkdir = client->createDirectories("a/b").wait().value();
+            HFS_TEST_CHECK(!relativeMkdir.ok() &&
+                           relativeMkdir.status() == Status::InvalidArgument);
+            auto trailingMkdir = client->createDirectories("/a/b/").wait().value();
+            HFS_TEST_CHECK(!trailingMkdir.ok() &&
+                           trailingMkdir.status() == Status::InvalidArgument);
+            /* A regular file component fails closed without replacing it. */
+            auto fileConflict =
+                client->createDirectories("/db/FILE-000001/sub").wait().value();
+            HFS_TEST_CHECK(!fileConflict.ok() &&
+                           fileConflict.status() == Status::AlreadyExists);
+            auto fileConflictStat = client->stat("/db/FILE-000001").wait().value();
+            HFS_TEST_CHECK(fileConflictStat.ok() &&
+                           !fileConflictStat.value().directory);
+
             /* 3. ordered pages and rename through the path API */
             for (int i = 2; i <= 5; ++i) {
                 const std::string path = "/db/FILE-00000" + std::to_string(i);

@@ -1008,6 +1008,11 @@ public:
     Task<Result<DirectoryPage>> getChildren(std::string_view path,
                                             std::string_view cursor,
                                             std::size_t maxEntries);
+    /* Path-based metadata lookup without opening a handle. */
+    Task<Result<FileStat>> stat(std::string_view path);
+    /* Creates every missing directory component; existing directories are
+     * accepted and a non-directory component fails closed. */
+    Task<Result<void>> createDirectories(std::string_view path);
     Result<IoHandle> submitRead(const std::shared_ptr<File>&, IoVec,
                                 std::uint64_t offset, CompletionToken);
     Result<IoHandle> submitWrite(const std::shared_ptr<File>&, IoVec,
@@ -1051,7 +1056,9 @@ public:
 - delete 先摘 namespace，再延迟回收 extent；打开的 File 可完成已有 operation；
 - directory fsync 提交 directory metadata epoch；
 - `max_inodes`、`max_namespace_bytes` 超限返回 NoMemory，不退回磁盘全表扫描；
-- 大目录必须按 shard/hash 维护，`GetChildren` 不扫描全部 namespace。
+- 大目录必须按 shard/hash 维护，`GetChildren` 不扫描全部 namespace；
+- `stat(path)` 不要求打开 handle；`createDirectories` 逐段创建且幂等，遇到非目录
+  组件 fail closed（Phase 7 起供 InnoDB adapter 使用）。
 
 ### 13.3 内存元数据模型
 

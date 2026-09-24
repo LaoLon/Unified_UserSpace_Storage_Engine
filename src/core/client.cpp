@@ -827,6 +827,66 @@ Task<Result<DirectoryPage>> Client::getChildren(std::string_view path,
     co_return state.namespaceState->getChildren(path, cursor, maxEntries);
 }
 
+/* Resolves metadata for a namespace path without keeping an open handle. */
+Task<Result<FileStat>> Client::stat(std::string_view path) {
+    auto &state = *impl_->state;
+    auto valid = validateClient(state);
+    if (!valid.ok()) {
+        co_return makeError<FileStat>(valid.status(), valid.message());
+    }
+    if (path.size() == 1 && path.front() == '/') {
+        /* The root inode has no parent entry; stat it through a short-lived
+         * open handle so root and non-root paths share one code path. */
+        auto handle = state.namespaceState->open(path);
+        if (!handle.ok()) {
+            co_return makeError<FileStat>(handle.status(), handle.message());
+        }
+        auto result = state.namespaceState->stat(handle.value());
+        state.namespaceState->close(handle.value());
+        co_return result;
+    }
+    co_return state.namespaceState->stat(path);
+}
+
+/* Creates missing directory components one by one; existing directories are
+ * reused and a non-directory component fails without creating anything after
+ * it. Each step is atomic inside the namespace lock of create(). */
+Task<Result<void>> Client::createDirectories(std::string_view path) {
+    auto &state = *impl_->state;
+    auto valid = validateClient(state);
+    if (!valid.ok()) {
+        co_return makeError(valid.status(), valid.message());
+    }
+    if (path.empty() || path.front() != '/') {
+        co_return makeError(Status::InvalidArgument, "path must be absolute");
+    }
+    if (path.size() == 1) {
+        co_return Result<void>(Status::Ok); /* root always exists */
+    }
+    if (path.back() == '/') {
+        co_return makeError(Status::InvalidArgument, "trailing slash is not allowed");
+    }
+    std::size_t start = 1;
+    while (start < path.size()) {
+        std::size_t slash = path.find('/', start);
+        if (slash == std::string_view::npos) {
+            slash = path.size();
+        }
+        const std::string_view prefix = path.substr(0, slash);
+        Result<FileHandle> handle =
+            state.namespaceState->create(prefix, false, false, true);
+        if (!handle.ok()) {
+            co_return makeError(handle.status(), handle.message());
+        }
+        auto closed = state.namespaceState->close(handle.value());
+        if (!closed.ok()) {
+            co_return closed;
+        }
+        start = slash + 1;
+    }
+    co_return Result<void>(Status::Ok);
+}
+
 File::File(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 
 File::~File() = default;

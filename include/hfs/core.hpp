@@ -180,6 +180,11 @@ public:
     Task<Result<DirectoryPage>> getChildren(std::string_view path,
                                             std::string_view cursor,
                                             std::size_t maxEntries);
+    /* Path-based metadata lookup without opening a handle. */
+    Task<Result<FileStat>> stat(std::string_view path);
+    /* Creates every missing directory component of an absolute path; existing
+     * directories are accepted and a non-directory component fails closed. */
+    Task<Result<void>> createDirectories(std::string_view path);
 
 private:
     explicit Client(Engine &engine, const ClientOptions &options);

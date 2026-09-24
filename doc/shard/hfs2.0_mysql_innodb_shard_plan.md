@@ -2,7 +2,7 @@
 
 > 日期：2026-09-24
 >
-> 状态：执行中；Shard-99 已完成（2026-09-24），进入 Shard-100
+> 状态：执行中；Shard-99 已完成（2026-09-24）、Shard-100 已完成（2026-09-24），进入 Shard-101
 >
 > 事实源：`doc/design/hfs2.0.md`（Phase 7 范围、契约与禁用项以更新后的设计为准）
 >
@@ -119,6 +119,15 @@ HFS 是单进程、单 engine、bdev 独占；MySQL 与 RocksDB 不会同进程/
 **不做**：任何 `os_file`/HFS API 改动。
 
 ### Shard-100：HFS 侧 API 补齐（纯加法）
+
+> 状态：已完成（2026-09-24）。新增 `Client::stat(path)`（含根路径）与
+> `Client::createDirectories(path)`；`file_api_test` 覆盖缺失路径/类型/根路径/幂等/
+> 相对路径/尾斜杠/文件组件冲突；设计 §13.1/§13.2 已同步。VM CTest 26/26、
+> `file_api_test` ok；L3 readrandom A/B 与 Shard-99 基线同口径无回退
+> （HFS 69.9–72.1K vs 基线 68.7–72.4K，p50 111–115 µs，全部干净退出）。
+> 锁与 statvfs 按计划复用宿主锁文件与现有
+> `Engine::freeDataBytes/deviceBlockSize/deviceCapacityBytes`，不新增 core API。
+> 证据：`/mnt/hfs-data/hfs2-mysql-baseline-20260924/shard100/`。
 
 **目标**：补齐审计 §6.6 的缺口，为 seam 提供最小依赖。
 
