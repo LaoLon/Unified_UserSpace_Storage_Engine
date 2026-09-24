@@ -2,7 +2,7 @@
 
 > 日期：2026-09-24
 >
-> 状态：执行中；Shard-99 已完成（2026-09-24）、Shard-100 已完成（2026-09-24），进入 Shard-101
+> 状态：执行中；Shard-99/100 已完成（2026-09-24）、Shard-101 进行中（实现已落地并构建通过）
 >
 > 事实源：`doc/design/hfs2.0.md`（Phase 7 范围、契约与禁用项以更新后的设计为准）
 >
@@ -144,6 +144,17 @@ HFS 是单进程、单 engine、bdev 独占；MySQL 与 RocksDB 不会同进程/
 **不做**：data-only `datasync`、punch hole（分别在 Shard-105/不做）。
 
 ### Shard-101：InnoDB os_file seam 与路径路由（读路径闭环）
+
+> 状态：进行中（2026-09-24）。MySQL fork 新增 `storage/innobase/os/hfs_vfs.{h,cc}`
+> （engine 生命周期、路径路由含相对路径/CWD 归一化、handle 表、同步门面），
+> `os0file.cc` 24 处 dispatch + `Dir_Walker::walk_posix` 递归扫描路由，innobase CMake
+> 加入 C++20 编译与 `libhfs_core` 链接，`innodb_init`/`innodb_shutdown` 生命周期钩子；
+> `mysqld` 构建通过，`--initialize` 在 HFS datadir 上执行，InnoDB 文件（ibdata1/
+> mysql.ibd/undo/dblwr/#innodb_redo）不再落宿主，host datadir 仅剩 server 层
+> `auto.cnf`/证书/空目录。补丁：`mysql/patches/hfs_seam_shard101.patch`（+240 行，
+> 另含两个新文件）。待办：确认 initialize 干净退出码、mysqld start/stop、第二实例
+> Busy、L1–L3 回归；已知边界：`posix_fallocate` 告警（Shard-102）、server 层文件落
+> 宿主（Shard-102）、TLS client "destroyed with live work" 告警（Shard-103）。
 
 **目标**：让 InnoDB 的 open/read/size/status/dir 全部经过 HFS，形成最小可启动闭环。
 
