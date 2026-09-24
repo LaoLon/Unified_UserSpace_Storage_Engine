@@ -171,7 +171,7 @@ index 2fa23026..06058ffd 100644
    DBUG_TRACE;
  
 diff --git a/mysys/my_create.cc b/mysys/my_create.cc
-index b50ecf6b..8d0115d3 100644
+index b50ecf6b..c74746ba 100644
 --- a/mysys/my_create.cc
 +++ b/mysys/my_create.cc
 @@ -31,6 +31,7 @@
@@ -182,7 +182,7 @@ index b50ecf6b..8d0115d3 100644
  
  #include "my_sys.h"
  #if defined(_WIN32)
-@@ -63,6 +64,14 @@
+@@ -63,6 +64,15 @@
  
  File my_create(const char *FileName, int CreateFlags, int AccessFlags,
                 myf MyFlags) {
@@ -190,6 +190,7 @@ index b50ecf6b..8d0115d3 100644
 +    File hfsFd =
 +        hfs_vfs::openPath(FileName, O_RDWR | O_CREAT | O_EXCL, AccessFlags);
 +    if (hfsFd < 0) {
++      fprintf(stderr, "HFSDBG my_create fail %s errno=%d\n", FileName, errno);
 +      set_my_errno(errno);
 +    }
 +    return (hfsFd);
@@ -532,7 +533,7 @@ index 552f9cab..6a516fbe 100644
    DBUG_TRACE;
    DBUG_PRINT("my", ("Fd: %d  my_flags: %d", fd, my_flags));
 diff --git a/mysys/my_write.cc b/mysys/my_write.cc
-index 79f34593..324d7bf4 100644
+index 79f34593..41d2e9bb 100644
 --- a/mysys/my_write.cc
 +++ b/mysys/my_write.cc
 @@ -31,6 +31,7 @@
@@ -543,7 +544,7 @@ index 79f34593..324d7bf4 100644
  
  #include <errno.h>
  #include <stddef.h>
-@@ -77,6 +78,17 @@ ssize_t (*mock_write)(int fd, const void *buf, size_t count) = nullptr;
+@@ -77,6 +78,19 @@ ssize_t (*mock_write)(int fd, const void *buf, size_t count) = nullptr;
      On failure, (size_t)-1 == MY_FILE_ERROR
  */
  size_t my_write(File Filedes, const uchar *Buffer, size_t Count, myf MyFlags) {
@@ -551,6 +552,8 @@ index 79f34593..324d7bf4 100644
 +    std::size_t hfsDone = 0;
 +    const int hfsRc = hfs_vfs::writeHandle(Filedes, Buffer, Count, &hfsDone);
 +    if (hfsRc != 0 || hfsDone != Count) {
++      fprintf(stderr, "HFSDBG my_write fail fd=%d rc=%d done=%zu want=%zu errno=%d\n",
++              Filedes, hfsRc, hfsDone, Count, errno);
 +      if (hfsRc == 0) errno = EIO;
 +      set_my_errno(errno);
 +      return (MY_FILE_ERROR);
@@ -561,6 +564,25 @@ index 79f34593..324d7bf4 100644
    int64_t sum_written = 0;
    uint errors = 0;
    const size_t initial_count = Count;
+diff --git a/sql/auth/sql_authentication.cc b/sql/auth/sql_authentication.cc
+index 9ea4f535..9b8da728 100644
+--- a/sql/auth/sql_authentication.cc
++++ b/sql/auth/sql_authentication.cc
+@@ -5805,10 +5805,12 @@ bool create_RSA_key_pair(RSA_generator_func &rsa_gen,
+   }
+   DBUG_EXECUTE_IF("valid_key_temp_files", DBUG_SUICIDE(););
+ 
+-  rename(temp_priv_key_filename.c_str(), priv_key_filename.c_str());
++  my_rename(temp_priv_key_filename.c_str(), priv_key_filename.c_str(),
++            MYF(MY_WME));
+   DBUG_EXECUTE_IF("valid_pub_key_temp_file_valid_priv_key_file",
+                   DBUG_SUICIDE(););
+-  rename(temp_pub_key_filename.c_str(), pub_key_filename.c_str());
++  my_rename(temp_pub_key_filename.c_str(), pub_key_filename.c_str(),
++            MYF(MY_WME));
+   DBUG_EXECUTE_IF("valid_key_files", DBUG_SUICIDE(););
+ 
+ end:
 diff --git a/sql/mysqld.cc b/sql/mysqld.cc
 index c8a7d00b..0b1a8094 100644
 --- a/sql/mysqld.cc
