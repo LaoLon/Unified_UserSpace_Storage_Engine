@@ -37,6 +37,7 @@
 #include "hfs/diagnostics.hpp"
 #include "hfs/file.hpp"
 #include "rocksdb/file_system.h"
+#include "rocksdb/version.h"
 
 namespace hfs::rocksdb_adapter {
 
@@ -305,7 +306,11 @@ struct AsyncReadState {
     std::shared_ptr<hfs::File> file;
     rocksdb::FSReadRequest *request = nullptr;
     rocksdb::IOOptions options;
+#if ROCKSDB_MAJOR >= 9
+    std::function<void(rocksdb::FSReadRequest &, void *)> callback;
+#else
     std::function<void(const rocksdb::FSReadRequest &, void *)> callback;
+#endif
     void *callbackArg = nullptr;
     std::mutex mutex;
     std::condition_variable condition;
@@ -1105,7 +1110,7 @@ public:
         void *handle = nullptr;
         rocksdb::IOHandleDeleter deleter = {};
         auto submitted = const_cast<HfsRandomAccessFile *>(this)->ReadAsync(
-            request, options, [](const rocksdb::FSReadRequest &, void *) {}, nullptr,
+            request, options, [](auto &, void *) {}, nullptr,
             &handle, &deleter, debug);
         if (!submitted.ok()) {
             return submitted;
@@ -1139,7 +1144,7 @@ public:
             rocksdb::IOHandleDeleter deleter = {};
             auto status = ReadAsync(
                 request, options,
-                [](const rocksdb::FSReadRequest &, void *) {}, nullptr,
+                [](auto &, void *) {}, nullptr,
                 &handle, &deleter, debug);
             if (!status.ok()) {
                 request.status = status;
@@ -1172,7 +1177,11 @@ public:
     /* Submits a real background read and returns before the HFS coroutine completes. */
     rocksdb::IOStatus ReadAsync(
         rocksdb::FSReadRequest &request, const rocksdb::IOOptions &options,
+#if ROCKSDB_MAJOR >= 9
+        std::function<void(rocksdb::FSReadRequest &, void *)> callback,
+#else
         std::function<void(const rocksdb::FSReadRequest &, void *)> callback,
+#endif
         void *callbackArg, void **ioHandle, rocksdb::IOHandleDeleter *deleter,
         rocksdb::IODebugContext *) override {
         if (ioHandle == nullptr || deleter == nullptr || callback == nullptr) {
@@ -1318,6 +1327,14 @@ public:
         }
         unregisterPending();
     }
+
+#if ROCKSDB_MAJOR >= 9
+    /* Report buffered logical bytes to RocksDB 9's writable-file interface. */
+    std::uint64_t GetFileSize(const rocksdb::IOOptions &,
+                              rocksdb::IODebugContext *) override {
+        return logicalOffset_ + buffer_.size();
+    }
+#endif
 
     /* Copies small appends into the pending buffer; large appends are written
      * through after the buffer is flushed to preserve byte order. */

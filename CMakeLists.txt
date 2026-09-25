@@ -209,6 +209,16 @@ target_include_directories(hfs_trace_dump PRIVATE
 target_compile_options(hfs_trace_dump PRIVATE -fno-exceptions -fno-rtti)
 
 enable_testing()
+# Keep device tests aligned with the checked-in single-device configuration.
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/config/hfs_nvme.conf" HFS_TEST_BDF_LINES
+  REGEX "^[ \t]*pci_bdf[ \t]*=")
+list(LENGTH HFS_TEST_BDF_LINES HFS_TEST_BDF_COUNT)
+if(NOT HFS_TEST_BDF_COUNT EQUAL 1)
+  message(FATAL_ERROR "config/hfs_nvme.conf must declare exactly one pci_bdf for device tests")
+endif()
+list(GET HFS_TEST_BDF_LINES 0 HFS_TEST_BDF_LINE)
+string(REGEX REPLACE "^[ \t]*pci_bdf[ \t]*=[ \t]*([^ \t#]+).*" "\\1"
+  HFS_TEST_PCI_BDF "${HFS_TEST_BDF_LINE}")
 set(HFS_TESTS config_parser_test task_test crc_test geometry_test journal_test)
 if(HFS_WITH_SPDK)
   list(APPEND HFS_TESTS engine_lifecycle_test spdk_runtime_test format_mount_test
@@ -223,7 +233,8 @@ foreach(test_name IN LISTS HFS_TESTS)
     ${CMAKE_CURRENT_SOURCE_DIR}/tests
   )
   target_compile_definitions(${test_name} PRIVATE
-    HFS_DEFAULT_CONF_PATH="${CMAKE_CURRENT_SOURCE_DIR}/config/hfs_nvme.conf")
+    HFS_DEFAULT_CONF_PATH="${CMAKE_CURRENT_SOURCE_DIR}/config/hfs_nvme.conf"
+    HFS_TEST_PCI_BDF="${HFS_TEST_PCI_BDF}")
   add_test(NAME ${test_name} COMMAND ${test_name})
 endforeach()
 
@@ -428,6 +439,8 @@ if(HFS_WITH_SPDK)
     ${CMAKE_CURRENT_SOURCE_DIR}/tests
   )
   target_compile_options(data_path_device_test PRIVATE -fno-exceptions -fno-rtti)
+  target_compile_definitions(data_path_device_test PRIVATE
+    HFS_TEST_PCI_BDF="${HFS_TEST_PCI_BDF}")
   target_link_libraries(data_path_device_test PRIVATE Threads::Threads)
   hfs_link_spdk(data_path_device_test)
   add_test(NAME data_path_device_test COMMAND data_path_device_test)

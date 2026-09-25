@@ -54,7 +54,7 @@ int main() {
         auto parsed = hfs::parseConfigFile(HFS_DEFAULT_CONF_PATH);
         HFS_TEST_CHECK(parsed.ok());
         HFS_TEST_CHECK(parsed.value().devices.size() == 1);
-        HFS_TEST_CHECK(parsed.value().devices[0].pciBdf == "0000:0b:00.0");
+        HFS_TEST_CHECK(parsed.value().devices[0].pciBdf == HFS_TEST_PCI_BDF);
     }
 
     /* 3. unknown key */
@@ -117,7 +117,7 @@ int main() {
     /* 11. missing pci_bdf for uio */
     {
         std::string text = base;
-        HFS_TEST_CHECK(replaceAll(text, "pci_bdf = 0000:0b:00.0\n", ""));
+        HFS_TEST_CHECK(replaceAll(text, std::string("pci_bdf = ") + HFS_TEST_PCI_BDF + "\n", ""));
         HFS_TEST_CHECK(expectInvalid(text, "missing-bdf") == 0);
     }
 
@@ -182,7 +182,7 @@ int main() {
                                   "metadata_replication = 2"));
         text += "\n[device.nvme1]\n"
                 "bdev_name = Nvme1n1\n"
-                "pci_bdf = 0000:0b:00.0\n"
+                "pci_bdf = " HFS_TEST_PCI_BDF "\n"
                 "role = metadata,data\n"
                 "weight = 1\n"
                 "required = true\n";

@@ -1096,6 +1096,18 @@ struct SpdkRuntime::Impl {
             if (call->cb != nullptr) {
                 call->cb(call->cbCtx, rc);
             }
+        } else if (stats::enabled()) {
+            /* Include the synchronous DataPath in accepted device I/O counts. */
+            auto &counters = stats::counters();
+            if (call->write) {
+                counters.bdevDataWriteOps.fetch_add(1, std::memory_order_relaxed);
+                counters.bdevDataWriteBytes.fetch_add(holder->iov.iov_len,
+                                                      std::memory_order_relaxed);
+            } else {
+                counters.bdevDataReadOps.fetch_add(1, std::memory_order_relaxed);
+                counters.bdevDataReadBytes.fetch_add(holder->iov.iov_len,
+                                                     std::memory_order_relaxed);
+            }
         }
         delete call;
     }

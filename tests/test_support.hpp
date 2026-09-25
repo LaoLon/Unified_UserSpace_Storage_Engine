@@ -11,6 +11,11 @@
         }                                                                                \
     } while (0)
 
+/* Device tests use the configured BDF; structure tests do not access a device. */
+#ifndef HFS_TEST_PCI_BDF
+#define HFS_TEST_PCI_BDF ""
+#endif
+
 /* A schema-complete single-device config; lockPath keeps tests isolated. */
 inline std::string validConfigText(const std::string &lockPath,
                                    const std::string &instance = "hfs2-test",
@@ -41,7 +46,7 @@ inline std::string validConfigText(const std::string &lockPath,
            "\n"
            "[device.nvme0]\n"
            "bdev_name = Nvme0n1\n"
-           "pci_bdf = 0000:0b:00.0\n"
+           "pci_bdf = " HFS_TEST_PCI_BDF "\n"
            "role = metadata,data\n"
            "weight = 1\n"
            "required = true\n"

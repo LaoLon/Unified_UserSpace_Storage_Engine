@@ -1386,7 +1386,7 @@ index 00000000..92527555
 +    return false;
 +  }
 +  if (!init()) {
-+    return false;
++    std::_Exit(EXIT_FAILURE); /* Never fall back to the host datadir. */
 +  }
 +  std::string namespacePath;
 +  return toNamespacePath(path, namespacePath);

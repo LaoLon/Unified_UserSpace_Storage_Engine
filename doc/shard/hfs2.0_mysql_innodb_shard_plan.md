@@ -2,7 +2,7 @@
 
 > 日期：2026-09-24
 >
-> 状态：执行中；Shard-99/100/101/101B/102/103 已完成（2026-09-24），进入 Shard-104
+> 状态：Shard-99/100/101/101B/102/103 已完成（2026-09-24）；Shard-104/105 已完成实施与 2026-09-25 当前 VM 验证。Phase 7 总体 85% FIO 性能目标仍未达到，见 `doc/performance/hfs2_mysql_shard104_105_20260925.md`。
 >
 > 事实源：`doc/design/hfs2.0.md`（Phase 7 范围、契约与禁用项以更新后的设计为准）
 >
@@ -40,7 +40,8 @@
 
 1. `make` 与 CMake 均可构建；HFS core 不引用 MySQL 源，MySQL fork 不反向依赖 HFS 内部头；
 2. 新增路径有单测或结构测试，生命周期与资源守恒测试通过；
-3. VM 真实 NVMe（`Nvme0n1`、BDF `0000:0b:00.0`）按 `.conf` 短回归通过；
+3. VM 真实 NVMe（`Nvme0n1`，当前 VM 的 `VMware NVME_0002` 为 BDF
+   `0000:13:00.0`）按 `.conf` 短回归通过；更换 VM 后以 sysfs 拓扑为准；
 4. `spdk_submit == spdk_complete`、errors=0、无 frame/lease/ring/handle 泄漏；
 5. 新增 tracepoint/计数可诊断，trace/stats off 无 per-request 分配；
 6. 结构或恢复门禁失败时不得用性能数字掩盖，按 `hfs2.0.md` §17.3 停止。
@@ -316,6 +317,10 @@ L1–L3 无回退。
 
 **验收**：矩阵全过；禁用项明确拒绝；`hfsctl check` 通过；L1–L3 无回退。
 
+**2026-09-25 结果**：真实 `Nvme0n1` 上功能矩阵与在线 DDL/页写入期间的两次
+SIGKILL 恢复均通过，`hfsctl check` 为 `corruption=none`；具体命令、结果及
+边界见 `doc/performance/hfs2_mysql_shard104_105_20260925.md`。
+
 ### Shard-105：性能与 durability
 
 **目标**：验证 MySQL 性能可接受，同时证明 RocksDB 无回退。
@@ -334,6 +339,13 @@ closure 闭合。
 
 **停止条件**：core 改动导致 RocksDB 回退 >5% → 立即回退该 core 改动，MySQL 维持
 namespace barrier；不得以 MySQL 收益换取 RocksDB 回退。
+
+**2026-09-25 结果**：MySQL 同会话交错基准、`stats=true` 设备 data I/O 归因、
+RocksDB L1–L3 及 L4 功能 smoke 和五组正式 8j4 gate 已执行。当前 VM 的五组
+HFS/raw 中位数约 65.2%，低于 HFS 2.0 总体 85% 目标；本次未实施 data-only
+`datasync`，保留 namespace barrier。同机重建改动前 core 并重跑五组
+8j4 后，HFS IOPS 中位数差异约 +0.10%，本次改动未见 L4 吞吐回退；
+详见同日报告。85% 总体性能目标仍未达到。
 
 ### Shard-106：收口
 

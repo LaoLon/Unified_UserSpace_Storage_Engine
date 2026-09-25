@@ -1234,8 +1234,15 @@ stats = false
 
 `metadata_devices` 和 `data_devices` 使用 `[device.<id>]` 中的逻辑 ID；设备可以只承担
 data，也可以同时承担 metadata。只配置一个 NVMe 时仍使用完全相同的 schema。正式单盘
-baseline 的配置文件为 `config/hfs_nvme.conf`，设备为 `Nvme0n1`、PCI BDF
-`0000:0b:00.0`；多盘测试必须列出实际 device set，不能通过临时环境变量追加设备。
+baseline 的配置文件为 `config/hfs_nvme.conf`，SPDK bdev 名称为 `Nvme0n1`；PCI BDF
+必须按当前 VM 的控制器拓扑填写，多盘测试必须列出实际 device set，不能通过临时环境变量
+追加设备。2026-09-25 当前 VM 的单盘验证目标为序列号 `VMware NVME_0002` 的 20 GiB
+NVMe，PCI BDF `0000:13:00.0`，此时内核设备名为 `/dev/nvme0n1`。内核 `nvmeXn1`
+编号可随启动或绑定变化，验证前必须用 sysfs 的控制器 address 和序列号核对目标盘，
+确认未挂载、无 holder，再绑定给 SPDK；历史 `0000:0b:00.0` 性能结果不直接移用到新盘。
+该 VM 为 6 vCPU；2026-09-25 在 `0000:13:00.0` 上完成 SPDK/HFS 编译与完整
+CTest `26/26`，其中设备测试使用真实 NVMe。该结果只证明当前功能回归通过，不继承旧
+8 vCPU 性能 gate 的吞吐结论。
 engine 用 `[device.*] pci_bdf` 生成 SPDK/DPDK allowlist 并写入 `spdk_env_opts`；`[spdk]`
 只描述 env 驱动和 hugepage 预算，不通过环境变量注入。
 
@@ -1309,7 +1316,7 @@ rw:      read, write, randread, randwrite, randrw
 bs:      4K, 16K, 64K, 1M
 ```
 
-正式性能固定：8 vCPU、真实 NVMe BDF `0000:0b:00.0`、`Nvme0n1`、O_DIRECT、256 MiB、
+2026-09-18 旧 VM 的正式性能口径固定：8 vCPU、真实 NVMe BDF `0000:0b:00.0`、`Nvme0n1`、O_DIRECT、256 MiB、
 shared-file、randrw 50/50、4K/8K/16K/32K/64K、合计 QD=32（HFS 8 jobs × iodepth 4，
 raw 1 job × iodepth 32）、10 秒、5-run median、trace/stats off。2026-09-18 优化复测前
 的 32 jobs × iodepth 1 口径保留为历史对比，不再作为主 gate 形状。HFS 正式 `.conf`
@@ -1792,6 +1799,9 @@ seam 位于 `storage/innobase/os/os0file.cc`（审计 §5.1）：
 
 - MySQL 使用独立 `.conf`（`config/hfs_mysql.conf`），不得修改
   `config/hfs_nvme.conf` 的正式口径；
+- 2026-09-25 当前 VM 的 MySQL 验收使用 `VMware NVME_0002`（`0000:13:00.0`）
+  和 VM 本地 `/home/hfs` 结果目录；历史 `0000:0b:00.0` 测量只作为旧 VM 记录。
+  性能对照必须在同一 VM、同一设备和同一会话重新采集。
 - MySQL fork 在 VM 内通过 Git 获取与维护；HFS core 不引用 MySQL 源码，fork 不反向
   依赖 HFS 内部头文件；补丁集中在 seam 与 §20.2 的绕过点；
 - ABI：Phase 7 只做加法；破坏性变更升 `coreAbiMajor` 并单独评审。
@@ -1806,5 +1816,14 @@ native AIO、页压缩/punch hole、clone、MyISAM/Aria 数据路径、`--daemon
 - MySQL：initialize/bootstrap、启停、SQL/事务/DDL（含 online）、binlog、逻辑备份、
   跨进程 reopen、kill -9 恢复、`mysqlcheck`；
 - HFS：`hfsctl check`、closure（submit==complete）、无 handle/frame/lease 泄漏；
+- 设备 I/O 归因：MySQL 使用的同步 `DataPath` 提交也计入 SPDK data bdev 读写
+  次数和字节；只在独立的 `stats=true` 诊断运行中记录，正式吞吐门禁保持
+  `stats=false`。该计数反映 SPDK 接受的 data I/O，不包含 metadata/journal I/O；
 - 回归：RocksDB/FIO L1–L4 无回退门禁（CTest、FIO smoke、readrandom 同会话 A/B <5%、
   正式 8j4 gate）；具体矩阵见 shard 计划 §0.3/§2。
+
+2026-09-25 当前 VM 的 Shard-104/105 结果见
+`doc/performance/hfs2_mysql_shard104_105_20260925.md`：功能与两处 SIGKILL
+恢复通过；同机重建改动前 core 的五组 8j4 对照未见本次统计改动造成
+>5% 吞吐回退。HFS/raw 中位数约 65.2% 和 p99 约 114.5% 仍未达到
+§16.2 总体性能目标，完整进程级 CPU gate 本轮未采集。
