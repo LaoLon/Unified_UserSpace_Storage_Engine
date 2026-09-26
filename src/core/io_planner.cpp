@@ -13,7 +13,6 @@ Result<IoPlanner::Plan> IoPlanner::plan(const ExtentMap &map, std::uint64_t offs
                                         std::uint64_t length, bool write,
                                         bool allowHoles,
                                         std::uint32_t blockSizeOverride) const {
-    (void)write;
     if (length == 0) {
         return makeError<Plan>(Status::InvalidArgument, "zero-length I/O");
     }
@@ -37,7 +36,7 @@ Result<IoPlanner::Plan> IoPlanner::plan(const ExtentMap &map, std::uint64_t offs
     std::uint64_t cursor = offset;
     const std::uint64_t end = offset + length;
     const std::uint64_t blockSize = blockSizeValue;
-    const bool usePhysicalAlignment = !write && blockSizeOverride != 0;
+    const bool usePhysicalAlignment = blockSizeOverride != 0;
 
     auto pushChild = [&](Child child) -> Result<void> {
         if (usePhysicalAlignment && child.kind == Child::Kind::Direct && plan.count != 0) {

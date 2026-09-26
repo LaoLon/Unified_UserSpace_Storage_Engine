@@ -124,7 +124,7 @@ struct AsyncDataServiceConfig {
     std::size_t maxOperations = 64;
     std::size_t maxInodesPerShard = 64;
     std::size_t maxPreparingPerShard = 0;
-    /* Native device sector used only by the read planner. */
+    /* Native device sector used to plan reads and partial writes. */
     std::uint32_t nativeReadBlockSize = 0;
     IoPlanner::Config planner{};
 };

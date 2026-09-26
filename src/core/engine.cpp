@@ -413,9 +413,24 @@ Task<Result<void>> Engine::mount() {
     plannerConfig.blockSize = metaBlock;
     plannerConfig.maxChildBytes = 1U << 20;
     plannerConfig.maxChildren = 64;
+    /* Use the native-sector planner only when every mounted device has the
+     * same geometry; the baseline is one 512-byte-sector NVMe. Writes planned
+     * at sector granularity avoid read-modify-write for aligned partial writes
+     * (for example InnoDB redo blocks). */
+    std::uint32_t nativeBlockSize = 0;
+    for (std::size_t index = 0; index < runtime.deviceCount(); ++index) {
+        const std::uint32_t deviceBlockSize = runtime.deviceBlockSize(index);
+        if (index == 0) {
+            nativeBlockSize = deviceBlockSize;
+        } else if (deviceBlockSize != nativeBlockSize) {
+            nativeBlockSize = 0;
+            break;
+        }
+    }
     DataPath::Config pathConfig;
     pathConfig.reactorIndex = 0;
     pathConfig.timeoutMs = static_cast<std::uint32_t>(impl.config.metadataWaitTimeoutMs);
+    pathConfig.nativeBlockSize = nativeBlockSize;
     impl.dataPlane = std::make_unique<DataPlane>(runtime, *impl.dmaArena, plannerConfig,
                                                  pathConfig);
 
@@ -447,19 +462,7 @@ Task<Result<void>> Engine::mount() {
         1, static_cast<std::size_t>(std::min<std::uint64_t>(
             inodeShardCeiling, static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()))));
     asyncConfig.maxPreparingPerShard = asyncConfig.maxOperations;
-    /* Use the native-sector read planner only when every mounted device has
-     * the same geometry; the baseline is one 512-byte-sector NVMe. */
-    std::uint32_t nativeReadBlockSize = 0;
-    for (std::size_t index = 0; index < runtime.deviceCount(); ++index) {
-        const std::uint32_t deviceBlockSize = runtime.deviceBlockSize(index);
-        if (index == 0) {
-            nativeReadBlockSize = deviceBlockSize;
-        } else if (deviceBlockSize != nativeReadBlockSize) {
-            nativeReadBlockSize = 0;
-            break;
-        }
-    }
-    asyncConfig.nativeReadBlockSize = nativeReadBlockSize;
+    asyncConfig.nativeReadBlockSize = nativeBlockSize;
     asyncConfig.planner = plannerConfig;
 
     /* Keep the backend credit bounded while allowing each shard to use its

@@ -151,7 +151,24 @@ int main() {
         }
     }
 
-    /* 4. multi-extent plans keep per-child physical and buffer offsets */
+    /* 4. sector-aligned partial writes stay direct under a native override */
+    {
+        SyntheticExtentMap map;
+        map.add(0, 16384, 4096);
+        IoPlanner planner(plannerConfig());
+        auto direct = planner.plan(map, 4096, 512, true, false, 512);
+        HFS_TEST_CHECK(direct.ok());
+        HFS_TEST_CHECK(direct.value().count == 1);
+        HFS_TEST_CHECK(direct.value().children[0].kind == IoPlanner::Child::Kind::Direct);
+        HFS_TEST_CHECK(direct.value().children[0].spanBytes == 512);
+        HFS_TEST_CHECK(direct.value().children[0].physicalByte == 8192);
+        auto unaligned = planner.plan(map, 4196, 100, true, false, 512);
+        HFS_TEST_CHECK(unaligned.ok());
+        HFS_TEST_CHECK(unaligned.value().children[0].kind == IoPlanner::Child::Kind::HeadRmw);
+        HFS_TEST_CHECK(unaligned.value().children[0].spanBytes == 512);
+    }
+
+    /* 5. multi-extent plans keep per-child physical and buffer offsets */
     {
         SyntheticExtentMap map;
         map.add(0, 4096, 0);
@@ -166,7 +183,7 @@ int main() {
                        plan.children[1].bufferOffset == 4096);
     }
 
-    /* 5. child chunking honors maxChildBytes and maxChildren */
+    /* 6. child chunking honors maxChildBytes and maxChildren */
     {
         SyntheticExtentMap map;
         map.add(0, 32768, 0);

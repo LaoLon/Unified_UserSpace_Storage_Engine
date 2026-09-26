@@ -131,15 +131,12 @@ DataPath::DataPath(SpdkRuntime &runtime, DmaArena &arena, IoPlanner::Config plan
     const std::size_t deviceCount = runtime_.deviceCount();
     const std::size_t count = deviceCount == 0 ? 1 : deviceCount;
     deviceBlockBytes_.assign(count, 512);
-    deviceBlocksPerMeta_.assign(count, 1);
     for (std::size_t i = 0; i < count; ++i) {
         std::uint32_t sector = runtime_.deviceBlockSize(i);
         if (sector == 0) {
             sector = 512;
         }
         deviceBlockBytes_[i] = sector;
-        const std::uint32_t factor = plannerConfig_.blockSize / sector;
-        deviceBlocksPerMeta_[i] = factor == 0 ? 1 : factor;
     }
 }
 
@@ -157,7 +154,8 @@ Result<void> DataPath::write(const ExtentMap &map, std::span<const std::byte> bu
 Result<void> DataPath::execute(const ExtentMap &map, std::span<std::byte> readBuffer,
                                std::span<const std::byte> writeBuffer, std::uint64_t offset,
                                std::uint64_t length, bool write, std::uint64_t knownEof) {
-    auto planResult = planner_.plan(map, offset, length, write, !write);
+    auto planResult = planner_.plan(map, offset, length, write, !write,
+                                    config_.nativeBlockSize);
     if (!planResult.ok()) {
         return makeError(planResult.status(), planResult.message());
     }
@@ -226,6 +224,8 @@ Result<void> DataPath::execute(const ExtentMap &map, std::span<std::byte> readBu
         }
         const std::uint32_t deviceBlockBytes = deviceBlockBytes_[child.deviceId];
         if (plannerConfig_.blockSize % deviceBlockBytes != 0 || child.spanBytes == 0 ||
+            child.physicalByte % deviceBlockBytes != 0 ||
+            child.spanBytes % deviceBlockBytes != 0 ||
             static_cast<std::uint64_t>(child.bufferOffset) + child.bytes >
                 (write ? writeBuffer.size() : readBuffer.size())) {
             firstError = static_cast<int>(Status::InvalidArgument);
@@ -295,8 +295,7 @@ Result<void> DataPath::execute(const ExtentMap &map, std::span<std::byte> readBu
         }
 
         const std::uint32_t deviceBlockBytes = deviceBlockBytes_[child.deviceId];
-        const std::uint32_t blocksPerMeta = deviceBlocksPerMeta_[child.deviceId];
-        const std::uint64_t deviceOffset = child.physicalBlock * blocksPerMeta;
+        const std::uint64_t deviceOffset = child.physicalByte / deviceBlockBytes;
         const std::uint64_t deviceBlocks = child.spanBytes / deviceBlockBytes;
         const std::uint64_t spanLogicalStart =
             child.logicalOffset >= child.spanOffset ? child.logicalOffset - child.spanOffset
@@ -373,14 +372,14 @@ Result<void> DataPath::execute(const ExtentMap &map, std::span<std::byte> readBu
         if (!executions[i].rmwRead || executions[i].status != 0) continue;
         const auto &child = plan.children[i];
         const std::uint32_t deviceBlockBytes = deviceBlockBytes_[child.deviceId];
+        const std::uint64_t rmwOffset = child.physicalByte / deviceBlockBytes;
         const std::uint32_t reactorIndex =
             runtime_.dataReactorCount() == 0
                 ? config_.reactorIndex
                 : runtime_.dataReactorForDevice(child.deviceId);
         prepareWait(executions[i].wait, true);
         const Result<void> submit = runtime_.submitDataWrite(
-            reactorIndex, child.deviceId, executions[i].ioBuffer.data(),
-            child.physicalBlock * deviceBlocksPerMeta_[child.deviceId],
+            reactorIndex, child.deviceId, executions[i].ioBuffer.data(), rmwOffset,
             child.spanBytes / deviceBlockBytes, childCallback, &executions[i].wait);
         if (!submit.ok()) {
             if (firstError == 0) firstError = static_cast<int>(submit.status());
@@ -390,8 +389,7 @@ Result<void> DataPath::execute(const ExtentMap &map, std::span<std::byte> readBu
         }
         executions[i].secondSubmitted = true;
         ++stats_.submits;
-        trace::event(trace::EventId::BdevSubmit,
-                     child.physicalBlock * deviceBlocksPerMeta_[child.deviceId],
+        trace::event(trace::EventId::BdevSubmit, rmwOffset,
                      child.spanBytes / deviceBlockBytes, 1ULL);
     }
     for (std::uint32_t i = 0; i < plan.count; ++i) {

@@ -739,8 +739,7 @@ private:
             auto planned = planner_.plan(state.extentSnapshot, state.request.offset,
                                          state.request.length, state.request.write,
                                          !state.request.write,
-                                         state.request.write ? 0U
-                                                              : config_.nativeReadBlockSize);
+                                         config_.nativeReadBlockSize);
             if (!planned.ok()) {
                 planFailures_.fetch_add(1, std::memory_order_relaxed);
                 finish(state, planned.status(), 0);
@@ -1081,7 +1080,7 @@ private:
         request.physicalBlock = child.plan.physicalBlock;
         request.physicalByte = child.plan.physicalByte;
         request.physicalByteValid =
-            !state.request.write && state.owner->config_.nativeReadBlockSize != 0;
+            state.owner->config_.nativeReadBlockSize != 0;
         request.deviceId = child.plan.deviceId;
         request.bytes = child.plan.bytes;
         request.spanBytes = child.plan.spanBytes;

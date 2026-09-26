@@ -22,6 +22,10 @@ public:
         std::size_t deviceIndex = 0;
         std::uint32_t reactorIndex = 0;
         std::uint32_t timeoutMs = 5000;
+        /* Native sector size used to plan writes; 0 keeps the metadata-block
+         * planner default. Sector planning avoids read-modify-write when a
+         * partial write is already aligned to the device. */
+        std::uint32_t nativeBlockSize = 0;
     };
 
     struct Stats {
@@ -62,7 +66,6 @@ private:
     std::atomic<std::uint32_t> nextReactor_{0};
     Stats stats_;
     std::vector<std::uint32_t> deviceBlockBytes_;   /* per-device sector size */
-    std::vector<std::uint32_t> deviceBlocksPerMeta_; /* sectors per metadata block */
 };
 
 } // namespace hfs
