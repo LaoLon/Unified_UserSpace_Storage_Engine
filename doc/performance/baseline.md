@@ -1,7 +1,10 @@
-# HFS 2.0 性能基线（2026-09-26）
+# HFS 2.0 性能基线（2026-09-26，fsync 覆盖修复回归 2026-09-27）
 
 数据会话：UTC 2026-09-26 09:09–09:45（本地 17:09–17:45）。HFS 二进制包含
 direct-buffer DMA 连续性校验修复（不可直接 DMA 的缓冲回落 bounce）。
+2026-09-27 追加 fsync 覆盖修复（`fix(core): cover in-place data writes in the sync barrier`）：
+原地覆盖写不再命中 `syncMetadata` 早退，barrier 必做 data flush（§10.2/§20.3）；
+下方矩阵为修复前二进制（`2e21ac8d…`）测得，修复后同会话回归见末节。
 
 ## 环境与口径
 
@@ -9,10 +12,10 @@ direct-buffer DMA 连续性校验修复（不可直接 DMA 的缓冲回落 bounc
 |---|---|
 | 设备 | `VMware NVME_0002`，PCI `0000:13:00.0`；内核 `nvme` 枚举为 `/dev/nvme2n1`，SPDK bdev `Nvme0n1` |
 | VM | 6 vCPU、约 7.2 GiB RAM、1024 hugepages |
-| HFS | `libhfs_core.so` SHA256 `2e21ac8d…`，`fio-hfs.so` `823be5a3…`，`hfs_db_bench` `b99e83…`，`hfsctl` `7c2472…`；`hfs_nvme.conf` `89e636…`，`hfs_mysql.conf` `b9b5a3…`；`trace=false`、`stats=false` |
+| HFS | `libhfs_core.so` SHA256 矩阵 `2e21ac8d…`、修复后 `fba6fe1c…`；`fio-hfs.so` `823be5a3…`，`hfs_db_bench` `b99e83…`，`hfsctl` `7c2472…`；`hfs_nvme.conf` `89e636…`，`hfs_mysql.conf` `b9b5a3…`；`trace=false`、`stats=false` |
 | SPDK / FIO | SPDK `f0b63ed866f0e4d3c56e73bd4a98d0042956147a`；FIO 3.42 |
 | 应用 | RocksDB 9.11.2；MySQL 8.0.46；sysbench 1.0.20 |
-| 证据 | FIO `/home/hfs/fio-three-way-20260926c/`；RocksDB `/home/hfs/rocksdb-rw32-cache1g-20260926b{,-r2,-r3}/`；MySQL `/home/hfs/mysql-samedisk-20260926b/` |
+| 证据 | FIO `/home/hfs/fio-three-way-20260926c/`；RocksDB `/home/hfs/rocksdb-rw32-cache1g-20260926b{,-r2,-r3}/`；MySQL `/home/hfs/mysql-samedisk-20260926b/`；修复回归 `/home/hfs/fsync-ab-{pre3,post4}/`、`/home/hfs/fio-8j4-fsync-20260927/`、`/home/hfs/syncstats-inplace-20260926/` |
 
 ## FIO 三方矩阵（256 MiB 已写范围、randrw 50/50、10 秒、每格 3 次中位数）
 
@@ -82,6 +85,26 @@ HFS/native（中位数之比）：写 **102.3%**，随机读 **377.6%**。三轮
 两轮均值 HFS/native：只读 **98.5%**，读写混合 **72.4%**，mysqlslap 主键读
 耗时 96.8%、随机更新耗时 117.3%；四轮 `innodb_flush_log_at_trx_commit=1`，
 HFS 两轮 `hfsctl check` 均为 `corruption=none`。
+
+## fsync 覆盖修复回归（2026-09-27，同会话 A/B）
+
+修复前 `File::sync/datasync` 对原地覆盖写命中 `syncMetadata` 早退：1 线程 1500 次
+覆盖写 + 每写 fsync 只有 1 次真实 flush；修复后每次 fsync 覆盖其前已完成写。
+
+| 指标 | 修复前 | 修复后 | 变化 |
+|---|---:|---:|---:|
+| in-place fsync 覆盖（1×1500 覆盖写，每写 sync） | barriers 1 / flushes 1 | barriers 1500 / flushes 1504 | 契约修复 |
+| in-place fsync 覆盖（8×4000） | barriers 1 / flushes 1 | barriers 4007 / flushes 4011 | 组提交合并 |
+| MySQL trx=1 TPS（20 s，8 线程） | 1548.10 | 1568.44 | +1.3% |
+| MySQL `barriers` / `flushes` | 31128 / 31128 | 49268 / 108204（skips 700） | — |
+| RocksDB `fillseq` IOPS（HFS） | 108916 | 108293 | −0.6% |
+| RocksDB `readrandom` IOPS（HFS） | 159920 | 165193 | +3.3% |
+| RocksDB `overwrite` 校验 IOPS（HFS） | 96722 | 86337 | 该轮 native 校验被设备停顿拖到 28393，属噪声带 |
+| 8j4 gate raw / HFS 中位 IOPS（5 轮） | 基线 115889 / 81714 | 120758 / 80268 | HFS −1.8%（<5% 门禁内） |
+
+8j4 五轮 HFS 全部 closure 闭合、`error=0`；MySQL 两轮 `hfsctl check` 均
+`corruption=none`；RocksDB 两种模式 `overwrite` 逐键校验通过。修复后
+`libhfs_core.so` SHA256 `fba6fe1c…`。
 
 ## 复现入口
 
