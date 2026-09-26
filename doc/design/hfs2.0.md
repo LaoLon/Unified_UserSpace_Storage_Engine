@@ -749,7 +749,7 @@ tail 丢弃（roll back），不做单盘前滚；journal 损坏、CRC 不一致
 ```text
 data submit → data drain
   → metadata prepare（staged durable sizes）
-  → checkpoint 记录写入（defer flush）→ superblock 写入（defer flush）
+  → checkpoint 记录 + superblock 一次批量写（defer flush）
   → 每设备一次 device flush（覆盖 user data + checkpoint + superblock）
   → publish durable epoch
 ```
@@ -1786,9 +1786,11 @@ seam 位于 `storage/innobase/os/os0file.cc`（审计 §5.1）：
   跳过 data flush，原地覆盖写（不改变 logical size）同样必须落盘；
 - data-only `datasync`（不发 checkpoint）是本契约的第一阶段；实施不得改变 `File::sync`
   行为与 ABI，且必须通过 RocksDB L4 无回退门禁；
+- checkpoint 记录与 superblock 以一次 `JournalDevice::writeBatch` 提交（每个 range 仍是
+  独立的设备命令，但并发在飞、只付一次唤醒），默认实现回退为逐条写；
 - 诊断：`HFS_DIAG_SYNC_STATS=1` 时 `Engine::stop()` 打印
   calls/early/joiners/barriers/flushes/flush_skips/checkpoints 与各相位 avg/max
-  （barrier/device_flush/ckpt_snapshot/ckpt_write/ckpt_flush/sb_write/sb_flush），
+  （barrier/device_flush/ckpt_snapshot/meta_write/ckpt_flush），
   用于核对 flush 覆盖比例与 commit 路径成本拆分；
 - 恢复：HFS journal replay 与 InnoDB redo 双层恢复；kill -9 断点后 datadir 的
   namespace/extent/size 必须守恒，`hfsctl check` 无 corruption。

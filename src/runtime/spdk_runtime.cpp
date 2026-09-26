@@ -1605,6 +1605,91 @@ struct SpdkRuntime::Impl {
         }
         return makeError(Status::IoError, "control I/O failed rc=" + std::to_string(rc));
     }
+
+    /* Submits several control writes together and waits for all of them; the
+     * metadata reactor keeps them in flight concurrently so the device can
+     * overlap the round trips. Each range must be block-aligned and <= 1 MiB. */
+    Result<void> controlWriteBatch(std::size_t index,
+                                   std::span<const ControlWriteRange> writes) {
+        if (!activeFlag.load(std::memory_order_acquire) ||
+            stoppingFlag.load(std::memory_order_acquire)) {
+            return makeError(Status::Busy, "SPDK runtime is not active");
+        }
+        if (index >= devices.size() || devices[index].desc == nullptr || reactors.empty() ||
+            reactors[0]->spdk == nullptr) {
+            return makeError(Status::InvalidArgument, "device index out of range");
+        }
+        if (writes.empty()) {
+            return Result<void>(Status::Ok);
+        }
+        if (writes.size() > kMaxControlBatchWrites) {
+            return makeError(Status::InvalidArgument, "control write batch is too large");
+        }
+        const std::uint32_t blockSize = devices[index].blockSize;
+        std::vector<std::shared_ptr<ControlIo>> pending;
+        pending.reserve(writes.size());
+        for (const ControlWriteRange &range : writes) {
+            if (range.buffer.empty()) {
+                continue;
+            }
+            if (blockSize == 0 || range.buffer.size() % blockSize != 0) {
+                return makeError(Status::InvalidArgument,
+                                 "buffer size must be a multiple of the device block size");
+            }
+            if (range.buffer.size() > (1U << 20)) {
+                return makeError(Status::InvalidArgument, "control I/O is limited to 1 MiB");
+            }
+            auto io = std::make_shared<ControlIo>();
+            io->op = ControlIo::Op::Write;
+            io->device = index;
+            io->offsetBlocks = range.offsetBlocks;
+            io->blocks = range.buffer.size() / blockSize;
+            io->dma = spdk_dma_zmalloc(range.buffer.size(), 4096, nullptr);
+            if (io->dma == nullptr) {
+                return makeError(Status::NoMemory, "DMA allocation failed");
+            }
+            std::memcpy(io->dma, range.buffer.data(), range.buffer.size());
+            auto *call = new ControlCall(this, io);
+            if (spdk_thread_send_msg(reactors[0]->spdk, controlSubmitTrampoline, call) != 0) {
+                delete call;
+                spdk_dma_free(io->dma);
+                io->dma = nullptr;
+                return makeError(Status::Busy, "spdk_thread_send_msg failed");
+            }
+            pending.push_back(std::move(io));
+        }
+        if (pending.empty()) {
+            return Result<void>(Status::Ok);
+        }
+        wakeReactor(reactors[0].get());
+
+        Result<void> result(Status::Ok);
+        for (auto &io : pending) {
+            std::unique_lock<std::mutex> lock(io->mutex);
+            const auto timeout = std::chrono::milliseconds(config.metadataWaitTimeoutMs);
+            if (!io->cv.wait_for(lock, timeout, [&io]() { return io->done; })) {
+                io->abandoned = true;
+                if (result.ok()) {
+                    result = makeError(Status::TimedOut, "control I/O timed out");
+                }
+                continue;
+            }
+            const int rc = io->rc;
+            lock.unlock();
+            if (rc != 0) {
+                if (result.ok()) {
+                    result = makeError(Status::IoError,
+                                       "control I/O failed rc=" + std::to_string(rc));
+                }
+            } else {
+                /* Metadata/journal writes also need flush coverage. */
+                noteDataWriteComplete(index);
+            }
+        }
+        return result;
+    }
+
+    static constexpr std::size_t kMaxControlBatchWrites = 8;
 };
 
 SpdkRuntime::SpdkRuntime() : impl_(std::make_unique<Impl>()) {}
@@ -1965,6 +2050,11 @@ Result<void> SpdkRuntime::controlWrite(std::size_t index, std::uint64_t offsetBl
     return impl_->controlIo(ControlIo::Op::Write, index, offsetBlocks, {}, buffer);
 }
 
+Result<void> SpdkRuntime::controlWriteBatch(std::size_t index,
+                                            std::span<const ControlWriteRange> writes) {
+    return impl_->controlWriteBatch(index, writes);
+}
+
 Result<void> SpdkRuntime::controlFlush(std::size_t index) {
     return impl_->controlIo(ControlIo::Op::Flush, index, 0, {}, {});
 }
@@ -2162,6 +2252,13 @@ Result<void> SpdkRuntime::controlWrite(std::size_t index, std::uint64_t offsetBl
     (void)buffer;
     return makeError(Status::NotSupported, "core built without SPDK support");
 }
+Result<void> SpdkRuntime::controlWriteBatch(std::size_t index,
+                                            std::span<const ControlWriteRange> writes) {
+    (void)index;
+    (void)writes;
+    return makeError(Status::NotSupported, "core built without SPDK support");
+}
+
 Result<void> SpdkRuntime::controlFlush(std::size_t index) {
     (void)index;
     return makeError(Status::NotSupported, "core built without SPDK support");

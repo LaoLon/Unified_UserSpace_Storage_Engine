@@ -261,33 +261,36 @@ struct Journal::Impl {
         return Result<void>(Status::Ok);
     }
 
-    Result<void> publishSuperblock(bool deferFlush) {
+    /* One checkpoint record ready to be written. */
+    struct CheckpointRecord {
+        std::uint64_t offsetBlocks = 0;
+        std::vector<std::byte> record;
+        bool writeA = false;
+        std::uint64_t txid = 0;
+        std::uint64_t sequence = 0;
+        std::uint64_t generation = 0;
+    };
+
+    /* One superblock record ready to be written. */
+    struct SuperblockRecord {
+        std::uint64_t offsetBlocks = 0;
+        std::vector<std::byte> record;
+        std::uint32_t slot = 0;
+    };
+
+    Result<SuperblockRecord> buildSuperblockRecord() {
         superblock.generation += 1;
         superblock.checkpointGeneration = lastTxid;
         superblock.journalHead = head;
         superblock.journalTail = tail;
         superblockFinalize(superblock);
-        std::vector<std::byte> record(kSuperblockRecordSize, std::byte{0});
-        std::memcpy(record.data(), &superblock, sizeof(superblock));
-        const std::uint64_t targetSlot = 1 - sbSlot;
-        const std::uint64_t offset =
-            targetSlot == 0 ? 0 : kSuperblockSlotOffsetBytes / blockSize;
-        const auto writeStart = std::chrono::steady_clock::now();
-        auto write = writeBlock(offset, record);
-        stats::counters().syncSuperblockWrite.record(elapsedNs(writeStart));
-        if (!write.ok()) {
-            return write;
-        }
-        if (!deferFlush) {
-            const auto flushStart = std::chrono::steady_clock::now();
-            auto flush = device->flush();
-            stats::counters().syncSuperblockFlush.record(elapsedNs(flushStart));
-            if (!flush.ok()) {
-                return flush;
-            }
-        }
-        sbSlot = static_cast<std::uint32_t>(targetSlot);
-        return Result<void>(Status::Ok);
+        SuperblockRecord built;
+        built.record.assign(kSuperblockRecordSize, std::byte{0});
+        std::memcpy(built.record.data(), &superblock, sizeof(superblock));
+        const std::uint32_t targetSlot = 1 - sbSlot;
+        built.offsetBlocks = targetSlot == 0 ? 0 : kSuperblockSlotOffsetBytes / blockSize;
+        built.slot = targetSlot;
+        return built;
     }
 
     Result<void> readCheckpoint(std::uint64_t slotStart, bool *valid, std::uint64_t *txid,
@@ -335,14 +338,15 @@ struct Journal::Impl {
         return Result<void>(Status::Ok);
     }
 
-    Result<void> writeCheckpoint(std::span<const std::byte> snapshot, bool deferFlush) {
+    Result<CheckpointRecord> buildCheckpointRecord(std::span<const std::byte> snapshot) {
         const std::uint64_t slotBlocks = checkpointBlocks / 2;
         const std::uint64_t totalBytes = sizeof(CheckpointHeader) + snapshot.size();
         if (bytesToBlocks(totalBytes, blockSize) > slotBlocks) {
-            return makeError(Status::NoSpace, "checkpoint snapshot does not fit the slot");
+            return makeError<CheckpointRecord>(Status::NoSpace,
+                                               "checkpoint snapshot does not fit the slot");
         }
-        std::vector<std::byte> record(bytesToBlocks(totalBytes, blockSize) * blockSize,
-                                      std::byte{0});
+        CheckpointRecord built;
+        built.record.assign(bytesToBlocks(totalBytes, blockSize) * blockSize, std::byte{0});
         CheckpointHeader header{};
         header.magic = kCheckpointMagic;
         header.formatVersion = kCheckpointFormatVersion;
@@ -351,19 +355,34 @@ struct Journal::Impl {
         header.sequence = head;
         header.generation = superblock.generation;
         header.uuid = superblock.uuid;
-        std::memcpy(record.data(), &header, sizeof(header));
-        std::memcpy(record.data() + sizeof(header), snapshot.data(), snapshot.size());
-        auto *headerView = reinterpret_cast<CheckpointHeader *>(record.data());
-        headerView->crc = crc32c(record.data() + sizeof(CheckpointHeader), snapshot.size(),
-                                 crc32c(record.data(), offsetof(CheckpointHeader, crc)));
+        std::memcpy(built.record.data(), &header, sizeof(header));
+        std::memcpy(built.record.data() + sizeof(header), snapshot.data(), snapshot.size());
+        auto *headerView = reinterpret_cast<CheckpointHeader *>(built.record.data());
+        headerView->crc = crc32c(built.record.data() + sizeof(CheckpointHeader), snapshot.size(),
+                                 crc32c(built.record.data(), offsetof(CheckpointHeader, crc)));
 
         /* Rotate to the inactive slot; once both are valid, replace the older
          * sequence so one complete checkpoint remains available on failure. */
-        const bool writeA = !checkpointAValid ||
-                            (checkpointBValid && checkpointASequence < checkpointBSequence);
-        const std::uint64_t start = writeA ? checkpointAStart : checkpointBStart;
+        built.writeA = !checkpointAValid ||
+                       (checkpointBValid && checkpointASequence < checkpointBSequence);
+        built.offsetBlocks = built.writeA ? checkpointAStart : checkpointBStart;
+        built.txid = lastTxid;
+        built.sequence = head;
+        built.generation = superblock.generation;
+        return built;
+    }
+
+    /* Writes the checkpoint record and the superblock as one batch, so the
+     * device overlaps both round trips, then applies the in-memory state. */
+    Result<void> writeCheckpointAndSuperblock(const CheckpointRecord &checkpoint,
+                                              const SuperblockRecord &superblockRecord,
+                                              bool deferFlush) {
+        JournalDevice::WriteRange ranges[2] = {
+            {checkpoint.offsetBlocks, checkpoint.record},
+            {superblockRecord.offsetBlocks, superblockRecord.record},
+        };
         const auto writeStart = std::chrono::steady_clock::now();
-        auto write = writeBlock(start, record);
+        auto write = device->writeBatch(ranges);
         stats::counters().syncCheckpointWrite.record(elapsedNs(writeStart));
         if (!write.ok()) {
             return write;
@@ -380,20 +399,23 @@ struct Journal::Impl {
                 return flush;
             }
         }
-        if (writeA) {
+        if (checkpoint.writeA) {
             checkpointAValid = true;
-            checkpointATxid = lastTxid;
-            checkpointASequence = head;
-            checkpointAGeneration = superblock.generation;
+            checkpointATxid = checkpoint.txid;
+            checkpointASequence = checkpoint.sequence;
+            checkpointAGeneration = checkpoint.generation;
         } else {
             checkpointBValid = true;
-            checkpointBTxid = lastTxid;
-            checkpointBSequence = head;
-            checkpointBGeneration = superblock.generation;
+            checkpointBTxid = checkpoint.txid;
+            checkpointBSequence = checkpoint.sequence;
+            checkpointBGeneration = checkpoint.generation;
         }
+        sbSlot = superblockRecord.slot;
         log::info("checkpoint written: slot=%c txid=%llu sequence=%llu bytes=%zu",
-                  writeA ? 'A' : 'B', static_cast<unsigned long long>(lastTxid),
-                  static_cast<unsigned long long>(head), snapshot.size());
+                  checkpoint.writeA ? 'A' : 'B',
+                  static_cast<unsigned long long>(checkpoint.txid),
+                  static_cast<unsigned long long>(checkpoint.sequence),
+                  checkpoint.record.size());
         return Result<void>(Status::Ok);
     }
 
@@ -538,6 +560,23 @@ public:
 
     Result<void> flush() override { return runtime_.controlFlush(index_); }
 
+    Result<void> writeBatch(std::span<const WriteRange> ranges) override {
+        std::vector<SpdkRuntime::ControlWriteRange> batch;
+        batch.reserve(ranges.size());
+        for (const WriteRange &range : ranges) {
+            std::size_t done = 0;
+            while (done < range.buffer.size()) {
+                const std::size_t bytes = std::min(kControlIoLimit, range.buffer.size() - done);
+                const std::uint64_t deviceOffset =
+                    (range.offsetBlocks * blockFactor_) +
+                    (done / metadataBlockSize_) * blockFactor_;
+                batch.push_back({deviceOffset, range.buffer.subspan(done, bytes)});
+                done += bytes;
+            }
+        }
+        return runtime_.controlWriteBatch(index_, batch);
+    }
+
 private:
     Result<void> transferRead(std::uint64_t offsetBlocks, std::span<std::byte> buffer) {
         std::size_t done = 0;
@@ -646,6 +685,43 @@ public:
                 std::memcpy(replica.data(), &superblock, sizeof(superblock));
             }
             auto written = entry.second->write(translate(offsetBlocks, entry.first), replica);
+            if (!written.ok()) return written;
+        }
+        return Result<void>(Status::Ok);
+    }
+
+    Result<void> writeBatch(std::span<const WriteRange> ranges) override {
+        std::vector<std::vector<std::byte>> replicas;
+        std::vector<WriteRange> batch;
+        replicas.reserve(ranges.size());
+        batch.reserve(ranges.size());
+        for (auto &entry : devices_) {
+            replicas.clear();
+            batch.clear();
+            for (const WriteRange &range : ranges) {
+                replicas.emplace_back(range.buffer.begin(), range.buffer.end());
+                std::vector<std::byte> &replica = replicas.back();
+                if (isSuperblock(range.offsetBlocks) &&
+                    replica.size() >= sizeof(Hfs2Superblock)) {
+                    Hfs2Superblock superblock{};
+                    std::memcpy(&superblock, replica.data(), sizeof(superblock));
+                    const DeviceGeometry &geometry = geometries_[entry.first];
+                    superblock.deviceId = static_cast<std::uint32_t>(entry.first);
+                    superblock.replicaId = geometry.replicaId;
+                    superblock.deviceBlocks = geometry.deviceBlocks;
+                    superblock.journalStart = geometry.journalStart;
+                    superblock.journalBlocks = geometry.journalBlocks;
+                    superblock.checkpointAStart = geometry.checkpointAStart;
+                    superblock.checkpointBStart = geometry.checkpointBStart;
+                    superblock.checkpointBlocks = geometry.checkpointBlocks;
+                    superblock.dataStart = geometry.dataStart;
+                    superblock.dataBlocks = geometry.dataBlocks;
+                    superblockFinalize(superblock);
+                    std::memcpy(replica.data(), &superblock, sizeof(superblock));
+                }
+                batch.push_back({translate(range.offsetBlocks, entry.first), replica});
+            }
+            auto written = entry.second->writeBatch(batch);
             if (!written.ok()) return written;
         }
         return Result<void>(Status::Ok);
@@ -1007,13 +1083,18 @@ Result<void> Journal::checkpoint(bool deferFlush) {
     if (impl.target->snapshotTxid() != impl.lastTxid) {
         return makeError(Status::Corrupt, "snapshot txid does not match the journal tail");
     }
-    auto written = impl.writeCheckpoint(snapshot, deferFlush);
+    auto checkpoint = impl.buildCheckpointRecord(snapshot);
+    if (!checkpoint.ok()) {
+        return makeError(checkpoint.status(), checkpoint.message());
+    }
+    auto superblockRecord = impl.buildSuperblockRecord();
+    if (!superblockRecord.ok()) {
+        return makeError(superblockRecord.status(), superblockRecord.message());
+    }
+    auto written = impl.writeCheckpointAndSuperblock(checkpoint.value(), superblockRecord.value(),
+                                                     deferFlush);
     if (!written.ok()) {
         return written;
-    }
-    auto published = impl.publishSuperblock(deferFlush);
-    if (!published.ok()) {
-        return published;
     }
     impl.tail = impl.head;
     impl.refreshStats();

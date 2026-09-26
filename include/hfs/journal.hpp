@@ -59,11 +59,28 @@ public:
 /* Block device used by the journal; offsets are in metadata blocks. */
 class HFS_API JournalDevice {
 public:
+    /* One write range of a batch; offsets are in metadata blocks. */
+    struct WriteRange {
+        std::uint64_t offsetBlocks = 0;
+        std::span<const std::byte> buffer;
+    };
+
     virtual ~JournalDevice() = default;
     virtual std::uint32_t blockSize() const noexcept = 0;
     virtual Result<void> read(std::uint64_t offsetBlocks, std::span<std::byte> buffer) = 0;
     virtual Result<void> write(std::uint64_t offsetBlocks,
                                std::span<const std::byte> buffer) = 0;
+    /* Writes several ranges, letting the device overlap them. The default
+     * keeps strict per-range ordering for devices without a batch path. */
+    virtual Result<void> writeBatch(std::span<const WriteRange> ranges) {
+        for (const WriteRange &range : ranges) {
+            auto written = write(range.offsetBlocks, range.buffer);
+            if (!written.ok()) {
+                return written;
+            }
+        }
+        return Result<void>(Status::Ok);
+    }
     virtual Result<void> flush() = 0;
 };
 

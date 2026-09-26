@@ -87,6 +87,15 @@ public:
                              std::span<std::byte> buffer);
     Result<void> controlWrite(std::size_t index, std::uint64_t offsetBlocks,
                               std::span<const std::byte> buffer);
+    /* One range of a batched control write; ranges are submitted together so
+     * the device can overlap them. Each range must be block-aligned and at
+     * most 1 MiB. */
+    struct ControlWriteRange {
+        std::uint64_t offsetBlocks = 0;
+        std::span<const std::byte> buffer;
+    };
+    Result<void> controlWriteBatch(std::size_t index,
+                                   std::span<const ControlWriteRange> writes);
     Result<void> controlFlush(std::size_t index);
 
     /* True when a completed data write is not yet covered by a device flush

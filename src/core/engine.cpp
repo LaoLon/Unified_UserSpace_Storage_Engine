@@ -685,7 +685,7 @@ Task<Result<void>> Engine::stop() {
             return std::to_string(timer.maxNs.load() / 1000);
         };
         log::info("sync phases us avg/max: barrier=%s/%s device_flush=%s/%s ckpt_snapshot=%s/%s "
-                  "ckpt_write=%s/%s ckpt_flush=%s/%s sb_write=%s/%s sb_flush=%s/%s",
+                  "meta_write=%s/%s ckpt_flush=%s/%s",
                   averageUs(counters.syncBarrier).c_str(), maxUs(counters.syncBarrier).c_str(),
                   averageUs(counters.syncDeviceFlush).c_str(),
                   maxUs(counters.syncDeviceFlush).c_str(),
@@ -694,11 +694,7 @@ Task<Result<void>> Engine::stop() {
                   averageUs(counters.syncCheckpointWrite).c_str(),
                   maxUs(counters.syncCheckpointWrite).c_str(),
                   averageUs(counters.syncCheckpointFlush).c_str(),
-                  maxUs(counters.syncCheckpointFlush).c_str(),
-                  averageUs(counters.syncSuperblockWrite).c_str(),
-                  maxUs(counters.syncSuperblockWrite).c_str(),
-                  averageUs(counters.syncSuperblockFlush).c_str(),
-                  maxUs(counters.syncSuperblockFlush).c_str());
+                  maxUs(counters.syncCheckpointFlush).c_str());
     }
     log::info("engine stopped");
     co_return Result<void>(Status::Ok);

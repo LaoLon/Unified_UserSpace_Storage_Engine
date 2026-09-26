@@ -87,8 +87,6 @@ struct Counters {
     PhaseTimer syncCheckpointSnapshot;
     PhaseTimer syncCheckpointWrite;
     PhaseTimer syncCheckpointFlush;
-    PhaseTimer syncSuperblockWrite;
-    PhaseTimer syncSuperblockFlush;
 };
 
 Counters &counters() noexcept;
