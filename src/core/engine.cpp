@@ -665,6 +665,18 @@ Task<Result<void>> Engine::stop() {
     trace::setEnabled(false);
     trace::stop();
     stats::setEnabled(false);
+    /* Diagnostic dump used to verify the fsync coverage contract. */
+    if (const char *flag = std::getenv("HFS_DIAG_SYNC_STATS"); flag != nullptr && *flag != '\0') {
+        const auto &counters = stats::counters();
+        log::info("sync stats: calls=%llu early=%llu joiners=%llu barriers=%llu flushes=%llu "
+                  "checkpoints=%llu",
+                  static_cast<unsigned long long>(counters.syncCalls.load()),
+                  static_cast<unsigned long long>(counters.syncEarlyReturns.load()),
+                  static_cast<unsigned long long>(counters.syncJoiners.load()),
+                  static_cast<unsigned long long>(counters.syncBarriers.load()),
+                  static_cast<unsigned long long>(counters.deviceFlushes.load()),
+                  static_cast<unsigned long long>(counters.journalCheckpoints.load()));
+    }
     log::info("engine stopped");
     co_return Result<void>(Status::Ok);
 }
@@ -681,6 +693,7 @@ Result<void> Engine::syncMetadata(std::uint64_t epoch) {
     if (epoch > impl_->namespaceState->logicalEpoch()) {
         return makeError(Status::InvalidArgument, "sync epoch is ahead of logical epoch");
     }
+    stats::counters().syncCalls.fetch_add(1, std::memory_order_relaxed);
     while (true) {
         std::shared_ptr<Impl::SyncBatch> batch;
         bool leader = false;
@@ -689,6 +702,7 @@ Result<void> Engine::syncMetadata(std::uint64_t epoch) {
             /* A repeated barrier for an already durable epoch needs no
              * checkpoint or metadata write. */
             if (epoch <= impl_->namespaceState->durableEpoch()) {
+                stats::counters().syncEarlyReturns.fetch_add(1, std::memory_order_relaxed);
                 return Result<void>(Status::Ok);
             }
             if (impl_->syncBatch != nullptr && !impl_->syncBatch->completed) {
@@ -705,6 +719,7 @@ Result<void> Engine::syncMetadata(std::uint64_t epoch) {
         if (!leader) {
             std::unique_lock<std::mutex> syncLock(impl_->syncMutex);
             batch->condition.wait(syncLock, [&batch] { return batch->completed; });
+            stats::counters().syncJoiners.fetch_add(1, std::memory_order_relaxed);
             if (epoch <= batch->frozenTargetEpoch) {
                 return Result<void>(batch->status, batch->message);
             }
@@ -727,6 +742,7 @@ Result<void> Engine::syncMetadata(std::uint64_t epoch) {
         }
 
         Result<void> result(Status::Ok);
+        stats::counters().syncBarriers.fetch_add(1, std::memory_order_relaxed);
         /* DataPath operations are synchronous at this boundary, so device
          * flush closes the user-data and extent-initialization phase first. */
         for (std::size_t i = 0; i < impl_->config.devices.size(); ++i) {
@@ -750,6 +766,7 @@ Result<void> Engine::syncMetadata(std::uint64_t epoch) {
         }
         if (result.ok()) {
             auto checkpoint = impl_->journal->checkpoint();
+            stats::counters().journalCheckpoints.fetch_add(1, std::memory_order_relaxed);
             if (!checkpoint.ok()) {
                 impl_->namespaceState->rollbackPreparedDurableEpoch();
                 result = checkpoint;
@@ -904,7 +921,11 @@ Result<void> Engine::flushDevice(std::size_t deviceIndex) {
     if (!SpdkRuntime::instance().active()) {
         return makeError(Status::InvalidState, "engine is not mounted");
     }
-    return SpdkRuntime::instance().controlFlush(deviceIndex);
+    auto flushed = SpdkRuntime::instance().controlFlush(deviceIndex);
+    if (flushed.ok()) {
+        stats::counters().deviceFlushes.fetch_add(1, std::memory_order_relaxed);
+    }
+    return flushed;
 }
 
 std::uint32_t Engine::deviceBlockSize(std::size_t deviceIndex) const noexcept {

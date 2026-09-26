@@ -56,6 +56,14 @@ struct Counters {
     std::atomic<std::uint64_t> readCopyOutOps{0};
     std::atomic<std::uint64_t> readCopyOutBytes{0};
     std::atomic<std::uint64_t> readCopyOutNs{0};
+    /* Durability-path diagnostics; used to verify that fsync covers in-place
+     * data writes (hfs2.0.md 20.3). Relaxed counters, safe to leave enabled. */
+    std::atomic<std::uint64_t> syncCalls{0};
+    std::atomic<std::uint64_t> syncEarlyReturns{0};
+    std::atomic<std::uint64_t> syncJoiners{0};
+    std::atomic<std::uint64_t> syncBarriers{0};
+    std::atomic<std::uint64_t> deviceFlushes{0};
+    std::atomic<std::uint64_t> journalCheckpoints{0};
 };
 
 Counters &counters() noexcept;
