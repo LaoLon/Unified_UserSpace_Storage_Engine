@@ -747,13 +747,17 @@ tail 丢弃（roll back），不做单盘前滚；journal 损坏、CRC 不一致
 `sync` 还包括文件时间戳、namespace 和 directory metadata。不可改变的顺序是：
 
 ```text
-data submit → data drain → data device flush
-  → metadata intent/commit → journal flush
-  → checkpoint/superblock flush → publish durable epoch
+data submit → data drain
+  → metadata prepare（staged durable sizes）
+  → checkpoint 记录写入（defer flush）→ superblock 写入（defer flush）
+  → 每设备一次 device flush（覆盖 user data + checkpoint + superblock）
+  → publish durable epoch
 ```
 
 这明确避免“metadata transaction 写完却没有最终设备屏障”的旧问题，也保证 metadata
-不会先指向未 durable 的用户数据。
+不会先指向未 durable 的用户数据：单次 flush 之前掉电则 data 与 metadata 一起回退到
+上一个 checkpoint，flush 之后三者同时 durable。写入顺序只保留一次设备屏障，
+消除 checkpoint/superblock 各自的 flush 往返（2026-09-27 barrier 合并）。
 
 并发 `sync/fsync` 使用 full-snapshot group commit：第一个 waiter 成为 leader，在
 `metadata.max_group_commit_wait_us` 窗口内合并更高目标 epoch；窗口结束后只执行一次
@@ -1770,10 +1774,10 @@ seam 位于 `storage/innobase/os/os0file.cc`（审计 §5.1）：
 
 - `os_file_fsync`/`os_file_flush` → `File::sync`；`sync` 与 `datasync` 同为 namespace 级
   durable barrier（强于 per-file fsync），ABI 不变；
-- barrier 按 §10.2 顺序执行两个阶段：
-  1. data 阶段：对每个设备下发 device flush，覆盖该设备上所有已完成的 data 写；
-  2. metadata 阶段：logical epoch 前进时执行 prepareDurableEpoch → journal checkpoint →
-     publishDurableEpoch；未前进时只发布内存 durable epoch；
+- barrier 按 §10.2 顺序执行：logical epoch 前进时先 prepareDurableEpoch → 写 checkpoint 记录与
+  superblock（defer flush），随后每个设备下发一次 device flush，最后 publishDurableEpoch；
+  未前进时只做 device flush。单次 flush 覆盖其提交前所有已完成写，checkpoint 不再自带
+  flush；
 - data 覆盖由 `SpdkRuntime` 的 per-device `writtenSeq`/`flushedSeq` 判定：data 写完成推进
   `writtenSeq`；`controlFlush` 在提交前采样 `writtenSeq`，成功后把 `flushedSeq` 推进到
   采样值。设备 flush 仅当 `flushedSeq >= writtenSeq`（上次 flush 后无新完成写）才可跳过，
@@ -1783,7 +1787,9 @@ seam 位于 `storage/innobase/os/os0file.cc`（审计 §5.1）：
 - data-only `datasync`（不发 checkpoint）是本契约的第一阶段；实施不得改变 `File::sync`
   行为与 ABI，且必须通过 RocksDB L4 无回退门禁；
 - 诊断：`HFS_DIAG_SYNC_STATS=1` 时 `Engine::stop()` 打印
-  calls/early/joiners/barriers/flushes/checkpoints，用于核对 flush 覆盖比例；
+  calls/early/joiners/barriers/flushes/flush_skips/checkpoints 与各相位 avg/max
+  （barrier/device_flush/ckpt_snapshot/ckpt_write/ckpt_flush/sb_write/sb_flush），
+  用于核对 flush 覆盖比例与 commit 路径成本拆分；
 - 恢复：HFS journal replay 与 InnoDB redo 双层恢复；kill -9 断点后 datadir 的
   namespace/extent/size 必须守恒，`hfsctl check` 无 corruption。
 

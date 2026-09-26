@@ -111,8 +111,10 @@ public:
     Result<std::uint64_t> append(std::initializer_list<JournalRecord> records,
                                  bool flushDevice);
 
-    /* Snapshot + checkpoint slot write + superblock publish + tail advance. */
-    Result<void> checkpoint();
+    /* Snapshot + checkpoint slot write + superblock publish + tail advance.
+     * With deferFlush the caller must flush the journal device afterwards; the
+     * barrier then covers data, checkpoint and superblock with one flush. */
+    Result<void> checkpoint(bool deferFlush = false);
 
     /* Flush the journal device (sync path). */
     Result<void> flush();

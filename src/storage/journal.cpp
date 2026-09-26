@@ -1,6 +1,7 @@
 #include "hfs/journal.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -10,6 +11,7 @@
 #include <vector>
 
 #include "common/log.hpp"
+#include "common/stats.hpp"
 #include "common/test_hooks.hpp"
 #include "hfs/core.hpp"
 #include "hfs/crc.hpp"
@@ -19,6 +21,14 @@
 namespace hfs {
 
 namespace {
+
+/* Nanoseconds elapsed since a phase start, for barrier diagnostics. */
+std::uint64_t elapsedNs(std::chrono::steady_clock::time_point start) noexcept {
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
+                                                             start)
+            .count());
+}
 
 constexpr std::uint64_t kJournalSlotMagic = 0x484653324a524e4cULL; /* "HFS2JRNL" */
 constexpr std::uint32_t kJournalFormatVersion = 1;
@@ -251,7 +261,7 @@ struct Journal::Impl {
         return Result<void>(Status::Ok);
     }
 
-    Result<void> publishSuperblock() {
+    Result<void> publishSuperblock(bool deferFlush) {
         superblock.generation += 1;
         superblock.checkpointGeneration = lastTxid;
         superblock.journalHead = head;
@@ -262,13 +272,19 @@ struct Journal::Impl {
         const std::uint64_t targetSlot = 1 - sbSlot;
         const std::uint64_t offset =
             targetSlot == 0 ? 0 : kSuperblockSlotOffsetBytes / blockSize;
+        const auto writeStart = std::chrono::steady_clock::now();
         auto write = writeBlock(offset, record);
+        stats::counters().syncSuperblockWrite.record(elapsedNs(writeStart));
         if (!write.ok()) {
             return write;
         }
-        auto flush = device->flush();
-        if (!flush.ok()) {
-            return flush;
+        if (!deferFlush) {
+            const auto flushStart = std::chrono::steady_clock::now();
+            auto flush = device->flush();
+            stats::counters().syncSuperblockFlush.record(elapsedNs(flushStart));
+            if (!flush.ok()) {
+                return flush;
+            }
         }
         sbSlot = static_cast<std::uint32_t>(targetSlot);
         return Result<void>(Status::Ok);
@@ -319,7 +335,7 @@ struct Journal::Impl {
         return Result<void>(Status::Ok);
     }
 
-    Result<void> writeCheckpoint(std::span<const std::byte> snapshot) {
+    Result<void> writeCheckpoint(std::span<const std::byte> snapshot, bool deferFlush) {
         const std::uint64_t slotBlocks = checkpointBlocks / 2;
         const std::uint64_t totalBytes = sizeof(CheckpointHeader) + snapshot.size();
         if (bytesToBlocks(totalBytes, blockSize) > slotBlocks) {
@@ -346,7 +362,9 @@ struct Journal::Impl {
         const bool writeA = !checkpointAValid ||
                             (checkpointBValid && checkpointASequence < checkpointBSequence);
         const std::uint64_t start = writeA ? checkpointAStart : checkpointBStart;
+        const auto writeStart = std::chrono::steady_clock::now();
         auto write = writeBlock(start, record);
+        stats::counters().syncCheckpointWrite.record(elapsedNs(writeStart));
         if (!write.ok()) {
             return write;
         }
@@ -354,9 +372,13 @@ struct Journal::Impl {
         if (testCheckpointFlushFailureRequested()) {
             return makeError(Status::IoError, "test-injected checkpoint flush failure");
         }
-        auto flush = device->flush();
-        if (!flush.ok()) {
-            return flush;
+        if (!deferFlush) {
+            const auto flushStart = std::chrono::steady_clock::now();
+            auto flush = device->flush();
+            stats::counters().syncCheckpointFlush.record(elapsedNs(flushStart));
+            if (!flush.ok()) {
+                return flush;
+            }
         }
         if (writeA) {
             checkpointAValid = true;
@@ -970,24 +992,26 @@ Result<std::uint64_t> Journal::append(std::initializer_list<JournalRecord> recor
                   flushDevice);
 }
 
-Result<void> Journal::checkpoint() {
+Result<void> Journal::checkpoint(bool deferFlush) {
     auto &impl = *impl_;
     if (impl.target == nullptr) {
         return makeError(Status::InvalidState, "checkpoint requires a replay target");
     }
     std::vector<std::byte> snapshot;
+    const auto snapshotStart = std::chrono::steady_clock::now();
     auto saved = impl.target->saveSnapshot(impl.lastTxid, snapshot);
+    stats::counters().syncCheckpointSnapshot.record(elapsedNs(snapshotStart));
     if (!saved.ok()) {
         return saved;
     }
     if (impl.target->snapshotTxid() != impl.lastTxid) {
         return makeError(Status::Corrupt, "snapshot txid does not match the journal tail");
     }
-    auto written = impl.writeCheckpoint(snapshot);
+    auto written = impl.writeCheckpoint(snapshot, deferFlush);
     if (!written.ok()) {
         return written;
     }
-    auto published = impl.publishSuperblock();
+    auto published = impl.publishSuperblock(deferFlush);
     if (!published.ok()) {
         return published;
     }

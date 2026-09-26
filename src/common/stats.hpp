@@ -5,6 +5,22 @@
 
 namespace hfs::stats {
 
+/* Accumulates one barrier phase duration for durability diagnostics. */
+struct PhaseTimer {
+    std::atomic<std::uint64_t> totalNs{0};
+    std::atomic<std::uint64_t> maxNs{0};
+    std::atomic<std::uint64_t> count{0};
+
+    void record(std::uint64_t ns) noexcept {
+        totalNs.fetch_add(ns, std::memory_order_relaxed);
+        count.fetch_add(1, std::memory_order_relaxed);
+        std::uint64_t current = maxNs.load(std::memory_order_relaxed);
+        while (ns > current &&
+               !maxNs.compare_exchange_weak(current, ns, std::memory_order_relaxed)) {
+        }
+    }
+};
+
 /* Always-cheap counters; enabled state is switched in the control phase. */
 struct Counters {
     std::atomic<std::uint64_t> submit{0};
@@ -65,6 +81,14 @@ struct Counters {
     std::atomic<std::uint64_t> deviceFlushes{0};
     std::atomic<std::uint64_t> deviceFlushSkips{0};
     std::atomic<std::uint64_t> journalCheckpoints{0};
+    /* Barrier phase durations; diagnostics for the commit-path analysis. */
+    PhaseTimer syncBarrier;
+    PhaseTimer syncDeviceFlush;
+    PhaseTimer syncCheckpointSnapshot;
+    PhaseTimer syncCheckpointWrite;
+    PhaseTimer syncCheckpointFlush;
+    PhaseTimer syncSuperblockWrite;
+    PhaseTimer syncSuperblockFlush;
 };
 
 Counters &counters() noexcept;

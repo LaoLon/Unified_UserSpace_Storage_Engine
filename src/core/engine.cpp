@@ -677,6 +677,28 @@ Task<Result<void>> Engine::stop() {
                   static_cast<unsigned long long>(counters.deviceFlushes.load()),
                   static_cast<unsigned long long>(counters.deviceFlushSkips.load()),
                   static_cast<unsigned long long>(counters.journalCheckpoints.load()));
+        const auto averageUs = [](const stats::PhaseTimer &timer) {
+            const std::uint64_t count = timer.count.load();
+            return std::to_string(count == 0 ? 0 : timer.totalNs.load() / count / 1000);
+        };
+        const auto maxUs = [](const stats::PhaseTimer &timer) {
+            return std::to_string(timer.maxNs.load() / 1000);
+        };
+        log::info("sync phases us avg/max: barrier=%s/%s device_flush=%s/%s ckpt_snapshot=%s/%s "
+                  "ckpt_write=%s/%s ckpt_flush=%s/%s sb_write=%s/%s sb_flush=%s/%s",
+                  averageUs(counters.syncBarrier).c_str(), maxUs(counters.syncBarrier).c_str(),
+                  averageUs(counters.syncDeviceFlush).c_str(),
+                  maxUs(counters.syncDeviceFlush).c_str(),
+                  averageUs(counters.syncCheckpointSnapshot).c_str(),
+                  maxUs(counters.syncCheckpointSnapshot).c_str(),
+                  averageUs(counters.syncCheckpointWrite).c_str(),
+                  maxUs(counters.syncCheckpointWrite).c_str(),
+                  averageUs(counters.syncCheckpointFlush).c_str(),
+                  maxUs(counters.syncCheckpointFlush).c_str(),
+                  averageUs(counters.syncSuperblockWrite).c_str(),
+                  maxUs(counters.syncSuperblockWrite).c_str(),
+                  averageUs(counters.syncSuperblockFlush).c_str(),
+                  maxUs(counters.syncSuperblockFlush).c_str());
     }
     log::info("engine stopped");
     co_return Result<void>(Status::Ok);
@@ -748,14 +770,45 @@ Result<void> Engine::syncMetadata(std::uint64_t epoch) {
 
         Result<void> result(Status::Ok);
         stats::counters().syncBarriers.fetch_add(1, std::memory_order_relaxed);
-        /* Phase 1 (data): every device flush covers the data writes that
-         * completed before it was submitted; the runtime skips a device whose
-         * previous flush already covers all completed writes. */
-        for (std::size_t i = 0; i < impl_->config.devices.size(); ++i) {
-            result = flushDevice(i);
-            if (!result.ok()) {
-                break;
+        const auto barrierStart = std::chrono::steady_clock::now();
+        const bool checkpointNeeded = targetEpoch > impl_->namespaceState->durableEpoch();
+        bool prepared = false;
+        /* Phase 1 (metadata): write the checkpoint and superblock without their
+         * own flushes when a namespace change needs a checkpoint. */
+        if (checkpointNeeded) {
+            auto staged = impl_->namespaceState->prepareDurableEpoch(targetEpoch);
+            if (!staged.ok()) {
+                result = staged;
+            } else {
+                prepared = true;
             }
+            if (result.ok()) {
+                auto checkpoint = impl_->journal->checkpoint(/*deferFlush=*/true);
+                stats::counters().journalCheckpoints.fetch_add(1, std::memory_order_relaxed);
+                if (!checkpoint.ok()) {
+                    impl_->namespaceState->rollbackPreparedDurableEpoch();
+                    prepared = false;
+                    result = checkpoint;
+                }
+            }
+        }
+        /* Phase 2 (data + metadata durability): one device flush covers every
+         * write completed before it was submitted - user data, the checkpoint
+         * record and the superblock - so the barrier needs a single round trip
+         * per device (hfs2.0.md 10.2/20.3). */
+        if (result.ok()) {
+            const auto deviceFlushStart = std::chrono::steady_clock::now();
+            for (std::size_t i = 0; i < impl_->config.devices.size(); ++i) {
+                result = flushDevice(i);
+                if (!result.ok()) {
+                    break;
+                }
+            }
+            stats::counters().syncDeviceFlush.record(
+                static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - deviceFlushStart)
+                        .count()));
         }
         if (result.ok()) {
             test_hooks::crashIfRequested("metadata_commit");
@@ -764,25 +817,18 @@ Result<void> Engine::syncMetadata(std::uint64_t epoch) {
                                    "test-injected metadata commit boundary failure");
             }
         }
-        /* Phase 2 (metadata): only a namespace change needs a checkpoint. */
-        if (result.ok() && targetEpoch > impl_->namespaceState->durableEpoch()) {
-            auto prepared = impl_->namespaceState->prepareDurableEpoch(targetEpoch);
-            if (!prepared.ok()) {
-                result = prepared;
-            }
-            if (result.ok()) {
-                auto checkpoint = impl_->journal->checkpoint();
-                stats::counters().journalCheckpoints.fetch_add(1, std::memory_order_relaxed);
-                if (!checkpoint.ok()) {
-                    impl_->namespaceState->rollbackPreparedDurableEpoch();
-                    result = checkpoint;
-                }
-            }
-            if (result.ok()) {
-                result = impl_->namespaceState->publishDurableEpoch(targetEpoch);
-            }
+        if (result.ok() && checkpointNeeded) {
+            result = impl_->namespaceState->publishDurableEpoch(targetEpoch);
+        }
+        if (!result.ok() && prepared) {
+            /* A failed barrier must not leave staged durable sizes behind. */
+            impl_->namespaceState->rollbackPreparedDurableEpoch();
         }
 
+        stats::counters().syncBarrier.record(
+            static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                           std::chrono::steady_clock::now() - barrierStart)
+                                           .count()));
         {
             std::lock_guard<std::mutex> syncLock(impl_->syncMutex);
             batch->status = result.status();
