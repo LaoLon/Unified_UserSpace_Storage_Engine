@@ -148,6 +148,26 @@ barrier 286 → 179 µs。门禁：CTest 26/26；Shard-104 crash matrix 通过�
 SHA256 `b40d3831…`；证据 `/home/hfs/barrier-ab-{merge2,batch2,batch1}/`、
 `/home/hfs/rocksdb-rw32-cache1g-20260927-batch/`、`/home/hfs/fio-8j4-batch-20260927/`。
 
+## MySQL 新口径：fsync 修复 + barrier 合并 + 批量写后（2026-09-27）
+
+同会话同盘协议（`mysql/run_shard105_samedisk_vm.sh`，每阶段重建 datadir、无预热）：
+
+| run | 只读 TPS | 读 avg/p99 ms | 读写 TPS | 读写 avg/p99 ms | mysqlslap 读/更新 s | redo fsync |
+|---|---:|---|---:|---|---:|---:|
+| hfs-1 | 10770.89 | 0.74 / 1.79 | 1680.33 | 4.76 / 9.22 | 0.056 / 12.090 | 45723 |
+| native-1 | 11533.86 | 0.69 / 1.64 | 2299.48 | 3.48 / 6.91 | 0.058 / 10.535 | 68434 |
+| hfs-2 | 10622.66 | 0.75 / 1.86 | 1680.26 | 4.76 / 9.06 | 0.067 / 12.211 | 45373 |
+| native-2 | 10938.11 | 0.73 / 1.73 | 2306.10 | 3.47 / 6.91 | 0.069 / 10.524 | 69104 |
+
+只读 **95.2%**、读写 **73.0%**（旧基线 98.5% / 72.4%）。预热同会话对照
+（2×10 s warmup + 20 s trx=1）：HFS 1640.15 TPS / avg 4.88 / p99 9.56，native
+2297.35 / 3.48 / 6.79，**HFS/native 71.4%**。即写路径比值在冷/热两种口径下一致
+（71–73%），fsync 修复与 barrier 优化未改变该比值：修复把"跳过 flush"换成正确落盘，
+合并/批量写把 barrier 从 286 µs 降到 ~180 µs，两者相抵。剩余差距
+（+1.4 ms/txn）不在 barrier（约 0.23 ms/txn），而在 seam 同步 I/O 与 InnoDB
+log 等待/自旋、CPU 争用。证据 `/home/hfs/mysql-samedisk-20260927-postfsync/`、
+`/home/hfs/mysql-warm-ab-20260927/`。
+
 ## 复现入口
 
 - FIO：`ALLOW_FORMAT=1 RESULT=<dir> bash fio/run_three_way_matrix_vm.sh`
