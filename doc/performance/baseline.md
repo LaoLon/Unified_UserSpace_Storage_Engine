@@ -106,6 +106,28 @@ HFS 两轮 `hfsctl check` 均为 `corruption=none`。
 `corruption=none`；RocksDB 两种模式 `overwrite` 逐键校验通过。修复后
 `libhfs_core.so` SHA256 `fba6fe1c…`。
 
+### barrier 相位与合并（2026-09-27）
+
+相位计时（`HFS_DIAG_SYNC_STATS=1`，MySQL trx=1 会话）：barrier avg 286 µs，其中
+data_flush 95、ckpt_snapshot 16、ckpt_write 111、ckpt_flush 44、sb_write 90、
+sb_flush 35 µs；带 checkpoint 的 barrier ≈ 391 µs，模型 flush 数 108,902 对实测
+108,204。合并后（checkpoint/superblock 延迟 flush，每设备单次 flush）：
+
+| 指标 | 合并前 | 合并后 | 变化 |
+|---|---:|---:|---:|
+| MySQL trx=1 TPS（同会话相邻两轮） | 1568.03 | 1592.69 | +1.6% |
+| barrier avg µs | 286 | 237 | −17% |
+| device flush 命令（会话） | 108176 | 52853 | −51% |
+| ckpt_write / sb_write µs | 111 / 90 | 182 / 109 | 合并后写入成为 barrier 首个设备 I/O |
+| ckpt_flush / sb_flush µs | 44 / 35 | 0 / 0 | 由 device flush 覆盖 |
+
+门禁：CTest 26/26；Shard-104 crash matrix（在线 DDL + torn page 双 SIGKILL）通过、
+两轮 `hfsctl check` `corruption=none`；RocksDB rw32 HFS fillseq 102.7%、readrandom
+408%、`overwrite` 校验 111.7%（对 native）；8j4 HFS 中位 79577 / raw 121547（0.655），
+较上一轮 HFS −0.9%（<5%）。合并后 `libhfs_core.so` SHA256 `1b31d870…`；证据
+`/home/hfs/barrier-ab-{premerge,postmerge}/`、`/home/hfs/mysql-shard104-crash-20260927/`、
+`/home/hfs/rocksdb-rw32-cache1g-20260927-merge/`、`/home/hfs/fio-8j4-merge-20260927/`。
+
 ## 复现入口
 
 - FIO：`ALLOW_FORMAT=1 RESULT=<dir> bash fio/run_three_way_matrix_vm.sh`
