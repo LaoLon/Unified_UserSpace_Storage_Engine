@@ -216,6 +216,11 @@ AsyncDataBackend::SubmitResult SpdkAsyncDataBackend::submitWrite(
     return submit(request, callback, context, true);
 }
 
+bool SpdkAsyncDataBackend::isBufferDmaCapable(const void *buffer,
+                                              std::size_t bytes) const noexcept {
+    return runtime_.isDmaCapable(buffer, bytes);
+}
+
 AsyncDataBackend::SubmitResult SpdkAsyncDataBackend::submit(
     const Request &request, CompletionCallback callback, void *context, bool write) noexcept {
     if (!valid_) {

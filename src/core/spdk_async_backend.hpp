@@ -48,6 +48,9 @@ public:
     void pump() noexcept override;
     /* Wakes the owning data reactor after a ring doorbell; any thread. */
     void wake() noexcept override;
+    /* Validates spdk_vtophys contiguity so the service can bounce instead of
+     * failing a direct user-buffer request with EINVAL. */
+    bool isBufferDmaCapable(const void *buffer, std::size_t bytes) const noexcept override;
 
     std::size_t pending() const noexcept {
         return pendingCount_;

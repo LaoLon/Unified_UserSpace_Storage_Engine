@@ -65,6 +65,15 @@ public:
     /* Reactor wake hint after a ring publish armed the shard doorbell. Called
      * from the publishing thread; must be nonblocking and coalescing. */
     virtual void wake() noexcept {}
+
+    /* True when the span can be submitted as one contiguous device DMA range.
+     * Backends without a device DMA path keep the historical direct behavior;
+     * the SPDK backend overrides this with spdk_vtophys validation. */
+    virtual bool isBufferDmaCapable(const void *buffer, std::size_t bytes) const noexcept {
+        (void)buffer;
+        (void)bytes;
+        return true;
+    }
 };
 
 /* Credit and completion sink owned by the frontend client. */

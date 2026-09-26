@@ -871,8 +871,13 @@ private:
                 continue;
             }
             const std::byte *userBuffer = state.request.buffer.data() + plan.bufferOffset;
-            const bool needsBounce = isRmw(plan.kind) ||
-                                     !arena_.ownsRange(userBuffer, plan.spanBytes);
+            /* Direct user DMA is valid only for a live arena slice that also
+             * translates to one contiguous device span; otherwise bounce. */
+            AsyncDataBackend *backend = state.owner->shards_[state.shard].backend;
+            const bool directCapable =
+                arena_.ownsRange(userBuffer, plan.spanBytes) && backend != nullptr &&
+                backend->isBufferDmaCapable(userBuffer, plan.spanBytes);
+            const bool needsBounce = isRmw(plan.kind) || !directCapable;
             if (!needsBounce) {
                 if (!state.request.write) {
                     ++directUserChildren;
