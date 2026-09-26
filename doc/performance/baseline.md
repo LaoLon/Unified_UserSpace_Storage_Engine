@@ -128,6 +128,26 @@ sb_flush 35 µs；带 checkpoint 的 barrier ≈ 391 µs，模型 flush 数 108,
 `/home/hfs/barrier-ab-{premerge,postmerge}/`、`/home/hfs/mysql-shard104-crash-20260927/`、
 `/home/hfs/rocksdb-rw32-cache1g-20260927-merge/`、`/home/hfs/fio-8j4-merge-20260927/`。
 
+### checkpoint/superblock 批量写（2026-09-27）
+
+`JournalDevice::writeBatch` 把 checkpoint 记录与 superblock 一次提交（并发在飞、只付
+一次唤醒）；`SpdkRuntime::controlWriteBatch` 负责批量控制写。
+
+| 指标 | 合并后 | 批量写后 | 变化 |
+|---|---:|---:|---:|
+| MySQL trx=1 TPS（同会话相邻两轮） | 1598.43 | 1615.76 | +1.1% |
+| barrier avg µs | 237 | 179–184 | −24% |
+| meta_write µs（两条记录） | 182 + 109 = 291 | 191–197 | −34% |
+| device_flush µs | 49 | 59–61 | — |
+| ckpt_snapshot µs | 16 | 16 | — |
+
+累计（修复前 → 批量写）：MySQL trx=1 1568.03 → 1615.76 TPS（同会话相邻轮 +3.0%）；
+barrier 286 → 179 µs。门禁：CTest 26/26；Shard-104 crash matrix 通过、
+`hfsctl check` `corruption=none`；RocksDB rw32 HFS fillseq 103.6%、readrandom 400%、
+校验 153%；8j4 HFS 中位 80861 / raw 121663（0.665）。批量写后 `libhfs_core.so`
+SHA256 `b40d3831…`；证据 `/home/hfs/barrier-ab-{merge2,batch2,batch1}/`、
+`/home/hfs/rocksdb-rw32-cache1g-20260927-batch/`、`/home/hfs/fio-8j4-batch-20260927/`。
+
 ## 复现入口
 
 - FIO：`ALLOW_FORMAT=1 RESULT=<dir> bash fio/run_three_way_matrix_vm.sh`
