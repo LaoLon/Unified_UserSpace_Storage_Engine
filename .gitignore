@@ -4,6 +4,8 @@
 /spdk/build/
 /spdk/dpdk/build/
 /spdk/dpdk/build-tmp/
+/temp_scripts/*
+!/temp_scripts/.gitkeep
 *.o
 *.d
 

@@ -4,6 +4,7 @@
 
 - `doc/bug.md` 是 HFS 2.0 当前 Bug 记录；HFS 1.x 的 Bug 历史已清理，HFS 2.0 的已知风险、停止条件和边界以 `doc/design/hfs2.0.md` §17 为准。
 - `doc/design/hfs2.0.md` 是 HFS 2.0 当前唯一的架构、边界、接口和实施计划事实源；实现、评审和验收必须以它为准。
+- `doc/performance/baseline.md` 是当前 VM 的 FIO/RocksDB 性能基线入口；重测前先核对设备、版本、配置和负载口径，在同环境交错对比。有效新结果按文档规则更新并保留旧数值及证据；不同 VM 或口径另建基线，不直接计算跨环境回退。性能目标仍以 `doc/design/hfs2.0.md` 为准。
 - `doc/review/hfs2.0_design_review_20260916.md` 是 HFS 2.0 的设计评审依据；发现设计冲突时先更新设计文档，再开始实现。
 - HFS 1.x 的旧设计、性能、review、shard、task 和 Bug 文档已从工作区清理；如需复盘只能查询 Git 历史，不得据此恢复旧功能、旧目录结构、旧容量或旧 API。
 - 需要了解当前进展时，先查看 `git log --stat` 和 `git status`，再以当前源码、测试脚本和最新文档为准。
@@ -17,7 +18,7 @@
 ## VM 与测试约束
 
 - 读取 `E:\Code\workspace.yaml` 获取本地路径、VM 连接信息和 SSH 默认值。
-- VM 操作使用 `E:\Code\ssh\pool.py` 提供的 `SSHPool`；所有临时脚本（包括 VM 操作脚本）统一写入 `E:\Code\test_script\`，不要放进项目工作树，任务完成后清理。
+- VM 操作使用 `E:\Code\ssh\pool.py` 提供的 `SSHPool`；所有临时脚本（包括 VM 操作脚本）及其临时依赖统一写入项目根目录 `temp_scripts/`。该目录除占位文件外由 Git 忽略；任务完成后只清理本任务创建的内容，保留他人文件。
 - 每次先修改 Windows 工作区文件，再按需同步 HFS 自身源码、脚本和文档到 VM。SPDK 源码及子模块必须在 VM 内通过 Git 获取和维护，禁止从 Windows 工作区同步 `spdk/` 覆盖 VM。
 - HFS 2.0 正式功能和性能验证固定使用 `.conf` 配置中的真实 NVMe：单盘 baseline 为 `Nvme0n1`，PCI BDF 必须与当前 VM 的目标控制器一致；多盘测试必须在同一 `.conf` 中声明完整 device set。除非任务明确要求故障注入或对照实验，不使用 Malloc/Aio 替代正式口径。
 - VM 重启后先确认 SPDK 设备重新绑定，并确认 `vm.nr_hugepages=1024`；大体积测试结果默认写入 VM 本地 `/home/hfs`，使用前检查根盘剩余空间并控制测试产物大小。

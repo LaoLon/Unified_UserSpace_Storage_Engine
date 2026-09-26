@@ -1,5 +1,7 @@
 # HFS 2.0 Phase 7（MySQL/InnoDB）RocksDB/FIO 基线快照
 
+> 这是 `0000:0b:00.0` 旧 VM 的历史快照。当前 VM 的统一入口见 `baseline.md`；不同 VM 的数值不直接比较回退。
+
 时间：2026-09-24  
 状态：Shard-99 出口基线，已采集（HFS core 零改动）  
 目的：为 Phase 7 后续 shard 提供同口径回归对照，防止 MySQL 适配引入 RocksDB/FIO 回退。
