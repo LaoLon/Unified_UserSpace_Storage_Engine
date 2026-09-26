@@ -289,6 +289,10 @@ struct SpdkRuntime::Impl {
     std::condition_variable stateChanged;
     Config config;
     std::vector<DeviceState> devices;
+    /* Per-device data durability sequences (hfs2.0.md 10.2/20.3): a write
+     * completion advances writtenSeq, a device flush publishes coverage. */
+    std::vector<std::atomic<std::uint64_t>> dataWrittenSeq;
+    std::vector<std::atomic<std::uint64_t>> dataFlushedSeq;
     std::vector<std::shared_ptr<Reactor>> reactors; /* [0] metadata, [1..R] data */
     std::vector<std::uint32_t> deviceReactors;
     std::atomic<bool> activeFlag{false};
@@ -307,6 +311,40 @@ struct SpdkRuntime::Impl {
         startResult = rc;
         startDone = true;
         stateChanged.notify_all();
+    }
+
+    /* Advances a device's completed-write sequence; called by both the
+     * synchronous and the actor-local data completion paths. */
+    void noteDataWriteComplete(std::size_t deviceIndex) noexcept {
+        if (deviceIndex < dataWrittenSeq.size()) {
+            dataWrittenSeq[deviceIndex].fetch_add(1, std::memory_order_release);
+        }
+    }
+
+    /* True when some device has a completed data write not yet covered by a
+     * device flush. */
+    bool dataFlushPending() const noexcept {
+        for (std::size_t i = 0; i < dataWrittenSeq.size(); ++i) {
+            if (dataWrittenSeq[i].load(std::memory_order_acquire) >
+                dataFlushedSeq[i].load(std::memory_order_acquire)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /* Publishes flush coverage: a successful flush covers every write that
+     * completed before the flush was submitted, i.e. the sampled target. */
+    void publishDataFlushed(std::size_t deviceIndex, std::uint64_t target) noexcept {
+        if (deviceIndex >= dataFlushedSeq.size()) {
+            return;
+        }
+        auto &flushed = dataFlushedSeq[deviceIndex];
+        std::uint64_t observed = flushed.load(std::memory_order_relaxed);
+        while (observed < target &&
+               !flushed.compare_exchange_weak(observed, target, std::memory_order_release,
+                                              std::memory_order_relaxed)) {
+        }
     }
 
     /* Process exit without an explicit stop() must not join busy-polling
@@ -1049,8 +1087,11 @@ struct SpdkRuntime::Impl {
     };
 
     struct DataIoHolder {
+        Impl *impl = nullptr;
         void (*cb)(void *, int) = nullptr;
         void *cbCtx = nullptr;
+        std::size_t deviceIndex = 0;
+        bool write = false;
         /* SPDK retains the iovec until the asynchronous completion. */
         struct iovec iov{};
     };
@@ -1059,6 +1100,9 @@ struct SpdkRuntime::Impl {
         auto *holder = static_cast<DataIoHolder *>(arg);
         const int rc = success ? 0 : dataIoCompletionErrno(bdevIo);
         spdk_bdev_free_io(bdevIo);
+        if (success && holder->write && holder->impl != nullptr) {
+            holder->impl->noteDataWriteComplete(holder->deviceIndex);
+        }
         if (holder->cb != nullptr) {
             holder->cb(holder->cbCtx, rc);
         }
@@ -1081,7 +1125,12 @@ struct SpdkRuntime::Impl {
         spdk_bdev_desc *desc = devices[call->deviceIndex].desc;
         spdk_io_channel *channel =
             reactors[call->reactorIndex]->channels[call->deviceIndex];
-        auto *holder = new DataIoHolder{call->cb, call->cbCtx};
+        auto *holder = new DataIoHolder{};
+        holder->impl = this;
+        holder->cb = call->cb;
+        holder->cbCtx = call->cbCtx;
+        holder->deviceIndex = call->deviceIndex;
+        holder->write = call->write;
         holder->iov.iov_base = call->buffer;
         holder->iov.iov_len = call->blocks * devices[call->deviceIndex].blockSize;
         const int rc = call->write
@@ -1125,6 +1174,7 @@ struct SpdkRuntime::Impl {
         Impl *impl = nullptr;
         Reactor *reactor = nullptr;
         DataIoRequest *request = nullptr;
+        std::size_t deviceIndex = 0;
         std::uint64_t traceRequestId = 0;
         std::uint32_t traceChildIndex = 0;
         spdk_bdev_desc *desc = nullptr;
@@ -1291,6 +1341,9 @@ struct SpdkRuntime::Impl {
         auto *state = static_cast<DataIoState *>(arg);
         const int rc = success ? 0 : dataIoCompletionErrno(bdevIo);
         spdk_bdev_free_io(bdevIo);
+        if (success && state->write) {
+            state->impl->noteDataWriteComplete(state->deviceIndex);
+        }
         if (state->write && stats::enabled()) {
             stats::counters().bdevDataWriteOps.fetch_add(1, std::memory_order_relaxed);
             stats::counters().bdevDataWriteBytes.fetch_add(state->bytes,
@@ -1435,6 +1488,7 @@ struct SpdkRuntime::Impl {
         state->impl = this;
         state->reactor = reactor;
         state->request = &request;
+        state->deviceIndex = deviceIndex;
         state->traceRequestId = request.traceRequestId;
         state->traceChildIndex = request.traceChildIndex;
         state->desc = device.desc;
@@ -1472,6 +1526,17 @@ struct SpdkRuntime::Impl {
             return makeError(Status::IoError,
                              "test-injected data/control flush failure on device " +
                                  std::to_string(index));
+        }
+        /* Coverage check: skip the device flush only when no data write has
+         * completed since the last flush on this device. Injection hooks above
+         * still fire, so crash/failure tests keep their trigger points. */
+        std::uint64_t flushTarget = 0;
+        if (op == ControlIo::Op::Flush) {
+            flushTarget = dataWrittenSeq[index].load(std::memory_order_acquire);
+            if (dataFlushedSeq[index].load(std::memory_order_acquire) >= flushTarget) {
+                stats::counters().deviceFlushSkips.fetch_add(1, std::memory_order_relaxed);
+                return Result<void>(Status::Ok);
+            }
         }
 
         auto io = std::make_shared<ControlIo>();
@@ -1517,6 +1582,9 @@ struct SpdkRuntime::Impl {
             return makeError(Status::Busy, "spdk_thread_send_msg failed");
         }
         wakeReactor(reactors[0].get());
+        if (op == ControlIo::Op::Flush) {
+            stats::counters().deviceFlushes.fetch_add(1, std::memory_order_relaxed);
+        }
 
         std::unique_lock<std::mutex> lock(io->mutex);
         const auto timeout = std::chrono::milliseconds(config.metadataWaitTimeoutMs);
@@ -1527,6 +1595,12 @@ struct SpdkRuntime::Impl {
         const int rc = io->rc;
         lock.unlock();
         if (rc == 0) {
+            if (op == ControlIo::Op::Flush) {
+                publishDataFlushed(index, flushTarget);
+            } else if (op == ControlIo::Op::Write) {
+                /* Metadata/journal writes also need flush coverage. */
+                noteDataWriteComplete(index);
+            }
             return Result<void>(Status::Ok);
         }
         return makeError(Status::IoError, "control I/O failed rc=" + std::to_string(rc));
@@ -1613,6 +1687,14 @@ Result<void> SpdkRuntime::start(const Config &config) {
         for (const auto &device : config.devices) {
             impl.devices.push_back(Impl::DeviceState{device.bdevName, nullptr});
         }
+    }
+    if (impl.dataWrittenSeq.size() != impl.devices.size()) {
+        impl.dataWrittenSeq = std::vector<std::atomic<std::uint64_t>>(impl.devices.size());
+        impl.dataFlushedSeq = std::vector<std::atomic<std::uint64_t>>(impl.devices.size());
+    }
+    for (std::size_t i = 0; i < impl.devices.size(); ++i) {
+        impl.dataWrittenSeq[i].store(0, std::memory_order_relaxed);
+        impl.dataFlushedSeq[i].store(0, std::memory_order_relaxed);
     }
     impl.reactorCount.store(dataReactors, std::memory_order_release);
     impl.startDone = false;
@@ -1887,6 +1969,10 @@ Result<void> SpdkRuntime::controlFlush(std::size_t index) {
     return impl_->controlIo(ControlIo::Op::Flush, index, 0, {}, {});
 }
 
+bool SpdkRuntime::dataFlushPending() const noexcept {
+    return impl_->dataFlushPending();
+}
+
 Result<void> SpdkRuntime::submitDataRead(std::uint32_t reactorIndex,
                                          std::size_t deviceIndex, void *buffer,
                                          std::uint64_t offsetBlocks, std::uint64_t blocks,
@@ -2080,6 +2166,8 @@ Result<void> SpdkRuntime::controlFlush(std::size_t index) {
     (void)index;
     return makeError(Status::NotSupported, "core built without SPDK support");
 }
+
+bool SpdkRuntime::dataFlushPending() const noexcept { return false; }
 
 Result<void> SpdkRuntime::submitDataRead(std::uint32_t reactorIndex,
                                          std::size_t deviceIndex, void *buffer,

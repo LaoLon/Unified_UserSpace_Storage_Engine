@@ -1768,12 +1768,22 @@ seam 位于 `storage/innobase/os/os0file.cc`（审计 §5.1）：
 
 ### 20.3 Durability 契约
 
-- `os_file_fsync`/`os_file_flush` → `File::sync`；HFS 当前 `sync` 与 `datasync` 同为
-  namespace 级 durable epoch（强于 per-file fsync）；
-- redo/doublewrite/undo 的提交顺序依赖 fsync 语义；HFS epoch barrier 必须保证
-  write→fsync→崩溃后已提交数据可见；
-- data-only `datasync` 是评估项：若实施，必须保持 `File::sync` 行为与 ABI 不变，
-  并同时通过 RocksDB L4 无回退门禁；否则维持 namespace barrier；
+- `os_file_fsync`/`os_file_flush` → `File::sync`；`sync` 与 `datasync` 同为 namespace 级
+  durable barrier（强于 per-file fsync），ABI 不变；
+- barrier 按 §10.2 顺序执行两个阶段：
+  1. data 阶段：对每个设备下发 device flush，覆盖该设备上所有已完成的 data 写；
+  2. metadata 阶段：logical epoch 前进时执行 prepareDurableEpoch → journal checkpoint →
+     publishDurableEpoch；未前进时只发布内存 durable epoch；
+- data 覆盖由 `SpdkRuntime` 的 per-device `writtenSeq`/`flushedSeq` 判定：data 写完成推进
+  `writtenSeq`；`controlFlush` 在提交前采样 `writtenSeq`，成功后把 `flushedSeq` 推进到
+  采样值。设备 flush 仅当 `flushedSeq >= writtenSeq`（上次 flush 后无新完成写）才可跳过，
+  且 `File::sync` 返回时必须满足该条件；
+- 只有 metadata 未变且 data 已覆盖时 barrier 才可早退；任何 write→fsync→掉电路径都不得
+  跳过 data flush，原地覆盖写（不改变 logical size）同样必须落盘；
+- data-only `datasync`（不发 checkpoint）是本契约的第一阶段；实施不得改变 `File::sync`
+  行为与 ABI，且必须通过 RocksDB L4 无回退门禁；
+- 诊断：`HFS_DIAG_SYNC_STATS=1` 时 `Engine::stop()` 打印
+  calls/early/joiners/barriers/flushes/checkpoints，用于核对 flush 覆盖比例；
 - 恢复：HFS journal replay 与 InnoDB redo 双层恢复；kill -9 断点后 datadir 的
   namespace/extent/size 必须守恒，`hfsctl check` 无 corruption。
 

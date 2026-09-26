@@ -89,6 +89,11 @@ public:
                               std::span<const std::byte> buffer);
     Result<void> controlFlush(std::size_t index);
 
+    /* True when a completed data write is not yet covered by a device flush
+     * (hfs2.0.md 20.3). A successful controlFlush publishes coverage for every
+     * write that completed before it was submitted. */
+    bool dataFlushPending() const noexcept;
+
     /* Async data-reactor block I/O; the callback runs on the reactor thread. */
     Result<void> submitDataRead(std::uint32_t reactorIndex, std::size_t deviceIndex,
                                 void *buffer, std::uint64_t offsetBlocks,

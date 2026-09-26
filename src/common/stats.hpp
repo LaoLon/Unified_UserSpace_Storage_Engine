@@ -63,6 +63,7 @@ struct Counters {
     std::atomic<std::uint64_t> syncJoiners{0};
     std::atomic<std::uint64_t> syncBarriers{0};
     std::atomic<std::uint64_t> deviceFlushes{0};
+    std::atomic<std::uint64_t> deviceFlushSkips{0};
     std::atomic<std::uint64_t> journalCheckpoints{0};
 };
 
