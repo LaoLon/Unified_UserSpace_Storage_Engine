@@ -315,6 +315,49 @@ MySQL 比值强烈依赖设备会话速度（同一 VM 内 native 写 TPS 可在
 - 环境：设备会话间吞吐波动可达 ±40%，且有间歇性 NVMe 停顿（dmesg timeout）；
   任何性能结论必须以同会话交错测量为准。
 
+## 新磁盘形态基线（2026-09-27 晚，当前环境）
+
+VM 磁盘形态变更后另建基线（不与此前环境直接比较）。环境：3 块 20 GiB NVMe
+（`VMware NVME_0000/0002/0001`，目标盘 `VMware NVME_0002` 仍在 `0000:13:00.0`，容量由
+2.5 GiB 变为 20 GiB）；6 vCPU、1024 hugepages 不变。稳定性探针 3×10 s SPDK raw 4K
+randwrite QD32 = **69628 / 68524 / 69229 IOPS（离散 1.6%）**，此前同格可达 49×。
+
+### FIO 三方矩阵（3 轮中位数）
+
+| I/O | 总 QD | ext4+libaio | SPDK raw | HFS | HFS/raw |
+|---|---:|---:|---:|---:|---:|
+| 4K | 32 | 8986 | 76034 | 70097 | 92.2% |
+| 4K | 64 | 18559 | 76569 | 77091 | 100.7% |
+| 16K | 32 | 32359 | 60455 | 58318 | 96.5% |
+| 16K | 64 | 9842 | 62240 | 61338 | 98.6% |
+| 64K | 32 | 12591 | 35795 | 33950 | 94.8% |
+| 64K | 64 | 3577 | 33860 | 31716 | 93.7% |
+
+每格 3 轮离散：raw/HFS 1.01–1.20（多数 ≤1.06）；**ext4+libaio 仍离散（最高 7.6×）**，
+属 ext4/内核侧，不影响 HFS/raw 口径。
+
+### RocksDB 32 并发、1 GiB cache（同会话）
+
+| 阶段 | native | HFS | 比值 |
+|---|---:|---:|---:|
+| fillseq | 67598 | 67918 | 100.5% |
+| readrandom | 86786 | 111812 | 128.8% |
+| overwrite 校验 | 52710 | 57469 | 109.0% |
+
+`hfsctl check` `corruption=none`；journal replay 跨挂载正常（`transactions=1`）。
+
+### MySQL 同盘 + 预热
+
+| 协议 | HFS | native | 比值 |
+|---|---:|---:|---:|
+| shard-105 同盘 只读 | 7982 | 8194 | 97.4% |
+| shard-105 同盘 读写 trx=1 | 1377 | 1395 | 98.7% |
+| 预热 trx=1（2×10 s + 20 s） | 1326.83（avg 6.02 / p99 10.84） | 1406.25（5.68 / 11.24） | 94.4% |
+
+证据 `/home/hfs/device-probe-20260927/`、`/home/hfs/fio-three-way-20260927-newshape/`、
+`/home/hfs/rocksdb-rw32-cache1g-20260927-newshape/`、
+`/home/hfs/mysql-samedisk-20260927-newshape/`、`/home/hfs/mysql-warm-newshape-20260927/`。
+
 ## 复现入口
 
 - FIO：`ALLOW_FORMAT=1 RESULT=<dir> bash fio/run_three_way_matrix_vm.sh`
