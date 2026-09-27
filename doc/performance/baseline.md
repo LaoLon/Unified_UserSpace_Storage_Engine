@@ -276,6 +276,45 @@ RocksDB rw32 HFS fillseq 104.8%、readrandom 411%、`overwrite` 校验 109.5%（
 `/home/hfs/rocksdb-rw32-cache1g-20260927-journal3/`、`/home/hfs/fio-8j4-journal2-20260927/`、
 `/home/hfs/mysql-shard104-crash-20260927-journal/`。
 
+## 收口口径（2026-09-27，最终二进制）
+
+MySQL 比值强烈依赖设备会话速度（同一 VM 内 native 写 TPS 可在 1.5K–2.3K 间波动），
+因此并列两个会话；绝对值不可跨会话比较，比值才是口径。
+
+| 会话 | 协议 | HFS | native | 比值 |
+|---|---|---:|---:|---:|
+| 快设备（native 读写 ~2.3K） | shard-105 同盘 只读 | 10793 | 11066 | 97.5% |
+| 快设备 | shard-105 同盘 读写 trx=1 | 1907 | 2293 | 83.2% |
+| 快设备 | 预热 trx=1（2×10 s + 20 s） | 1958 | 2297 | 85.2% |
+| 慢设备（native 读写 ~1.5K） | shard-105 同盘 只读 | 8562 | 8777 | 97.6% |
+| 慢设备 | shard-105 同盘 读写 trx=1 | 1476 | 1504 | 98.2% |
+| 慢设备 | 预热 trx=1 | 1483 | 1629 | 91.1% |
+
+只读稳定在 **97.5–97.6%**；读写比值在设备受限时收敛到 ~98%，在设备快、CPU/延迟主导时
+为 **83–85%**。证据 `/home/hfs/mysql-samedisk-20260927-final{2}/`、
+`/home/hfs/mysql-warm-ab-20260927/`。
+
+### 优化台账（本轮全部改动，按时间序）
+
+| 改动 | 结果 | 状态 |
+|---|---|---|
+| fsync 覆盖修复（原地写必须落盘） | 契约修复；同会话 +1.3% | 保留 |
+| barrier 合并（ckpt+sb 单次 flush） | flush 命令 −51%、barrier 286→237 µs、+1.6% | 保留 |
+| checkpoint/superblock 批量写 | meta_write 291→191 µs、+1.1% | 保留 |
+| seam worker-direct 异步（owner-file 模型） | 每 I/O 140→71 µs、+1.5% | 保留 |
+| `max_group_commit_wait_us = 0` | +9.2% | 保留 |
+| 元数据 journal 化 | checkpoints −99.8%、+1.0% | 保留 |
+| per-file `File::sync` 目标 epoch | −0.8%（噪声内），语义降级 | 回退 |
+| 异步 journal writer（write-behind） | −5.8% | 回退 |
+
+### 已知边界（profile 证据）
+
+- 剩余 HFS 特有开销：barrier 的设备往返（耐久性必需，2 次实验证明无法再省）、
+  SPDK 轮询 ~0.35 核（无中断）、内核自旋 +2.9pp；committer 等待自旋已与 native 持平
+  （`log_write_up_to` 8.68% vs 8.61%）。
+- 环境：设备会话间吞吐波动可达 ±40%，且有间歇性 NVMe 停顿（dmesg timeout）；
+  任何性能结论必须以同会话交错测量为准。
+
 ## 复现入口
 
 - FIO：`ALLOW_FORMAT=1 RESULT=<dir> bash fio/run_three_way_matrix_vm.sh`

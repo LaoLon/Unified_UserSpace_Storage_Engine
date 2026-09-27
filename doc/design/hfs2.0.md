@@ -1540,6 +1540,7 @@ checkpoint region 必须容纳 namespace/inode/extent map/各 device allocator b
 | MySQL `os_file` seam 遗漏绕过点 | 审计清单 + 每 shard strace 校验；datadir 文件必须落 HFS |
 | `File::sync` 无 data-only barrier | 组提交先行；任何 core 改动必须通过 RocksDB L4 无回退门禁 |
 | MySQL frontend 回归影响 RocksDB | shard 出口 L1–L4 门禁；默认值/ABI 冻结，MySQL 独立 `.conf` |
+| MySQL 提交路径剩余差距 | 已定位为 barrier 的设备往返（耐久性必需）+ SPDK 轮询；异步 journal writer 与 per-file sync 均实测回退（见 baseline 台账），不重复尝试 |
 
 ### 17.3 立即停止条件
 
