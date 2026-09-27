@@ -216,6 +216,31 @@ TPS 1841.04 → 1825.49（−0.8%，噪声内）。checkpoint 主要来自 fsync
 `/home/hfs/rocksdb-rw32-cache1g-20260927-v2/`、`/home/hfs/fio-8j4-v2-20260927/`、
 `/home/hfs/mysql-shard104-crash-20260927-v2/`。
 
+## 最终口径（2026-09-27 晚，fsync 修复 + barrier 合并/批量 + seam 异步 + gcw=0）
+
+同盘协议（每阶段重建 datadir、无预热）：
+
+| run | 只读 TPS | 读 avg/p99 ms | 读写 TPS | 读写 avg/p99 ms | mysqlslap 读/更新 s | redo fsync |
+|---|---:|---|---:|---|---:|---:|
+| hfs-1 | 11073.01 | 0.72 / 1.73 | 1919.76 | 4.16 / 10.46 | 0.058 / 10.901 | 70556 |
+| native-1 | 11266.50 | 0.71 / 1.70 | 2287.40 | 3.49 / 6.79 | 0.064 / 10.566 | 67983 |
+| hfs-2 | 10512.78 | 0.76 / 1.79 | 1893.58 | 4.22 / 10.27 | 0.062 / 11.010 | 71343 |
+| native-2 | 10865.98 | 0.74 / 1.73 | 2297.99 | 3.48 / 7.17 | 0.069 / 10.508 | 69228 |
+
+只读 **97.5%**、读写 **83.2%**（此前 95.2% / 73.0%，旧基线 98.5% / 72.4%）；mysqlslap
+单行更新耗时已到 native 的 96–104%。预热同会话 profile：HFS 1769.19 TPS / avg 4.52 ms
+vs native 2196.78 / 3.64 ms（**80.5%**），fsync/txn 2.39 vs 2.34。
+
+| 自耗 | HFS | native | 说明 |
+|---|---:|---:|---|
+| `log_write_up_to` | **8.68%** | 8.61% | committer 等待自旋已持平（此前 24.4%） |
+| `log_flusher` | **15.37%** | 4.53% | 剩余 HFS 特有项：barrier 的 on-CPU 工作（51KB 快照 + CRC + control 路径） |
+| `log_writer` | 6.07% | 22.79% | HFS 写线程阻塞在同步 I/O，采样不到 |
+| 内核自旋 | 9.21% | 6.27% | — |
+| SPDK 轮询 | 4.33% | — | reactor 轮询（无中断） |
+
+证据 `/home/hfs/mysql-samedisk-20260927-final/`、`/home/hfs/mysql-profile-20260927b/`。
+
 ## 复现入口
 
 - FIO：`ALLOW_FORMAT=1 RESULT=<dir> bash fio/run_three_way_matrix_vm.sh`
