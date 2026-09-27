@@ -631,6 +631,15 @@ Result<void> Client::bindFrontendThread() {
     return Result<void>(Status::Ok);
 }
 
+/* Design §20.4 keeps File handles on the process-level owner client while
+ * per-thread clients submit I/O, so a file only has to belong to the same
+ * engine; the submitting client still owns slots, credits and completions.
+ * Client is a friend of File, so the private impl_ is reachable here. */
+bool Client::fileBelongsToEngine(Engine &engine, const std::shared_ptr<File> &file) {
+    return file != nullptr && file->impl_ != nullptr && file->impl_->state != nullptr &&
+           file->impl_->state->engine == &engine;
+}
+
 Result<IoHandle> Client::submitRead(const std::shared_ptr<File> &file, IoVec buffer,
                                     std::uint64_t offset, CompletionToken token) {
     auto &state = *impl_->state;
@@ -638,10 +647,9 @@ Result<IoHandle> Client::submitRead(const std::shared_ptr<File> &file, IoVec buf
     if (!valid.ok()) {
         return makeError<IoHandle>(valid.status(), valid.message());
     }
-    if (file == nullptr || file->impl_ == nullptr ||
-        file->impl_->state.get() != impl_->state.get()) {
+    if (!fileBelongsToEngine(*state.engine, file)) {
         return makeError<IoHandle>(Status::InvalidArgument,
-                                   "file does not belong to this client");
+                                   "file does not belong to this engine");
     }
     auto snapshot = file->impl_->asyncSnapshot();
     if (!snapshot.ok()) {
@@ -671,10 +679,9 @@ Result<IoHandle> Client::submitWrite(const std::shared_ptr<File> &file, IoVec bu
     if (!valid.ok()) {
         return makeError<IoHandle>(valid.status(), valid.message());
     }
-    if (file == nullptr || file->impl_ == nullptr ||
-        file->impl_->state.get() != impl_->state.get()) {
+    if (!fileBelongsToEngine(*state.engine, file)) {
         return makeError<IoHandle>(Status::InvalidArgument,
-                                   "file does not belong to this client");
+                                   "file does not belong to this engine");
     }
     auto snapshot = file->impl_->asyncSnapshot();
     if (!snapshot.ok()) {

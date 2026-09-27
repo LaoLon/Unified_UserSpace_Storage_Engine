@@ -179,17 +179,37 @@ log 等待/自旋、CPU 争用。证据 `/home/hfs/mysql-samedisk-20260927-postf
 ## seam worker-direct 快路径（2026-09-27，Shard-106）
 
 seam 的 `read/write` 改为 per-thread client `submitRead/submitWrite` + 同线程 `poll`
-（增长写与 submit 失败回落同步门面）。同会话双向 A/B（8 线程 trx=1、2×10 s warmup）：
+（File 由 owner client 持有；core 的 file 归属校验放宽到同一 engine，增长写与 submit
+失败回落同步门面）。同会话双向 A/B（8 线程 trx=1、2×10 s warmup）：
 
 | 轮次 | pre-async TPS | seam-async TPS | 变化 | async 计数 |
 |---|---:|---:|---:|---|
 | pre → post | 1642.05 | 1656.59 | +0.9% | reads 339 / writes 126949 / fallbacks 46036 |
 | post → pre（反序） | 1631.26 | 1662.11 | +1.9% | reads 337 / writes 127118 / fallbacks 46063 |
+| v2（owner-file 模型，反序 post→pre） | 1625.40 | 1650.40 | +1.5% | reads 337 / writes 126677 / fallbacks 46132 |
 
-两序均值约 **+1.4%**。定向 profile（预热协议）显示 committer 自旋几乎未降：
-`log_write_up_to` 自耗 24.4% → 24.0%、内核自旋 14.7% → 12.6%，即写延迟不是自旋主因；
-剩余 HFS 特有开销集中在 fsync barrier 与 InnoDB group-commit 等待结构。
-证据 `/home/hfs/mysql-seam-async-ab{,-2}-20260927/`、`/home/hfs/mysql-profile-async-20260927/`。
+两序均值约 **+1.4%**；v2 停机干净（`engine stopped`、复挂载 `clean=1`）。定向 profile
+（预热协议）显示 committer 自旋几乎未降：`log_write_up_to` 自耗 24.4% → 24.0%、
+内核自旋 14.7% → 12.6%，即写延迟不是自旋主因；剩余 HFS 特有开销集中在 fsync barrier
+与 InnoDB group-commit 等待结构。
+
+### `max_group_commit_wait_us` 0 vs 200（2026-09-27，同会话四相位）
+
+| 配置 | TPS（两相位） | avg ms | barriers | flushes | checkpoints |
+|---|---|---:|---:|---:|---:|
+| 0 | 1829.23 / 1788.37 | 4.37 / 4.47 | 166707 / 167897 | 166709 / 167899 | 43704 / 43757 |
+| 200 | 1662.26 / 1649.40 | 4.81 / 4.85 | 48509 / 48247 | 48511 / 48249 | 32592 / 32371 |
+
+0 的 barrier/flush 是 200 的 3.4×，吞吐仍 **+9.2%**：窗口是纯延迟项，每次 barrier 已真实
+落盘，设备可吸收更多 flush。`config/hfs_mysql.conf` 已改为 `max_group_commit_wait_us = 0`。
+
+门禁（core 校验放宽 + v2 seam + gcw=0）：CTest 26/26；Shard-104 crash matrix 通过、
+`hfsctl check` `corruption=none`；RocksDB rw32 HFS fillseq 105.8%、readrandom 411%、
+`overwrite` 校验 107.6%（对 native）；8j4 HFS 中位 79825 / raw 121426（0.657）、
+5 轮 closure 全闭合。证据 `/home/hfs/mysql-seam-v2-ab-20260927/`、
+`/home/hfs/mysql-gcw-v2-20260927/`、`/home/hfs/mysql-seam-v2-check-20260927/`、
+`/home/hfs/rocksdb-rw32-cache1g-20260927-v2/`、`/home/hfs/fio-8j4-v2-20260927/`、
+`/home/hfs/mysql-shard104-crash-20260927-v2/`。
 
 ## 复现入口
 

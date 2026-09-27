@@ -189,6 +189,10 @@ public:
 private:
     explicit Client(Engine &engine, const ClientOptions &options);
     struct Impl;
+    /* Design §20.4: files live on the process-level owner client while
+     * per-thread clients submit I/O, so a file only has to belong to the same
+     * engine. Client is a friend of File, which keeps the check here. */
+    static bool fileBelongsToEngine(Engine &engine, const std::shared_ptr<File> &file);
     std::unique_ptr<Impl> impl_;
 };
 

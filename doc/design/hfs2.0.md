@@ -760,7 +760,9 @@ data submit → data drain
 消除 checkpoint/superblock 各自的 flush 往返（2026-09-27 barrier 合并）。
 
 并发 `sync/fsync` 使用 full-snapshot group commit：第一个 waiter 成为 leader，在
-`metadata.max_group_commit_wait_us` 窗口内合并更高目标 epoch；窗口结束后只执行一次
+`metadata.max_group_commit_wait_us` 窗口内合并更高目标 epoch；该窗口是纯延迟项，每次
+barrier 都已真实落盘，因此 MySQL 配置取 0（实测 +9%），需要合并时由并发 caller 自然
+join；窗口结束后只执行一次
 全设备 data flush、namespace checkpoint 和 superblock publish，所有不超过冻结目标的
 waiter 共享同一个成功或失败结果。该窗口只用于合并请求，不是 durability timeout；
 增量 dirty-object checkpoint 仍未改变当前 on-disk format，留待后续格式版本。
@@ -1769,10 +1771,12 @@ seam 位于 `storage/innobase/os/os0file.cc`（审计 §5.1）：
   落到宿主 OS；
 - native AIO（`AIO::linux_dispatch`/`os_aio_linux_handler`）在 v1 关闭
   （`innodb_use_native_aio=OFF`），模拟 AIO 统一收敛到 seam；AIO bridge 属二期。
-- Shard-106：seam 的 `read/write` 增加 worker-direct 快路径——调用线程用自己的
-  per-thread client 对同名 namespace 路径打开 File，`submitRead/submitWrite` 后用
-  `poll` 在本线程收完成；仅用于文件内读与 fixed-overwrite 写（增长写、前端受限或
-  submit 失败时回落同步门面，ABI 与 `File::sync` 语义不变）。计数器
+- Shard-106：seam 的 `read/write` 增加 worker-direct 快路径——File 仍由进程级 owner
+  client 持有，调用线程用自己的 per-thread client `submitRead/submitWrite` 后在本线程
+  `poll` 收完成；仅用于文件内读与 fixed-overwrite 写（增长写、前端受限或 submit 失败时
+  回落同步门面，ABI 与 `File::sync` 语义不变）。为此 `Client::submitRead/submitWrite`
+  的 file 归属校验从"同一 client"放宽到"同一 engine"，即 §20.4 的 owner-file 模型：
+  槽位、credit 与完成队列仍属于提交方 client。计数器
   `async_reads/async_writes/async_fallbacks` 随 `shutdown complete` 行输出；完整
   AIO bridge（跨线程提交/完成回调）仍属二期。
 

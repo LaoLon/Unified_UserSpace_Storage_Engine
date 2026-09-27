@@ -9,7 +9,7 @@
  #include <atomic>
  #include <cerrno>
  #include <csignal>
-@@ -8,12 +10,15 @@
+@@ -8,9 +10,11 @@
  #include <cstdlib>
  #include <cstring>
  #include <fcntl.h>
@@ -21,11 +21,7 @@
  #include <string>
  #include <string_view>
  #include <unistd.h>
-+#include <unordered_map>
- #include <vector>
- 
- #include "hfs/config.hpp"
-@@ -65,9 +70,14 @@
+@@ -65,6 +69,10 @@
    std::mutex fileClientMutex;
    std::atomic<std::uint64_t> threadClients{0};
    std::atomic<std::uint64_t> fallbackClients{0};
@@ -36,98 +32,28 @@
    struct Entry {
      std::shared_ptr<hfs::File> file;
      std::uint64_t position = 0;
-+    std::string path; /* namespace path for the per-thread async file */
-   };
-   std::vector<Entry> handles;
-   std::vector<int> freeHandles;
-@@ -85,8 +95,13 @@
+@@ -85,6 +93,8 @@
  /* Owns one thread's client and closes it when the thread exits. */
  struct ThreadClientHolder {
    std::shared_ptr<hfs::Client> client;
-+  /* Files opened by this thread's client: the async frontend only accepts
-+   * I/O for files owned by the same client. */
-+  std::unordered_map<std::string, std::shared_ptr<hfs::File>> files;
++  /* Completion token generation for this thread's synchronous fast path. */
 +  std::uint32_t tokenGeneration = 0;
  
    ~ThreadClientHolder() {
-+    files.clear();
      if (client && !state().stopping.load(std::memory_order_acquire)) {
-       auto result = client->close().wait().value();
-       if (!result.ok()) {
-@@ -274,7 +289,8 @@
-   return created.value();
- }
- 
--int registerHandle(const std::shared_ptr<hfs::File> &file) {
-+int registerHandle(const std::shared_ptr<hfs::File> &file,
-+                   const std::string &path) {
-   BridgeState &bridge = state();
-   std::lock_guard<std::mutex> lock(bridge.mutex);
-   int index = 0;
-@@ -282,10 +298,10 @@
-     index = bridge.freeHandles.back();
-     bridge.freeHandles.pop_back();
-     bridge.handles[static_cast<std::size_t>(index)] =
--        BridgeState::Entry{file, 0};
-+        BridgeState::Entry{file, 0, path};
-   } else {
-     index = static_cast<int>(bridge.handles.size());
--    bridge.handles.push_back(BridgeState::Entry{file, 0});
-+    bridge.handles.push_back(BridgeState::Entry{file, 0, path});
-   }
-   return kHandleBase + index;
- }
-@@ -351,6 +367,106 @@
+@@ -351,6 +361,68 @@
    return path.substr(0, slash);
  }
  
-+/* Returns the namespace path of one open handle (empty when unavailable). */
-+std::string handlePath(int handle) {
-+  BridgeState &bridge = state();
-+  if (handle < kHandleBase) {
-+    return {};
-+  }
-+  const int index = handle - kHandleBase;
-+  std::lock_guard<std::mutex> lock(bridge.mutex);
-+  if (index < 0 || static_cast<std::size_t>(index) >= bridge.handles.size()) {
-+    return {};
-+  }
-+  return bridge.handles[static_cast<std::size_t>(index)].path;
-+}
-+
-+/* Returns the calling thread's File for a namespace path, opening it with the
-+ * thread client on first use: the async frontend only accepts I/O for files
-+ * owned by the same client. */
-+std::shared_ptr<hfs::File> threadFile(const std::string &path) {
++/* Runs one I/O through the calling thread's async frontend and polls for its
++ * completion on this thread. The File is owned by the process-level client and
++ * the submitting client owns slots, credits and completions (design §20.4).
++ * Returns false when the async path cannot be used (nothing was submitted), so
++ * the caller falls back to the synchronous facade. */
++bool asyncIo(const std::shared_ptr<hfs::File> &file, void *buf, std::size_t n,
++             std::uint64_t offset, bool write, std::size_t *out, int *errorOut) {
 +  ThreadClientHolder *holder = t_holder.get();
-+  if (holder == nullptr || holder->client == nullptr || path.empty()) {
-+    return nullptr;
-+  }
-+  auto found = holder->files.find(path);
-+  if (found != holder->files.end()) {
-+    return found->second;
-+  }
-+  auto opened = holder->client->open(path).wait().value();
-+  if (!opened.ok()) {
-+    return nullptr;
-+  }
-+  auto file = opened.value();
-+  holder->files.emplace(path, file);
-+  return file;
-+}
-+
-+/* Runs one I/O through the per-thread async frontend and polls for its
-+ * completion on this thread. Returns false when the async path cannot be used
-+ * (nothing was submitted), so the caller falls back to the sync facade. */
-+bool asyncIo(const std::string &path, void *buf, std::size_t n, std::uint64_t offset,
-+             bool write, std::size_t *out, int *errorOut) {
-+  ThreadClientHolder *holder = t_holder.get();
-+  if (holder == nullptr || holder->client == nullptr || n == 0) {
-+    state().asyncFallbacks.fetch_add(1, std::memory_order_relaxed);
-+    return false;
-+  }
-+  auto file = threadFile(path);
-+  if (file == nullptr) {
++  if (holder == nullptr || holder->client == nullptr || file == nullptr || n == 0) {
 +    state().asyncFallbacks.fetch_add(1, std::memory_order_relaxed);
 +    return false;
 +  }
@@ -184,7 +110,7 @@
  /* SPDK/DPDK threads run with an empty signal mask, so a process-directed
   * SIGTERM/SIGINT/SIGHUP/SIGQUIT would kill mysqld via the default action
   * instead of reaching mysqld's sigwait() handler thread. Forward such signals
-@@ -512,11 +628,19 @@
+@@ -512,11 +584,19 @@
    }
    bridge.enabled = false;
    std::fprintf(
@@ -206,21 +132,11 @@
    /* The engine object is intentionally kept alive until process exit so that
     * late thread-local client destructors never observe a freed engine. */
  }
-@@ -627,7 +751,7 @@
-     errno = EISDIR;
-     return -1;
-   }
--  *handle = registerHandle(opened.value());
-+  *handle = registerHandle(opened.value(), namespacePath);
-   return 0;
- }
- 
-@@ -647,6 +771,29 @@
+@@ -647,6 +727,28 @@
      errno = EBADF;
      return -1;
    }
-+  const std::string path = handlePath(handle);
-+  if (!path.empty()) {
++  {
 +    auto stat = file->stat();
 +    if (stat.ok()) {
 +      const std::uint64_t size = stat.value().logicalSize;
@@ -232,7 +148,7 @@
 +          static_cast<std::size_t>(std::min<std::uint64_t>(n, size - offset));
 +      std::size_t done = 0;
 +      int error = 0;
-+      if (asyncIo(path, buf, clamped, offset, false, &done, &error)) {
++      if (asyncIo(file, buf, clamped, offset, false, &done, &error)) {
 +        if (error != 0) {
 +          errno = error;
 +          return -1;
@@ -245,15 +161,14 @@
    hfs::IoVec vec{static_cast<std::byte *>(buf), n};
    auto result =
        file->read(std::span<hfs::IoVec>(&vec, 1), offset, std::stop_token{})
-@@ -667,6 +814,19 @@
+@@ -667,6 +769,18 @@
      errno = EBADF;
      return -1;
    }
-+  const std::string path = handlePath(handle);
-+  if (!path.empty()) {
++  {
 +    std::size_t done = 0;
 +    int error = 0;
-+    if (asyncIo(path, const_cast<void *>(buf), n, offset, true, &done, &error)) {
++    if (asyncIo(file, const_cast<void *>(buf), n, offset, true, &done, &error)) {
 +      if (error != 0) {
 +        errno = error;
 +        return -1;
@@ -265,12 +180,3 @@
    hfs::IoVec vec{const_cast<std::byte *>(static_cast<const std::byte *>(buf)), n};
    auto result =
        file->write(std::span<const hfs::IoVec>(&vec, 1), offset, std::stop_token{})
-@@ -1029,7 +1189,7 @@
-       return -1;
-     }
-   }
--  return registerHandle(opened.value());
-+  return registerHandle(opened.value(), namespacePath);
- }
- 
- int statPath(const char *path, struct stat *st) {
