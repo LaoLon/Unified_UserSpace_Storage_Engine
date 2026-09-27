@@ -160,3 +160,27 @@ sysbench --db-driver=mysql --mysql-user=root --mysql-socket="$SOCKET" \
   TPS/QPS/avg/P50/P95/P99/fsync 汇总。
 - `/home/hfs/mysql-native-vs-hfs-20260927.run.log`：完成日志
   （`cleanup: stage=complete exit=0`）。
+
+## 7. 跨矩阵分析：为什么 SPDK 设备优势没有转化为 MySQL 端到端优势
+
+FIO 三层/四引擎矩阵显示 HFS+SPDK 在设备层远超 ext4（4K randrw QD64：
+15684 → HFS 106753，6.8×），但 MySQL 同盘对照只有 84.8–102.8%。原因是
+端到端性能由多层瓶颈的最小值决定，SPDK 只改善"设备"这一层：
+
+| 层 | 本会话证据 | 后果 |
+|---|---|---|
+| 设备形状依赖 | 同一内核路径：4K randread QD32 为 98556（vs raw 130667，1.33×）；4K randrw QD64 只有 15684（6.8×）。ext4 的劣势集中在 4K 随机**写**（O_DIRECT 分配/日志），不是读 | FIO 的 6.8× 不代表应用 I/O 形状 |
+| 读缓存 | MySQL 数据集 10 万行，远小于默认 InnoDB buffer pool（128 MiB）；`oltp_read_only`/`point_select` 基本内存命中，HFS/native 98.8–102.8% | 读场景瓶颈是 CPU，不是设备 |
+| 写持久性 | `trx=1` 下每个事务等 group commit + redo fsync/barrier；写场景 fsync 增量 1.2–4.3 万/10s，读场景仅 5–18/10s。HFS 的 `File::sync` 屏障含 journal/checkpoint/元数据 + 设备 flush（早前同 VM profile：barrier ≈180–286 µs、`log_flusher` CPU 15.4% vs native 4.5%，见 Git 历史 `8dc2175:doc/performance/baseline.md`） | 写路径比的是屏障延迟与 CPU，HFS 多做的工作抵消设备优势，纯写 84.8–96.4% |
+| 顺序写/flush | RocksDB `fillseq/fillrandom` 两侧都 86–99 MB/s（96–100%），受 memtable/flush/compaction CPU 与顺序带宽限制 | 设备随机能力用不上，双方持平 |
+| CPU 竞争 | 6 vCPU；HFS 额外 metadata/data reactor 轮询与元数据工作 | 64 线程读写混合降至 92.8% |
+
+反过来，**在设备真正受限的环节 HFS 确实超过 native**：RocksDB `readrandom`
+（1 GiB block cache / 1.25 GiB 数据，大量 miss）为 3.4–6.4×；受控实验显示
+32 线程 miss 时 HFS 每次设备读 ≈16 µs，native 同步读 ≈170–620 µs；而两侧
+全缓存命中时同为 ≈320 万 ops/s。即 HFS 的优势只在"设备受限"时兑现。
+
+结论：HFS 在 FIO 上的设备优势被缓存（读）、持久化屏障（写）、CPU（6 vCPU）
+和负载形状（非 4K 随机写）逐层截断，所以 MySQL 端到端只能接近 native；
+要让写路径也超过 native，需要继续降低同步屏障成本（HFS 侧已做过 journal/
+批量写优化，但设备往返仍是下限）。本分析限于本 VM 与本文口径。
