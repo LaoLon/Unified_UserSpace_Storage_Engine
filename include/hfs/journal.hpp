@@ -139,10 +139,12 @@ public:
     /* Flush the journal device (sync path). */
     Result<void> flush();
 
-    double usageRatio() const noexcept;
-    bool needsCheckpoint() const noexcept;
-    bool checkpointForced() const noexcept;
-    const Stats &stats() const noexcept;
+    /* Journal state queries; all public entry points are internally
+     * serialized because the background writer and a barrier may race. */
+    double usageRatio() const;
+    bool needsCheckpoint() const;
+    bool checkpointForced() const;
+    Stats stats() const;
 
     /* Instances are created by open(); the constructor is public only so the
      * library can build the unique_ptr. */
@@ -152,6 +154,12 @@ public:
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
+
+    /* Unlocked bodies shared by the public serialized entry points. */
+    Result<std::uint64_t> appendLocked(std::span<const JournalRecord> records,
+                                       bool flushDevice, bool applyToTarget);
+    Result<void> checkpointLocked(bool deferFlush);
+    Result<void> replayLocked();
 
     /* Internal factory shared by the two open() overloads. */
     static Result<std::unique_ptr<Journal>> create(std::unique_ptr<JournalDevice> owned,

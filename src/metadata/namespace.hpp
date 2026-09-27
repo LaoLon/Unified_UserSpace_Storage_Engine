@@ -116,14 +116,20 @@ public:
     void rollbackPreparedDurableEpoch() noexcept;
 
     /* Metadata journaling (hfs2.0.md §9.3): mutations stage compact records
-     * that the next durable barrier appends and flushes; mutation types without
-     * a record force a full checkpoint instead. The barrier runs on another
-     * thread, so these accessors take the namespace lock. */
+     * that the background journal writer appends and the next durable barrier
+     * flushes; mutation types without a record force a full checkpoint
+     * instead. The barrier and writer run on other threads, so these accessors
+     * take the namespace lock. */
     bool checkpointRequired() const;
     void clearPendingRecords();
     /* Falls back to a full checkpoint for mutations without a record. */
     void requireCheckpoint();
-    std::vector<JournalRecord> takePendingRecords();
+    /* One staged batch and the epoch its records cover. */
+    struct StagedBatch {
+        std::vector<JournalRecord> records;
+        std::uint64_t epoch = 0;
+    };
+    StagedBatch takeStagedRecords();
     /* Applies one replayed journal record to the resident state. */
     Result<void> applyJournalRecord(const JournalRecord &record);
 
@@ -160,6 +166,7 @@ private:
     void requireCheckpointLocked() noexcept {
         checkpointRequired_ = true;
         pendingRecords_.clear();
+        pendingEpoch_ = 0;
     }
     Inode *inodeById(std::uint64_t inodeId) noexcept;
     /* Shared by truncateFile and journal replay; mutex_ held by the caller. */
@@ -192,8 +199,10 @@ private:
     std::uint64_t durableEpoch_ = 0;
     std::uint64_t snapshotTxid_ = 0;
     std::vector<std::uint64_t> preparedDurableSizes_;
-    /* Staged metadata records and the no-record fallback flag (§9.3). */
+    /* Staged metadata records, their epoch, the writer wake-up hook and the
+     * no-record fallback flag (§9.3). */
     std::vector<JournalRecord> pendingRecords_;
+    std::uint64_t pendingEpoch_ = 0;
     bool checkpointRequired_ = false;
     Stats stats_;
     std::vector<std::unique_ptr<Allocator>> allocators_;

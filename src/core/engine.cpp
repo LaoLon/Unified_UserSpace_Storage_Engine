@@ -189,6 +189,7 @@ struct Engine::Impl {
      * namespace lock while device I/O and checkpoint writes are in flight. */
     std::mutex syncMutex;
     std::shared_ptr<SyncBatch> syncBatch;
+
 };
 
 Engine::Engine(Config config) : impl_(std::make_unique<Impl>()) {
@@ -651,6 +652,12 @@ Task<Result<void>> Engine::stop() {
         impl.asyncBackends.clear();
         impl.asyncPollers.clear();
         impl.asyncPollersRegistered.clear();
+        if (impl.journal != nullptr) {
+            auto flushed = impl.journal->flush();
+            if (!flushed.ok()) {
+                log::error("journal flush on stop failed: %s", flushed.message().c_str());
+            }
+        }
         impl.journal.reset();
         impl.metadataTarget.reset();
         impl.dataPlane.reset();
@@ -785,31 +792,36 @@ Result<void> Engine::syncMetadata(std::uint64_t epoch) {
         const bool checkpointPath =
             checkpointNeeded && (impl_->namespaceState->checkpointRequired() ||
                                  impl_->journal->needsCheckpoint());
-        if (checkpointPath) {
+        const auto checkpointPhase = [&]() {
             impl_->namespaceState->clearPendingRecords();
             auto staged = impl_->namespaceState->prepareDurableEpoch(targetEpoch);
             if (!staged.ok()) {
                 result = staged;
-            } else {
-                prepared = true;
+                return;
             }
-            if (result.ok()) {
-                auto checkpoint = impl_->journal->checkpoint(/*deferFlush=*/true);
-                stats::counters().journalCheckpoints.fetch_add(1, std::memory_order_relaxed);
-                if (!checkpoint.ok()) {
-                    impl_->namespaceState->rollbackPreparedDurableEpoch();
-                    prepared = false;
-                    result = checkpoint;
-                }
+            prepared = true;
+            auto checkpoint = impl_->journal->checkpoint(/*deferFlush=*/true);
+            stats::counters().journalCheckpoints.fetch_add(1, std::memory_order_relaxed);
+            if (!checkpoint.ok()) {
+                impl_->namespaceState->rollbackPreparedDurableEpoch();
+                prepared = false;
+                /* Staged records were consumed by this attempt; the next
+                 * barrier must retry the snapshot. */
+                impl_->namespaceState->requireCheckpoint();
+                result = checkpoint;
             }
+        };
+        if (checkpointPath) {
+            checkpointPhase();
         }
         /* Phase 2 (journal): append the staged metadata records; the single
          * device flush below makes data, journal slots and checkpoint records
          * durable together, so the barrier still needs one round trip. */
         if (result.ok() && checkpointNeeded && !checkpointPath) {
-            auto records = impl_->namespaceState->takePendingRecords();
-            if (!records.empty()) {
-                auto appended = impl_->journal->append(records, /*flushDevice=*/false,
+            auto batch = impl_->namespaceState->takeStagedRecords();
+            if (!batch.records.empty()) {
+                auto appended = impl_->journal->append(batch.records,
+                                                       /*flushDevice=*/false,
                                                        /*applyToTarget=*/false);
                 if (!appended.ok()) {
                     /* The staged records are gone; the next barrier snapshots. */
@@ -853,6 +865,10 @@ Result<void> Engine::syncMetadata(std::uint64_t epoch) {
             impl_->namespaceState->rollbackPreparedDurableEpoch();
         }
 
+        if (!result.ok()) {
+            log::error("sync barrier failed: status=%u message=%s",
+                       static_cast<unsigned>(result.status()), result.message().c_str());
+        }
         stats::counters().syncBarrier.record(
             static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                            std::chrono::steady_clock::now() - barrierStart)

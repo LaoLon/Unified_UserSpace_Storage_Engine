@@ -1018,6 +1018,7 @@ bool Namespace::checkpointRequired() const {
 void Namespace::clearPendingRecords() {
     std::lock_guard<std::mutex> lock(mutex_);
     pendingRecords_.clear();
+    pendingEpoch_ = 0;
     checkpointRequired_ = false;
 }
 
@@ -1026,11 +1027,14 @@ void Namespace::requireCheckpoint() {
     requireCheckpointLocked();
 }
 
-std::vector<JournalRecord> Namespace::takePendingRecords() {
+Namespace::StagedBatch Namespace::takeStagedRecords() {
     std::lock_guard<std::mutex> lock(mutex_);
-    std::vector<JournalRecord> out = std::move(pendingRecords_);
+    StagedBatch batch;
+    batch.records = std::move(pendingRecords_);
+    batch.epoch = pendingEpoch_;
     pendingRecords_.clear();
-    return out;
+    pendingEpoch_ = 0;
+    return batch;
 }
 
 /* Stages one journal record for the next durable barrier (§9.3). */
@@ -1039,6 +1043,7 @@ void Namespace::stageRecord(JournalRecord record) {
         return; /* the checkpoint snapshot covers every staged mutation */
     }
     pendingRecords_.push_back(record);
+    pendingEpoch_ = std::max(pendingEpoch_, logicalEpoch_);
 }
 
 Inode *Namespace::inodeById(std::uint64_t inodeId) noexcept {

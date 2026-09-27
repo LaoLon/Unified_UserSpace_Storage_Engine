@@ -149,6 +149,9 @@ struct Journal::Impl {
     std::uint64_t checkpointBGeneration = 0;
     std::string corruption;
     Stats statsCache;
+    /* Serializes append/checkpoint/replay/flush: the background metadata
+     * journal writer and a durability barrier may call concurrently. */
+    mutable std::mutex mutex;
 
     Result<void> readBlock(std::uint64_t offsetBlocks, std::span<std::byte> buffer) {
         return device->read(offsetBlocks, buffer);
@@ -848,6 +851,11 @@ Result<std::unique_ptr<Journal>> Journal::open(JournalDevice &device,
 }
 
 Result<void> Journal::replay() {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return replayLocked();
+}
+
+Result<void> Journal::replayLocked() {
     auto &impl = *impl_;
     impl.corruption.clear();
     impl.validTransactions = 0;
@@ -998,12 +1006,23 @@ Result<void> Journal::replay() {
 
 Result<std::uint64_t> Journal::append(std::span<const JournalRecord> records,
                                       bool flushDevice, bool applyToTarget) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return appendLocked(records, flushDevice, applyToTarget);
+}
+
+Result<std::uint64_t> Journal::appendLocked(std::span<const JournalRecord> records,
+                                            bool flushDevice, bool applyToTarget) {
     auto &impl = *impl_;
     if (records.empty()) {
         return makeError<std::uint64_t>(Status::InvalidArgument, "empty transaction");
     }
-    if (checkpointForced()) {
-        auto checkpointResult = checkpoint();
+    /* Unlocked force check: the caller already holds the journal mutex. */
+    const bool forced =
+        impl.journalBlocks != 0 &&
+        static_cast<double>(impl.head - impl.tail) * 100.0 >=
+            static_cast<double>(impl.forcePercent) * static_cast<double>(impl.journalBlocks);
+    if (forced) {
+        auto checkpointResult = checkpointLocked(/*deferFlush=*/false);
         if (!checkpointResult.ok()) {
             return makeError<std::uint64_t>(Status::NoSpace,
                                             "journal full and checkpoint failed: " +
@@ -1012,7 +1031,7 @@ Result<std::uint64_t> Journal::append(std::span<const JournalRecord> records,
     }
     const std::uint64_t needed = 2 + records.size();
     if ((impl.head - impl.tail) + needed > impl.journalBlocks) {
-        auto checkpointResult = checkpoint();
+        auto checkpointResult = checkpointLocked(/*deferFlush=*/false);
         if (!checkpointResult.ok()) {
             return makeError<std::uint64_t>(Status::NoSpace,
                                             "journal full and checkpoint failed: " +
@@ -1106,6 +1125,11 @@ Result<std::uint64_t> Journal::append(std::initializer_list<JournalRecord> recor
 }
 
 Result<void> Journal::checkpoint(bool deferFlush) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return checkpointLocked(deferFlush);
+}
+
+Result<void> Journal::checkpointLocked(bool deferFlush) {
     auto &impl = *impl_;
     if (impl.target == nullptr) {
         return makeError(Status::InvalidState, "checkpoint requires a replay target");
@@ -1138,7 +1162,13 @@ Result<void> Journal::checkpoint(bool deferFlush) {
     return Result<void>(Status::Ok);
 }
 
-Result<void> Journal::flush() { return impl_->device->flush(); }double Journal::usageRatio() const noexcept {
+Result<void> Journal::flush() {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->device->flush();
+}
+
+double Journal::usageRatio() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
     const auto &impl = *impl_;
     if (impl.journalBlocks == 0) {
         return 0.0;
@@ -1147,14 +1177,17 @@ Result<void> Journal::flush() { return impl_->device->flush(); }double Journal::
            static_cast<double>(impl.journalBlocks);
 }
 
-bool Journal::needsCheckpoint() const noexcept {
+bool Journal::needsCheckpoint() const {
     return usageRatio() * 100.0 >= static_cast<double>(impl_->triggerPercent);
 }
 
-bool Journal::checkpointForced() const noexcept {
+bool Journal::checkpointForced() const {
     return usageRatio() * 100.0 >= static_cast<double>(impl_->forcePercent);
 }
 
-const Journal::Stats &Journal::stats() const noexcept { return impl_->statsCache; }
+Journal::Stats Journal::stats() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->statsCache;
+}
 
 } // namespace hfs

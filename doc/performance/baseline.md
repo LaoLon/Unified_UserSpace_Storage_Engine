@@ -264,9 +264,14 @@ profile 显示 `log_flusher` 自耗 15.37% → 15.59% 未变，即 flusher CPU �
 `/home/hfs/journal-replay-repro-20260927/`（fillseq → 重挂载 replay → `transactions=1`、
 `corruption=none`）。
 
-门禁：CTest 26/26；Shard-104 crash matrix 通过、`hfsctl check` `corruption=none`；
-RocksDB rw32 HFS fillseq 105.9%、readrandom 216%、`overwrite` 校验 100.2%（对 native）；
-8j4 HFS 中位 81014 / raw 122421（0.662）、5 轮 closure 全闭合。证据
+异步 journal writer（write-behind）评估（同日，已回退）：1809.90 vs 1957.94 TPS（−5.8%）——
+barrier 仍需等 append 的设备往返，额外线程与每次 mutation 的唤醒是净损失。回退后保留
+Journal 内部串行化（append/checkpoint/replay/flush 共用锁）与 checkpoint 失败重试修复
+（失败后 `requireCheckpoint()`，否则已消费的 staged 记录会丢）。
+
+门禁（最终态）：CTest 26/26；Shard-104 crash matrix 通过、`hfsctl check` `corruption=none`；
+RocksDB rw32 HFS fillseq 104.8%、readrandom 411%、`overwrite` 校验 109.5%（对 native）；
+8j4 HFS 中位 80282 / raw 121734（0.660）、5 轮 closure 全闭合。证据
 `/home/hfs/mysql-perfile-sync-ab-20260927/{pre2journal,post2journal}/`、
 `/home/hfs/rocksdb-rw32-cache1g-20260927-journal3/`、`/home/hfs/fio-8j4-journal2-20260927/`、
 `/home/hfs/mysql-shard104-crash-20260927-journal/`。

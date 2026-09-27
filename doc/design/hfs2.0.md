@@ -690,6 +690,12 @@ mutation 直接 stage（`arg1` 打包 extent run：device/start/count），barri
 replay 侧 `ALLOC` 按 checkpoint 中的 allocator 状态把 run 从 FREE/RESERVED/INITIALIZED
 逐级推进到 COMMITTED（`markReserved` → `markInitialized` → `commit`），`FREE` 幂等。
 
+异步 journal writer（write-behind：后台线程追加、barrier 只 flush）已评估并**回退**：
+实测 1809.90 vs 1926–1958 TPS（约 −5.8%），因为 barrier 仍要等 append 的设备往返，
+额外线程与唤醒开销是净损失。回退后保留两项加固：Journal 公开入口（append/checkpoint/
+replay/flush/stats）内部串行化，供并发调用者使用；checkpoint 失败时必须
+`requireCheckpoint()`——本次尝试已消费 staged 记录，快照失败后下一次 barrier 必须重试。
+
 ### 9.4 Extent 和 allocator
 
 第一版每个 data device 固定 1 MiB extent，全部 device 的 allocator 由 metadata actor 独占：

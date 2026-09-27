@@ -243,7 +243,7 @@ int runCheck(const hfs::Config &config) {
             continue;
         }
         auto replayed = journal.value()->replay();
-        const auto &stats = journal.value()->stats();
+        const auto stats = journal.value()->stats();
         std::printf("metadata device %zu: checkpointA=%s(txid %llu seq %llu) "
                     "checkpointB=%s(txid %llu seq %llu) journal head=%llu tail=%llu "
                     "last_txid=%llu transactions=%u usage=%.1f%% corruption=%s\n",
@@ -328,7 +328,7 @@ int runDump(const hfs::Config &config) {
             continue;
         }
         (void)journal.value()->replay();
-        const auto &stats = journal.value()->stats();
+        const auto stats = journal.value()->stats();
         std::printf("metadata device %zu:\n", i);
         std::printf("  checkpoint A: %s txid=%llu sequence=%llu\n",
                     stats.checkpointAValid ? "valid" : "empty",
