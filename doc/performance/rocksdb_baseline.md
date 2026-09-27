@@ -94,12 +94,49 @@
   复跑 `rnd` 阶段通过（探针 `/home/hfs/rocksdb-probe-rnd.*`，`rc=0`），因此矩阵
   数据未受影响。多库并存时的分配器行为仍是待查项，不影响本报告的单库结论。
 - native 侧顺序读/随机读本会话为 39–40k ops/s，明显低于 HFS 的 132–255k；
-  两侧读路径不同（ext4 direct 读 vs HFS worker-direct 异步读），本会话没有做
-  profile 拆分，**不能据此宣称任何场景的普适优势**，只能作为同会话对照。
+  两侧读路径不同（ext4 direct 读 vs HFS worker-direct 异步读），**不能据此宣称
+  任何场景的普适优势**；2026-09-28 的受控归因实验（§5.1）显示差距来自 native
+  冷读并发塌陷，而非 HFS 读软件路径优势。
 - `native-s32` 的 `readwhilewriting` 一轮耗时 30.5 s、聚合约 7.3k ops/s，而其余
   轮次为 0.2–0.5 s；该轮为设备停顿/后台压缩叠加的异常样本，已在矩阵中标注。
 - 1 GiB block cache 相对约 1.25 GiB 逻辑数据，`readseq/readrandom` 部分命中缓存；
   所有结论限于本口径。
+
+### 5.1 读场景差距的受控归因（2026-09-28）
+
+用 200,000 key × 1 KiB 的数据集在同一会话内做对照（32 线程，`taskset -c 0-5`，
+`--use_direct_reads=1`，除注明外）：
+
+| 用例 | native ext4 | HFS |
+|---|---:|---:|
+| `fillseq` | 115754 ops/s | 112231 ops/s |
+| `readrandom` 单线程、16 MB cache（每次 Get 约 0.93 次设备读） | 18256 ops/s（54.8 µs/op） | 16227 ops/s（61.6 µs/op） |
+| `readrandom` 32 线程、1 GiB cache 首轮（约 4.9 万次设备读） | 6603 ops/s（30.3 s） | 228227 ops/s（0.88 s） |
+| `readrandom` 32 线程、16 MB cache 首轮（约 18.5 万次设备读） | 6282 ops/s | 67210 ops/s |
+| `readrandom` 32 线程、16 MB cache 次轮 | 3219 ops/s（异常轮） | 65677 ops/s |
+| `readrandom` 32 线程、1 GiB cache 次/三轮（全 block cache 命中） | 3317341 / 3271912 ops/s | 3256826 / 3144870 ops/s |
+| `readrandom` 32 线程、1 GiB cache、buffered 首轮（page cache 命中） | 1263819 ops/s | — |
+| FIO 同会话锚定：4K `randread` QD32 | ext4+libaio 98556 IOPS（10.1 µs/次） | raw SPDK 130667 IOPS（7.7 µs/次） |
+
+结论：
+
+1. **单线程设备读延迟两侧一致**（≈55–62 µs/次），**全缓存命中吞吐也一致**
+   （≈320 万 ops/s）：HFS 读路径没有固有软件优势，与 2026-09-22 根因报告的
+   “warm 同档”结论一致。
+2. 差距只在“32 线程 + block cache miss”时出现：native 内核同步读退化到
+   ≈170 µs（16 MB cache）甚至 ≈620 µs（1 GiB cache 首轮）每次设备读，
+   呈负扩展；HFS 为 ≈16–17 µs/次。
+3. 同会话 FIO 证明内核路径本身不慢：ext4+libaio QD32 4K `randread` 达
+   98.5k IOPS（10.1 µs/次），接近 raw SPDK 的 130.7k。因此瓶颈是
+   **RocksDB native 在 32 线程下的同步 `pread` 访问模式在该 VM/内核上
+   的并发行为**，而不是设备或 ext4 的绝对能力；具体内核侧机制未在本轮
+   做 profile，列为待查项。
+4. 因此矩阵中的 3.4–6.4 倍读差距 = native 冷读并发塌陷 + 1.28M key/1 GiB
+   cache 口径下的大量 miss + 会话漂移（native 内核路径跨会话波动大，
+   HFS 稳定）；不能解读为 HFS 读性能的普适倍率。
+
+证据：`/home/hfs/rocksdb-read-cause-20260928/`（各用例 stdout/stderr、
+native `diskstats` 前后计数、两个 FIO 锚定 JSON、`environment.txt`）。
 
 ## 6. 复现
 
