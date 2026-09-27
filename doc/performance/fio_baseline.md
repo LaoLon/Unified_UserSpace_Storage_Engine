@@ -119,3 +119,47 @@ ALLOW_FORMAT=1 RUNS=3 RUNTIME_SECONDS=10 \
   IOPS/p99/errors/runtime 汇总。
 - `/home/hfs/fio-three-way-20260927-matrix.run.log`：脚本完成日志
   （`matrix cleanup: stage=complete exit=0`）。
+
+## 8. 四引擎 64 并发对照（2026-09-28 追加）
+
+口径：同一测试盘、4K `randrw` 50/50、256 MiB、10 s、3 轮中位数、
+`taskset -c 0-5`、`--direct=1`。两种形状：
+
+- 形状 A（与 §3 的 QD64 格一致）：libaio/io_uring/SPDK raw = 1 job × QD64；
+  HFS = 2 jobs × 32（`hfs_client_depth=32`）。
+- 形状 B（字面 64 线程）：四引擎均 64 jobs × QD1（HFS 仍 `hfs_client_depth=32`）。
+
+### 8.1 形状 A（总并发 64）
+
+| 引擎 | 3 轮总 IOPS | 中位 | 读/写 p99（µs） |
+|---|---:|---:|---:|
+| ext4 + libaio | 15031 / 15684 / 16031 | 15684 | 1057 / 1057 |
+| ext4 + io_uring | 15856 / 9678 / 15438 | 15438 | 1012 / 1012 |
+| SPDK raw bdev | 109343 / 107702 / 110468 | **109343** | 1090 / 1106 |
+| HFS | 106753 / 106736 / 107651 | **106753** | 946 / 954 |
+
+HFS/raw 中位 = **97.6%**；io_uring 与 libaio 在 QD64 单 job 下同档
+（≈15.4–15.7k），两者都远低于 SPDK/HFS。
+
+### 8.2 形状 B（64 线程 × QD1）
+
+| 引擎 | 3 轮总 IOPS | 中位 | 读/写 p99（µs） |
+|---|---:|---:|---:|
+| ext4 + libaio | 15686 / 21091 / 65093 | 21091 | 4817 / 4882 |
+| ext4 + io_uring | 53121 / 35763 / 53140 | **53121** | 5341 / 5407 |
+| SPDK raw bdev | 不支持（控制器队列上限） | — | — |
+| HFS | 60280 / 60327 / 61521 | **60327** | 1384 / 1384 |
+
+- SPDK raw 64 线程失败：`Failed to alloc io_channel`、`No free I/O queue IDs`。
+  VMware 虚拟 NVMe 控制器只有 15 个 I/O 队列（`dmesg: nvme0: 15/0/0
+  default/read/poll queues`），64 个 job 需要 64 个 qpair，超出控制器上限；
+  raw 在本 VM 的自然形状是 1 job × QD64（形状 A）。失败 cell 保留在证据目录。
+- 64 线程下 io_uring 中位 53.1k，明显优于 libaio 的 21.1k，但两者离散都很大
+  （libaio 15.7–65.1k）；HFS 最稳（60.3–61.5k，p99 1.38 ms）。
+- HFS 形状 B 比形状 A 低 44%（60.3k vs 106.8k）：6 vCPU 上 64 线程 × QD1
+  主要受线程调度限制，2 job × 32 的深度更能喂满异步路径。
+- 与 §3 的会话不同（本次设备更快：raw 4K QD64 中位 109343 vs 94092），
+  绝对 IOPS 不跨会话比较。
+
+证据：`/home/hfs/fio-four-engine-20260928/`（24 个 cell 的 JSON/stderr、
+`cells.tsv`、`environment.txt`、`spdk-nvme.json`、`hfs-check.log`）。
