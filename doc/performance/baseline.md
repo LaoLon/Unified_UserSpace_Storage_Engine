@@ -203,6 +203,11 @@ seam 的 `read/write` 改为 per-thread client `submitRead/submitWrite` + 同线
 0 的 barrier/flush 是 200 的 3.4×，吞吐仍 **+9.2%**：窗口是纯延迟项，每次 barrier 已真实
 落盘，设备可吸收更多 flush。`config/hfs_mysql.conf` 已改为 `max_group_commit_wait_us = 0`。
 
+per-file `File::sync` 目标 epoch 实验（同日，已回退）：checkpoints 45148 → 41519（−8%）、
+TPS 1841.04 → 1825.49（−0.8%，噪声内）。checkpoint 主要来自 fsync 文件自身的增长
+（数据/undo/doublewrite），不是跨文件连带，per-file 语义无法也不应跳过；证据
+`/home/hfs/mysql-perfile-sync-ab-20260927/`。
+
 门禁（core 校验放宽 + v2 seam + gcw=0）：CTest 26/26；Shard-104 crash matrix 通过、
 `hfsctl check` `corruption=none`；RocksDB rw32 HFS fillseq 105.8%、readrandom 411%、
 `overwrite` 校验 107.6%（对 native）；8j4 HFS 中位 79825 / raw 121426（0.657）、
