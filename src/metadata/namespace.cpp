@@ -55,6 +55,33 @@ bool readSnapshotString(std::span<const std::byte> data, std::size_t &cursor,
     return true;
 }
 
+/* Extent-run packing for journal records: arg1 = device | start | count. */
+constexpr std::uint64_t kRunDeviceShift = 56;
+constexpr std::uint64_t kRunStartShift = 16;
+constexpr std::uint64_t kRunCountMask = (1ULL << 16) - 1;
+constexpr std::uint64_t kRunStartMask = (1ULL << 40) - 1;
+
+bool runFitsRecord(std::uint64_t device, std::uint64_t start, std::uint64_t count) {
+    return device < (1ULL << (64 - kRunDeviceShift)) && start <= kRunStartMask &&
+           count != 0 && count <= kRunCountMask;
+}
+
+std::uint64_t packRun(std::uint64_t device, std::uint64_t start, std::uint64_t count) {
+    return (device << kRunDeviceShift) | ((start & kRunStartMask) << kRunStartShift) |
+           (count & kRunCountMask);
+}
+
+bool unpackRun(std::uint64_t packed, std::uint64_t *device, std::uint64_t *start,
+               std::uint64_t *count) {
+    if (device == nullptr || start == nullptr || count == nullptr) {
+        return false;
+    }
+    *device = packed >> kRunDeviceShift;
+    *start = (packed >> kRunStartShift) & kRunStartMask;
+    *count = packed & kRunCountMask;
+    return *count != 0;
+}
+
 std::uint64_t systemNowNs(void *) {
     const auto now = std::chrono::system_clock::now().time_since_epoch();
     return static_cast<std::uint64_t>(
@@ -383,6 +410,7 @@ Result<FileHandle> Namespace::create(std::string_view path, bool exclusive, bool
             if (truncate && !existing.directory) {
                 existing.logicalSize = 0;
                 touch(existing, nowNs(), true);
+                requireCheckpointLocked();
             }
             ++existing.openCount;
             ++stats_.opens;
@@ -417,6 +445,8 @@ Result<FileHandle> Namespace::create(std::string_view path, bool exclusive, bool
     namespaceBytes_ += entryCost;
     ++stats_.creates;
     ++stats_.opens;
+    /* Namespace shape changes stay on the full checkpoint path (§9.3). */
+    requireCheckpointLocked();
     return makeHandle(inodeId);
 }
 
@@ -466,6 +496,7 @@ Result<void> Namespace::remove(std::string_view path) {
         freeInode(inodeId);
     }
     ++stats_.removes;
+    requireCheckpointLocked();
     return Result<void>(Status::Ok);
 }
 
@@ -556,6 +587,7 @@ Result<void> Namespace::rename(std::string_view from, std::string_view to) {
     }
     touch(inode, now, false);
     ++stats_.renames;
+    requireCheckpointLocked();
     return Result<void>(Status::Ok);
 }
 
@@ -590,6 +622,7 @@ Result<void> Namespace::link(std::string_view from, std::string_view to) {
     ++inode.linkCount;
     touch(parent, now, true);
     touch(inode, now, false);
+    requireCheckpointLocked();
     return Result<void>(Status::Ok);
 }
 
@@ -603,6 +636,7 @@ Result<void> Namespace::setTimes(FileHandle handle, std::uint64_t mtimeNs,
     Inode &inode = *inodeResult.value();
     inode.mtimeNs = mtimeNs;
     inode.ctimeNs = ctimeNs;
+    stageRecord(JournalRecord{JournalRecordType::SetTimes, inode.id, mtimeNs, ctimeNs});
     return Result<void>(Status::Ok);
 }
 
@@ -670,6 +704,7 @@ Result<void> Namespace::close(FileHandle handle) {
     --inode.openCount;
     if (inode.id != kRootInodeId && inode.linkCount == 0 && inode.openCount == 0) {
         freeInode(inode.id);
+        requireCheckpointLocked();
     }
     return Result<void>(Status::Ok);
 }
@@ -850,6 +885,16 @@ Result<void> Namespace::commitExtents(FileHandle handle,
         stats_.allocatedExtents += allocation.run.count;
     }
     touch(inode, nowNs(), false);
+    for (const ExtentAllocation &allocation : allocations) {
+        const std::uint64_t device = allocation.run.deviceId;
+        if (!runFitsRecord(device, allocation.run.start, allocation.run.count)) {
+            requireCheckpointLocked();
+            break;
+        }
+        stageRecord(JournalRecord{
+            JournalRecordType::Alloc, inode.id, allocation.logicalExtent,
+            packRun(device, allocation.run.start, allocation.run.count)});
+    }
     return Result<void>(Status::Ok);
 }
 
@@ -885,6 +930,16 @@ Result<void> Namespace::releaseExtents(FileHandle handle,
             return released;
         }
     }
+    for (const ExtentAllocation &allocation : allocations) {
+        const std::uint64_t device = allocation.run.deviceId;
+        if (!runFitsRecord(device, allocation.run.start, allocation.run.count)) {
+            requireCheckpointLocked();
+            break;
+        }
+        stageRecord(JournalRecord{
+            JournalRecordType::Free, inodeResult.value()->id, 0,
+            packRun(device, allocation.run.start, allocation.run.count)});
+    }
     return Result<void>(Status::Ok);
 }
 
@@ -898,13 +953,8 @@ Result<std::vector<ExtentDescriptor>> Namespace::extents(FileHandle handle) cons
     return inodeResult.value()->extents.snapshot();
 }
 
-Result<void> Namespace::truncateFile(FileHandle handle, std::uint64_t size) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    auto inodeResult = lookupInode(handle);
-    if (!inodeResult.ok()) {
-        return makeError(inodeResult.status(), inodeResult.message());
-    }
-    Inode &inode = *inodeResult.value();
+/* Shared by truncateFile and journal replay; mutex_ is held by the caller. */
+Result<void> Namespace::applyTruncateLocked(Inode &inode, std::uint64_t size) {
     const std::uint64_t extentBytes = config_.extentBytes;
     const std::uint64_t keep = size / extentBytes + (size % extentBytes != 0 ? 1 : 0);
     for (const ExtentDescriptor &descriptor : inode.extents.snapshot()) {
@@ -928,6 +978,22 @@ Result<void> Namespace::truncateFile(FileHandle handle, std::uint64_t size) {
     return Result<void>(Status::Ok);
 }
 
+Result<void> Namespace::truncateFile(FileHandle handle, std::uint64_t size) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto inodeResult = lookupInode(handle);
+    if (!inodeResult.ok()) {
+        return makeError(inodeResult.status(), inodeResult.message());
+    }
+    Inode &inode = *inodeResult.value();
+    auto truncated = applyTruncateLocked(inode, size);
+    if (!truncated.ok()) {
+        return truncated;
+    }
+    /* Replay recomputes the released runs from the inode extent map. */
+    stageRecord(JournalRecord{JournalRecordType::Truncate, inode.id, size, 0});
+    return Result<void>(Status::Ok);
+}
+
 Result<void> Namespace::setSize(FileHandle handle, std::uint64_t size) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto inodeResult = lookupInode(handle);
@@ -938,8 +1004,152 @@ Result<void> Namespace::setSize(FileHandle handle, std::uint64_t size) {
     if (size > inode.logicalSize) {
         inode.logicalSize = size;
         touch(inode, nowNs(), true);
+        stageRecord(JournalRecord{JournalRecordType::SetSize, inode.id, size, 0});
     }
     return Result<void>(Status::Ok);
+}
+
+/* Barrier-side accessors: the barrier runs on another thread. */
+bool Namespace::checkpointRequired() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return checkpointRequired_;
+}
+
+void Namespace::clearPendingRecords() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    pendingRecords_.clear();
+    checkpointRequired_ = false;
+}
+
+void Namespace::requireCheckpoint() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    requireCheckpointLocked();
+}
+
+std::vector<JournalRecord> Namespace::takePendingRecords() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<JournalRecord> out = std::move(pendingRecords_);
+    pendingRecords_.clear();
+    return out;
+}
+
+/* Stages one journal record for the next durable barrier (§9.3). */
+void Namespace::stageRecord(JournalRecord record) {
+    if (checkpointRequired_) {
+        return; /* the checkpoint snapshot covers every staged mutation */
+    }
+    pendingRecords_.push_back(record);
+}
+
+Inode *Namespace::inodeById(std::uint64_t inodeId) noexcept {
+    if (inodeId >= inodes_.size() || inodes_[inodeId].id != inodeId) {
+        return nullptr;
+    }
+    return &inodes_[inodeId];
+}
+
+/* Applies one replayed journal record to the resident state. Replay starts
+ * after the checkpoint sequence, so records are never re-applied to a state
+ * that already contains their effect; Alloc/Free tolerate a committed or
+ * released run because Journal::append may checkpoint before writing. */
+Result<void> Namespace::applyJournalRecord(const JournalRecord &record) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    switch (record.type) {
+    case JournalRecordType::Checkpoint:
+        return Result<void>(Status::Ok);
+    case JournalRecordType::SetSize: {
+        Inode *inode = inodeById(record.objectId);
+        if (inode == nullptr) {
+            return makeError(Status::NotFound, "replayed SetSize inode is missing");
+        }
+        if (record.arg0 > inode->logicalSize) {
+            inode->logicalSize = record.arg0;
+        }
+        touch(*inode, nowNs(), true);
+        return Result<void>(Status::Ok);
+    }
+    case JournalRecordType::SetTimes: {
+        Inode *inode = inodeById(record.objectId);
+        if (inode == nullptr) {
+            return makeError(Status::NotFound, "replayed SetTimes inode is missing");
+        }
+        inode->mtimeNs = record.arg0;
+        inode->ctimeNs = record.arg1;
+        touch(*inode, nowNs(), false);
+        return Result<void>(Status::Ok);
+    }
+    case JournalRecordType::Alloc: {
+        Inode *inode = inodeById(record.objectId);
+        if (inode == nullptr) {
+            return makeError(Status::NotFound, "replayed Alloc inode is missing");
+        }
+        std::uint64_t device = 0;
+        std::uint64_t start = 0;
+        std::uint64_t count = 0;
+        if (!unpackRun(record.arg1, &device, &start, &count) ||
+            device >= allocators_.size() || device >= config_.deviceStartExtents.size()) {
+            return makeError(Status::Corrupt, "replayed Alloc run is invalid");
+        }
+        Allocator *allocator = allocators_[device].get();
+        /* The checkpoint may predate the reservation (Free) or the zero-fill
+         * (Reserved/Initialized); walk the run up to COMMITTED. */
+        ExtentState state = allocator->stateAt(start);
+        if (state == ExtentState::Free) {
+            auto reserved = allocator->markReserved(start, count);
+            if (!reserved.ok()) {
+                return reserved;
+            }
+            state = ExtentState::Reserved;
+        }
+        if (state != ExtentState::Committed) {
+            auto initialized = allocator->markInitialized(start, count);
+            if (!initialized.ok()) {
+                return initialized;
+            }
+            auto committed = allocator->commit(start, count);
+            if (!committed.ok()) {
+                return committed;
+            }
+        }
+        ExtentDescriptor descriptor;
+        descriptor.logicalExtent = record.arg0;
+        descriptor.physicalExtent =
+            deviceStartExtent(static_cast<std::uint32_t>(device)) + start;
+        descriptor.count = count;
+        descriptor.deviceId = static_cast<std::uint32_t>(device);
+        auto added =
+            inode->extents.addExtents(std::span<const ExtentDescriptor>(&descriptor, 1));
+        if (!added.ok()) {
+            return added;
+        }
+        touch(*inode, nowNs(), false);
+        return Result<void>(Status::Ok);
+    }
+    case JournalRecordType::Free: {
+        std::uint64_t device = 0;
+        std::uint64_t start = 0;
+        std::uint64_t count = 0;
+        if (!unpackRun(record.arg1, &device, &start, &count) ||
+            device >= allocators_.size()) {
+            return makeError(Status::Corrupt, "replayed Free run is invalid");
+        }
+        Allocator *allocator = allocators_[device].get();
+        if (allocator->stateAt(start) == ExtentState::Free) {
+            return Result<void>(Status::Ok); /* already released */
+        }
+        return allocator->release(start, count);
+    }
+    case JournalRecordType::Truncate: {
+        Inode *inode = inodeById(record.objectId);
+        if (inode == nullptr) {
+            return makeError(Status::NotFound, "replayed Truncate inode is missing");
+        }
+        return applyTruncateLocked(*inode, record.arg0);
+    }
+    default:
+        return makeError(Status::NotSupported,
+                         "journal record type requires the checkpoint path");
+    }
 }
 
 std::uint64_t Namespace::logicalEpoch() const {

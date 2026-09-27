@@ -241,6 +241,36 @@ vs native 2196.78 / 3.64 ms（**80.5%**），fsync/txn 2.39 vs 2.34。
 
 证据 `/home/hfs/mysql-samedisk-20260927-final/`、`/home/hfs/mysql-profile-20260927b/`。
 
+## 元数据 journal 化（2026-09-27，Shard-107）
+
+`SET_SIZE`/`ALLOC`/`FREE`/`SET_TIMES`/`TRUNCATE` 以 compact record 在 barrier 中一次连续写
+落盘（与数据 flush 合并），namespace 形状变化仍走全量 checkpoint。同会话 A/B（8 线程
+trx=1、2×10 s warmup）：
+
+| 指标 | pre-journal | journal | 变化 |
+|---|---:|---:|---:|
+| MySQL trx=1 TPS | 1908.37 | 1926.61 | +1.0% |
+| checkpoints（会话） | 47310 | **99** | −99.8% |
+| journal transactions | — | 48111 | — |
+| device flushes | 182221 | 190165 | +4.4% |
+
+收益小的原因：barrier 的**设备往返数不变**（journal 写 + flush ≈ checkpoint 写 + flush），
+profile 显示 `log_flusher` 自耗 15.37% → 15.59% 未变，即 flusher CPU 跟随 fsync **延迟**
+（设备往返）而非序列化工作量；journal 化省掉的是 51 KB 全量快照序列化与 CRC。
+
+修复的 replay 缺陷：checkpoint 可能落在 reserve 之后、commit 之前，`ALLOC` replay 原先
+直接 `markInitialized` 会报 "extent is not reserved"；现按 checkpoint 的 allocator 状态
+逐级推进（FREE → `markReserved` → INITIALIZED → COMMITTED）。复现脚本证据
+`/home/hfs/journal-replay-repro-20260927/`（fillseq → 重挂载 replay → `transactions=1`、
+`corruption=none`）。
+
+门禁：CTest 26/26；Shard-104 crash matrix 通过、`hfsctl check` `corruption=none`；
+RocksDB rw32 HFS fillseq 105.9%、readrandom 216%、`overwrite` 校验 100.2%（对 native）；
+8j4 HFS 中位 81014 / raw 122421（0.662）、5 轮 closure 全闭合。证据
+`/home/hfs/mysql-perfile-sync-ab-20260927/{pre2journal,post2journal}/`、
+`/home/hfs/rocksdb-rw32-cache1g-20260927-journal3/`、`/home/hfs/fio-8j4-journal2-20260927/`、
+`/home/hfs/mysql-shard104-crash-20260927-journal/`。
+
 ## 复现入口
 
 - FIO：`ALLOW_FORMAT=1 RESULT=<dir> bash fio/run_three_way_matrix_vm.sh`

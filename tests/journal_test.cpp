@@ -358,17 +358,40 @@ int main() {
         HFS_TEST_CHECK(!reopened->stats().corruption.empty());
     }
 
-    /* 5. BEGIN/RECORD/COMMIT write failures leave an ignorable tail. */
-    for (std::size_t failAt : {0U, 1U, 2U}) {
+    /* 5. A failed transaction write leaves an ignorable tail. BEGIN, records
+     * and COMMIT are one batched write, so a single injected failure covers it. */
+    {
         Fixture fixture;
         HFS_TEST_CHECK(fixture.valid());
         HFS_TEST_CHECK(fixture.format() == 0);
         MemoryTarget writer;
         auto journal = fixture.open(&writer);
         HFS_TEST_CHECK(journal != nullptr);
-        fixture.device->failWriteAt(failAt);
+        fixture.device->failWriteAt(0);
         HFS_TEST_CHECK(!journal->append({setSize(21, 42)}, true).ok());
         fixture.device->failWriteAt(std::numeric_limits<std::size_t>::max());
+        MemoryTarget reader;
+        auto reopened = fixture.open(&reader);
+        HFS_TEST_CHECK(reopened != nullptr);
+        HFS_TEST_CHECK(reopened->replay().ok());
+        HFS_TEST_CHECK(reader.values.empty());
+        HFS_TEST_CHECK(reopened->stats().lastTxid == 0);
+        HFS_TEST_CHECK(reopened->stats().corruption.empty());
+    }
+
+    /* 5b. A batched transaction whose COMMIT slot never landed (torn write) is
+     * an ignorable tail: replay stops before the transaction is published. */
+    {
+        Fixture fixture;
+        HFS_TEST_CHECK(fixture.valid());
+        HFS_TEST_CHECK(fixture.format() == 0);
+        MemoryTarget writer;
+        auto journal = fixture.open(&writer);
+        HFS_TEST_CHECK(journal != nullptr);
+        HFS_TEST_CHECK(journal->append({setSize(21, 42)}, true).ok());
+        std::memset(fixture.device->slot(2, fixture.geometry.journalStart,
+                                         fixture.geometry.journalBlocks),
+                    0, fixture.device->blockSize());
         MemoryTarget reader;
         auto reopened = fixture.open(&reader);
         HFS_TEST_CHECK(reopened != nullptr);

@@ -180,7 +180,16 @@ int main() {
                 HFS_TEST_CHECK(::unsetenv("HFS_TEST_FAIL_FLUSH_DEVICE") == 0);
                 /* Both barriers now flush data and checkpoint metadata. */
                 HFS_TEST_CHECK(first.value()->datasync().wait().value().ok());
-                /* A checkpoint slot write must not publish without its flush. */
+                /* A checkpoint slot write must not publish without its flush.
+                 * Namespace shape changes are not journaled, so create+remove
+                 * forces the snapshot path for the next barrier. */
+                {
+                    auto forced = client->open("/db/.checkpoint-force", OpenFlags::Create)
+                                      .wait()
+                                      .value();
+                    HFS_TEST_CHECK(forced.ok());
+                }
+                HFS_TEST_CHECK(client->remove("/db/.checkpoint-force").wait().value().ok());
                 std::vector<std::byte> checkpointPattern(4096, std::byte{0x3C});
                 IoVec checkpointVec{checkpointPattern.data(), checkpointPattern.size()};
                 HFS_TEST_CHECK(first.value()

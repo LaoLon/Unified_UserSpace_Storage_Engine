@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "hfs/file.hpp"
+#include "hfs/journal.hpp"
 #include "hfs/types.hpp"
 #include "metadata/allocator.hpp"
 #include "metadata/inode.hpp"
@@ -114,6 +115,18 @@ public:
     /* Restores durable sizes when the checkpoint transaction fails. */
     void rollbackPreparedDurableEpoch() noexcept;
 
+    /* Metadata journaling (hfs2.0.md §9.3): mutations stage compact records
+     * that the next durable barrier appends and flushes; mutation types without
+     * a record force a full checkpoint instead. The barrier runs on another
+     * thread, so these accessors take the namespace lock. */
+    bool checkpointRequired() const;
+    void clearPendingRecords();
+    /* Falls back to a full checkpoint for mutations without a record. */
+    void requireCheckpoint();
+    std::vector<JournalRecord> takePendingRecords();
+    /* Applies one replayed journal record to the resident state. */
+    Result<void> applyJournalRecord(const JournalRecord &record);
+
     /* Serializes the complete metadata state for a journal checkpoint. */
     Result<void> saveSnapshot(std::uint64_t txid, std::vector<std::byte> &out);
     /* Restores a checkpoint and drops non-durable open-handle references. */
@@ -142,6 +155,15 @@ private:
     /* All helpers run with mutex_ held. */
     std::uint64_t nowNs() const noexcept;
     void touch(Inode &inode, std::uint64_t now, bool content) noexcept;
+    /* All of the following run with mutex_ held. */
+    void stageRecord(JournalRecord record);
+    void requireCheckpointLocked() noexcept {
+        checkpointRequired_ = true;
+        pendingRecords_.clear();
+    }
+    Inode *inodeById(std::uint64_t inodeId) noexcept;
+    /* Shared by truncateFile and journal replay; mutex_ held by the caller. */
+    Result<void> applyTruncateLocked(Inode &inode, std::uint64_t size);
     Result<FileHandle> makeHandle(std::uint64_t inodeId) const;
     Result<Inode *> lookupInode(FileHandle handle) noexcept;
     Result<const Inode *> lookupInode(FileHandle handle) const noexcept;
@@ -170,6 +192,9 @@ private:
     std::uint64_t durableEpoch_ = 0;
     std::uint64_t snapshotTxid_ = 0;
     std::vector<std::uint64_t> preparedDurableSizes_;
+    /* Staged metadata records and the no-record fallback flag (§9.3). */
+    std::vector<JournalRecord> pendingRecords_;
+    bool checkpointRequired_ = false;
     Stats stats_;
     std::vector<std::unique_ptr<Allocator>> allocators_;
     PlacementPicker picker_;

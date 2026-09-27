@@ -81,6 +81,7 @@ struct Counters {
     std::atomic<std::uint64_t> deviceFlushes{0};
     std::atomic<std::uint64_t> deviceFlushSkips{0};
     std::atomic<std::uint64_t> journalCheckpoints{0};
+    std::atomic<std::uint64_t> journalTransactions{0};
     /* Barrier phase durations; diagnostics for the commit-path analysis. */
     PhaseTimer syncBarrier;
     PhaseTimer syncDeviceFlush;

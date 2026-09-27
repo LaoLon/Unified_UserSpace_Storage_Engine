@@ -123,10 +123,13 @@ public:
     Result<void> replay();
 
     /* Append one transaction; auto-checkpoints when the force threshold is
-     * reached and returns NoSpace when the ring cannot make room. */
-    Result<std::uint64_t> append(std::span<const JournalRecord> records, bool flushDevice);
+     * reached and returns NoSpace when the ring cannot make room. With
+     * applyToTarget=false the resident state already holds the mutation and
+     * only the durable record is written (metadata journaling, §9.3). */
+    Result<std::uint64_t> append(std::span<const JournalRecord> records, bool flushDevice,
+                                 bool applyToTarget = true);
     Result<std::uint64_t> append(std::initializer_list<JournalRecord> records,
-                                 bool flushDevice);
+                                 bool flushDevice, bool applyToTarget = true);
 
     /* Snapshot + checkpoint slot write + superblock publish + tail advance.
      * With deferFlush the caller must flush the journal device afterwards; the

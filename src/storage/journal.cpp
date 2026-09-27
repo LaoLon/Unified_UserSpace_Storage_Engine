@@ -203,10 +203,11 @@ struct Journal::Impl {
         return SlotState::Valid;
     }
 
-    Result<void> writeSlot(std::uint64_t sequence, std::uint16_t type, std::uint64_t txid,
-                           std::uint32_t recordCount, std::uint64_t txCrc,
-                           std::span<const std::byte> payload) {
-        std::vector<std::byte> slot(blockSize, std::byte{0});
+    /* Builds one slot image into a caller-provided block. */
+    void buildSlot(std::span<std::byte> slot, std::uint64_t sequence, std::uint16_t type,
+                   std::uint64_t txid, std::uint32_t recordCount, std::uint64_t txCrc,
+                   std::span<const std::byte> payload) {
+        std::fill(slot.begin(), slot.end(), std::byte{0});
         SlotHeader header{};
         header.magic = kJournalSlotMagic;
         header.formatVersion = kJournalFormatVersion;
@@ -225,8 +226,36 @@ struct Journal::Impl {
         auto *headerView = reinterpret_cast<SlotHeader *>(slot.data());
         headerView->crc = crc32c(slot.data() + sizeof(header), payload.size(),
                                  crc32c(slot.data(), offsetof(SlotHeader, crc)));
+    }
+
+    Result<void> writeSlot(std::uint64_t sequence, std::uint16_t type, std::uint64_t txid,
+                           std::uint32_t recordCount, std::uint64_t txCrc,
+                           std::span<const std::byte> payload) {
+        std::vector<std::byte> slot(blockSize, std::byte{0});
+        buildSlot(slot, sequence, type, txid, recordCount, txCrc, payload);
         const std::uint64_t offset = journalStart + (sequence % journalBlocks);
         return writeBlock(offset, slot);
+    }
+
+    /* Writes a contiguous run of ring slots starting at sequence; splits at the
+     * ring wrap so each part stays contiguous. */
+    Result<void> writeSlots(std::uint64_t sequence, std::span<const std::byte> buffer) {
+        std::size_t done = 0;
+        while (done < buffer.size()) {
+            const std::uint64_t slotIndex =
+                (sequence + done / blockSize) % journalBlocks;
+            const std::size_t blocks = (buffer.size() - done) / blockSize;
+            const std::size_t contiguous =
+                std::min<std::size_t>(blocks, journalBlocks - slotIndex);
+            const std::size_t bytes = contiguous * blockSize;
+            auto written = writeBlock(journalStart + slotIndex,
+                                      buffer.subspan(done, bytes));
+            if (!written.ok()) {
+                return written;
+            }
+            done += bytes;
+        }
+        return Result<void>(Status::Ok);
     }
 
     Result<void> readSuperblocks() {
@@ -936,7 +965,11 @@ Result<void> Journal::replay() {
                 auto applied = impl.target->apply(record);
                 if (!applied.ok()) {
                     auto restored = impl.target->loadSnapshot(beforeImage);
-                    impl.corruption = "target rejected txid " + std::to_string(begin.txid);
+                    impl.corruption = "target rejected txid " + std::to_string(begin.txid) +
+                                      " record type " + std::to_string(payload.type) +
+                                      " object " + std::to_string(payload.objectId) +
+                                      " args " + std::to_string(payload.arg0) + "/" +
+                                      std::to_string(payload.arg1) + ": " + applied.message();
                     if (!restored.ok()) {
                         impl.corruption += "; target after-image restore failed";
                     }
@@ -964,7 +997,7 @@ Result<void> Journal::replay() {
 }
 
 Result<std::uint64_t> Journal::append(std::span<const JournalRecord> records,
-                                      bool flushDevice) {
+                                      bool flushDevice, bool applyToTarget) {
     auto &impl = *impl_;
     if (records.empty()) {
         return makeError<std::uint64_t>(Status::InvalidArgument, "empty transaction");
@@ -1006,28 +1039,32 @@ Result<std::uint64_t> Journal::append(std::span<const JournalRecord> records,
     const std::uint32_t txSeed = crc32c(&txid, sizeof(txid));
     const std::uint32_t txCrc = crc32c(payloads.data(), payloads.size(), txSeed);
 
+    /* One contiguous write covers BEGIN + records + COMMIT, so a metadata
+     * transaction costs a single device round trip (plus the barrier flush). */
     std::uint64_t sequence = impl.head;
-    auto begin = impl.writeSlot(sequence, static_cast<std::uint16_t>(Begin), txid,
-                                static_cast<std::uint32_t>(records.size()), 0, {});
-    if (!begin.ok()) {
-        return makeError<std::uint64_t>(begin.status(), begin.message());
-    }
+    const std::size_t slotCount = 2 + records.size();
+    std::vector<std::byte> transaction(slotCount * impl.blockSize, std::byte{0});
+    impl.buildSlot(std::span<std::byte>(transaction.data(), impl.blockSize), sequence,
+                   static_cast<std::uint16_t>(Begin), txid,
+                   static_cast<std::uint32_t>(records.size()), 0, {});
     for (std::size_t i = 0; i < records.size(); ++i) {
-        ++sequence;
-        auto written = impl.writeSlot(
-            sequence, static_cast<std::uint16_t>(Record), txid, 0, 0,
+        impl.buildSlot(
+            std::span<std::byte>(transaction.data() + (1 + i) * impl.blockSize,
+                                 impl.blockSize),
+            sequence + 1 + i, static_cast<std::uint16_t>(Record), txid, 0, 0,
             std::span<const std::byte>(payloads).subspan(i * sizeof(RecordPayload),
                                                          sizeof(RecordPayload)));
-        if (!written.ok()) {
-            return makeError<std::uint64_t>(written.status(), written.message());
-        }
     }
-    ++sequence;
-    auto commit = impl.writeSlot(sequence, static_cast<std::uint16_t>(Commit), txid, 0,
-                                 txCrc, {});
-    if (!commit.ok()) {
-        return makeError<std::uint64_t>(commit.status(), commit.message());
+    impl.buildSlot(
+        std::span<std::byte>(transaction.data() + (1 + records.size()) * impl.blockSize,
+                             impl.blockSize),
+        sequence + 1 + records.size(), static_cast<std::uint16_t>(Commit), txid, 0,
+        txCrc, {});
+    auto written = impl.writeSlots(sequence, transaction);
+    if (!written.ok()) {
+        return makeError<std::uint64_t>(written.status(), written.message());
     }
+    sequence += records.size() + 1;
     test_hooks::crashIfRequested("journal_commit");
     if (flushDevice) {
         auto flushed = impl.device->flush();
@@ -1036,7 +1073,7 @@ Result<std::uint64_t> Journal::append(std::span<const JournalRecord> records,
         }
     }
     impl.head = sequence + 1;
-    if (impl.target != nullptr) {
+    if (applyToTarget && impl.target != nullptr) {
         /* Committing a transaction publishes it to the in-memory state. */
         std::vector<std::byte> beforeImage;
         auto saved = impl.target->saveSnapshot(impl.lastTxid, beforeImage);
@@ -1063,9 +1100,9 @@ Result<std::uint64_t> Journal::append(std::span<const JournalRecord> records,
 }
 
 Result<std::uint64_t> Journal::append(std::initializer_list<JournalRecord> records,
-                                      bool flushDevice) {
+                                      bool flushDevice, bool applyToTarget) {
     return append(std::span<const JournalRecord>(records.begin(), records.size()),
-                  flushDevice);
+                  flushDevice, applyToTarget);
 }
 
 Result<void> Journal::checkpoint(bool deferFlush) {

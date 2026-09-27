@@ -682,6 +682,14 @@ journal 开始。
 - superblock durable 后才推进 journal tail；
 - 撕裂/未知/超长 record 丢弃并记录 corruption evidence，不静默 replay。
 
+已实施的记录路径（Shard-107）：`SET_SIZE`/`ALLOC`/`FREE`/`SET_TIMES`/`TRUNCATE` 由对应
+mutation 直接 stage（`arg1` 打包 extent run：device/start/count），barrier 在数据 flush
+之前把整笔事务（BEGIN+records+COMMIT）作为**一次连续写**追加，随后同一次设备 flush
+一并落盘；`CREATE`/`LINK`/`UNLINK`/`RENAME` 等 namespace 形状变化与 journal 压缩仍走
+全量 checkpoint（`checkpointRequired`），checkpoint 快照覆盖已 stage 的记录。
+replay 侧 `ALLOC` 按 checkpoint 中的 allocator 状态把 run 从 FREE/RESERVED/INITIALIZED
+逐级推进到 COMMITTED（`markReserved` → `markInitialized` → `commit`），`FREE` 幂等。
+
 ### 9.4 Extent 和 allocator
 
 第一版每个 data device 固定 1 MiB extent，全部 device 的 allocator 由 metadata actor 独占：
@@ -749,8 +757,9 @@ tail 丢弃（roll back），不做单盘前滚；journal 损坏、CRC 不一致
 ```text
 data submit → data drain
   → metadata prepare（staged durable sizes）
-  → checkpoint 记录 + superblock 一次批量写（defer flush）
-  → 每设备一次 device flush（覆盖 user data + checkpoint + superblock）
+  → checkpoint 路径：checkpoint 记录 + superblock 一次批量写（defer flush）
+     journal 路径：BEGIN+records+COMMIT 一次连续写（defer flush）
+  → 每设备一次 device flush（覆盖 user data + journal slots/checkpoint + superblock）
   → publish durable epoch
 ```
 

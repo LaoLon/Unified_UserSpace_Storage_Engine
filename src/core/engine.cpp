@@ -102,13 +102,9 @@ public:
     explicit NamespaceJournalTarget(metadata::Namespace &namespaceState)
         : namespaceState_(namespaceState) {}
 
-    /* Journal records are not emitted by the legacy in-memory mutation path. */
+    /* Applies one replayed metadata transaction record (hfs2.0.md §9.3). */
     Result<void> apply(const JournalRecord &record) override {
-        if (record.type == JournalRecordType::Checkpoint) {
-            return Result<void>(Status::Ok);
-        }
-        return makeError(Status::NotSupported,
-                         "metadata record replay requires the transaction path");
+        return namespaceState_.applyJournalRecord(record);
     }
 
     /* Saves the complete inode, directory, extent and allocator state. */
@@ -404,6 +400,18 @@ Task<Result<void>> Engine::mount() {
         co_return makeError(replay.status(), "metadata journal replay failed: " +
                                                 replay.message());
     }
+    /* Everything replayed from the checkpoint + journal is durable. */
+    auto replayedEpoch =
+        impl.namespaceState->publishDurableEpoch(impl.namespaceState->logicalEpoch());
+    if (!replayedEpoch.ok()) {
+        impl.journal.reset();
+        impl.metadataTarget.reset();
+        impl.namespaceState.reset();
+        runtime.stop();
+        co_return makeError(replayedEpoch.status(),
+                            "replayed durable epoch publish failed: " +
+                                replayedEpoch.message());
+    }
 
     /* Shared DMA arena and data plane (bounded by [limits] dma_arena_mb). */
     impl.dmaArena = std::make_unique<DmaArena>();
@@ -669,14 +677,15 @@ Task<Result<void>> Engine::stop() {
     if (const char *flag = std::getenv("HFS_DIAG_SYNC_STATS"); flag != nullptr && *flag != '\0') {
         const auto &counters = stats::counters();
         log::info("sync stats: calls=%llu early=%llu joiners=%llu barriers=%llu flushes=%llu "
-                  "flush_skips=%llu checkpoints=%llu",
+                  "flush_skips=%llu checkpoints=%llu journal_txns=%llu",
                   static_cast<unsigned long long>(counters.syncCalls.load()),
                   static_cast<unsigned long long>(counters.syncEarlyReturns.load()),
                   static_cast<unsigned long long>(counters.syncJoiners.load()),
                   static_cast<unsigned long long>(counters.syncBarriers.load()),
                   static_cast<unsigned long long>(counters.deviceFlushes.load()),
                   static_cast<unsigned long long>(counters.deviceFlushSkips.load()),
-                  static_cast<unsigned long long>(counters.journalCheckpoints.load()));
+                  static_cast<unsigned long long>(counters.journalCheckpoints.load()),
+                  static_cast<unsigned long long>(counters.journalTransactions.load()));
         const auto averageUs = [](const stats::PhaseTimer &timer) {
             const std::uint64_t count = timer.count.load();
             return std::to_string(count == 0 ? 0 : timer.totalNs.load() / count / 1000);
@@ -769,9 +778,15 @@ Result<void> Engine::syncMetadata(std::uint64_t epoch) {
         const auto barrierStart = std::chrono::steady_clock::now();
         const bool checkpointNeeded = targetEpoch > impl_->namespaceState->durableEpoch();
         bool prepared = false;
-        /* Phase 1 (metadata): write the checkpoint and superblock without their
-         * own flushes when a namespace change needs a checkpoint. */
-        if (checkpointNeeded) {
+        /* Phase 1 (metadata, hfs2.0.md §9.3): namespace-shape changes and
+         * journal compaction write the full snapshot; journaled mutations are
+         * appended after the data flush so a failed flush cannot leave durable
+         * metadata ahead of non-durable data. */
+        const bool checkpointPath =
+            checkpointNeeded && (impl_->namespaceState->checkpointRequired() ||
+                                 impl_->journal->needsCheckpoint());
+        if (checkpointPath) {
+            impl_->namespaceState->clearPendingRecords();
             auto staged = impl_->namespaceState->prepareDurableEpoch(targetEpoch);
             if (!staged.ok()) {
                 result = staged;
@@ -788,10 +803,27 @@ Result<void> Engine::syncMetadata(std::uint64_t epoch) {
                 }
             }
         }
-        /* Phase 2 (data + metadata durability): one device flush covers every
-         * write completed before it was submitted - user data, the checkpoint
-         * record and the superblock - so the barrier needs a single round trip
-         * per device (hfs2.0.md 10.2/20.3). */
+        /* Phase 2 (journal): append the staged metadata records; the single
+         * device flush below makes data, journal slots and checkpoint records
+         * durable together, so the barrier still needs one round trip. */
+        if (result.ok() && checkpointNeeded && !checkpointPath) {
+            auto records = impl_->namespaceState->takePendingRecords();
+            if (!records.empty()) {
+                auto appended = impl_->journal->append(records, /*flushDevice=*/false,
+                                                       /*applyToTarget=*/false);
+                if (!appended.ok()) {
+                    /* The staged records are gone; the next barrier snapshots. */
+                    impl_->namespaceState->requireCheckpoint();
+                    result = makeError(appended.status(), appended.message());
+                } else {
+                    stats::counters().journalTransactions.fetch_add(
+                        1, std::memory_order_relaxed);
+                }
+            }
+        }
+        /* Phase 3 (durability): one device flush covers every write completed
+         * before it was submitted - user data, journal slots, the checkpoint
+         * record and the superblock (hfs2.0.md 10.2/20.3). */
         if (result.ok()) {
             const auto deviceFlushStart = std::chrono::steady_clock::now();
             for (std::size_t i = 0; i < impl_->config.devices.size(); ++i) {
