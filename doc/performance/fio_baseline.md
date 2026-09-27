@@ -24,8 +24,8 @@
 ## 2. 口径与命令
 
 - 负载：`--rw=randrw --rwmixread=50 --direct=1 --time_based=1 --runtime=10`，
-  文件/区域 256 MiB，计时前先以 direct 写填满 256 MiB（raw/HFS 各自预填充，
-  64 KiB 顺序写）。
+  文件/区域 256 MiB，计时前先以 direct 写填满 256 MiB（raw 1 MiB、HFS 64 KiB
+  顺序写）。
 - 进程统一 `taskset -c 0-5`，`--group_reporting=1`，`--numjobs` 与 `--iodepth`
   按层设置；JSON 的 IOPS 为该层读+写合计速率，取 3 次中位数。
 - ext4：`mkfs.ext4` + `mount -o noatime`，`--ioengine=libaio`，1 job × QD。
@@ -86,6 +86,9 @@
   混合下 HFS 与 raw 接近。
 - ext4+libaio 层保持已知的离散特性（部分格 runtime 超出 10 s，为 30–40 s），
   其数值只作为宿主文件系统参考层，不参与 HFS/raw 判定。
+- HFS QD64 格在 JSON 中 `job_runtime=20000 ms` 是两个并发 10 s job 的累计
+  报告值，实际墙钟约 11 s；raw 侧为单 job。报告使用 JSON 的 IOPS 速率字段，
+  两种报告方式对 IOPS 无影响。
 - 与 2026-09-27 newshape 会话相比，本会话 raw 4K QD32 中位由 76034 升至
   95986（+26%），HFS 同步上升；属设备/会话漂移，不做跨会话回退结论。
 
