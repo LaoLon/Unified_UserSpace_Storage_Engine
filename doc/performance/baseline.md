@@ -159,6 +159,14 @@ SHA256 `b40d3831…`；证据 `/home/hfs/barrier-ab-{merge2,batch2,batch1}/`、
 | hfs-2 | 10622.66 | 0.75 / 1.86 | 1680.26 | 4.76 / 9.06 | 0.067 / 12.211 | 45373 |
 | native-2 | 10938.11 | 0.73 / 1.73 | 2306.10 | 3.47 / 6.91 | 0.069 / 10.524 | 69104 |
 
+同会话定向 profile（预热协议，`perf record` 自耗 + fsync 计数）：HFS 1577.84 TPS /
+avg 5.07 ms / 1.21 fsync per txn，`log_write_up_to` 自耗 24.4%、内核
+`_raw_spin_unlock_irqrestore` 14.7%、SPDK 轮询 3.1%；native 2326.84 / 3.44 ms /
+2.31 fsync，`log_writer` 23.1%、`log_write_up_to` 6.9%、内核自旋 6.7%。即 HFS 的
+fsync 次数只有 native 一半，但 committer 多出约 25pp 的自旋（≈2 核/6 vCPU），
+对应吞吐差距；根因是 redo 同步写（~140 µs）与 barrier（~180 µs）拉长等待。
+证据 `/home/hfs/mysql-profile-20260927/`。
+
 只读 **95.2%**、读写 **73.0%**（旧基线 98.5% / 72.4%）。预热同会话对照
 （2×10 s warmup + 20 s trx=1）：HFS 1640.15 TPS / avg 4.88 / p99 9.56，native
 2297.35 / 3.48 / 6.79，**HFS/native 71.4%**。即写路径比值在冷/热两种口径下一致
