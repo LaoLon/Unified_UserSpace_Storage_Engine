@@ -336,15 +336,19 @@ randwrite QD32 = **69628 / 68524 / 69229 IOPS（离散 1.6%）**，此前同格�
 每格 3 轮离散：raw/HFS 1.01–1.20（多数 ≤1.06）；**ext4+libaio 仍离散（最高 7.6×）**，
 属 ext4/内核侧，不影响 HFS/raw 口径。
 
-### RocksDB 32 并发、1 GiB cache（同会话）
+### RocksDB 32 并发、1 GiB cache（3 轮）
 
-| 阶段 | native | HFS | 比值 |
-|---|---:|---:|---:|
-| fillseq | 67598 | 67918 | 100.5% |
-| readrandom | 86786 | 111812 | 128.8% |
-| overwrite 校验 | 52710 | 57469 | 109.0% |
+| 轮次 | native 写 | HFS 写 | native 读 | HFS 读 | native 校验 | HFS 校验 |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 | 67598 | 67918 | 86786 | 111812 | 52710 | 57469 |
+| 2 | 69058 | 67764 | 35726 | 109563 | 56039 | 57640 |
+| 3 | 67999 | 68428 | 31981 | 113064 | 53918 | 59866 |
+| **中位数** | **67999** | **67918** | **35726** | **111812** | **53918** | **57640** |
 
-`hfsctl check` `corruption=none`；journal replay 跨挂载正常（`transactions=1`）。
+HFS/native（中位数之比）：写 **99.9%**，随机读 **313%**，校验 **106.9%**。注意本轮
+**native ext4 侧离散**（readrandom 31.9–86.8K，2.7×）而 HFS 稳定（109.6–113.1K，1.03），
+与 FIO 的 ext4+libaio 离散现象一致。三轮 `hfsctl check` `corruption=none`，journal
+replay 跨挂载正常（`transactions=1`）。
 
 ### MySQL 同盘 + 预热
 
