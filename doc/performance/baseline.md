@@ -358,9 +358,21 @@ replay 跨挂载正常（`transactions=1`）。
 | shard-105 同盘 读写 trx=1 | 1377 | 1395 | 98.7% |
 | 预热 trx=1（2×10 s + 20 s） | 1326.83（avg 6.02 / p99 10.84） | 1406.25（5.68 / 11.24） | 94.4% |
 
+### 功能门禁（新形态）
+
+| 门禁 | 结果 |
+|---|---|
+| CTest | 26/26 通过 |
+| Shard-104 crash matrix | 通过（rows=131072，`corruption=none`×2） |
+| 8j4 正式 gate（5 组交替） | raw 中位 79482 / HFS 60718（**0.764**），5/5 closure 闭合 |
+
+新形态 8j4 绝对值低于此前环境（raw 121734→79482、HFS 80282→60718），但 HFS/raw 比值
+由 0.660 升至 0.764；仍低于 `hfs2.0.md` §16.2 的 ≥85% 目标，属已知边界。
+
 证据 `/home/hfs/device-probe-20260927/`、`/home/hfs/fio-three-way-20260927-newshape/`、
-`/home/hfs/rocksdb-rw32-cache1g-20260927-newshape/`、
-`/home/hfs/mysql-samedisk-20260927-newshape/`、`/home/hfs/mysql-warm-newshape-20260927/`。
+`/home/hfs/rocksdb-rw32-cache1g-20260927-newshape{,-r2,-r3}/`、
+`/home/hfs/mysql-samedisk-20260927-newshape/`、`/home/hfs/mysql-warm-newshape-20260927/`、
+`/home/hfs/mysql-shard104-crash-20260927-newshape/`、`/home/hfs/fio-8j4-newshape-20260927/`。
 
 ## 复现入口
 
