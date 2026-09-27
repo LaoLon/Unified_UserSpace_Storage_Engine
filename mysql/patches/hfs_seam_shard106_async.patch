@@ -1,0 +1,276 @@
+--- a/storage/innobase/os/hfs_vfs.cc
++++ b/storage/innobase/os/hfs_vfs.cc
+@@ -1,6 +1,8 @@
+ /* HFS-backed InnoDB os_file seam implementation (Phase 7, Shard-101). */
+ #include "hfs_vfs.h"
+ 
++#include <algorithm>
++#include <array>
+ #include <atomic>
+ #include <cerrno>
+ #include <csignal>
+@@ -8,12 +10,15 @@
+ #include <cstdlib>
+ #include <cstring>
+ #include <fcntl.h>
++#include <chrono>
+ #include <memory>
+ #include <mutex>
+ #include <pthread.h>
++#include <span>
+ #include <string>
+ #include <string_view>
+ #include <unistd.h>
++#include <unordered_map>
+ #include <vector>
+ 
+ #include "hfs/config.hpp"
+@@ -65,9 +70,14 @@
+   std::mutex fileClientMutex;
+   std::atomic<std::uint64_t> threadClients{0};
+   std::atomic<std::uint64_t> fallbackClients{0};
++  /* Async fast-path counters (Shard-106). */
++  std::atomic<std::uint64_t> asyncReads{0};
++  std::atomic<std::uint64_t> asyncWrites{0};
++  std::atomic<std::uint64_t> asyncFallbacks{0};
+   struct Entry {
+     std::shared_ptr<hfs::File> file;
+     std::uint64_t position = 0;
++    std::string path; /* namespace path for the per-thread async file */
+   };
+   std::vector<Entry> handles;
+   std::vector<int> freeHandles;
+@@ -85,8 +95,13 @@
+ /* Owns one thread's client and closes it when the thread exits. */
+ struct ThreadClientHolder {
+   std::shared_ptr<hfs::Client> client;
++  /* Files opened by this thread's client: the async frontend only accepts
++   * I/O for files owned by the same client. */
++  std::unordered_map<std::string, std::shared_ptr<hfs::File>> files;
++  std::uint32_t tokenGeneration = 0;
+ 
+   ~ThreadClientHolder() {
++    files.clear();
+     if (client && !state().stopping.load(std::memory_order_acquire)) {
+       auto result = client->close().wait().value();
+       if (!result.ok()) {
+@@ -274,7 +289,8 @@
+   return created.value();
+ }
+ 
+-int registerHandle(const std::shared_ptr<hfs::File> &file) {
++int registerHandle(const std::shared_ptr<hfs::File> &file,
++                   const std::string &path) {
+   BridgeState &bridge = state();
+   std::lock_guard<std::mutex> lock(bridge.mutex);
+   int index = 0;
+@@ -282,10 +298,10 @@
+     index = bridge.freeHandles.back();
+     bridge.freeHandles.pop_back();
+     bridge.handles[static_cast<std::size_t>(index)] =
+-        BridgeState::Entry{file, 0};
++        BridgeState::Entry{file, 0, path};
+   } else {
+     index = static_cast<int>(bridge.handles.size());
+-    bridge.handles.push_back(BridgeState::Entry{file, 0});
++    bridge.handles.push_back(BridgeState::Entry{file, 0, path});
+   }
+   return kHandleBase + index;
+ }
+@@ -351,6 +367,106 @@
+   return path.substr(0, slash);
+ }
+ 
++/* Returns the namespace path of one open handle (empty when unavailable). */
++std::string handlePath(int handle) {
++  BridgeState &bridge = state();
++  if (handle < kHandleBase) {
++    return {};
++  }
++  const int index = handle - kHandleBase;
++  std::lock_guard<std::mutex> lock(bridge.mutex);
++  if (index < 0 || static_cast<std::size_t>(index) >= bridge.handles.size()) {
++    return {};
++  }
++  return bridge.handles[static_cast<std::size_t>(index)].path;
++}
++
++/* Returns the calling thread's File for a namespace path, opening it with the
++ * thread client on first use: the async frontend only accepts I/O for files
++ * owned by the same client. */
++std::shared_ptr<hfs::File> threadFile(const std::string &path) {
++  ThreadClientHolder *holder = t_holder.get();
++  if (holder == nullptr || holder->client == nullptr || path.empty()) {
++    return nullptr;
++  }
++  auto found = holder->files.find(path);
++  if (found != holder->files.end()) {
++    return found->second;
++  }
++  auto opened = holder->client->open(path).wait().value();
++  if (!opened.ok()) {
++    return nullptr;
++  }
++  auto file = opened.value();
++  holder->files.emplace(path, file);
++  return file;
++}
++
++/* Runs one I/O through the per-thread async frontend and polls for its
++ * completion on this thread. Returns false when the async path cannot be used
++ * (nothing was submitted), so the caller falls back to the sync facade. */
++bool asyncIo(const std::string &path, void *buf, std::size_t n, std::uint64_t offset,
++             bool write, std::size_t *out, int *errorOut) {
++  ThreadClientHolder *holder = t_holder.get();
++  if (holder == nullptr || holder->client == nullptr || n == 0) {
++    state().asyncFallbacks.fetch_add(1, std::memory_order_relaxed);
++    return false;
++  }
++  auto file = threadFile(path);
++  if (file == nullptr) {
++    state().asyncFallbacks.fetch_add(1, std::memory_order_relaxed);
++    return false;
++  }
++  hfs::CompletionToken token{};
++  token.slot = 0;
++  token.generation = ++holder->tokenGeneration;
++  if (token.generation == 0) {
++    token.generation = ++holder->tokenGeneration;
++  }
++  hfs::IoVec vec{static_cast<std::byte *>(buf), n};
++  auto submitted = write ? holder->client->submitWrite(file, vec, offset, token)
++                         : holder->client->submitRead(file, vec, offset, token);
++  if (!submitted.ok()) {
++    /* Growth writes and exhausted frontends land here; the sync path owns them. */
++    state().asyncFallbacks.fetch_add(1, std::memory_order_relaxed);
++    return false;
++  }
++  auto io = std::move(submitted).value();
++  const std::uint64_t requestId = io.requestId();
++  std::array<hfs::CompletionEvent, 8> events{};
++  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
++  for (;;) {
++    auto polled = holder->client->poll(
++        std::span<hfs::CompletionEvent>(events.data(), events.size()), 1, events.size(),
++        std::chrono::microseconds(1000));
++    if (polled.status != hfs::Status::Ok) {
++      *errorOut = EIO;
++      return true;
++    }
++    for (std::size_t index = 0; index < polled.count; ++index) {
++      if (events[index].requestId != requestId) {
++        continue;
++      }
++      if (events[index].status != hfs::Status::Ok) {
++        setErrno(events[index].status);
++        *errorOut = errno != 0 ? errno : EIO;
++        return true;
++      }
++      *out = static_cast<std::size_t>(events[index].completedBytes);
++      if (write) {
++        state().asyncWrites.fetch_add(1, std::memory_order_relaxed);
++      } else {
++        state().asyncReads.fetch_add(1, std::memory_order_relaxed);
++      }
++      return true;
++    }
++    if (std::chrono::steady_clock::now() >= deadline) {
++      *errorOut = ETIMEDOUT;
++      return true;
++    }
++  }
++}
++
+ /* SPDK/DPDK threads run with an empty signal mask, so a process-directed
+  * SIGTERM/SIGINT/SIGHUP/SIGQUIT would kill mysqld via the default action
+  * instead of reaching mysqld's sigwait() handler thread. Forward such signals
+@@ -512,11 +628,19 @@
+   }
+   bridge.enabled = false;
+   std::fprintf(
+-      stderr, "hfs_vfs: shutdown complete (thread_clients=%llu fallback=%llu)\n",
++      stderr,
++      "hfs_vfs: shutdown complete (thread_clients=%llu fallback=%llu "
++      "async_reads=%llu async_writes=%llu async_fallbacks=%llu)\n",
+       static_cast<unsigned long long>(
+           bridge.threadClients.load(std::memory_order_relaxed)),
+       static_cast<unsigned long long>(
+-          bridge.fallbackClients.load(std::memory_order_relaxed)));
++          bridge.fallbackClients.load(std::memory_order_relaxed)),
++      static_cast<unsigned long long>(
++          bridge.asyncReads.load(std::memory_order_relaxed)),
++      static_cast<unsigned long long>(
++          bridge.asyncWrites.load(std::memory_order_relaxed)),
++      static_cast<unsigned long long>(
++          bridge.asyncFallbacks.load(std::memory_order_relaxed)));
+   /* The engine object is intentionally kept alive until process exit so that
+    * late thread-local client destructors never observe a freed engine. */
+ }
+@@ -627,7 +751,7 @@
+     errno = EISDIR;
+     return -1;
+   }
+-  *handle = registerHandle(opened.value());
++  *handle = registerHandle(opened.value(), namespacePath);
+   return 0;
+ }
+ 
+@@ -647,6 +771,29 @@
+     errno = EBADF;
+     return -1;
+   }
++  const std::string path = handlePath(handle);
++  if (!path.empty()) {
++    auto stat = file->stat();
++    if (stat.ok()) {
++      const std::uint64_t size = stat.value().logicalSize;
++      if (offset >= size) {
++        *out = 0;
++        return 0;
++      }
++      const std::size_t clamped =
++          static_cast<std::size_t>(std::min<std::uint64_t>(n, size - offset));
++      std::size_t done = 0;
++      int error = 0;
++      if (asyncIo(path, buf, clamped, offset, false, &done, &error)) {
++        if (error != 0) {
++          errno = error;
++          return -1;
++        }
++        *out = done;
++        return 0;
++      }
++    }
++  }
+   hfs::IoVec vec{static_cast<std::byte *>(buf), n};
+   auto result =
+       file->read(std::span<hfs::IoVec>(&vec, 1), offset, std::stop_token{})
+@@ -667,6 +814,19 @@
+     errno = EBADF;
+     return -1;
+   }
++  const std::string path = handlePath(handle);
++  if (!path.empty()) {
++    std::size_t done = 0;
++    int error = 0;
++    if (asyncIo(path, const_cast<void *>(buf), n, offset, true, &done, &error)) {
++      if (error != 0) {
++        errno = error;
++        return -1;
++      }
++      *out = done;
++      return 0;
++    }
++  }
+   hfs::IoVec vec{const_cast<std::byte *>(static_cast<const std::byte *>(buf)), n};
+   auto result =
+       file->write(std::span<const hfs::IoVec>(&vec, 1), offset, std::stop_token{})
+@@ -1029,7 +1189,7 @@
+       return -1;
+     }
+   }
+-  return registerHandle(opened.value());
++  return registerHandle(opened.value(), namespacePath);
+ }
+ 
+ int statPath(const char *path, struct stat *st) {

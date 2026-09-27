@@ -176,6 +176,21 @@ fsync 次数只有 native 一半，但 committer 多出约 25pp 的自旋（≈2
 log 等待/自旋、CPU 争用。证据 `/home/hfs/mysql-samedisk-20260927-postfsync/`、
 `/home/hfs/mysql-warm-ab-20260927/`。
 
+## seam worker-direct 快路径（2026-09-27，Shard-106）
+
+seam 的 `read/write` 改为 per-thread client `submitRead/submitWrite` + 同线程 `poll`
+（增长写与 submit 失败回落同步门面）。同会话双向 A/B（8 线程 trx=1、2×10 s warmup）：
+
+| 轮次 | pre-async TPS | seam-async TPS | 变化 | async 计数 |
+|---|---:|---:|---:|---|
+| pre → post | 1642.05 | 1656.59 | +0.9% | reads 339 / writes 126949 / fallbacks 46036 |
+| post → pre（反序） | 1631.26 | 1662.11 | +1.9% | reads 337 / writes 127118 / fallbacks 46063 |
+
+两序均值约 **+1.4%**。定向 profile（预热协议）显示 committer 自旋几乎未降：
+`log_write_up_to` 自耗 24.4% → 24.0%、内核自旋 14.7% → 12.6%，即写延迟不是自旋主因；
+剩余 HFS 特有开销集中在 fsync barrier 与 InnoDB group-commit 等待结构。
+证据 `/home/hfs/mysql-seam-async-ab{,-2}-20260927/`、`/home/hfs/mysql-profile-async-20260927/`。
+
 ## 复现入口
 
 - FIO：`ALLOW_FORMAT=1 RESULT=<dir> bash fio/run_three_way_matrix_vm.sh`

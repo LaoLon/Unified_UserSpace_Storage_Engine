@@ -1769,6 +1769,12 @@ seam 位于 `storage/innobase/os/os0file.cc`（审计 §5.1）：
   落到宿主 OS；
 - native AIO（`AIO::linux_dispatch`/`os_aio_linux_handler`）在 v1 关闭
   （`innodb_use_native_aio=OFF`），模拟 AIO 统一收敛到 seam；AIO bridge 属二期。
+- Shard-106：seam 的 `read/write` 增加 worker-direct 快路径——调用线程用自己的
+  per-thread client 对同名 namespace 路径打开 File，`submitRead/submitWrite` 后用
+  `poll` 在本线程收完成；仅用于文件内读与 fixed-overwrite 写（增长写、前端受限或
+  submit 失败时回落同步门面，ABI 与 `File::sync` 语义不变）。计数器
+  `async_reads/async_writes/async_fallbacks` 随 `shutdown complete` 行输出；完整
+  AIO bridge（跨线程提交/完成回调）仍属二期。
 
 ### 20.3 Durability 契约
 
