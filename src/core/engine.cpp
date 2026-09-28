@@ -9,6 +9,7 @@
 #include <limits>
 #include <mutex>
 #include <new>
+#include <pthread.h>
 #include <sstream>
 #include <string>
 #include <sys/file.h>
@@ -94,6 +95,26 @@ HugepageInfo readHugepageInfo() { return {}; }
 bool testMetadataCommitFailureRequested() {
     const char *value = std::getenv("HFS_TEST_FAIL_METADATA_COMMIT");
     return value != nullptr && std::string(value) == "1";
+}
+
+/* Process-wide fork marker: a forked child must fail closed for every API.
+ * The handler only stores a lock-free flag, so it stays async-signal-safe. */
+std::atomic<bool> g_forkedChild{false};
+
+void markForkedChild() noexcept {
+    g_forkedChild.store(true, std::memory_order_release);
+}
+
+const bool g_forkHandlerInstalled [[maybe_unused]] = [] {
+    (void)::pthread_atfork(nullptr, nullptr, &markForkedChild);
+    return true;
+}();
+
+/* getpid() is a real syscall on glibc >= 2.25; cache it and rely on the fork
+ * marker above so processValid() stays a few loads. */
+pid_t cachedProcessId() noexcept {
+    static const pid_t pid = ::getpid();
+    return pid;
 }
 
 /* Adapts the resident namespace snapshot to the journal checkpoint contract. */
@@ -962,7 +983,8 @@ bool Engine::mounted() const noexcept { return impl_->mounted; }
 
 bool Engine::processValid() const noexcept {
     return impl_ != nullptr && impl_->ownerPid != 0 &&
-           impl_->ownerPid == static_cast<pid_t>(::getpid());
+           !g_forkedChild.load(std::memory_order_acquire) &&
+           impl_->ownerPid == cachedProcessId();
 }
 
 bool Engine::formatted() const noexcept { return impl_->formatted; }
