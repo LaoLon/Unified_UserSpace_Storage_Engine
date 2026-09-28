@@ -1,5 +1,6 @@
 #include "core/data_path.hpp"
 
+#include <array>
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
@@ -20,67 +21,81 @@ namespace hfs {
 
 namespace {
 
-struct WaitState {
+/* One completion latch shared by every child of a parent request: the sync
+ * path pays one condvar handshake per batch instead of one per child. */
+struct ParentLatch {
     std::mutex mutex;
     std::condition_variable cv;
-    bool done = false;
-    int status = 0;
-    bool writePhase = false;
+    std::size_t pending = 0;
+    int firstError = 0;
 };
 
 /* Keeps one planned child and its DMA storage alive across submit/reap. */
 struct ChildExecution {
     BufferLease lease;
-    WaitState wait;
     std::span<std::byte> ioBuffer{};
+    int status = 0;
     bool direct = false;
     bool submitted = false;
-    bool completed = false;
     bool rmwRead = false;
     bool secondSubmitted = false;
-    int status = 0;
+};
+
+/* Callback context: one child slot plus the shared parent latch. */
+struct ChildCallbackContext {
+    ParentLatch *latch = nullptr;
+    ChildExecution *child = nullptr;
+    bool writePhase = false;
 };
 
 void childCallback(void *ctx, int status) {
-    auto *state = static_cast<WaitState *>(ctx);
+    auto *context = static_cast<ChildCallbackContext *>(ctx);
     trace::event(trace::EventId::BdevComplete, static_cast<std::uint64_t>(status));
-    bool writePhase = false;
-    {
-        std::lock_guard<std::mutex> lock(state->mutex);
-        writePhase = state->writePhase;
-    }
     /* Test-only delays make completion and RMW lifetime boundaries
      * deterministic; the cached hook keeps device completions getenv-free. */
     const test_hooks::DataIoDelaySetting delay =
-        test_hooks::effectiveDataIoDelay(writePhase);
+        test_hooks::effectiveDataIoDelay(context->writePhase);
     if (delay.present) {
         std::this_thread::sleep_for(std::chrono::milliseconds(delay.milliseconds));
     }
+    ParentLatch *latch = context->latch;
     {
-        std::lock_guard<std::mutex> lock(state->mutex);
-        state->done = true;
-        state->status = status;
+        std::lock_guard<std::mutex> lock(latch->mutex);
+        context->child->status = status;
+        if (status != 0 && latch->firstError == 0) {
+            latch->firstError = status;
+        }
+        if (latch->pending != 0) {
+            --latch->pending;
+        }
     }
-    state->cv.notify_all();
+    latch->cv.notify_all();
 }
 
-/* Re-arms a child wait state before submitting a second RMW phase. */
-void prepareWait(WaitState &state, bool writePhase) {
-    std::lock_guard<std::mutex> lock(state.mutex);
-    state.done = false;
-    state.status = 0;
-    state.writePhase = writePhase;
+/* Arms the latch before submission so a fast completion cannot be lost. */
+void armLatch(ParentLatch &latch, std::size_t count) {
+    std::lock_guard<std::mutex> lock(latch.mutex);
+    latch.pending = count;
 }
 
-/* Wait for a child completion; on timeout report TimedOut but keep waiting so
- * a late SPDK completion never writes into a released buffer. */
-int waitForChild(WaitState &state, std::uint32_t timeoutMs) {
-    std::unique_lock<std::mutex> lock(state.mutex);
-    if (state.cv.wait_for(lock, std::chrono::milliseconds(timeoutMs),
-                          [&state]() { return state.done; })) {
-        return state.status;
+/* Releases one armed slot for a child that was skipped or failed to submit. */
+void cancelLatchSlot(ParentLatch &latch) {
+    std::lock_guard<std::mutex> lock(latch.mutex);
+    if (latch.pending != 0) {
+        --latch.pending;
     }
-    state.cv.wait(lock, [&state]() { return state.done; });
+}
+
+/* Waits for every armed child; on timeout it reports TimedOut but keeps
+ * waiting so a late SPDK completion never writes into a released buffer. */
+int waitForLatch(ParentLatch &latch, std::uint32_t timeoutMs) {
+    std::unique_lock<std::mutex> lock(latch.mutex);
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(timeoutMs);
+    if (latch.cv.wait_until(lock, deadline, [&latch] { return latch.pending == 0; })) {
+        return latch.firstError;
+    }
+    latch.cv.wait(lock, [&latch] { return latch.pending == 0; });
     return -ETIMEDOUT;
 }
 
@@ -203,11 +218,13 @@ Result<void> DataPath::execute(const ExtentMap &map, std::span<std::byte> readBu
     /* Admit every DMA lease before the first device submission. This makes
      * resource shortage fail as one parent instead of partially publishing
      * children and then discovering that a later child cannot be prepared. */
-    std::vector<ChildExecution> executions(plan.count);
-    std::vector<std::size_t> leaseSizes;
-    std::vector<std::uint32_t> leaseIndices(plan.count,
-                                            std::numeric_limits<std::uint32_t>::max());
-    leaseSizes.reserve(plan.count);
+    std::array<ChildExecution, IoPlanner::Plan::kMaxChildren> executions{};
+    std::array<std::size_t, IoPlanner::Plan::kMaxChildren> leaseSizes{};
+    std::array<std::uint32_t, IoPlanner::Plan::kMaxChildren> leaseIndices{};
+    std::array<BufferLease, IoPlanner::Plan::kMaxChildren> leases{};
+    std::array<ChildCallbackContext, IoPlanner::Plan::kMaxChildren> callbackContexts{};
+    leaseIndices.fill(std::numeric_limits<std::uint32_t>::max());
+    std::size_t leaseCount = 0;
     for (std::uint32_t i = 0; i < plan.count; ++i) {
         const auto &child = plan.children[i];
         if (child.kind == IoPlanner::Child::Kind::Zero) {
@@ -249,16 +266,15 @@ Result<void> DataPath::execute(const ExtentMap &map, std::span<std::byte> readBu
             executions[i].ioBuffer = directSpan;
             ++stats_.directChildren;
         } else {
-            leaseIndices[i] = static_cast<std::uint32_t>(leaseSizes.size());
-            leaseSizes.push_back(child.spanBytes);
+            leaseIndices[i] = static_cast<std::uint32_t>(leaseCount);
+            leaseSizes[leaseCount++] = child.spanBytes;
             ++stats_.bounceChildren;
         }
     }
-    if (firstError == 0 && !leaseSizes.empty()) {
-        std::vector<BufferLease> leases(leaseSizes.size());
+    if (firstError == 0 && leaseCount != 0) {
         auto acquired = arena_.tryAcquireBatch(
-            std::span<const std::size_t>(leaseSizes.data(), leaseSizes.size()),
-            std::span<BufferLease>(leases.data(), leases.size()));
+            std::span<const std::size_t>(leaseSizes.data(), leaseCount),
+            std::span<BufferLease>(leases.data(), leaseCount));
         if (!acquired.ok()) {
             firstError = static_cast<int>(acquired.status());
         } else {
@@ -272,6 +288,10 @@ Result<void> DataPath::execute(const ExtentMap &map, std::span<std::byte> readBu
         }
     }
 
+    /* Phase 1: arm the shared latch, submit every ready child, then wait once
+     * for the whole batch instead of one condvar handshake per child. */
+    ParentLatch latch;
+    armLatch(latch, plan.count);
     for (std::uint32_t i = 0; i < plan.count; ++i) {
         const auto &child = plan.children[i];
         if (child.kind == IoPlanner::Child::Kind::Zero) {
@@ -281,11 +301,13 @@ Result<void> DataPath::execute(const ExtentMap &map, std::span<std::byte> readBu
             stats_.zeroBytes += child.bytes;
             ++stats_.zeroChildren;
             parent.childDone(0, child.bytes);
+            cancelLatchSlot(latch);
             continue;
         }
         if (firstError != 0 || executions[i].ioBuffer.empty()) {
             parent.childDone(firstError == 0 ? static_cast<int>(Status::NoMemory) : firstError,
                              0);
+            cancelLatchSlot(latch);
             continue;
         }
 
@@ -312,19 +334,21 @@ Result<void> DataPath::execute(const ExtentMap &map, std::span<std::byte> readBu
             runtime_.dataReactorCount() == 0
                 ? config_.reactorIndex
                 : runtime_.dataReactorForDevice(child.deviceId);
-        prepareWait(executions[i].wait, write && !needsRmw);
+        callbackContexts[i] = ChildCallbackContext{&latch, &executions[i],
+                                                   write && !needsRmw};
         Result<void> submit =
             needsRmw || !write
                 ? runtime_.submitDataRead(reactorIndex, child.deviceId,
                                           executions[i].ioBuffer.data(), deviceOffset,
-                                          deviceBlocks, childCallback, &executions[i].wait)
+                                          deviceBlocks, childCallback, &callbackContexts[i])
                 : runtime_.submitDataWrite(reactorIndex, child.deviceId,
                                            executions[i].ioBuffer.data(), deviceOffset,
-                                           deviceBlocks, childCallback, &executions[i].wait);
+                                           deviceBlocks, childCallback, &callbackContexts[i]);
         if (!submit.ok()) {
             if (firstError == 0) firstError = static_cast<int>(submit.status());
             executions[i].status = static_cast<int>(submit.status());
             parent.childDone(static_cast<int>(submit.status()), 0);
+            cancelLatchSlot(latch);
             continue;
         }
         executions[i].submitted = true;
@@ -332,18 +356,18 @@ Result<void> DataPath::execute(const ExtentMap &map, std::span<std::byte> readBu
         trace::event(trace::EventId::BdevSubmit, deviceOffset, deviceBlocks,
                      needsRmw ? 2ULL : (write ? 1ULL : 0ULL));
     }
+    if (waitForLatch(latch, config_.timeoutMs) == -ETIMEDOUT && firstError == 0) {
+        firstError = -ETIMEDOUT;
+    }
 
-    /* Reap the first wave only after all ready children have been submitted. */
     for (std::uint32_t i = 0; i < plan.count; ++i) {
         if (!executions[i].submitted) continue;
-        const int status = waitForChild(executions[i].wait, config_.timeoutMs);
-        executions[i].completed = true;
-        executions[i].status = status;
+        executions[i].submitted = false;
         ++stats_.completes;
         const auto &child = plan.children[i];
-        if (status != 0) {
-            if (firstError == 0) firstError = status;
-            parent.childDone(status, 0);
+        if (executions[i].status != 0) {
+            if (firstError == 0) firstError = executions[i].status;
+            parent.childDone(executions[i].status, 0);
             continue;
         }
         if (executions[i].rmwRead) {
@@ -362,9 +386,13 @@ Result<void> DataPath::execute(const ExtentMap &map, std::span<std::byte> readBu
         parent.childDone(0, child.bytes);
     }
 
-    /* RMW writes are the only second phase; they are submitted as a batch too. */
+    /* Phase 2: RMW writes are submitted and reaped as one armed batch. */
+    armLatch(latch, plan.count);
     for (std::uint32_t i = 0; i < plan.count; ++i) {
-        if (!executions[i].rmwRead || executions[i].status != 0) continue;
+        if (!executions[i].rmwRead || executions[i].status != 0) {
+            cancelLatchSlot(latch);
+            continue;
+        }
         const auto &child = plan.children[i];
         const std::uint32_t deviceBlockBytes = deviceBlockBytes_[child.deviceId];
         const std::uint64_t rmwOffset = child.physicalByte / deviceBlockBytes;
@@ -372,14 +400,15 @@ Result<void> DataPath::execute(const ExtentMap &map, std::span<std::byte> readBu
             runtime_.dataReactorCount() == 0
                 ? config_.reactorIndex
                 : runtime_.dataReactorForDevice(child.deviceId);
-        prepareWait(executions[i].wait, true);
+        callbackContexts[i] = ChildCallbackContext{&latch, &executions[i], true};
         const Result<void> submit = runtime_.submitDataWrite(
             reactorIndex, child.deviceId, executions[i].ioBuffer.data(), rmwOffset,
-            child.spanBytes / deviceBlockBytes, childCallback, &executions[i].wait);
+            child.spanBytes / deviceBlockBytes, childCallback, &callbackContexts[i]);
         if (!submit.ok()) {
             if (firstError == 0) firstError = static_cast<int>(submit.status());
             executions[i].status = static_cast<int>(submit.status());
             parent.childDone(static_cast<int>(submit.status()), 0);
+            cancelLatchSlot(latch);
             continue;
         }
         executions[i].secondSubmitted = true;
@@ -387,13 +416,15 @@ Result<void> DataPath::execute(const ExtentMap &map, std::span<std::byte> readBu
         trace::event(trace::EventId::BdevSubmit, rmwOffset,
                      child.spanBytes / deviceBlockBytes, 1ULL);
     }
+    if (waitForLatch(latch, config_.timeoutMs) == -ETIMEDOUT && firstError == 0) {
+        firstError = -ETIMEDOUT;
+    }
     for (std::uint32_t i = 0; i < plan.count; ++i) {
         if (!executions[i].secondSubmitted) continue;
-        const int status = waitForChild(executions[i].wait, config_.timeoutMs);
         ++stats_.completes;
-        if (status != 0) {
-            if (firstError == 0) firstError = status;
-            parent.childDone(status, 0);
+        if (executions[i].status != 0) {
+            if (firstError == 0) firstError = executions[i].status;
+            parent.childDone(executions[i].status, 0);
         } else {
             parent.childDone(0, plan.children[i].bytes);
         }
