@@ -88,6 +88,9 @@ int main() {
     hfs::SpdkAsyncDataBackend backend(runtime, 0, 4096, 2);
     HFS_TEST_CHECK(backend.capacity() == 2);
     HFS_TEST_CHECK(backend.inFlight() == 0);
+    /* Without an active SPDK device set the backend stays invalid and keeps no
+     * free list; with a live device every slot must be free at construction. */
+    HFS_TEST_CHECK(backend.freeSlots() == (backend.valid() ? 2 : 0));
 
     /* Without an active SPDK reactor, submission must reject without leasing
      * a slot; on a live system this also exercises the DMA validation edge. */
@@ -95,6 +98,7 @@ int main() {
     const auto rejected = backend.submitRead(request, nullptr, nullptr);
     HFS_TEST_CHECK(rejected.disposition == hfs::AsyncDataBackend::SubmitDisposition::Rejected);
     HFS_TEST_CHECK(backend.inFlight() == 0);
+    HFS_TEST_CHECK(backend.freeSlots() == (backend.valid() ? 2 : 0));
 
     hfs::DataIoRequest ioRequest;
     auto wrongThread = runtime.submitDataReadOnReactor(

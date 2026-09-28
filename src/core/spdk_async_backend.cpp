@@ -19,7 +19,10 @@ struct SpdkAsyncDataBackend::Slot {
     void *context = nullptr;
     std::uint32_t childIndex = 0;
     std::uint32_t completedBytes = 0;
-    std::atomic<bool> inUse{false};
+    /* Actor-thread-only state: inUse guards exactly-once release, freeNext
+     * links the backend-owned free list. */
+    bool inUse = false;
+    Slot *freeNext = nullptr;
 };
 
 /* One accepted request waiting for slot credit; actor-thread private. */
@@ -98,35 +101,38 @@ SpdkAsyncDataBackend::SpdkAsyncDataBackend(SpdkRuntime &runtime,
             return;
         }
     }
+    /* Build the actor-owned free list once; acquire/release are O(1). */
     for (std::size_t index = 0; index < maxInFlight_; ++index) {
         slots_[index].backend = this;
+        slots_[index].freeNext =
+            index + 1 < maxInFlight_ ? &slots_[index + 1] : nullptr;
     }
+    freeList_ = &slots_[0];
+    freeCount_ = maxInFlight_;
     valid_ = true;
 }
 
 SpdkAsyncDataBackend::~SpdkAsyncDataBackend() noexcept = default;
 
 SpdkAsyncDataBackend::Slot *SpdkAsyncDataBackend::acquireSlot() noexcept {
-    if (slots_ == nullptr) {
+    Slot *slot = freeList_;
+    if (slot == nullptr) {
         return nullptr;
     }
-    for (std::size_t index = 0; index < maxInFlight_; ++index) {
-        Slot &slot = slots_[index];
-        bool expected = false;
-        if (slot.inUse.compare_exchange_weak(expected, true, std::memory_order_acq_rel,
-                                             std::memory_order_relaxed)) {
-            return &slot;
-        }
+    freeList_ = slot->freeNext;
+    slot->freeNext = nullptr;
+    if (freeCount_ != 0) {
+        --freeCount_;
     }
-    return nullptr;
+    slot->inUse = true;
+    return slot;
 }
 
 bool SpdkAsyncDataBackend::releaseSlot(Slot &slot) noexcept {
-    bool expected = true;
-    if (!slot.inUse.compare_exchange_strong(expected, false, std::memory_order_acq_rel,
-                                            std::memory_order_relaxed)) {
-        return false;
+    if (!slot.inUse) {
+        return false; /* double release: never re-link the same slot twice */
     }
+    slot.inUse = false;
     slot.request.stateTag = 0;
     slot.request.traceRequestId = 0;
     slot.request.traceChildIndex = 0;
@@ -134,6 +140,9 @@ bool SpdkAsyncDataBackend::releaseSlot(Slot &slot) noexcept {
     slot.context = nullptr;
     slot.childIndex = 0;
     slot.completedBytes = 0;
+    slot.freeNext = freeList_;
+    freeList_ = &slot;
+    ++freeCount_;
     inFlight_.fetch_sub(1, std::memory_order_acq_rel);
     return true;
 }

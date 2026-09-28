@@ -92,20 +92,27 @@ Result<std::size_t> InodeExtentMap::lookup(std::uint64_t offset, std::uint64_t l
         return makeError<std::size_t>(Status::InvalidArgument, "extent lookup range overflows");
     }
     const std::uint64_t end = offset + length;
+    /* Descriptors are sorted and disjoint, so their end offsets are strictly
+     * increasing: binary-search the first descriptor that can overlap instead
+     * of scanning the whole map from the start (O(E) -> O(log E + k)). */
+    const std::uint64_t offsetExtent = offset / extentBytes_;
+    auto next = std::lower_bound(
+        extents_.begin(), extents_.end(), offsetExtent,
+        [](const ExtentDescriptor &descriptor, std::uint64_t extent) {
+            return descriptor.logicalExtent + descriptor.count <= extent;
+        });
     std::size_t count = 0;
-    for (const ExtentDescriptor &descriptor : extents_) {
+    for (; next != extents_.end(); ++next) {
+        const ExtentDescriptor &descriptor = *next;
         const std::uint64_t startByte = descriptor.logicalExtent * extentBytes_;
-        const std::uint64_t endByte =
-            (descriptor.logicalExtent + descriptor.count) * extentBytes_;
-        if (endByte <= offset) {
-            continue;
-        }
         if (startByte >= end) {
             break;
         }
         if (count >= out.size()) {
             return makeError<std::size_t>(Status::NoMemory, "extent lookup buffer too small");
         }
+        const std::uint64_t endByte =
+            (descriptor.logicalExtent + descriptor.count) * extentBytes_;
         const std::uint64_t clippedStart = std::max(startByte, offset);
         const std::uint64_t clippedEnd = std::min(endByte, end);
         ExtentView view;

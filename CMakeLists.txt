@@ -480,6 +480,20 @@ target_compile_options(allocator_test PRIVATE -fno-exceptions -fno-rtti)
 target_link_libraries(allocator_test PRIVATE Threads::Threads)
 add_test(NAME allocator_test COMMAND allocator_test)
 
+# Per-inode extent map lookup correctness and lookup microbenchmark (no SPDK).
+add_executable(inode_map_test
+  tests/inode_map_test.cpp
+  src/metadata/inode_map.cpp
+)
+target_include_directories(inode_map_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests
+)
+target_compile_options(inode_map_test PRIVATE -fno-exceptions -fno-rtti)
+target_link_libraries(inode_map_test PRIVATE Threads::Threads)
+add_test(NAME inode_map_test COMMAND inode_map_test)
+
 # Keep clangd's compilation database at the repository root.
 add_custom_target(compile-commands ALL
   COMMAND ${CMAKE_COMMAND} -E copy_if_different

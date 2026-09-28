@@ -751,7 +751,7 @@ private:
                 return;
             }
             state.plan = std::move(planned).value();
-            if (!state.request.write) {
+            if (!state.request.write && diagnostics::profilingEnabled()) {
                 std::uint64_t childBytes = 0;
                 std::uint64_t spanBytes = 0;
                 std::uint64_t directChildren = 0;

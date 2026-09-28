@@ -12,6 +12,7 @@
 #include <spdk/env.h>
 #include <spdk/memory.h>
 
+#include "common/test_hooks.hpp"
 #include "core/data_path.hpp"
 #include "core/dma_arena.hpp"
 #include "core/extent_map.hpp"
@@ -109,13 +110,13 @@ int main() {
         std::vector<std::byte> unaligned(5000);
         fillPattern(unaligned, 0x22);
         const std::uint64_t unalignedOffset = 3 * metaBlock - 1000;
-        HFS_TEST_CHECK(::setenv("HFS_TEST_DATA_IO_WRITE_DELAY_MS", "25", 1) == 0);
+        test_hooks::setDataIoDelay(test_hooks::DataIoDelayKind::Write, 25);
         const auto delayedWriteStart = std::chrono::steady_clock::now();
         const auto delayedWrite =
             path.write(map, unaligned, unalignedOffset, unaligned.size(), ~0ULL);
         const auto delayedWriteElapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - delayedWriteStart);
-        HFS_TEST_CHECK(::unsetenv("HFS_TEST_DATA_IO_WRITE_DELAY_MS") == 0);
+        test_hooks::setDataIoDelay(test_hooks::DataIoDelayKind::Write, 0);
         HFS_TEST_CHECK(delayedWrite.ok());
         /* The second RMW phase must be fully reaped before DataPath returns. */
         HFS_TEST_CHECK(delayedWriteElapsed.count() >= 20);
@@ -255,9 +256,9 @@ int main() {
         timeoutConfig.timeoutMs = 1;
         DataPath timeoutPath(runtime, arena, plannerConfig, timeoutConfig);
         std::vector<std::byte> timeoutRead(metaBlock, std::byte{0});
-        HFS_TEST_CHECK(::setenv("HFS_TEST_DATA_IO_DELAY_MS", "25", 1) == 0);
+        test_hooks::setDataIoDelay(test_hooks::DataIoDelayKind::Generic, 25);
         auto timeoutResult = timeoutPath.read(map, timeoutRead, 0, timeoutRead.size());
-        HFS_TEST_CHECK(::unsetenv("HFS_TEST_DATA_IO_DELAY_MS") == 0);
+        test_hooks::setDataIoDelay(test_hooks::DataIoDelayKind::Generic, 0);
         HFS_TEST_CHECK(!timeoutResult.ok() && timeoutResult.status() == Status::TimedOut);
         HFS_TEST_CHECK(timeoutPath.stats().submits == timeoutPath.stats().completes);
 

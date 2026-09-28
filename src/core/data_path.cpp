@@ -11,6 +11,7 @@
 #include <thread>
 
 #include "common/trace.hpp"
+#include "common/test_hooks.hpp"
 #include "core/parent_completion.hpp"
 #include "hfs/diagnostics.hpp"
 #include "runtime/spdk_runtime.hpp"
@@ -48,18 +49,12 @@ void childCallback(void *ctx, int status) {
         std::lock_guard<std::mutex> lock(state->mutex);
         writePhase = state->writePhase;
     }
-    /* Test-only delays make completion and RMW lifetime boundaries deterministic. */
-    const char *delayText = std::getenv(writePhase ? "HFS_TEST_DATA_IO_WRITE_DELAY_MS"
-                                                   : "HFS_TEST_DATA_IO_READ_DELAY_MS");
-    if (delayText == nullptr || *delayText == '\0') {
-        delayText = std::getenv("HFS_TEST_DATA_IO_DELAY_MS");
-    }
-    if (delayText != nullptr && *delayText != '\0') {
-        char *end = nullptr;
-        const unsigned long delay = std::strtoul(delayText, &end, 10);
-        if (end != delayText && *end == '\0' && delay <= 60000) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(delay));
-        }
+    /* Test-only delays make completion and RMW lifetime boundaries
+     * deterministic; the cached hook keeps device completions getenv-free. */
+    const test_hooks::DataIoDelaySetting delay =
+        test_hooks::effectiveDataIoDelay(writePhase);
+    if (delay.present) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(delay.milliseconds));
     }
     {
         std::lock_guard<std::mutex> lock(state->mutex);
@@ -160,7 +155,7 @@ Result<void> DataPath::execute(const ExtentMap &map, std::span<std::byte> readBu
         return makeError(planResult.status(), planResult.message());
     }
     const auto &plan = planResult.value();
-    if (!write) {
+    if (!write && diagnostics::profilingEnabled()) {
         std::uint64_t childBytes = 0;
         std::uint64_t spanBytes = 0;
         std::uint64_t directChildren = 0;

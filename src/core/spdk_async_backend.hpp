@@ -39,6 +39,8 @@ public:
     std::size_t inFlight() const noexcept {
         return inFlight_.load(std::memory_order_acquire);
     }
+    /* Actor-owned free list depth; capacity - inFlight when idle. */
+    std::size_t freeSlots() const noexcept { return freeCount_; }
 
     SubmitResult submitRead(const Request &request, CompletionCallback callback,
                             void *context) noexcept override;
@@ -84,6 +86,10 @@ private:
     std::size_t deviceCount_ = 0;
     std::unique_ptr<Geometry[]> geometry_;
     std::unique_ptr<Slot[]> slots_;
+    /* Actor-owned free list; slots are only acquired/released on the owning
+     * reactor thread, so no per-slot atomic is required. */
+    Slot *freeList_ = nullptr;
+    std::size_t freeCount_ = 0;
     std::unique_ptr<PendingEntry[]> pending_;
     std::size_t pendingCapacity_ = 0;
     std::size_t pendingHead_ = 0;

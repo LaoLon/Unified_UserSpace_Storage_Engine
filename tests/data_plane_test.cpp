@@ -242,14 +242,6 @@ int main() {
         dirty->asyncState().submittedChildren = 2;
         dirty->asyncState().drainedChildren = 1;
         dirty->asyncState().completionPublished = true;
-        dirty->asyncState().children[0].backendIo = &sidecarProbe;
-        dirty->asyncState().children[0].buffer = &sidecarProbe;
-        dirty->asyncState().children[0].dmaLease = &sidecarProbe;
-        dirty->asyncState().children[0].offset = 99;
-        dirty->asyncState().children[0].physicalBlock = 100;
-        dirty->asyncState().children[0].deviceId = 2;
-        dirty->asyncState().children[0].bufferOffset = 3;
-        dirty->asyncState().children[0].bufferLength = 4;
         HFS_TEST_CHECK(dirty->attachAsyncStorage(&sidecarProbe, sizeof(sidecarProbe),
                                                   resetSidecarProbe));
         dirty->release();
@@ -280,14 +272,6 @@ int main() {
         HFS_TEST_CHECK(reused->asyncState().submittedChildren == 0);
         HFS_TEST_CHECK(reused->asyncState().drainedChildren == 0);
         HFS_TEST_CHECK(!reused->asyncState().completionPublished);
-        HFS_TEST_CHECK(reused->asyncState().children[0].backendIo == nullptr);
-        HFS_TEST_CHECK(reused->asyncState().children[0].buffer == nullptr);
-        HFS_TEST_CHECK(reused->asyncState().children[0].dmaLease == nullptr);
-        HFS_TEST_CHECK(reused->asyncState().children[0].offset == 0);
-        HFS_TEST_CHECK(reused->asyncState().children[0].physicalBlock == 0);
-        HFS_TEST_CHECK(reused->asyncState().children[0].deviceId == 0);
-        HFS_TEST_CHECK(reused->asyncState().children[0].bufferOffset == 0);
-        HFS_TEST_CHECK(reused->asyncState().children[0].bufferLength == 0);
         HFS_TEST_CHECK(reused->refCount() == 1);
         HFS_TEST_CHECK(reused->refCount(hfs::OperationRefRole::Legacy) == 1);
         HFS_TEST_CHECK(reused->refCount(hfs::OperationRefRole::Actor) == 0);

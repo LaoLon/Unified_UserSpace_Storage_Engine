@@ -31,28 +31,11 @@ struct CompletionSink {
     PublishCallback publish = nullptr;
 };
 
-/* Fixed-capacity child storage owned by one Operation sidecar. */
-struct AsyncChildState {
-    void *backendIo = nullptr;
-    void *waitEntry = nullptr;
-    void *buffer = nullptr;
-    void *dmaLease = nullptr;
-    std::uint64_t offset = 0;
-    std::uint64_t length = 0;
-    std::uint64_t physicalBlock = 0;
-    std::uint64_t completedBytes = 0;
-    std::uint32_t deviceId = 0;
-    std::uint32_t bufferOffset = 0;
-    std::uint32_t bufferLength = 0;
-    int status = 0;
-    int backendErrno = 0;
-    std::uint32_t flags = 0;
-};
-
-/* Bounded async bookkeeping storage; it does not own frontend or file objects. */
+/* Bounded async bookkeeping storage; it does not own frontend or file objects.
+ * Per-child state lives in the async data service's RequestState sidecar; only
+ * aggregate counters are kept here so the operation remains small and the
+ * per-request reset cost stays bounded (hfs2.0.md §5.2). */
 struct AsyncIoState {
-    static constexpr std::size_t kMaxChildren = 64;
-
     void *schedulerNode = nullptr;
     void *parent = nullptr;
     void *backendState = nullptr;
@@ -65,7 +48,6 @@ struct AsyncIoState {
     std::uint32_t drainedChildren = 0;
     std::uint32_t flags = 0;
     bool completionPublished = false;
-    std::array<AsyncChildState, kMaxChildren> children{};
 
     /* Clears every operation-local sidecar field without releasing external objects. */
     void reset() noexcept { *this = AsyncIoState{}; }
