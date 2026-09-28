@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Compare the same MySQL 8.0 binary on one NVMe: HFS volume vs native ext4
-# datadir. Sysbench uses 10 tables x 10000 rows; every phase runs
-# oltp_read_write (about 70% read / 30% write), oltp_read_only,
-# oltp_write_only and oltp_point_select at threads=16/32/64 with full latency
-# histograms, so TPS scaling and P95/P99 stability can be read from the logs.
+# datadir. Sysbench runs read_write (about 70% read / 30% write), read_only,
+# write_only, point_select and an optional mysqlslap seq_scan, at the given
+# thread list with full latency histograms. MYSQLD_EXTRA_ARGS can shrink the
+# buffer pool and force O_DIRECT so large working sets stay device-bound.
 set -euo pipefail
 
 BUILD="${BUILD:-/home/hfs/mysql-build}"
@@ -19,18 +19,25 @@ DURATION="${DURATION:-10}"
 THREADS_LIST="${THREADS_LIST:-16 32 64}"
 SCENARIOS="${SCENARIOS:-read_write read_only write_only point_select}"
 PHASES="${PHASES:-hfs-1 native-1 hfs-2 native-2}"
+# Extra mysqld flags, e.g. "--innodb-buffer-pool-size=64M --innodb-flush-method=O_DIRECT".
+MYSQLD_EXTRA_ARGS="${MYSQLD_EXTRA_ARGS:-}"
+# seq_scan runs a mysqlslap UNION ALL scan over SEQ_TABLES tables per query.
+SEQ_TABLES="${SEQ_TABLES:-4}"
+SEQ_QUERIES_PER_THREAD="${SEQ_QUERIES_PER_THREAD:-1}"
 BIN="$BUILD/runtime_output_directory"
 MYSQLD="$BIN/mysqld"
 MYSQL="$BIN/mysql"
 MYSQLADMIN="$BIN/mysqladmin"
+MYSQLSLAP="$BIN/mysqlslap"
 SOCKET="$RESULT/mysql.sock"
 SERVER_PID=""
 DEVICE=""
 BDF="$(awk -F= '/^[[:space:]]*pci_bdf[[:space:]]*=/ {gsub(/[[:space:]]/, "", $2); print $2; exit}' "$CONFIG")"
 STAGE=preflight
+read -r -a MYSQLD_EXTRA <<< "$MYSQLD_EXTRA_ARGS"
 
 test -n "$BDF" && test -d "/sys/bus/pci/devices/$BDF"
-for executable in "$MYSQLD" "$MYSQL" "$MYSQLADMIN" "$HFSCTL"; do
+for executable in "$MYSQLD" "$MYSQL" "$MYSQLADMIN" "$MYSQLSLAP" "$HFSCTL"; do
   test -x "$executable" || { printf 'missing: %s\n' "$executable" >&2; exit 2; }
 done
 command -v sysbench > /dev/null
@@ -119,6 +126,7 @@ start_server() {
       --log-error="$RESULT/${run}-mysqld.log" --skip-networking \
       --server-id=105 --innodb-flush-log-at-trx-commit=1 \
       --innodb-use-native-aio=OFF --disabled-storage-engines=MyISAM \
+      "${MYSQLD_EXTRA[@]}" \
       > "$RESULT/${run}-mysqld.stdout" 2>&1 &
   else
     env -u HFS_MYSQL_CONFIG -u HFS_MYSQL_PREFIX \
@@ -127,6 +135,7 @@ start_server() {
       --log-error="$RESULT/${run}-mysqld.log" --skip-networking \
       --server-id=105 --innodb-flush-log-at-trx-commit=1 \
       --innodb-use-native-aio=OFF --disabled-storage-engines=MyISAM \
+      "${MYSQLD_EXTRA[@]}" \
       > "$RESULT/${run}-mysqld.stdout" 2>&1 &
   fi
   SERVER_PID=$!
@@ -158,6 +167,13 @@ sysbench_test_for() {
   esac
 }
 
+# seq_scan is a mysqlslap full scan across SEQ_TABLES tables (device-bound
+# when the buffer pool is smaller than the scanned data).
+SEQ_SCAN_QUERY="SELECT SQL_NO_CACHE SUM(k) FROM sbtest1"
+for seq_table in $(seq 2 "$SEQ_TABLES"); do
+  SEQ_SCAN_QUERY="$SEQ_SCAN_QUERY UNION ALL SELECT SQL_NO_CACHE SUM(k) FROM sbtest$seq_table"
+done
+
 # Run the scenario matrix once on the live server of one phase.
 measure() {
   local run="$1"
@@ -169,14 +185,22 @@ measure() {
   printf 'run\tscenario\tthreads\tduration_s\tfsync_before\tfsync_after\tlog\n' \
     > "$RESULT/${run}-results.tsv"
   for scenario in $SCENARIOS; do
-    local test_name
-    test_name="$(sysbench_test_for "$scenario")"
     for threads in $THREADS_LIST; do
       local log="$RESULT/${run}-${scenario}-t${threads}.log"
       local fsync_before fsync_after
       fsync_before="$(sql -e "SHOW GLOBAL STATUS LIKE 'Innodb_os_log_fsyncs'" | awk '{print $2}')"
-      sysbench_mysql --threads="$threads" --time="$DURATION" --percentile=99 \
-        --histogram=on "$test_name" run > "$log" 2>&1
+      if [[ "$scenario" == seq_scan ]]; then
+        "$MYSQLSLAP" --no-defaults --protocol=socket --socket="$SOCKET" -uroot \
+          --create-schema=hfs_perf --query="$SEQ_SCAN_QUERY" \
+          --concurrency="$threads" \
+          --number-of-queries=$((threads * SEQ_QUERIES_PER_THREAD)) \
+          --iterations=1 > "$log" 2>&1
+      else
+        local test_name
+        test_name="$(sysbench_test_for "$scenario")"
+        sysbench_mysql --threads="$threads" --time="$DURATION" --percentile=99 \
+          --histogram=on "$test_name" run > "$log" 2>&1
+      fi
       fsync_after="$(sql -e "SHOW GLOBAL STATUS LIKE 'Innodb_os_log_fsyncs'" | awk '{print $2}')"
       printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$run" "$scenario" "$threads" "$DURATION" "$fsync_before" "$fsync_after" \
@@ -192,6 +216,8 @@ measure() {
   printf 'mount=%s hfs_data=%s\n' "$MOUNT" "$HFS_DATA"
   printf 'tables=%s table_size=%s duration_s=%s threads=%s scenarios=%s\n' \
     "$TABLES" "$TABLE_SIZE" "$DURATION" "$THREADS_LIST" "$SCENARIOS"
+  printf 'mysqld_extra_args=%s\n' "$MYSQLD_EXTRA_ARGS"
+  printf 'seq_tables=%s seq_queries_per_thread=%s\n' "$SEQ_TABLES" "$SEQ_QUERIES_PER_THREAD"
   printf 'cpus=%s hugepages=%s\n' "$(nproc)" \
     "$(awk '/^HugePages_Total:/ {print $2}' /proc/meminfo)"
   free -h
@@ -216,6 +242,7 @@ for run in $PHASES; do
       "$MYSQLD" --no-defaults --user=root --basedir="$BUILD" \
       --datadir="$native_data" --initialize-insecure \
       --innodb-use-native-aio=OFF --disabled-storage-engines=MyISAM \
+      "${MYSQLD_EXTRA[@]}" \
       --log-error="$RESULT/${run}-initialize.log" \
       > "$RESULT/${run}-initialize.stdout" 2>&1
     STAGE="native-run-$run"
@@ -236,6 +263,7 @@ for run in $PHASES; do
       "$MYSQLD" --no-defaults --user=root --basedir="$BUILD" --datadir="$HFS_DATA" \
       --initialize-insecure --innodb-use-native-aio=OFF \
       --disabled-storage-engines=MyISAM \
+      "${MYSQLD_EXTRA[@]}" \
       --log-error="$RESULT/${run}-initialize.log" \
       > "$RESULT/${run}-initialize.stdout" 2>&1
     STAGE="hfs-run-$run"

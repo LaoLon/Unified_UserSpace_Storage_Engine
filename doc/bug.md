@@ -655,6 +655,32 @@ Bug 等级：**致命 > 严重 > 一般**。
   `iodepth=4`、4K randrw、3 秒 smoke，退出码 0、`err=0`，读写各约 111 MiB/s，
   `queued=264006`、`reaped=264006`、`outstanding=0`；未再出现 SIGSEGV。
 
+### 41. RocksDB 大库在 HFS 上提前耗尽 extent（no allocatable extents）
+
+- **状态**：待处理（根因未定位；测试规避 = 单库 ≤1.2M key）
+- **等级**：严重（大工作集在数据区远未写满时提前 NoSpace）
+- **时间**：2026-09-28
+- **现象**：`hfs_db_bench` 在 HFS 上跑 16 B key / 1 KiB value 的 RocksDB
+  库时，1.5M key 的 `rnd` 阶段（`fillrandom,overwrite,readwhilewriting`）
+  在 `fillrandom`+`overwrite` 完成后 Flush/Compact 失败（rc=7）；2.0M key
+  的 `rnd` 阶段在 `overwrite` 中出现
+  `Put failed: IO error: No space left on device: no allocatable extents
+  across data devices`（rc=5）。native ext4 同数据集两阶段全部通过；
+  1.2M key 在 HFS 上两阶段通过。
+- **排查过程**：`hfsctl info` 显示数据区约 19.24 GiB，失败时 live 数据仅
+  1.2–2 GB；错误来自 `namespace.cpp` `reserveExtents` →
+  allocator `allocatableExtents()==0`；`capacityExtents` 未配置覆盖
+  （默认等于 totalExtents），不是容量上限配置。`seq` 阶段（fillseq+读）
+  在 2M key 通过，失败只出现在高文件 churn 的 `rnd` 阶段，失败前
+  `append_bytes` 约 25 GB。
+- **根因**：未定位。候选：`prealloc_extents=64` 的按文件预留被大量
+  SST/临时文件同时占用；文件删除/压缩后的 extent 回收不及时；分配器
+  碎片化后 `reserveScattered` 找不到连续 run。
+- **修复**：未实施。
+- **验证结果**：1.2M key（64 MiB block cache）`rnd` 阶段 rc=0、`hfsctl check`
+  `corruption=none`；证据 `/home/hfs/rocksdb-large-cache64m-1_2m-20260928`、
+  `…-1_5m-20260928-aborted`、`…-20260928-aborted2m`。
+
 ## 记录模板
 
 ### N. 简短标题

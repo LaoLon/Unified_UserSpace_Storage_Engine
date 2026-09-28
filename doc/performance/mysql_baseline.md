@@ -184,3 +184,39 @@ FIO 三层/四引擎矩阵显示 HFS+SPDK 在设备层远超 ext4（4K randrw QD
 和负载形状（非 4K 随机写）逐层截断，所以 MySQL 端到端只能接近 native；
 要让写路径也超过 native，需要继续降低同步屏障成本（HFS 侧已做过 journal/
 批量写优化，但设备往返仍是下限）。本分析限于本 VM 与本文口径。
+
+## 8. 大工作集对照（64 MiB buffer pool + O_DIRECT，2026-09-28）
+
+口径：`TABLES=10 TABLE_SIZE=100000`（1M 行，InnoDB 数据约 0.6 GB）、
+`--innodb-buffer-pool-size=64M`、`--innodb-flush-method=O_DIRECT`
+（HFS 数据文件本来就不过页缓存，native 用 O_DIRECT 对齐口径）、
+`--innodb-redo-log-capacity=256M`、`threads=32`、`hfs-1 → native-1` 交错。
+
+| 场景 | HFS TPS（qps） | native TPS（qps） | HFS/native | HFS avg/p95/p99 ms | native avg/p95/p99 ms |
+|---|---:|---:|---:|---:|---:|
+| `point_select`（主键点查） | 205063.77 | 201090.60 | **102.0%** | 0.16 / 0.367 / 0.68 | 0.16 / 0.354 / 0.58 |
+| `read_write`（70/30 混合） | 2507.05（50141） | 2505.26（50105） | **100.1%** | 12.75 / 19.65 / 26.68 | 12.76 / 21.89 / 27.66 |
+| `write_only`（纯写） | 4957.12（29743） | 5735.86（34415） | **86.4%** | 6.45 / 10.65 / 14.73 | 5.57 / 11.04 / 17.01 |
+| `read_only`（随机范围读） | 2860.38（45766） | 8207.60（131322） | **34.9%** | 11.18 / 9.73 / 287.38 | 3.89 / 5.88 / 7.98 |
+| `seq_scan`（4 表 UNION 全扫，mysqlslap 平均秒） | 0.165 s | 0.149 s | **90.3%** | — | — |
+
+观察：
+
+- 点查和 70/30 混合在 64 MiB 池下两侧持平（热子集仍能进池）；纯写 86.4%
+  （屏障成本）；全表扫描 90.3%。
+- **范围读（`read_only`）HFS 只有 native 的 34.9%**，且 p99 287 ms 对
+  native 8 ms。InnoDB 范围扫描是成批的连续页读，native O_DIRECT 同步 pread
+  在这个形状上比 HFS seam 的逐 I/O 同步路径更高效；这与 RocksDB 冷读里
+  HFS 大幅领先的形状相反，说明"设备受限"并不自动等于"HFS 更快"，还取决于
+  访问形状（随机块 vs 范围页读）。
+- 2M 行（数据约 1.2 GB）的同口径尝试不可用：native 侧 O_DIRECT 随机写在
+  本 VM 上塌陷（`write_only` 25–445 TPS、p99 30 s，伴随内核
+  `nvme0: I/O tag timeout`），HFS 侧范围读出现秒级尾部（129–205 TPS，
+  疑似 extent 分配压力，见 `rocksdb_baseline.md` §8.1）；该规模未纳入结论。
+- 结论：buffer pool 缩小后 MySQL 没有复现 RocksDB 式的 HFS 读优势；HFS 只在
+  点查/混合场景持平、写略低。MySQL 的范围读要超过 native，需要优化 HFS seam
+  的批量/范围读路径，而不是设备本身。
+
+证据：`/home/hfs/mysql-large-bp64m-1m-20260928c/`（5 场景日志、prepare、
+durability、`*-results.tsv`、`*-hfs-check.log` 为 `corruption=none`）；
+2M 行尝试证据：`mysql-large-bp64m-20260928`、`…-20260928b`。

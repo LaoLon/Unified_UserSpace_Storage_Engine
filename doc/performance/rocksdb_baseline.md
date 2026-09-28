@@ -151,9 +151,47 @@ ALLOW_FORMAT=1 RESULT=/home/hfs/rocksdb-native-vs-hfs-<date> \
 
 ## 7. 证据
 
-- `/home/hfs/rocksdb-native-vs-hfs-20260927/`：8 个阶段 stdout、4 个 HFS `check`
-  日志、format/ext4-format 日志、`environment.txt` 与 `*-size.txt`。
+- `/home/hfs/rocksdb-native-vs-hfs-20260927/`：8 个阶段 stdout、4 个 HFS `check`  日志、format/ext4-format 日志、`environment.txt` 与 `*-size.txt`。
 - `/home/hfs/rocksdb-native-vs-hfs-20260927-metrics.tsv`（会话期间从 stdout 汇总）
   以及 `-aborted1`、`rocksdb-probe-rnd.*` 失败/探针证据。
 - `/home/hfs/rocksdb-native-vs-hfs-20260927.run.log`：完成日志
   （`cleanup: stage=complete exit=0`）。
+
+## 8. 大工作集对照（64 MiB block cache，2026-09-28）
+
+口径：`TOTAL_KEYS=1200000`（16 B key、1 KiB value，约 1.2 GB 数据）、
+`CACHE_BYTES=67108864`（64 MiB，数据/缓存 ≈19×）、`THREADS_LIST=32`，
+其余选项与 §2 相同；每个阶段仍从全新设备状态开始。
+
+| 工作负载 | native ext4 | HFS | HFS/native |
+|---|---:|---:|---:|
+| fillseq（顺序写） | 103752 | 105625 | **101.8%** |
+| readseq（顺序读） | 37654 | 257934 | **685.0%** |
+| readrandom（随机读） | 33518 | 61457 | **183.4%** |
+| fillrandom（随机写） | 102048 | 103717 | **101.6%** |
+| overwrite（覆盖写+校验） | 85497 | 77056 | **90.1%** |
+| readwhilewriting（混合） | 15489（30.1 s，异常轮） | 2783772（0.39 s） | 见 §5 注 |
+
+观察：缓存缩到 64 MiB 后，读场景几乎全部落到设备——HFS 顺序读 6.9×、
+随机读 1.8× native；写入仍受 flush/compaction CPU 限制，两侧 ≈100%；
+`overwrite` 90.1%。这与 §5.1 的结论一致：HFS 的优势只在设备受限读路径兑现。
+
+### 8.1 大库 extent 边界（待查）
+
+同一脚本在更大数据集上可复现 HFS 提前 `NoSpace`：
+
+| 数据集 | native | HFS |
+|---|---|---|
+| 1.2M key | 两阶段通过 | 两阶段通过（上表） |
+| 1.5M key | 两阶段通过 | `seq` 通过；`rnd` 阶段 `fillrandom`+`overwrite` 完成后 Flush/Compact 失败（rc=7） |
+| 2.0M key | 两阶段通过 | `seq` 通过；`rnd` 阶段 `overwrite` 中 `Put failed: no allocatable extents across data devices`（rc=5） |
+
+- 数据区约 19.24 GiB（`hfsctl info`），失败时 live 数据仅 1.2–2 GB；
+  `capacityExtents` 未配置覆盖（默认等于全区），错误来自
+  `namespace.cpp` `reserveExtents` → allocator 无可用 extent。
+- 失败只出现在高文件 churn 的 `rnd` 阶段（fillrandom/overwrite/压缩），
+  失败前 `append_bytes` 约 25 GB；疑似与按文件预分配（`prealloc_extents=64`）
+  或删除/压缩后的 extent 回收有关，根因未定位，已登记到 `doc/bug.md`。
+- 测试规避：单库 ≤1.2M key。证据目录：
+  `/home/hfs/rocksdb-large-cache64m-20260928-aborted2m`、
+  `…-1_5m-20260928-aborted`、`…-1_2m-20260928`（成功）。
