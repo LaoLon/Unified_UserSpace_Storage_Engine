@@ -413,3 +413,25 @@ HFS I/O 通过本线程 client 提交（每批最多 16 条在途），再用一
 证据：`/home/hfs/mysql-native-vs-hfs-final-20260928`（标准 4 阶段）、
 `/home/hfs/mysql-large-1m-final-20260928`（大工作集 2 阶段），
 均 `cleanup: stage=complete exit=0`。
+
+### 12.3 `read_only`/`read_write` 复测（4 阶段交错，2026-09-28）
+
+针对 §12.2 中 native `read_write` 的 22 s 停顿，对两个场景做 4 阶段交错复测
+（10 表 × 10 万行、64 MiB pool + O_DIRECT、32 线程）：
+
+| 场景 | 模式 | 第 1 轮 TPS | 第 2 轮 TPS | 均值 | avg ms（两轮） | p99 ms（两轮） | max ms（两轮） |
+|---|---|---:|---:|---:|---:|---:|---:|
+| read_only | HFS | 7799.07 | 7945.65 | 7872.36 | 4.10 / 4.02 | 9.06 / 9.22 | 30.1 / 35.4 |
+| read_only | native | 8424.53 | 7904.12 | 8164.33 | 3.79 / 4.04 | 7.56 / 8.13 | 25.5 / 27.7 |
+| read_write | HFS | 2374.77 | 2262.58 | 2318.68 | 13.46 / 14.13 | 27.66 / 30.26 | 82.2 / 93.1 |
+| read_write | native | 2053.10 | **26.04**（30.8 s 墙钟，max 30299 ms） | — | 15.57 / 1228.64 | 34.33 / 30469.9 | 211.4 / 30298.9 |
+
+- `read_only`：HFS/native = **96.4%**，两轮稳定，与 §12.2 的 96.1% 一致；
+  p99 9.06/9.22 ms 对 native 7.56/8.13 ms。
+- `read_write`：native 第二轮再次出现 **30 s 设备停顿**（dmesg 新增 1 次
+  `nvme0: I/O tag timeout`，92→93），该轮不可比；干净轮对比
+  **HFS 2374.77 vs native 2053.10（115.7%）**，HFS p99 27.66 对 native 34.33 ms。
+  即混合读写在本口径下 HFS 不落后，native 内核路径的间歇停顿是主要风险。
+- 两阶段 HFS `hfsctl check` 均 `corruption=none`，`flush_log_at_trx_commit=1`。
+
+证据：`/home/hfs/mysql-large-1m-rw-ro-20260928`（4 阶段）。
