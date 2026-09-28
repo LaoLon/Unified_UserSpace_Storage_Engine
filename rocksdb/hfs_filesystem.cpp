@@ -380,6 +380,9 @@ struct AsyncReadState {
     bool terminal = false;
     bool aborted = false;
     bool callbackStarted = false;
+    /* True while this state is owned by a worker-direct pool; pooled states
+     * are only destroyed together with their pool. */
+    bool pooled = false;
     std::chrono::steady_clock::time_point deadline{};
     std::chrono::steady_clock::time_point notBefore{};
     std::chrono::steady_clock::time_point enqueuedAt{};
@@ -388,8 +391,37 @@ struct AsyncReadState {
     std::shared_ptr<hfs::Client> directClient;
     std::shared_ptr<hfs::File> directFile;
 
-    /* A handle may be deleted after a timeout callback but before core drain. */
+    /* Clears every borrowed reference before pooling or reuse. */
+    void resetForReuse() noexcept {
+        file.reset();
+        request = nullptr;
+        options = {};
+        callback = nullptr;
+        callbackArg = nullptr;
+        dispatcher = nullptr;
+        ioHandle.reset();
+        requestId = 0;
+        token = {};
+        submitted = false;
+        callbackDone = false;
+        terminal = false;
+        aborted = false;
+        callbackStarted = false;
+        deadline = {};
+        notBefore = {};
+        enqueuedAt = {};
+        submittedAt = {};
+        directEntry = nullptr;
+        directClient.reset();
+        directFile.reset();
+    }
+
+    /* A handle may be deleted after a timeout callback but before core drain.
+     * Pooled states are idle and are only destroyed with their pool. */
     ~AsyncReadState() {
+        if (pooled) {
+            return;
+        }
         std::unique_lock<std::mutex> lock(mutex);
         condition.wait(lock, [this] { return terminal; });
     }
@@ -408,10 +440,121 @@ struct DirectWorkerEntry {
     std::uint64_t nextToken = 0;
     mutable std::mutex mutex;
     bool retired = false;
+    /* Bounded AsyncReadState pool for the worker-direct read path; capacity is
+     * maxOutstanding + margin because completed handles may outlive the
+     * completion callback until RocksDB deletes them. Only free states are
+     * owned here; an acquired state is owned by its opaque handle. */
+    std::vector<std::unique_ptr<AsyncReadState>> stateFree;
+    std::size_t stateCapacity = 0;
 
     bool isRetired() const noexcept {
         std::lock_guard<std::mutex> lock(mutex);
         return retired;
+    }
+
+    /* Creates the pooled states once on the owning worker thread. */
+    void initializeStatePool(std::size_t capacity) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (stateCapacity != 0 || capacity == 0) {
+            return;
+        }
+        stateCapacity = capacity;
+        stateFree.reserve(capacity);
+        for (std::size_t index = 0; index < capacity; ++index) {
+            auto state = std::make_unique<AsyncReadState>();
+            state->pooled = true;
+            stateFree.push_back(std::move(state));
+        }
+    }
+
+    /* Returns a pooled state, or nullptr when the channel is retired. */
+    AsyncReadState *acquireState() noexcept {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (retired || stateFree.empty()) {
+            return nullptr;
+        }
+        std::unique_ptr<AsyncReadState> state = std::move(stateFree.back());
+        stateFree.pop_back();
+        state->resetForReuse();
+        state->pooled = true;
+        return state.release();
+    }
+
+    /* Waits for the terminal publication, then returns the state to the pool.
+     * A retired channel or an oversized pool simply drops the state. */
+    void releaseState(AsyncReadState *raw) noexcept {
+        if (raw == nullptr) {
+            return;
+        }
+        std::unique_ptr<AsyncReadState> state(raw);
+        if (!state->pooled) {
+            return; /* destructor waits for the terminal publication */
+        }
+        {
+            std::unique_lock<std::mutex> lock(state->mutex);
+            state->condition.wait(lock, [&state] { return state->terminal; });
+        }
+        state->resetForReuse();
+        state->pooled = true;
+        std::lock_guard<std::mutex> lock(mutex);
+        if (retired || stateFree.size() >= stateCapacity) {
+            return; /* terminal is already published; the destructor is safe */
+        }
+        stateFree.push_back(std::move(state));
+    }
+
+    /* Detaches a state that must continue on the shared dispatcher path. */
+    void detachState(AsyncReadState *state) noexcept {
+        if (state == nullptr) {
+            return;
+        }
+        state->pooled = false;
+        state->directEntry = nullptr;
+        state->directClient.reset();
+        state->directFile.reset();
+    }
+
+    /* One lock: resolve or open the cached per-path File, allocate the token
+     * and submit the read on this worker's client. */
+    bool submitRead(AsyncReadState &state, const std::string &path,
+                    const rocksdb::FSReadRequest &request) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (retired || client == nullptr) {
+            return false;
+        }
+        std::shared_ptr<hfs::File> file;
+        auto found = files.find(path);
+        if (found != files.end()) {
+            file = found->second;
+        } else {
+            auto outer = client->open(path).wait();
+            if (!outer.ok()) {
+                return false;
+            }
+            auto inner = std::move(outer).value();
+            if (!inner.ok()) {
+                return false;
+            }
+            file = std::move(inner).value();
+            files.emplace(path, file);
+        }
+        const std::size_t slots = std::max<std::size_t>(1, client->maxOutstanding());
+        const std::uint64_t sequence = nextToken++;
+        state.token.slot = static_cast<std::uint32_t>(sequence % slots);
+        state.token.generation = static_cast<std::uint32_t>(sequence / slots + 1);
+        hfs::IoVec buffer{reinterpret_cast<std::byte *>(request.scratch), request.len};
+        auto submitted = client->submitRead(file, buffer, request.offset, state.token);
+        if (!submitted.ok()) {
+            return false;
+        }
+        state.directEntry = this;
+        state.directClient = client;
+        state.directFile = file;
+        state.ioHandle = std::move(submitted).value();
+        state.requestId = state.ioHandle.requestId();
+        state.submitted = true;
+        active.emplace(state.requestId, &state);
+        return true;
     }
 
     /* Closes this channel once; callable from the owner thread or from the
@@ -453,6 +596,7 @@ void DirectWorkerEntry::retire(bool fromOwnerThread) noexcept {
     std::shared_ptr<hfs::Client> ownedClient;
     std::unordered_map<std::string, std::shared_ptr<hfs::File>> ownedFiles;
     std::unordered_map<std::uint64_t, AsyncReadState *> ownedActive;
+    std::vector<std::unique_ptr<AsyncReadState>> ownedStates;
     HfsContext *owner = nullptr;
     {
         std::lock_guard<std::mutex> lock(mutex);
@@ -465,6 +609,8 @@ void DirectWorkerEntry::retire(bool fromOwnerThread) noexcept {
         ownedClient = std::move(client);
         ownedFiles = std::move(files);
         ownedActive = std::move(active);
+        ownedStates = std::move(stateFree);
+        stateCapacity = 0;
     }
     if (owner != nullptr) {
         owner->unregisterDirectEntry(this);
@@ -484,6 +630,8 @@ void DirectWorkerEntry::retire(bool fromOwnerThread) noexcept {
         }
         ownedClient.reset();
     }
+    /* Idle pooled states hold no client/file references; drop them last. */
+    ownedStates.clear();
 }
 
 void HfsContext::retireAllDirectEntries() noexcept {
@@ -568,6 +716,9 @@ DirectWorkerEntry *directWorkerEntry(const std::shared_ptr<HfsContext> &context)
     auto client = hfs::Client::create(*context->engine, options);
     if (!client.ok()) return nullptr;
     entry->client = std::move(client).value();
+    /* Pool states on the owning worker thread; the margin covers completed
+     * handles that RocksDB has not deleted yet. */
+    entry->initializeStatePool(static_cast<std::size_t>(entry->client->maxOutstanding()) + 32);
     if (!context->registerDirectEntry(entry)) {
         std::lock_guard<std::mutex> lock(entry->mutex);
         entry->retired = true;
@@ -578,24 +729,6 @@ DirectWorkerEntry *directWorkerEntry(const std::shared_ptr<HfsContext> &context)
     auto *raw = entry.get();
     gDirectWorkerEntries.emplace(context.get(), std::move(entry));
     return raw;
-}
-
-/* Opens a file through the worker-owned Client so its async File handle is
- * valid for submissions made directly by that same worker. */
-std::shared_ptr<hfs::File> directWorkerFile(DirectWorkerEntry *entry,
-                                            const std::string &path) {
-    if (entry == nullptr) return nullptr;
-    std::lock_guard<std::mutex> lock(entry->mutex);
-    if (entry->retired || entry->client == nullptr) return nullptr;
-    auto found = entry->files.find(path);
-    if (found != entry->files.end()) return found->second;
-    auto outer = entry->client->open(path).wait();
-    if (!outer.ok()) return nullptr;
-    auto inner = std::move(outer).value();
-    if (!inner.ok()) return nullptr;
-    auto file = std::move(inner).value();
-    entry->files.emplace(path, file);
-    return file;
 }
 
 /* One bounded frontend owner replaces the old per-request blocking workers. */
@@ -1156,7 +1289,11 @@ void deleteAsyncReadHandle(void *handle) {
     if (state == nullptr) {
         return;
     }
-    if (state->directEntry == nullptr && state->dispatcher != nullptr) {
+    if (state->directEntry != nullptr) {
+        state->directEntry->releaseState(state);
+        return;
+    }
+    if (state->dispatcher != nullptr) {
         state->dispatcher->retireHandle(state);
         return;
     }
@@ -1299,86 +1436,70 @@ public:
                 "HFS async frontend dispatcher is unavailable");
         }
         try {
-            auto state = std::make_unique<AsyncReadState>();
-            state->file = file_;
-            state->request = &request;
-            state->options = options;
-            state->callback = std::move(callback);
-            state->callbackArg = callbackArg;
-            state->dispatcher = context_->asyncDispatcher.get();
-            if (hfs::diagnostics::profilingEnabled()) {
-                state->enqueuedAt = std::chrono::steady_clock::now();
-            }
-            if (options.timeout.count() > 0) {
-                state->deadline = std::chrono::steady_clock::now() + options.timeout;
-            }
             /* Test-only delay injection: cached in an atomic so the read path
              * never calls getenv; tests switch it at runtime. */
             const std::uint32_t delayMs = asyncReadDelayMs();
+            const bool directCandidate =
+                request.len != 0 && context_->workerDirectReads && delayMs == 0;
+
+            DirectWorkerEntry *entry =
+                directCandidate ? directWorkerEntry(context_) : nullptr;
+            AsyncReadState *rawState =
+                entry != nullptr ? entry->acquireState() : nullptr;
+            std::unique_ptr<AsyncReadState> ownedState;
+            if (rawState == nullptr) {
+                ownedState = std::make_unique<AsyncReadState>();
+                rawState = ownedState.get();
+            }
+            AsyncReadState &state = *rawState;
+            state.file = file_;
+            state.request = &request;
+            state.options = options;
+            state.callback = std::move(callback);
+            state.callbackArg = callbackArg;
+            state.dispatcher = context_->asyncDispatcher.get();
+            if (hfs::diagnostics::profilingEnabled()) {
+                state.enqueuedAt = std::chrono::steady_clock::now();
+            }
+            if (options.timeout.count() > 0) {
+                state.deadline = std::chrono::steady_clock::now() + options.timeout;
+            }
             if (delayMs != 0) {
-                state->notBefore = std::chrono::steady_clock::now() +
-                                   std::chrono::milliseconds(delayMs);
+                state.notBefore = std::chrono::steady_clock::now() +
+                                  std::chrono::milliseconds(delayMs);
             }
 
-            /* Experimental fast path: submit from the RocksDB worker itself so
-             * Client::submitRead publishes directly to a data-reactor ring.
-             * A failed direct setup falls back to the production dispatcher.
-             * Timing-injection reads stay on the dispatcher path, which owns
-             * the notBefore delay used by the contract tests. */
-            if (request.len != 0 && context_->workerDirectReads &&
-                state->notBefore == std::chrono::steady_clock::time_point{}) {
-                DirectWorkerEntry *entry = directWorkerEntry(context_);
-                auto directFile = directWorkerFile(entry, path_);
-                if (entry != nullptr && directFile != nullptr) {
-                    bool submittedDirect = false;
-                    {
-                        std::lock_guard<std::mutex> entryLock(entry->mutex);
-                        if (!entry->retired && entry->client != nullptr) {
-                            const std::size_t slots =
-                                std::max<std::size_t>(1, entry->client->maxOutstanding());
-                            const std::uint64_t sequence = entry->nextToken++;
-                            state->token.slot = static_cast<std::uint32_t>(sequence % slots);
-                            state->token.generation =
-                                static_cast<std::uint32_t>(sequence / slots + 1);
-                            hfs::IoVec buffer{
-                                reinterpret_cast<std::byte *>(request.scratch),
-                                request.len};
-                            auto submitted = entry->client->submitRead(
-                                directFile, buffer, request.offset, state->token);
-                            if (submitted.ok()) {
-                                state->directEntry = entry;
-                                state->directClient = entry->client;
-                                state->directFile = std::move(directFile);
-                                state->ioHandle = std::move(submitted).value();
-                                state->requestId = state->ioHandle.requestId();
-                                state->submitted = true;
-                                entry->active.emplace(state->requestId, state.get());
-                                submittedDirect = true;
-                            }
-                        }
-                    }
-                    if (submittedDirect) {
-                        hfs::diagnostics::recordDirectWorkerRead(request.len);
-                        *ioHandle = state.release();
-                        *deleter = deleteAsyncReadHandle;
-                        return rocksdb::IOStatus::OK();
-                    }
+            /* Worker-direct fast path: one entry lock resolves the cached File,
+             * allocates the token and submits; the state comes from a bounded
+             * per-worker pool so the common read does not allocate. Timing
+             * injection reads stay on the dispatcher path, which owns notBefore. */
+            if (entry != nullptr && entry->submitRead(state, path_, request)) {
+                hfs::diagnostics::recordDirectWorkerRead(request.len);
+                *ioHandle = rawState;
+                *deleter = deleteAsyncReadHandle;
+                return rocksdb::IOStatus::OK();
+            }
+            if (entry != nullptr) {
+                /* Direct setup failed: continue on the shared dispatcher. */
+                entry->detachState(rawState);
+                if (ownedState == nullptr) {
+                    ownedState.reset(rawState);
                 }
             }
 
             /* HFS 2.0 has no adapter read cache; every shared-path read is a
              * miss.  Direct-worker reads are accounted separately above. */
             hfs::diagnostics::recordFrontendRead(false, request.len);
-            if (!context_->asyncDispatcher->enqueue(state.get())) {
+            if (!context_->asyncDispatcher->enqueue(rawState)) {
                 {
-                    std::lock_guard<std::mutex> lock(state->mutex);
-                    state->callbackDone = true;
-                    state->terminal = true;
+                    std::lock_guard<std::mutex> lock(state.mutex);
+                    state.callbackDone = true;
+                    state.terminal = true;
                 }
-                state->condition.notify_all();
+                state.condition.notify_all();
                 return rocksdb::IOStatus::Busy("HFS async frontend queue is full");
             }
-            *ioHandle = state.release();
+            *ioHandle = ownedState.release();
             *deleter = deleteAsyncReadHandle;
             return rocksdb::IOStatus::OK();
         } catch (const std::exception &error) {
