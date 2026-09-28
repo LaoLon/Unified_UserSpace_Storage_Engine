@@ -1,6 +1,7 @@
 #include "runtime/spdk_runtime.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cctype>
 #include <cerrno>
@@ -142,6 +143,82 @@ void drainThreadMessages(spdk_thread *thread) {
     }
 }
 
+/* Bounded multi-producer/single-consumer queue for synchronous data
+ * submissions. Producers reserve a slot with a CAS; the owning reactor drains
+ * it in its poll loop, so the common path needs no heap allocation and no SPDK
+ * thread message. A full queue is reported to the caller as bounded backpressure. */
+template <typename T, std::size_t Capacity>
+class BoundedMpscQueue {
+public:
+    static_assert(Capacity >= 2 && (Capacity & (Capacity - 1)) == 0,
+                  "capacity must be a power of two");
+
+    BoundedMpscQueue() noexcept {
+        for (std::size_t index = 0; index < Capacity; ++index) {
+            slots_[index].sequence.store(index, std::memory_order_relaxed);
+        }
+    }
+
+    BoundedMpscQueue(const BoundedMpscQueue &) = delete;
+    BoundedMpscQueue &operator=(const BoundedMpscQueue &) = delete;
+
+    bool tryPush(const T &value) noexcept {
+        std::uint64_t position = head_.load(std::memory_order_relaxed);
+        for (;;) {
+            Slot &slot = slots_[position & kMask];
+            const std::uint64_t sequence = slot.sequence.load(std::memory_order_acquire);
+            const std::int64_t difference =
+                static_cast<std::int64_t>(sequence) - static_cast<std::int64_t>(position);
+            if (difference == 0) {
+                if (head_.compare_exchange_weak(position, position + 1,
+                                                std::memory_order_relaxed,
+                                                std::memory_order_relaxed)) {
+                    slot.value = value;
+                    slot.sequence.store(position + 1, std::memory_order_release);
+                    return true;
+                }
+            } else if (difference < 0) {
+                return false; /* full: the consumer has not freed this slot yet */
+            } else {
+                position = head_.load(std::memory_order_relaxed);
+            }
+        }
+    }
+
+    /* Consumer-only, including the reactor's idle re-check. */
+    bool tryPop(T &value) noexcept {
+        Slot &slot = slots_[tail_ & kMask];
+        const std::uint64_t sequence = slot.sequence.load(std::memory_order_acquire);
+        if (static_cast<std::int64_t>(sequence) -
+                static_cast<std::int64_t>(tail_ + 1) != 0) {
+            return false;
+        }
+        value = slot.value;
+        slot.sequence.store(tail_ + Capacity, std::memory_order_release);
+        ++tail_;
+        return true;
+    }
+
+    bool hasPending() const noexcept {
+        const Slot &slot = slots_[tail_ & kMask];
+        const std::uint64_t sequence = slot.sequence.load(std::memory_order_acquire);
+        return static_cast<std::int64_t>(sequence) -
+                   static_cast<std::int64_t>(tail_ + 1) == 0;
+    }
+
+private:
+    static constexpr std::uint64_t kMask = Capacity - 1;
+
+    struct Slot {
+        std::atomic<std::uint64_t> sequence{0};
+        T value{};
+    };
+
+    std::array<Slot, Capacity> slots_{};
+    std::atomic<std::uint64_t> head_{0};
+    std::uint64_t tail_ = 0; /* consumer only */
+};
+
 /* Keep a backend-provided negative errno when the bdev exposes one. NVMe
  * completion status has no portable errno field, so it falls back to EIO
  * except for the explicitly representable abort case. */
@@ -258,6 +335,8 @@ struct SpdkRuntime::Impl {
         bool pollerStopping = false;
         std::int32_t numaNode = -1;
         std::uint32_t cpu = 0;
+        /* Zero-based data reactor index; also the ingress/holder slot. */
+        std::size_t ingressSlot = 0;
         std::uint32_t idlePolls = 0;
         std::uint64_t pollSleeps = 0;
         /* Doorbell: producers write this eventfd only while idleWait is set. */
@@ -447,7 +526,8 @@ struct SpdkRuntime::Impl {
         } while (drained < 0 && errno == EINTR);
         (void)drained;
         reactor->idleWait.store(true, std::memory_order_release);
-        if (invokeDataReactorPoller(reactor) != 0) {
+        if (invokeDataReactorPoller(reactor) != 0 ||
+            dataIngressPending(reactor->ingressSlot)) {
             reactor->idleWait.store(false, std::memory_order_release);
             return;
         }
@@ -466,7 +546,8 @@ struct SpdkRuntime::Impl {
         }
     }
 
-    /* Wakes one idle-waiting reactor; safe from any thread. */
+    /* Wakes the target data reactor only while it is idle-waiting. The
+     * lock-free entry point is Impl::wakeDataReactor() below. */
     void wakeReactor(Reactor *reactor) noexcept {
         if (reactor == nullptr || reactor->wakeFd < 0 ||
             !reactor->idleWait.load(std::memory_order_acquire)) {
@@ -479,21 +560,6 @@ struct SpdkRuntime::Impl {
         } while (written < 0 && errno == EINTR);
         /* EAGAIN means a wake is already pending. */
         (void)written;
-    }
-
-    /* Wakes the target data reactor only while it is idle-waiting. */
-    Result<void> wakeDataReactor(std::uint32_t index) noexcept {
-        std::shared_ptr<Reactor> reactor;
-        {
-            std::lock_guard<std::mutex> lock(mutex);
-            if (index + 1 >= reactors.size() || reactors[index + 1] == nullptr) {
-                return makeError(Status::InvalidArgument,
-                                 "data reactor index out of range");
-            }
-            reactor = reactors[index + 1];
-        }
-        wakeReactor(reactor.get());
-        return Result<void>(Status::Ok);
     }
 
     /* Metadata reactor idle wait: same doorbell protocol, but the re-check
@@ -976,8 +1042,10 @@ struct SpdkRuntime::Impl {
         const bool pollingInterrupt = config.numa.polling == "interrupt";
         while (!reactor->stop.load(std::memory_order_acquire) ||
                reactor->activeHead != nullptr || reactor->retryHead != nullptr ||
-               reactor->completionHead != nullptr) {
+               reactor->completionHead != nullptr ||
+               dataIngressPending(reactor->ingressSlot)) {
             const int polled = spdk_thread_poll(reactor->spdk, 0, 0);
+            const std::size_t ingested = drainDataIngress(reactor->ingressSlot);
             if (reactor->retryHead != nullptr) {
                 drainDataIoRetries(reactor);
             }
@@ -985,7 +1053,7 @@ struct SpdkRuntime::Impl {
                 drainDataIoCompletions(reactor);
             }
             const int pumped = invokeDataReactorPoller(reactor);
-            const bool hasWork = polled != 0 || pumped != 0 ||
+            const bool hasWork = polled != 0 || ingested != 0 || pumped != 0 ||
                                  reactor->activeHead != nullptr ||
                                  reactor->retryHead != nullptr ||
                                  reactor->completionHead != nullptr;
@@ -1039,6 +1107,9 @@ struct SpdkRuntime::Impl {
     /* Stop and join all reactors; safe to call from start() failure paths. */
     void shutdownReactors() {
         disableDataReactorPollers();
+        /* Retire the doorbell table before stopping the reactors so no wake can
+         * touch a reactor after its thread exits. */
+        disableWakeTable();
         {
             std::lock_guard<std::mutex> lock(mutex);
             for (auto &reactor : reactors) {
@@ -1050,6 +1121,25 @@ struct SpdkRuntime::Impl {
                 reactor->thread.join();
             }
         }
+        /* Safety net: fail any synchronous ingress entry the reactors could
+         * not drain, then release the per-reactor ingress and holder storage. */
+        for (std::size_t index = 0; index < dataIngress_.size(); ++index) {
+            if (dataIngress_[index] == nullptr) {
+                continue;
+            }
+            DataIoCall call{};
+            while (dataIngress_[index]->tryPop(call)) {
+                if (call.cb != nullptr) {
+                    call.cb(call.cbCtx, -ECANCELED);
+                }
+            }
+        }
+        dataIngress_.clear();
+        dataHolderPools_.clear();
+        dataHolderPoolSize_.clear();
+        dataHolderFree_.clear();
+        wakeEntries_.reset();
+        wakeEntryCount_ = 0;
         std::lock_guard<std::mutex> lock(mutex);
         reactors.clear();
     }
@@ -1091,10 +1181,143 @@ struct SpdkRuntime::Impl {
         void (*cb)(void *, int) = nullptr;
         void *cbCtx = nullptr;
         std::size_t deviceIndex = 0;
+        std::size_t reactorIndex = 0;
         bool write = false;
+        /* Pooled holders return to the owning reactor's free list on completion. */
+        bool pooled = false;
+        DataIoHolder *freeNext = nullptr;
         /* SPDK retains the iovec until the asynchronous completion. */
         struct iovec iov{};
     };
+
+    static constexpr std::size_t kDataIngressDepth = 1024;
+    static constexpr std::size_t kDataIngressBatch = 64;
+    using DataIngress = BoundedMpscQueue<DataIoCall, kDataIngressDepth>;
+
+    /* Per-data-reactor synchronous submission ingress (heap storage). */
+    std::vector<std::unique_ptr<DataIngress>> dataIngress_;
+    /* Per-data-reactor completion holder pool; reactor-thread private. */
+    std::vector<std::unique_ptr<DataIoHolder[]>> dataHolderPools_;
+    std::vector<std::size_t> dataHolderPoolSize_;
+    std::vector<DataIoHolder *> dataHolderFree_;
+
+    void initializeDataIngress(std::size_t reactorCount) {
+        dataIngress_.clear();
+        dataIngress_.resize(reactorCount);
+        for (std::size_t index = 0; index < reactorCount; ++index) {
+            dataIngress_[index] = std::make_unique<DataIngress>();
+        }
+    }
+
+    void initializeDataHolderPools(std::size_t reactorCount) {
+        dataHolderPools_.clear();
+        dataHolderPoolSize_.clear();
+        dataHolderFree_.clear();
+        dataHolderPools_.resize(reactorCount);
+        dataHolderPoolSize_.assign(reactorCount, 0);
+        dataHolderFree_.assign(reactorCount, nullptr);
+        for (std::size_t index = 0; index < reactorCount; ++index) {
+            auto pool = std::unique_ptr<DataIoHolder[]>(
+                new (std::nothrow) DataIoHolder[kDataIngressDepth]);
+            if (pool == nullptr) {
+                continue;
+            }
+            for (std::size_t slot = 0; slot < kDataIngressDepth; ++slot) {
+                pool[slot].pooled = true;
+                pool[slot].freeNext =
+                    slot + 1 < kDataIngressDepth ? &pool[slot + 1] : nullptr;
+            }
+            dataHolderFree_[index] = &pool[0];
+            dataHolderPoolSize_[index] = kDataIngressDepth;
+            dataHolderPools_[index] = std::move(pool);
+        }
+    }
+
+    DataIoHolder *acquireDataIoHolder(std::size_t reactorIndex) noexcept {
+        if (reactorIndex < dataHolderFree_.size()) {
+            DataIoHolder *holder = dataHolderFree_[reactorIndex];
+            if (holder != nullptr) {
+                dataHolderFree_[reactorIndex] = holder->freeNext;
+                holder->freeNext = nullptr;
+                return holder;
+            }
+        }
+        /* Rare overflow: bounded by in-flight synchronous I/O, not the pool. */
+        return new (std::nothrow) DataIoHolder();
+    }
+
+    void releaseDataIoHolder(DataIoHolder *holder) noexcept {
+        if (holder == nullptr) {
+            return;
+        }
+        if (!holder->pooled) {
+            delete holder;
+            return;
+        }
+        const std::size_t index = holder->reactorIndex;
+        if (index < dataHolderFree_.size()) {
+            holder->freeNext = dataHolderFree_[index];
+            dataHolderFree_[index] = holder;
+        }
+    }
+
+    /* Lock-free doorbell table: entries are published while the runtime is
+     * active and retired under a reader gate, so a concurrent wake can never
+     * touch a dying reactor (same protocol as the poller reader mask). */
+    static constexpr std::uint64_t kWakeEnabledBit = std::uint64_t{1} << 63;
+    static constexpr std::uint64_t kWakeReaderMask = ~kWakeEnabledBit;
+    std::atomic<std::uint64_t> wakeGateState_{0};
+    std::unique_ptr<std::atomic<Reactor *>[]> wakeEntries_;
+    std::size_t wakeEntryCount_ = 0;
+
+    void enableWakeTable() noexcept {
+        for (std::size_t index = 0; index < wakeEntryCount_; ++index) {
+            wakeEntries_[index].store(reactors[index + 1].get(),
+                                      std::memory_order_relaxed);
+        }
+        wakeGateState_.store(kWakeEnabledBit, std::memory_order_release);
+    }
+
+    void disableWakeTable() noexcept {
+        wakeGateState_.fetch_and(kWakeReaderMask, std::memory_order_acq_rel);
+        for (;;) {
+            const std::uint64_t state = wakeGateState_.load(std::memory_order_acquire);
+            if ((state & kWakeReaderMask) == 0) {
+                break;
+            }
+            wakeGateState_.wait(state, std::memory_order_acquire);
+        }
+        for (std::size_t index = 0; index < wakeEntryCount_; ++index) {
+            wakeEntries_[index].store(nullptr, std::memory_order_relaxed);
+        }
+    }
+
+    /* Wakes one idle-waiting data reactor without taking the runtime mutex. */
+    Result<void> wakeDataReactor(std::uint32_t index) noexcept {
+        if (index >= wakeEntryCount_) {
+            return makeError(Status::InvalidArgument, "data reactor index out of range");
+        }
+        for (;;) {
+            std::uint64_t state = wakeGateState_.load(std::memory_order_acquire);
+            if ((state & kWakeEnabledBit) == 0) {
+                return makeError(Status::Busy, "SPDK runtime is not active");
+            }
+            if (wakeGateState_.compare_exchange_weak(state, state + 1,
+                                                     std::memory_order_acquire,
+                                                     std::memory_order_relaxed)) {
+                break;
+            }
+        }
+        Reactor *reactor = wakeEntries_[index].load(std::memory_order_acquire);
+        if (reactor != nullptr) {
+            wakeReactor(reactor);
+        }
+        const std::uint64_t previous = wakeGateState_.fetch_sub(1, std::memory_order_acq_rel);
+        if ((previous & kWakeReaderMask) == 1) {
+            wakeGateState_.notify_all();
+        }
+        return Result<void>(Status::Ok);
+    }
 
     static void dataIoDone(struct spdk_bdev_io *bdevIo, bool success, void *arg) {
         auto *holder = static_cast<DataIoHolder *>(arg);
@@ -1103,52 +1326,64 @@ struct SpdkRuntime::Impl {
         if (success && holder->write && holder->impl != nullptr) {
             holder->impl->noteDataWriteComplete(holder->deviceIndex);
         }
-        if (holder->cb != nullptr) {
-            holder->cb(holder->cbCtx, rc);
+        void (*cb)(void *, int) = holder->cb;
+        void *cbCtx = holder->cbCtx;
+        Impl *impl = holder->impl;
+        /* Release before invoking the callback so a synchronous re-submit can
+         * reuse the same holder. */
+        impl->releaseDataIoHolder(holder);
+        if (cb != nullptr) {
+            cb(cbCtx, rc);
         }
-        delete holder;
     }
 
-    void submitDataIo(DataIoCall *call) {
-        if (call->cb == nullptr || call->reactorIndex >= reactors.size() ||
-            call->deviceIndex >= devices.size() ||
-            reactors[call->reactorIndex]->spdk == nullptr ||
-            call->deviceIndex >= reactors[call->reactorIndex]->channels.size() ||
-            devices[call->deviceIndex].desc == nullptr || call->buffer == nullptr ||
-            call->blocks == 0) {
-            if (call->cb != nullptr) {
-                call->cb(call->cbCtx, -EINVAL);
+    void submitDataIo(const DataIoCall &call) {
+        if (call.cb == nullptr || call.reactorIndex >= reactors.size() ||
+            call.deviceIndex >= devices.size() ||
+            reactors[call.reactorIndex]->spdk == nullptr ||
+            call.deviceIndex >= reactors[call.reactorIndex]->channels.size() ||
+            devices[call.deviceIndex].desc == nullptr || call.buffer == nullptr ||
+            call.blocks == 0) {
+            if (call.cb != nullptr) {
+                call.cb(call.cbCtx, -EINVAL);
             }
-            delete call;
             return;
         }
-        spdk_bdev_desc *desc = devices[call->deviceIndex].desc;
+        spdk_bdev_desc *desc = devices[call.deviceIndex].desc;
         spdk_io_channel *channel =
-            reactors[call->reactorIndex]->channels[call->deviceIndex];
-        auto *holder = new DataIoHolder{};
+            reactors[call.reactorIndex]->channels[call.deviceIndex];
+        auto *holder = acquireDataIoHolder(call.reactorIndex - 1);
+        if (holder == nullptr) {
+            if (call.cb != nullptr) {
+                call.cb(call.cbCtx, -ENOMEM);
+            }
+            return;
+        }
         holder->impl = this;
-        holder->cb = call->cb;
-        holder->cbCtx = call->cbCtx;
-        holder->deviceIndex = call->deviceIndex;
-        holder->write = call->write;
-        holder->iov.iov_base = call->buffer;
-        holder->iov.iov_len = call->blocks * devices[call->deviceIndex].blockSize;
-        const int rc = call->write
+        holder->cb = call.cb;
+        holder->cbCtx = call.cbCtx;
+        holder->deviceIndex = call.deviceIndex;
+        holder->reactorIndex = call.reactorIndex - 1;
+        holder->write = call.write;
+        holder->freeNext = nullptr;
+        holder->iov.iov_base = call.buffer;
+        holder->iov.iov_len = call.blocks * devices[call.deviceIndex].blockSize;
+        const int rc = call.write
                            ? spdk_bdev_writev_blocks(desc, channel, &holder->iov, 1,
-                                                     call->offsetBlocks, call->blocks,
+                                                     call.offsetBlocks, call.blocks,
                                                      dataIoDone, holder)
                            : spdk_bdev_readv_blocks(desc, channel, &holder->iov, 1,
-                                                    call->offsetBlocks, call->blocks,
+                                                    call.offsetBlocks, call.blocks,
                                                     dataIoDone, holder);
         if (rc != 0) {
-            delete holder;
-            if (call->cb != nullptr) {
-                call->cb(call->cbCtx, rc);
+            releaseDataIoHolder(holder);
+            if (call.cb != nullptr) {
+                call.cb(call.cbCtx, rc);
             }
         } else if (stats::enabled()) {
             /* Include the synchronous DataPath in accepted device I/O counts. */
             auto &counters = stats::counters();
-            if (call->write) {
+            if (call.write) {
                 counters.bdevDataWriteOps.fetch_add(1, std::memory_order_relaxed);
                 counters.bdevDataWriteBytes.fetch_add(holder->iov.iov_len,
                                                       std::memory_order_relaxed);
@@ -1158,13 +1393,80 @@ struct SpdkRuntime::Impl {
                                                      std::memory_order_relaxed);
             }
         }
-        delete call;
+    }
+
+    /* Reactor-thread drain for the bounded synchronous ingress. */
+    std::size_t drainDataIngress(std::size_t index) noexcept {
+        if (index >= dataIngress_.size() || dataIngress_[index] == nullptr) {
+            return 0;
+        }
+        DataIoCall call{};
+        std::size_t drained = 0;
+        while (drained < kDataIngressBatch && dataIngress_[index]->tryPop(call)) {
+            submitDataIo(call);
+            ++drained;
+        }
+        return drained;
+    }
+
+    bool dataIngressPending(std::size_t index) const noexcept {
+        return index < dataIngress_.size() && dataIngress_[index] != nullptr &&
+               dataIngress_[index]->hasPending();
+    }
+
+    /* Synchronous (non-actor) data submission used by DataPath. The common
+     * path publishes into the reactor's bounded ingress; the historical SPDK
+     * message path remains as a rare fallback when the ingress is full. */
+    Result<void> submitSyncDataIo(std::uint32_t reactorIndex, std::size_t deviceIndex,
+                                  void *buffer, std::uint64_t offsetBlocks,
+                                  std::uint64_t blocks, bool write,
+                                  void (*cb)(void *, int), void *cbCtx) {
+        DataIoCall call{};
+        call.impl = this;
+        call.reactorIndex = reactorIndex + 1;
+        call.deviceIndex = deviceIndex;
+        call.buffer = buffer;
+        call.offsetBlocks = offsetBlocks;
+        call.blocks = blocks;
+        call.write = write;
+        call.cb = cb;
+        call.cbCtx = cbCtx;
+        /* Serialize with stop(): once stoppingFlag is set no new ingress entry
+         * may be published, so the owning reactor drains everything accepted. */
+        std::lock_guard<std::mutex> lock(mutex);
+        if (!activeFlag.load(std::memory_order_acquire) ||
+            stoppingFlag.load(std::memory_order_acquire)) {
+            return makeError(Status::Busy, "SPDK runtime is not active");
+        }
+        if (reactorIndex >= dataIngress_.size() || reactorIndex + 1 >= reactors.size() ||
+            deviceIndex >= devices.size()) {
+            return makeError(Status::InvalidArgument, "data reactor or device out of range");
+        }
+        if (dataIngress_[reactorIndex]->tryPush(call)) {
+            (void)wakeDataReactor(reactorIndex);
+            return Result<void>(Status::Ok);
+        }
+        spdk_thread *thread = reactors[reactorIndex + 1]->spdk;
+        if (thread == nullptr) {
+            return makeError(Status::Busy, "data reactor is not ready");
+        }
+        auto *heapCall = new (std::nothrow) DataIoCall(call);
+        if (heapCall == nullptr) {
+            return makeError(Status::Busy, "data ingress is full");
+        }
+        if (spdk_thread_send_msg(thread, dataSubmitTrampoline, heapCall) != 0) {
+            delete heapCall;
+            return makeError(Status::Busy, "spdk_thread_send_msg failed");
+        }
+        (void)wakeDataReactor(reactorIndex);
+        return Result<void>(Status::Ok);
     }
 
     static void dataSubmitTrampoline(void *ctx) {
         auto *call = static_cast<DataIoCall *>(ctx);
         Impl *impl = call->impl;
-        impl->submitDataIo(call);
+        impl->submitDataIo(*call);
+        delete call;
     }
 
     /* State for the actor-local API. This object is placement-constructed in
@@ -1790,9 +2092,18 @@ Result<void> SpdkRuntime::start(const Config &config) {
     impl.reactors.clear();
     impl.reactors.push_back(std::make_shared<Impl::Reactor>());
     for (std::uint32_t i = 0; i < dataReactors; ++i) {
-        impl.reactors.push_back(std::make_shared<Impl::Reactor>());
+        auto reactor = std::make_shared<Impl::Reactor>();
+        reactor->ingressSlot = i;
+        impl.reactors.push_back(std::move(reactor));
     }
     impl.configureReactorPlacement(topology, dataReactors);
+    /* Synchronous ingress, completion holders and the doorbell table must be
+     * ready before the data reactors start polling. */
+    impl.initializeDataIngress(dataReactors);
+    impl.initializeDataHolderPools(dataReactors);
+    impl.wakeEntryCount_ = dataReactors;
+    impl.wakeEntries_ = std::make_unique<std::atomic<Impl::Reactor *>[]>(dataReactors);
+    impl.enableWakeTable();
 
     impl.reactors[0]->thread = std::jthread([&impl]() { impl.metadataMain(); });
 
@@ -2067,74 +2378,23 @@ Result<void> SpdkRuntime::submitDataRead(std::uint32_t reactorIndex,
                                          std::size_t deviceIndex, void *buffer,
                                          std::uint64_t offsetBlocks, std::uint64_t blocks,
                                          void (*cb)(void *, int), void *cbCtx) {
-    auto &impl = *impl_;
-    spdk_thread *thread = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(impl.mutex);
-        if (!impl.activeFlag.load(std::memory_order_acquire) ||
-            impl.stoppingFlag.load(std::memory_order_acquire)) {
-            return makeError(Status::Busy, "SPDK runtime is not active");
-        }
-        if (reactorIndex + 1 >= impl.reactors.size() ||
-            impl.reactors[reactorIndex + 1]->spdk == nullptr ||
-            deviceIndex >= impl.devices.size()) {
-            return makeError(Status::InvalidArgument, "data reactor or device out of range");
-        }
-        thread = impl.reactors[reactorIndex + 1]->spdk;
+    if (impl_ == nullptr) {
+        return makeError(Status::InvalidState, "SPDK runtime is unavailable");
     }
-    auto *call = new Impl::DataIoCall();
-    call->impl = &impl;
-    call->reactorIndex = reactorIndex + 1;
-    call->deviceIndex = deviceIndex;
-    call->buffer = buffer;
-    call->offsetBlocks = offsetBlocks;
-    call->blocks = blocks;
-    call->write = false;
-    call->cb = cb;
-    call->cbCtx = cbCtx;
-    if (spdk_thread_send_msg(thread, Impl::dataSubmitTrampoline, call) != 0) {
-        delete call;
-        return makeError(Status::Busy, "spdk_thread_send_msg failed");
-    }
-    (void)impl.wakeDataReactor(reactorIndex);
-    return Result<void>(Status::Ok);
+    return impl_->submitSyncDataIo(reactorIndex, deviceIndex, buffer, offsetBlocks, blocks,
+                                   false, cb, cbCtx);
 }
 
 Result<void> SpdkRuntime::submitDataWrite(std::uint32_t reactorIndex,
                                           std::size_t deviceIndex, const void *buffer,
                                           std::uint64_t offsetBlocks, std::uint64_t blocks,
                                           void (*cb)(void *, int), void *cbCtx) {
-    auto &impl = *impl_;
-    spdk_thread *thread = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(impl.mutex);
-        if (!impl.activeFlag.load(std::memory_order_acquire) ||
-            impl.stoppingFlag.load(std::memory_order_acquire)) {
-            return makeError(Status::Busy, "SPDK runtime is not active");
-        }
-        if (reactorIndex + 1 >= impl.reactors.size() ||
-            impl.reactors[reactorIndex + 1]->spdk == nullptr ||
-            deviceIndex >= impl.devices.size()) {
-            return makeError(Status::InvalidArgument, "data reactor or device out of range");
-        }
-        thread = impl.reactors[reactorIndex + 1]->spdk;
+    if (impl_ == nullptr) {
+        return makeError(Status::InvalidState, "SPDK runtime is unavailable");
     }
-    auto *call = new Impl::DataIoCall();
-    call->impl = &impl;
-    call->reactorIndex = reactorIndex + 1;
-    call->deviceIndex = deviceIndex;
-    call->buffer = const_cast<void *>(buffer);
-    call->offsetBlocks = offsetBlocks;
-    call->blocks = blocks;
-    call->write = true;
-    call->cb = cb;
-    call->cbCtx = cbCtx;
-    if (spdk_thread_send_msg(thread, Impl::dataSubmitTrampoline, call) != 0) {
-        delete call;
-        return makeError(Status::Busy, "spdk_thread_send_msg failed");
-    }
-    (void)impl.wakeDataReactor(reactorIndex);
-    return Result<void>(Status::Ok);
+    return impl_->submitSyncDataIo(reactorIndex, deviceIndex,
+                                   const_cast<void *>(buffer), offsetBlocks, blocks, true,
+                                   cb, cbCtx);
 }
 
 Result<void> SpdkRuntime::submitDataReadOnReactor(std::uint32_t reactorIndex,
