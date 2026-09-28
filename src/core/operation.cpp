@@ -6,11 +6,14 @@
 #include <mutex>
 #include <new>
 
+#include "core/index_stack.hpp"
 #include "hfs/types.hpp"
 
 namespace hfs {
 
-/* Bounded pool for Operation objects; see operation.hpp. */
+/* Bounded pool for Operation objects; see operation.hpp. Storage is
+ * preallocated once, so create/destroy never allocate and the free list is a
+ * bounded lock-free index stack shared by frontend and reactor threads. */
 class OperationPool {
 public:
     static OperationPool &instance() noexcept {
@@ -18,74 +21,104 @@ public:
         return pool;
     }
 
+    /* Control-plane sizing; refuses to resize while any operation is live. */
     void setCapacity(std::size_t count) noexcept {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (count != 0 && live_ == 0) {
-            capacity_ = count > freeCount_ ? count : freeCount_;
+        if (count == 0) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(controlMutex_);
+        if (live_.load(std::memory_order_acquire) != 0) {
+            return;
+        }
+        capacity_ = count;
+        if (storageCapacity_ < count) {
+            growLocked(count);
         }
     }
 
     Operation *create(std::uint64_t requestId) noexcept {
-        Operation *operation = nullptr;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            if (free_ != nullptr) {
-                operation = free_;
-                free_ = operation->freeNext_;
-                operation->freeNext_ = nullptr;
-                --freeCount_;
-            } else if (live_ < capacity_) {
-                /* noexcept path: a throwing new would terminate the core. */
-                operation = new (std::nothrow) Operation();
-                if (operation == nullptr) {
-                    overflow_.fetch_add(1, std::memory_order_relaxed);
-                    return nullptr;
-                }
-            } else {
-                overflow_.fetch_add(1, std::memory_order_relaxed);
-                return nullptr;
-            }
-            ++live_;
-            if (live_ > highWatermark_) {
-                highWatermark_ = live_;
-            }
+        ensureStorage();
+        const std::size_t live = live_.fetch_add(1, std::memory_order_acq_rel);
+        if (live >= capacity_) {
+            live_.fetch_sub(1, std::memory_order_acq_rel);
+            overflow_.fetch_add(1, std::memory_order_relaxed);
+            return nullptr;
         }
+        std::uint32_t index = 0;
+        if (!freeStack_.pop(index)) {
+            live_.fetch_sub(1, std::memory_order_acq_rel);
+            overflow_.fetch_add(1, std::memory_order_relaxed);
+            return nullptr;
+        }
+        Operation *operation = storage_ + index;
         operation->resetForReuse(requestId);
+        std::size_t high = highWatermark_.load(std::memory_order_relaxed);
+        while (live + 1 > high &&
+               !highWatermark_.compare_exchange_weak(high, live + 1,
+                                                     std::memory_order_relaxed)) {
+        }
         return operation;
     }
 
     void destroy(Operation *operation) noexcept {
-        std::lock_guard<std::mutex> lock(mutex_);
-        operation->freeNext_ = free_;
-        free_ = operation;
-        ++freeCount_;
-        --live_;
+        if (operation == nullptr || storage_ == nullptr) {
+            return;
+        }
+        const auto index = static_cast<std::uint32_t>(operation - storage_);
+        (void)freeStack_.push(index);
+        live_.fetch_sub(1, std::memory_order_acq_rel);
     }
 
-    std::size_t liveCount() const noexcept {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return live_;
-    }
+    std::size_t liveCount() const noexcept { return live_.load(std::memory_order_acquire); }
 
     std::size_t overflow() const noexcept {
         return static_cast<std::size_t>(overflow_.load(std::memory_order_relaxed));
     }
 
     std::size_t highWatermark() const noexcept {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return highWatermark_;
+        return highWatermark_.load(std::memory_order_relaxed);
     }
 
 private:
     OperationPool() = default;
+    ~OperationPool() { delete[] storage_; }
 
-    mutable std::mutex mutex_;
-    Operation *free_ = nullptr;
+    void ensureStorage() noexcept {
+        if (storage_ != nullptr) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(controlMutex_);
+        if (storage_ == nullptr) {
+            growLocked(capacity_);
+        }
+    }
+
+    void growLocked(std::size_t count) noexcept {
+        if (count == 0) {
+            return;
+        }
+        Operation *storage = new (std::nothrow) Operation[count];
+        if (storage == nullptr) {
+            return;
+        }
+        if (!freeStack_.initialize(count)) {
+            delete[] storage;
+            return;
+        }
+        /* Only reachable while no operation is live (control-plane resize). */
+        delete[] storage_;
+        storage_ = storage;
+        storageCapacity_ = count;
+    }
+
+    mutable std::mutex controlMutex_;
+    Operation *storage_ = nullptr;
+    std::size_t storageCapacity_ = 0;
     std::size_t capacity_ = 4096;
-    std::size_t live_ = 0;
-    std::size_t freeCount_ = 0;
-    std::size_t highWatermark_ = 0;
+    std::atomic<std::size_t> live_{0};
+    std::atomic<std::size_t> highWatermark_{0};
     std::atomic<std::uint64_t> overflow_{0};
+    BoundedIndexStack freeStack_;
 };
 
 void Operation::setPoolCapacity(std::size_t count) noexcept {
@@ -132,7 +165,6 @@ void Operation::resetForReuse(std::uint64_t newRequestId) noexcept {
     completionSink_ = {};
     asyncState_.reset();
     asyncStorage_ = {};
-    freeNext_ = nullptr;
 }
 
 bool Operation::validRefRole(OperationRefRole role) noexcept {

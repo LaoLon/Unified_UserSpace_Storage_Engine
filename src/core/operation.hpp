@@ -194,7 +194,6 @@ private:
     CompletionSink completionSink_{};
     AsyncIoState asyncState_{};
     AsyncStorageHook asyncStorage_{};
-    Operation *freeNext_ = nullptr; /* pool free list link */
 };
 
 } // namespace hfs

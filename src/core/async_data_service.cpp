@@ -16,6 +16,7 @@
 #include "common/trace.hpp"
 #include "core/dma_arena.hpp"
 #include "core/extent_map.hpp"
+#include "core/index_stack.hpp"
 #include "core/parent_completion.hpp"
 #include "core/request_lookup.hpp"
 #include "core/scheduler.hpp"
@@ -178,7 +179,8 @@ private:
         std::uint32_t leaseCount = 0;
         std::uint32_t submittedChildren = 0;
         std::uint32_t drainedChildren = 0;
-        std::atomic<bool> inUse{false};
+        /* Pool ownership flag; the pool guarantees exactly-once release. */
+        bool inUse = false;
         bool planned = false;
         bool bufferPlanRecorded = false;
         bool parked = false;
@@ -188,13 +190,21 @@ private:
         Status firstStatus = Status::Ok;
         int firstErrno = 0;
 
-        /* Clears all borrowed resources after every backend callback drained. */
+        /* Clears all borrowed resources after every backend callback drained.
+         * Only the entries used by the finished request are touched, so a
+         * one-child request does not pay for the full plan capacity. */
         void reset() noexcept {
-            for (BufferLease &lease : leases) {
-                lease.reset();
+            const std::uint32_t childTotal =
+                childCount < children.size() ? childCount
+                                             : static_cast<std::uint32_t>(children.size());
+            const std::uint32_t leaseTotal =
+                leaseCount < leases.size() ? leaseCount
+                                           : static_cast<std::uint32_t>(leases.size());
+            for (std::uint32_t index = 0; index < leaseTotal; ++index) {
+                leases[index].reset();
             }
-            for (ChildState &child : children) {
-                child.reset();
+            for (std::uint32_t index = 0; index < childTotal; ++index) {
+                children[index].reset();
             }
             owner = nullptr;
             operation = nullptr;
@@ -235,44 +245,42 @@ private:
             }
             auto states = std::unique_ptr<RequestState[]>(new (std::nothrow)
                                                                RequestState[capacity]);
-            if (states == nullptr) {
+            if (states == nullptr || !freeStack_.initialize(capacity)) {
                 return false;
             }
             states_ = std::move(states);
             capacity_ = capacity;
-            for (std::size_t index = 0; index < capacity_; ++index) {
-                states_[index].inUse.store(false, std::memory_order_relaxed);
-            }
             return true;
         }
 
+        /* O(1) lock-free reserve; release resets the sidecar before reuse. */
         RequestState *acquire() noexcept {
-            if (states_ == nullptr) {
+            std::uint32_t index = 0;
+            if (states_ == nullptr || !freeStack_.pop(index)) {
                 return nullptr;
             }
-            for (std::size_t index = 0; index < capacity_; ++index) {
-                bool expected = false;
-                if (states_[index].inUse.compare_exchange_strong(
-                        expected, true, std::memory_order_acq_rel,
-                        std::memory_order_relaxed)) {
-                    states_[index].reset();
-                    return &states_[index];
-                }
-            }
-            return nullptr;
+            RequestState *state = &states_[index];
+            state->inUse = true;
+            return state;
         }
 
         void release(RequestState *state) noexcept {
-            if (state == nullptr) {
+            if (state == nullptr || states_ == nullptr) {
                 return;
             }
             state->reset();
-            state->inUse.store(false, std::memory_order_release);
+            if (!state->inUse) {
+                return; /* double release: never link the same state twice */
+            }
+            state->inUse = false;
+            const auto index = static_cast<std::uint32_t>(state - states_.get());
+            (void)freeStack_.push(index);
         }
 
     private:
         std::unique_ptr<RequestState[]> states_;
         std::size_t capacity_ = 0;
+        BoundedIndexStack freeStack_;
     };
 
     /* Per-shard inode table and actor-owned preparation FIFO. */

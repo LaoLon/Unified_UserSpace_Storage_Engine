@@ -429,6 +429,17 @@ target_compile_options(request_lookup_test PRIVATE -fno-exceptions -fno-rtti)
 target_link_libraries(request_lookup_test PRIVATE Threads::Threads)
 add_test(NAME request_lookup_test COMMAND request_lookup_test)
 
+# Bounded lock-free index stack MPMC churn test (header-only primitive).
+add_executable(index_stack_test tests/index_stack_test.cpp)
+target_include_directories(index_stack_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests
+)
+target_compile_options(index_stack_test PRIVATE -fno-exceptions -fno-rtti)
+target_link_libraries(index_stack_test PRIVATE Threads::Threads)
+add_test(NAME index_stack_test COMMAND index_stack_test)
+
 # Device-backed data-path test: real NVMe read/write through the async data
 # reactor path (compiles the core sources directly and links SPDK).
 if(HFS_WITH_SPDK)

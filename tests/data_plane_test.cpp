@@ -460,6 +460,41 @@ int main() {
         HFS_TEST_CHECK(hfs::Operation::liveCount() == 0);
     }
 
+    /* 7. concurrent pool churn: the lock-free free list must never hand one
+     * operation to two threads and must return to zero live count. */
+    {
+        constexpr int kThreads = 4;
+        constexpr int kIterations = 20000;
+        hfs::Operation::setPoolCapacity(64);
+        std::atomic<bool> failure{false};
+        std::vector<std::thread> threads;
+        threads.reserve(kThreads);
+        for (int thread = 0; thread < kThreads; ++thread) {
+            threads.emplace_back([&failure]() {
+                for (int i = 0; i < kIterations; ++i) {
+                    auto *operation = hfs::Operation::create(1);
+                    if (operation == nullptr) {
+                        failure.store(true);
+                        continue;
+                    }
+                    if (operation->requestId != 1) {
+                        failure.store(true);
+                    }
+                    operation->requestId = 0xDEADBEEFULL;
+                    if (operation->requestId != 0xDEADBEEFULL) {
+                        failure.store(true);
+                    }
+                    operation->release();
+                }
+            });
+        }
+        for (auto &thread : threads) {
+            thread.join();
+        }
+        HFS_TEST_CHECK(!failure.load());
+        HFS_TEST_CHECK(hfs::Operation::liveCount() == 0);
+    }
+
     std::printf("data_plane_test: ok\n");
     return 0;
 }
