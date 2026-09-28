@@ -27,6 +27,12 @@ public:
     Result<void> addExtents(std::span<const ExtentDescriptor> descriptors);
     /* Removes mappings at or beyond the logical extent (truncate). */
     Result<void> removeFrom(std::uint64_t logicalExtent);
+    /* Index of the first descriptor that can overlap `logicalExtent`. */
+    std::size_t firstOverlapping(std::uint64_t logicalExtent) const noexcept;
+    /* Descriptor by index, or nullptr; valid while the map is unchanged. */
+    const ExtentDescriptor *descriptorAt(std::size_t index) const noexcept;
+    /* True when inserting `descriptors` cannot overlap the current map. */
+    Result<void> validateInsert(std::span<const ExtentDescriptor> descriptors) const;
     std::uint64_t mappedExtents() const noexcept;
     /* Highest mapped logical extent end (0 when empty). */
     std::uint64_t logicalExtents() const noexcept;

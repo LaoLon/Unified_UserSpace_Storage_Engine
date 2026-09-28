@@ -18,6 +18,14 @@ Result<void> InodeExtentMap::addExtents(std::span<const ExtentDescriptor> descri
         }
         const std::uint64_t start = descriptor.logicalExtent;
         const std::uint64_t end = start + descriptor.count;
+        /* Monotonic file growth appends at the end without a search. */
+        if (!extents_.empty()) {
+            const ExtentDescriptor &last = extents_.back();
+            if (start == last.logicalExtent + last.count) {
+                extents_.push_back(descriptor);
+                continue;
+            }
+        }
         auto it = std::lower_bound(extents_.begin(), extents_.end(), start,
                                    [](const ExtentDescriptor &left, std::uint64_t value) {
                                        return left.logicalExtent < value;
@@ -32,6 +40,48 @@ Result<void> InodeExtentMap::addExtents(std::span<const ExtentDescriptor> descri
             return makeError(Status::AlreadyExists, "extent overlaps existing mapping");
         }
         extents_.insert(it, descriptor);
+    }
+    return Result<void>(Status::Ok);
+}
+
+std::size_t InodeExtentMap::firstOverlapping(std::uint64_t logicalExtent) const noexcept {
+    return static_cast<std::size_t>(
+        std::lower_bound(extents_.begin(), extents_.end(), logicalExtent,
+                         [](const ExtentDescriptor &descriptor, std::uint64_t extent) {
+                             return descriptor.logicalExtent + descriptor.count <= extent;
+                         }) -
+        extents_.begin());
+}
+
+const ExtentDescriptor *InodeExtentMap::descriptorAt(std::size_t index) const noexcept {
+    return index < extents_.size() ? &extents_[index] : nullptr;
+}
+
+/* Validates a batch without mutating the map so commitExtents can keep the
+ * old all-or-nothing contract without copying the whole extent vector. */
+Result<void> InodeExtentMap::validateInsert(
+    std::span<const ExtentDescriptor> descriptors) const {
+    for (std::size_t i = 0; i < descriptors.size(); ++i) {
+        const ExtentDescriptor &descriptor = descriptors[i];
+        if (descriptor.count == 0) {
+            return makeError(Status::InvalidArgument, "empty extent descriptor");
+        }
+        const std::uint64_t start = descriptor.logicalExtent;
+        const std::uint64_t end = start + descriptor.count;
+        if (end < start) {
+            return makeError(Status::InvalidArgument, "extent range overflows");
+        }
+        const std::size_t position = firstOverlapping(start);
+        if (position < extents_.size() && extents_[position].logicalExtent < end) {
+            return makeError(Status::AlreadyExists, "extent overlaps existing mapping");
+        }
+        for (std::size_t j = 0; j < i; ++j) {
+            const ExtentDescriptor &other = descriptors[j];
+            if (other.logicalExtent < end &&
+                start < other.logicalExtent + other.count) {
+                return makeError(Status::AlreadyExists, "extent batch overlaps itself");
+            }
+        }
     }
     return Result<void>(Status::Ok);
 }

@@ -72,6 +72,9 @@ struct Counters {
     std::atomic<std::uint64_t> readCopyOutOps{0};
     std::atomic<std::uint64_t> readCopyOutBytes{0};
     std::atomic<std::uint64_t> readCopyOutNs{0};
+    /* Frontend immutable-snapshot cache behavior (per-inode data version). */
+    std::atomic<std::uint64_t> snapshotHits{0};
+    std::atomic<std::uint64_t> snapshotBuilds{0};
     /* Durability-path diagnostics; used to verify that fsync covers in-place
      * data writes (hfs2.0.md 20.3). Relaxed counters, safe to leave enabled. */
     std::atomic<std::uint64_t> syncCalls{0};

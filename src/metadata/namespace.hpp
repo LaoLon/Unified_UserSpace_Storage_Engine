@@ -120,6 +120,11 @@ public:
     std::uint64_t logicalEpoch() const;
     /* Lock-free invalidation key for immutable frontend snapshots. */
     std::uint64_t logicalEpochFast() const noexcept;
+    /* Lock-free per-inode data-map version (logical size + extents + type).
+     * Frontends use it as the invalidation key for immutable read snapshots;
+     * it is independent of the global logical epoch, so unrelated namespace
+     * changes never invalidate a file's snapshot. */
+    std::uint64_t dataVersionFast(FileHandle handle) const noexcept;
     std::uint64_t durableEpoch() const;
     Result<void> publishDurableEpoch(std::uint64_t epoch);
     /* Stages durable sizes in the snapshot without publishing the epoch yet. */
@@ -173,6 +178,11 @@ private:
     /* All helpers run with mutex_ held. */
     std::uint64_t nowNs() const noexcept;
     void touch(Inode &inode, std::uint64_t now, bool content) noexcept;
+    /* Bumps the lock-free data version of one inode (mutex_ held). */
+    void publishDataVersionLocked(Inode &inode) noexcept;
+    /* Marks an inode whose logical size changed since the last durable publish
+     * (mutex_ held); the dirty list keeps publish/prepare O(dirty). */
+    void markSizeDirtyLocked(Inode &inode) noexcept;
     /* All of the following run with mutex_ held. */
     void stageRecord(JournalRecord record);
     void requireCheckpointLocked() noexcept {
@@ -210,7 +220,17 @@ private:
     std::atomic<std::uint64_t> logicalEpochPublished_{0};
     std::uint64_t durableEpoch_ = 0;
     std::uint64_t snapshotTxid_ = 0;
-    std::vector<std::uint64_t> preparedDurableSizes_;
+    /* Before-image of the dirty inodes staged by prepareDurableEpoch. */
+    struct PreparedDurableSize {
+        std::uint64_t inodeId = 0;
+        std::uint64_t durableSize = 0;
+    };
+    std::vector<PreparedDurableSize> preparedDurableSizes_;
+    /* Inodes whose logical size changed since the last durable publish. */
+    std::vector<std::uint64_t> dirtyInodes_;
+    /* Lock-free per-inode data-map versions, indexed by inode id. */
+    std::unique_ptr<std::atomic<std::uint64_t>[]> dataVersions_;
+    std::size_t dataVersionCount_ = 0;
     /* Staged metadata records, their epoch, the writer wake-up hook and the
      * no-record fallback flag (§9.3). */
     std::vector<JournalRecord> pendingRecords_;

@@ -52,6 +52,9 @@ struct HFS_API Snapshot {
     std::uint64_t readCopyOutOps = 0;
     std::uint64_t readCopyOutBytes = 0;
     std::uint64_t readCopyOutNs = 0;
+    /* Frontend immutable-snapshot cache: hits vs rebuilds. */
+    std::uint64_t snapshotHits = 0;
+    std::uint64_t snapshotBuilds = 0;
 };
 
 /* Reads the process-wide counters without stopping the I/O path. */
@@ -86,5 +89,9 @@ HFS_API void recordReadBufferPlan(std::uint64_t bounceChildren,
                                   std::uint64_t directUserChildren,
                                   std::uint64_t directUserBytes) noexcept;
 HFS_API void recordReadCopyOut(std::uint64_t bytes, std::uint64_t nanoseconds) noexcept;
+
+/* Frontend snapshot cache events (per-inode data-version key). */
+HFS_API void recordSnapshotHit() noexcept;
+HFS_API void recordSnapshotBuild() noexcept;
 
 } // namespace hfs::diagnostics

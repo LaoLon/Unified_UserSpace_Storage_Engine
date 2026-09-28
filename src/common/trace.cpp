@@ -94,6 +94,8 @@ bool isHighFrequency(EventId id) noexcept {
     case EventId::RequestBdevSubmit:
     case EventId::RequestBdevComplete:
     case EventId::RequestParentComplete:
+    case EventId::SnapHit:
+    case EventId::SnapBuild:
         return true;
     default:
         return false;

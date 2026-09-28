@@ -94,6 +94,9 @@ Namespace::Namespace(const NamespaceConfig &config, Clock clock, void *clockCont
     : config_(config), clock_(clock != nullptr ? clock : systemNowNs),
       clockContext_(clockContext),
       picker_(config.placement, config.deviceExtents.size()) {
+    /* Value-initialized atomic versions for every possible inode id. */
+    dataVersionCount_ = static_cast<std::size_t>(config_.maxInodes) + 1;
+    dataVersions_ = std::make_unique<std::atomic<std::uint64_t>[]>(dataVersionCount_);
     inodes_.resize(kRootInodeId + 1);
     Inode &root = inodes_[kRootInodeId];
     root.id = kRootInodeId;
@@ -153,6 +156,34 @@ void Namespace::touch(Inode &inode, std::uint64_t now, bool content) noexcept {
     }
     inode.logicalEpoch = logicalEpoch_;
     logicalEpochPublished_.store(logicalEpoch_, std::memory_order_release);
+    if (content) {
+        /* Size/content changes invalidate the frontend data snapshot; pure
+         * namespace-shape touches (rename/link/times) do not. */
+        markSizeDirtyLocked(inode);
+        publishDataVersionLocked(inode);
+    }
+}
+
+/* Bumps the per-inode data version; readers use it as the snapshot key. */
+void Namespace::publishDataVersionLocked(Inode &inode) noexcept {
+    if (inode.id < dataVersionCount_) {
+        dataVersions_[inode.id].fetch_add(1, std::memory_order_release);
+    }
+}
+
+/* Tracks inodes whose durable size must advance on the next publish. */
+void Namespace::markSizeDirtyLocked(Inode &inode) noexcept {
+    if (inode.id != 0 && !inode.sizeDirty) {
+        inode.sizeDirty = true;
+        dirtyInodes_.push_back(inode.id);
+    }
+}
+
+std::uint64_t Namespace::dataVersionFast(FileHandle handle) const noexcept {
+    if (handle.inodeId >= dataVersionCount_) {
+        return 0;
+    }
+    return dataVersions_[handle.inodeId].load(std::memory_order_acquire);
 }
 
 std::uint64_t Namespace::entryBytes(std::string_view name) const noexcept {
@@ -341,11 +372,13 @@ void Namespace::freeInode(std::uint64_t inodeId) noexcept {
         releaseDescriptor(descriptor);
     }
     inode.extents.removeFrom(0);
+    publishDataVersionLocked(inode);
     inode.id = 0; /* slot is free; generation is kept for the next reuse */
     inode.directory = false;
     inode.linkCount = 0;
     inode.openCount = 0;
     inode.logicalSize = 0;
+    inode.sizeDirty = false;
     inode.parent = 0;
     inode.childCount = 0;
     inode.index.reset();
@@ -749,7 +782,6 @@ Result<std::vector<ExtentAllocation>> Namespace::reserveExtents(FileHandle handl
     const std::uint64_t logicalStart = offset / extentBytes;
     const std::uint64_t end = offset + length;
     const std::uint64_t logicalEnd = end / extentBytes + (end % extentBytes != 0 ? 1 : 0);
-    const std::vector<ExtentDescriptor> descriptors = inode.extents.snapshot();
     std::vector<ExtentAllocation> allocations;
     std::vector<std::uint64_t> freeCounts(allocators_.size(), 0);
 
@@ -761,20 +793,29 @@ Result<std::vector<ExtentAllocation>> Namespace::reserveExtents(FileHandle handl
         allocations.clear();
     };
 
+    /* Binary-search the first mapped descriptor that can overlap the range and
+     * walk only descriptors inside it (O(log E + k), no full-map copy). */
+    const std::size_t descriptorCount = inode.extents.size();
+    std::size_t index = inode.extents.firstOverlapping(logicalStart);
     std::uint64_t cursor = logicalStart;
-    std::size_t index = 0;
     while (cursor < logicalEnd) {
-        while (index < descriptors.size() &&
-               descriptors[index].logicalExtent + descriptors[index].count <= cursor) {
-            ++index;
+        while (index < descriptorCount) {
+            const ExtentDescriptor *mapped = inode.extents.descriptorAt(index);
+            if (mapped != nullptr &&
+                mapped->logicalExtent + mapped->count <= cursor) {
+                ++index;
+                continue;
+            }
+            break;
         }
-        if (index < descriptors.size() && descriptors[index].logicalExtent <= cursor) {
-            cursor = descriptors[index].logicalExtent + descriptors[index].count;
+        const ExtentDescriptor *next = inode.extents.descriptorAt(index);
+        if (next != nullptr && next->logicalExtent <= cursor) {
+            cursor = next->logicalExtent + next->count;
             continue;
         }
         std::uint64_t runEnd = logicalEnd;
-        if (index < descriptors.size() && descriptors[index].logicalExtent < runEnd) {
-            runEnd = descriptors[index].logicalExtent;
+        if (next != nullptr && next->logicalExtent < runEnd) {
+            runEnd = next->logicalExtent;
         }
         std::uint64_t remaining = runEnd - cursor;
         std::uint64_t logical = cursor;
@@ -827,8 +868,8 @@ Result<void> Namespace::commitExtents(FileHandle handle,
     std::vector<ExtentDescriptor> descriptors;
     descriptors.reserve(allocations.size());
 
-    /* Validate the complete publish set before changing allocator state. */
-    InodeExtentMap candidate = inode.extents;
+    /* Validate the complete publish set before changing allocator state. The
+     * extent map is checked in place (no full-map copy). */
     for (const ExtentAllocation &allocation : allocations) {
         const std::uint64_t device = allocation.run.deviceId;
         if (allocation.run.count == 0 || device >= allocators_.size() ||
@@ -856,9 +897,9 @@ Result<void> Namespace::commitExtents(FileHandle handle,
         descriptor.deviceId = static_cast<std::uint32_t>(device);
         descriptors.push_back(descriptor);
     }
-    auto added = candidate.addExtents(descriptors);
-    if (!added.ok()) {
-        return added;
+    auto validated = inode.extents.validateInsert(descriptors);
+    if (!validated.ok()) {
+        return validated;
     }
 
     std::size_t committedRuns = 0;
@@ -880,10 +921,21 @@ Result<void> Namespace::commitExtents(FileHandle handle,
         }
         ++committedRuns;
     }
-    inode.extents = std::move(candidate);
+    /* The map was validated above; commit it in place. On an unexpected insert
+     * failure, return the allocator runs to FREE so state stays conserved. */
+    auto added = inode.extents.addExtents(descriptors);
+    if (!added.ok()) {
+        for (const ExtentAllocation &allocation : allocations) {
+            allocators_[allocation.run.deviceId]->release(allocation.run.start,
+                                                          allocation.run.count);
+        }
+        return added;
+    }
     for (const ExtentAllocation &allocation : allocations) {
         stats_.allocatedExtents += allocation.run.count;
     }
+    /* Extent-map changes invalidate readers even without a size change. */
+    publishDataVersionLocked(inode);
     touch(inode, nowNs(), false);
     for (const ExtentAllocation &allocation : allocations) {
         const std::uint64_t device = allocation.run.deviceId;
@@ -1127,6 +1179,7 @@ Result<void> Namespace::applyJournalRecord(const JournalRecord &record) {
         if (!added.ok()) {
             return added;
         }
+        publishDataVersionLocked(*inode);
         touch(*inode, nowNs(), false);
         return Result<void>(Status::Ok);
     }
@@ -1183,11 +1236,20 @@ Result<void> Namespace::publishDurableEpoch(std::uint64_t epoch) {
                          "durable epoch cannot move backwards");
     }
     durableEpoch_ = epoch;
-    for (Inode &inode : inodes_) {
+    /* Only inodes whose size changed since the last publish are visited; all
+     * other inodes already carry a durable size at or beyond this epoch. */
+    std::size_t keep = 0;
+    for (std::size_t index = 0; index < dirtyInodes_.size(); ++index) {
+        const std::uint64_t inodeId = dirtyInodes_[index];
+        Inode &inode = inodes_[inodeId];
         if (inode.id != 0 && inode.logicalEpoch <= epoch) {
             inode.durableSize = inode.logicalSize;
+            inode.sizeDirty = false;
+        } else {
+            dirtyInodes_[keep++] = inodeId;
         }
     }
+    dirtyInodes_.resize(keep);
     preparedDurableSizes_.clear();
     return Result<void>(Status::Ok);
 }
@@ -1205,12 +1267,16 @@ Result<void> Namespace::prepareDurableEpoch(std::uint64_t epoch) {
     if (!preparedDurableSizes_.empty()) {
         return makeError(Status::Busy, "another durable epoch is being prepared");
     }
-    preparedDurableSizes_.reserve(inodes_.size());
-    for (const Inode &inode : inodes_) {
-        preparedDurableSizes_.push_back(inode.durableSize);
+    preparedDurableSizes_.reserve(dirtyInodes_.size());
+    for (const std::uint64_t inodeId : dirtyInodes_) {
+        const Inode &inode = inodes_[inodeId];
+        if (inode.id != 0) {
+            preparedDurableSizes_.push_back(PreparedDurableSize{inodeId, inode.durableSize});
+        }
     }
     /* Stage file sizes before checkpoint; the epoch itself publishes afterward. */
-    for (Inode &inode : inodes_) {
+    for (const std::uint64_t inodeId : dirtyInodes_) {
+        Inode &inode = inodes_[inodeId];
         if (inode.id != 0 && inode.logicalEpoch <= epoch) {
             inode.durableSize = inode.logicalSize;
         }
@@ -1221,9 +1287,9 @@ Result<void> Namespace::prepareDurableEpoch(std::uint64_t epoch) {
 /* Restores staged durable sizes after a failed checkpoint. */
 void Namespace::rollbackPreparedDurableEpoch() noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (preparedDurableSizes_.size() == inodes_.size()) {
-        for (std::size_t i = 0; i < inodes_.size(); ++i) {
-            inodes_[i].durableSize = preparedDurableSizes_[i];
+    for (const PreparedDurableSize &prepared : preparedDurableSizes_) {
+        if (prepared.inodeId < inodes_.size()) {
+            inodes_[prepared.inodeId].durableSize = prepared.durableSize;
         }
     }
     preparedDurableSizes_.clear();
@@ -1430,6 +1496,15 @@ Result<void> Namespace::loadSnapshot(std::span<const std::byte> data) {
     durableEpoch_ = savedDurableEpoch;
     snapshotTxid_ = txid;
     preparedDurableSizes_.clear();
+    dirtyInodes_.clear();
+    /* Snapshots are mount-time only; refresh every per-inode data version so
+     * no stale frontend cache can survive the restore. */
+    for (Inode &inode : inodes_) {
+        inode.sizeDirty = false;
+        if (inode.id != 0) {
+            publishDataVersionLocked(inode);
+        }
+    }
     stats_ = {};
     for (const Inode &inode : inodes_) {
         if (inode.id != 0) {

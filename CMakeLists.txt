@@ -455,6 +455,20 @@ if(HFS_WITH_SPDK)
   target_link_libraries(data_path_device_test PRIVATE Threads::Threads)
   hfs_link_spdk(data_path_device_test)
   add_test(NAME data_path_device_test COMMAND data_path_device_test)
+
+  # Device-backed per-inode snapshot-cache test (review P1-1).
+  add_executable(snapshot_cache_device_test tests/snapshot_cache_device_test.cpp ${HFS_CORE_SRC})
+  target_include_directories(snapshot_cache_device_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests
+  )
+  target_compile_options(snapshot_cache_device_test PRIVATE -fno-exceptions -fno-rtti)
+  target_compile_definitions(snapshot_cache_device_test PRIVATE
+    HFS_TEST_PCI_BDF="${HFS_TEST_PCI_BDF}")
+  target_link_libraries(snapshot_cache_device_test PRIVATE Threads::Threads)
+  hfs_link_spdk(snapshot_cache_device_test)
+  add_test(NAME snapshot_cache_device_test COMMAND snapshot_cache_device_test)
 endif()
 
 # Namespace/inode/directory-index structure test (internal sources, no SPDK).

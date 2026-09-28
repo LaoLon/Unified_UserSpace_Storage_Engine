@@ -1,4 +1,5 @@
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <string>
 #include <thread>
@@ -389,6 +390,100 @@ int main() {
         stat = ns.stat(handle.value());
         HFS_TEST_CHECK(stat.ok() && stat.value().durableSize == 4096);
         HFS_TEST_CHECK(!ns.publishDurableEpoch(logical - 1).ok());
+    }
+
+    /* Per-inode data version: only the file's own data-map changes invalidate
+     * the frontend snapshot; rename/link touches must not. */
+    {
+        auto created = Namespace::create(testConfig(64, 1ULL << 20), fakeClock, nullptr);
+        HFS_TEST_CHECK(created.ok());
+        Namespace &ns = *created.value();
+        auto first = ns.create("/v1", true, false, false);
+        auto second = ns.create("/v2", true, false, false);
+        HFS_TEST_CHECK(first.ok() && second.ok());
+
+        const std::uint64_t firstBefore = ns.dataVersionFast(first.value());
+        const std::uint64_t secondBefore = ns.dataVersionFast(second.value());
+        HFS_TEST_CHECK(ns.setSize(first.value(), 4096).ok());
+        HFS_TEST_CHECK(ns.dataVersionFast(first.value()) != firstBefore);
+        HFS_TEST_CHECK(ns.dataVersionFast(second.value()) == secondBefore);
+
+        const std::uint64_t firstAfterSize = ns.dataVersionFast(first.value());
+        HFS_TEST_CHECK(ns.rename("/v1", "/v1-renamed").ok());
+        HFS_TEST_CHECK(ns.dataVersionFast(first.value()) == firstAfterSize);
+
+        /* prepare stages only the dirty inode; rollback restores it. */
+        auto statFirst = ns.stat(first.value());
+        HFS_TEST_CHECK(statFirst.ok() && statFirst.value().durableSize == 0);
+        const std::uint64_t epoch = ns.logicalEpoch();
+        HFS_TEST_CHECK(ns.prepareDurableEpoch(epoch).ok());
+        statFirst = ns.stat(first.value());
+        HFS_TEST_CHECK(statFirst.ok() && statFirst.value().durableSize == 4096);
+        HFS_TEST_CHECK(!ns.prepareDurableEpoch(epoch).ok()); /* already staged */
+        ns.rollbackPreparedDurableEpoch();
+        statFirst = ns.stat(first.value());
+        HFS_TEST_CHECK(statFirst.ok() && statFirst.value().durableSize == 0);
+        HFS_TEST_CHECK(ns.publishDurableEpoch(epoch).ok());
+        statFirst = ns.stat(first.value());
+        const auto statSecond = ns.stat(second.value());
+        HFS_TEST_CHECK(statFirst.ok() && statFirst.value().durableSize == 4096);
+        HFS_TEST_CHECK(statSecond.ok() && statSecond.value().durableSize == 0);
+    }
+
+    /* Durable publish cost follows the dirty set, not the inode count. */
+    {
+        const auto measurePublish = [](std::uint64_t inodeCount, bool &ok) -> long long {
+            auto created = Namespace::create(testConfig(inodeCount + 8, 64ULL << 20),
+                                             fakeClock, nullptr);
+            if (!created.ok()) {
+                ok = false;
+                return 0;
+            }
+            Namespace &ns = *created.value();
+            if (!ns.create("/f", false, false, true).ok()) {
+                ok = false;
+                return 0;
+            }
+            for (std::uint64_t index = 0; index < inodeCount; ++index) {
+                char name[64];
+                std::snprintf(name, sizeof(name), "/f/%llu",
+                              static_cast<unsigned long long>(index));
+                if (!ns.create(name, true, false, false).ok()) {
+                    ok = false;
+                    return 0;
+                }
+            }
+            auto handle = ns.create("/f/dirty", true, false, false);
+            if (!handle.ok()) {
+                ok = false;
+                return 0;
+            }
+            constexpr int kPublishes = 100;
+            const auto start = std::chrono::steady_clock::now();
+            for (int iteration = 0; iteration < kPublishes; ++iteration) {
+                const bool grown =
+                    ns.setSize(handle.value(), 4096 + static_cast<std::uint64_t>(iteration))
+                        .ok();
+                const bool published = ns.publishDurableEpoch(ns.logicalEpoch()).ok();
+                if (!grown || !published) {
+                    ok = false;
+                    return 0;
+                }
+            }
+            const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     std::chrono::steady_clock::now() - start)
+                                     .count();
+            return elapsed / kPublishes;
+        };
+        bool smallOk = true;
+        bool largeOk = true;
+        const auto small = measurePublish(1000, smallOk);
+        const auto large = measurePublish(20000, largeOk);
+        HFS_TEST_CHECK(smallOk && largeOk);
+        std::printf("namespace durable publish: ns/publish small_inodes=%lld "
+                    "large_inodes=%lld\n",
+                    static_cast<long long>(small), static_cast<long long>(large));
+        HFS_TEST_CHECK(large < 1000000); /* sanity: must not be O(inode count^2) */
     }
 
     std::printf("namespace_test: ok\n");

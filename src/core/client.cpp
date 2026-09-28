@@ -16,6 +16,7 @@
 #include "core/async_data_service.hpp"
 #include "core/data_plane.hpp"
 #include "core/request_lookup.hpp"
+#include "hfs/diagnostics.hpp"
 #include "metadata/inode_map.hpp"
 #include "metadata/namespace.hpp"
 
@@ -50,7 +51,9 @@ enum class ClientLifecycle : std::uint8_t {
 struct AsyncFileSnapshot {
     FileStat stat{};
     metadata::InodeExtentMap extentMap;
-    std::uint64_t namespaceEpoch = 0;
+    /* Per-inode data-map version; only this file's own size/extent changes
+     * invalidate the snapshot (namespace-wide changes do not). */
+    std::uint64_t dataVersion = 0;
 };
 
 /* One bounded frontend slot keeps the immutable extent snapshot alive until
@@ -456,17 +459,19 @@ struct File::Impl {
     mutable std::mutex asyncCacheMutex;
     mutable std::shared_ptr<const AsyncFileSnapshot> asyncCache;
 
-    /* Refresh metadata only when the namespace publication epoch changes. */
+    /* Refresh metadata only when this inode's data-map version changes. */
     Result<std::shared_ptr<const AsyncFileSnapshot>> asyncSnapshot() const {
         if (state == nullptr || state->namespaceState == nullptr) {
             return makeError<std::shared_ptr<const AsyncFileSnapshot>>(
                 Status::InvalidState, "file namespace is unavailable");
         }
-        const std::uint64_t currentEpoch = state->namespaceState->logicalEpochFast();
+        const std::uint64_t currentVersion =
+            state->namespaceState->dataVersionFast(handle);
         {
             std::lock_guard<std::mutex> lock(asyncCacheMutex);
-            if (asyncCache != nullptr &&
-                asyncCache->namespaceEpoch == currentEpoch) {
+            if (asyncCache != nullptr && asyncCache->dataVersion == currentVersion) {
+                diagnostics::recordSnapshotHit();
+                trace::event(trace::EventId::SnapHit, handle.inodeId, currentVersion);
                 return asyncCache;
             }
         }
@@ -474,7 +479,7 @@ struct File::Impl {
         /* A retry closes the stat/extents race with a concurrent metadata
          * mutation without holding the namespace mutex across allocations. */
         for (unsigned attempt = 0; attempt < 3; ++attempt) {
-            const std::uint64_t before = state->namespaceState->logicalEpochFast();
+            const std::uint64_t before = state->namespaceState->dataVersionFast(handle);
             auto stat = state->namespaceState->stat(handle);
             if (!stat.ok()) {
                 return makeError<std::shared_ptr<const AsyncFileSnapshot>>(
@@ -485,19 +490,22 @@ struct File::Impl {
                 return makeError<std::shared_ptr<const AsyncFileSnapshot>>(
                     map.status(), map.message());
             }
-            const std::uint64_t after = state->namespaceState->logicalEpochFast();
+            const std::uint64_t after = state->namespaceState->dataVersionFast(handle);
             if (before != after) {
                 continue;
             }
             auto refreshed = std::make_shared<AsyncFileSnapshot>();
             refreshed->stat = stat.value();
             refreshed->extentMap = std::move(map).value();
-            refreshed->namespaceEpoch = after;
+            refreshed->dataVersion = after;
             std::lock_guard<std::mutex> lock(asyncCacheMutex);
-            if (state->namespaceState->logicalEpochFast() != after) {
+            if (state->namespaceState->dataVersionFast(handle) != after) {
                 continue;
             }
             asyncCache = std::move(refreshed);
+            diagnostics::recordSnapshotBuild();
+            trace::event(trace::EventId::SnapBuild, handle.inodeId, after,
+                         static_cast<std::uint64_t>(asyncCache->extentMap.size()));
             return asyncCache;
         }
         return makeError<std::shared_ptr<const AsyncFileSnapshot>>(

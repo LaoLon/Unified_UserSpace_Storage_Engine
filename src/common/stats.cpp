@@ -74,6 +74,8 @@ Snapshot snapshot() noexcept {
     value.readCopyOutOps = c.readCopyOutOps.load(std::memory_order_relaxed);
     value.readCopyOutBytes = c.readCopyOutBytes.load(std::memory_order_relaxed);
     value.readCopyOutNs = c.readCopyOutNs.load(std::memory_order_relaxed);
+    value.snapshotHits = c.snapshotHits.load(std::memory_order_relaxed);
+    value.snapshotBuilds = c.snapshotBuilds.load(std::memory_order_relaxed);
     return value;
 }
 
@@ -125,6 +127,8 @@ void reset() noexcept {
     c.readCopyOutOps.store(0, std::memory_order_relaxed);
     c.readCopyOutBytes.store(0, std::memory_order_relaxed);
     c.readCopyOutNs.store(0, std::memory_order_relaxed);
+    c.snapshotHits.store(0, std::memory_order_relaxed);
+    c.snapshotBuilds.store(0, std::memory_order_relaxed);
 }
 
 void recordFrontendRead(bool cacheHit, std::uint64_t requestBytes) noexcept {
@@ -225,6 +229,16 @@ void recordReadCopyOut(std::uint64_t bytes, std::uint64_t nanoseconds) noexcept 
     c.readCopyOutOps.fetch_add(1, std::memory_order_relaxed);
     c.readCopyOutBytes.fetch_add(bytes, std::memory_order_relaxed);
     c.readCopyOutNs.fetch_add(nanoseconds, std::memory_order_relaxed);
+}
+
+void recordSnapshotHit() noexcept {
+    if (!stats::enabled()) return;
+    stats::counters().snapshotHits.fetch_add(1, std::memory_order_relaxed);
+}
+
+void recordSnapshotBuild() noexcept {
+    if (!stats::enabled()) return;
+    stats::counters().snapshotBuilds.fetch_add(1, std::memory_order_relaxed);
 }
 
 } // namespace hfs::diagnostics
