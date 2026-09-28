@@ -93,6 +93,9 @@ struct FioHfsThread {
     std::unique_ptr<FioHfsPending[]> pending;
     std::unique_ptr<FioHfsReported[]> reported;
     std::unique_ptr<hfs::CompletionEvent[]> polled;
+    /* Free pending-slot index stack; frontend-owner private, O(1) reserve. */
+    std::unique_ptr<std::uint32_t[]> freePending;
+    std::size_t freePendingCount = 0;
 };
 
 /* FIO numjobs share one process lock while retaining one Client per worker. */
@@ -372,7 +375,10 @@ std::uint32_t nextGeneration(FioHfsPending &slot) noexcept {
     return slot.generation;
 }
 
-void clearPending(FioHfsPending &slot) noexcept {
+void clearPending(FioHfsThread &state, FioHfsPending &slot) noexcept {
+    if (slot.state == PendingState::Free) {
+        return; /* already released: never link the same slot twice */
+    }
     if (slot.bounceOwner != nullptr && slot.bounce != nullptr &&
         slot.bounceAllocationSize != 0) {
         slot.bounceOwner->releaseDmaBuffer(slot.bounce, slot.bounceAllocationSize);
@@ -387,6 +393,10 @@ void clearPending(FioHfsPending &slot) noexcept {
     slot.bounceSize = 0;
     slot.bounceAllocationSize = 0;
     slot.state = PendingState::Free;
+    const auto index = static_cast<std::uint32_t>(&slot - state.pending.get());
+    if (state.freePendingCount < state.slotCount) {
+        state.freePending[state.freePendingCount++] = index;
+    }
 }
 
 struct PreallocationContext {
@@ -673,7 +683,9 @@ int fioHfsInit(struct thread_data *td) {
         state->pending.reset(new (std::nothrow) FioHfsPending[state->slotCount]);
         state->reported.reset(new (std::nothrow) FioHfsReported[state->slotCount]);
         state->polled.reset(new (std::nothrow) hfs::CompletionEvent[state->slotCount]);
-        if (state->pending == nullptr || state->reported == nullptr || state->polled == nullptr) {
+        state->freePending.reset(new (std::nothrow) std::uint32_t[state->slotCount]);
+        if (state->pending == nullptr || state->reported == nullptr ||
+            state->polled == nullptr || state->freePending == nullptr) {
             fioLog("fio-hfs: asynchronous pending table allocation failed\n");
             state->client->close().wait();
             state->client.reset();
@@ -684,18 +696,20 @@ int fioHfsInit(struct thread_data *td) {
             releaseProcessUser();
             return 1;
         }
+        for (std::size_t index = 0; index < state->slotCount; ++index) {
+            state->freePending[index] = static_cast<std::uint32_t>(index);
+        }
+        state->freePendingCount = state->slotCount;
     }
     td->io_ops_data = state;
     return 0;
 }
 
-std::size_t findFreePending(const FioHfsThread &state) noexcept {
-    for (std::size_t index = 0; index < state.slotCount; ++index) {
-        if (state.pending[index].state == PendingState::Free) {
-            return index;
-        }
+std::size_t findFreePending(FioHfsThread &state) noexcept {
+    if (state.freePendingCount == 0) {
+        return state.slotCount;
     }
-    return state.slotCount;
+    return state.freePending[--state.freePendingCount];
 }
 
 /* Validate a completion before touching the frontend-owned io_u. */
@@ -742,14 +756,14 @@ bool consumeCompletion(FioHfsThread &state, const hfs::CompletionEvent &event,
         --state.submitted;
     }
     if (releaseNow) {
-        clearPending(*slot);
+        clearPending(state, *slot);
         recordReaped();
         return true;
     }
     if (state.reportedCount >= state.slotCount) {
         fioLog("fio-hfs: completion report table overflow\n");
         state.protocolError = true;
-        clearPending(*slot);
+        clearPending(state, *slot);
         return false;
     }
     const auto slotIndex = static_cast<std::uint32_t>(slot - state.pending.get());
@@ -777,7 +791,7 @@ io_u *releaseReported(FioHfsThread &state, std::size_t reportIndex) noexcept {
         return nullptr;
     }
     io_u *io = slot.io;
-    clearPending(slot);
+    clearPending(state, slot);
     recordReaped();
     state.reported[reportIndex] = {};
     if (state.reportedRemaining != 0) {
@@ -1118,7 +1132,7 @@ enum fio_q_status fioHfsQueue(struct thread_data *td, struct io_u *io) {
     if (!state->direct) {
         auto acquired = state->engine->acquireDmaBuffer(io->xfer_buflen, 0);
         if (!acquired.ok()) {
-            clearPending(slot);
+            clearPending(*state, slot);
             if (isQueueRetryable(acquired.status())) {
                 processQueueBusy.fetch_add(1, std::memory_order_relaxed);
                 io->error = 0;
@@ -1147,7 +1161,7 @@ enum fio_q_status fioHfsQueue(struct thread_data *td, struct io_u *io) {
             : state->client->submitWrite(file->file, buffer, io->offset, token);
     if (!submitted.ok()) {
         const hfs::Status status = submitted.status();
-        clearPending(slot);
+        clearPending(*state, slot);
         if (isQueueRetryable(status)) {
             processQueueBusy.fetch_add(1, std::memory_order_relaxed);
             io->error = 0;

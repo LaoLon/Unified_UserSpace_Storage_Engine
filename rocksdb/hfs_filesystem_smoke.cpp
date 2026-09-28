@@ -277,23 +277,21 @@ int main(int argc, char **argv) {
     std::atomic<bool> timeoutCallback = false;
     void *timeoutHandle = nullptr;
     rocksdb::IOHandleDeleter timeoutDeleter;
-    if (::setenv("HFS_TEST_ASYNC_READ_DELAY_MS", "25", 1) != 0) {
-        return 12;
-    }
+    hfs::rocksdb_adapter::setAsyncReadDelayMs(25);
     status = random->ReadAsync(
         timeoutRequest, timeoutOptions,
         [&timeoutCallback](const rocksdb::FSReadRequest &, void *) {
             timeoutCallback.store(true);
         }, nullptr, &timeoutHandle, &timeoutDeleter, &debug);
     if (!status.ok() || timeoutHandle == nullptr || !timeoutDeleter) {
-        ::unsetenv("HFS_TEST_ASYNC_READ_DELAY_MS");
+        hfs::rocksdb_adapter::setAsyncReadDelayMs(0);
         return 12;
     }
     std::vector<void *> timeoutHandles{timeoutHandle};
     status = fileSystem->Poll(timeoutHandles, 1);
     if (!status.ok() || !timeoutCallback.load() || !timeoutRequest.status.IsTimedOut() ||
         timeoutRequest.result.size() != 0) {
-        ::unsetenv("HFS_TEST_ASYNC_READ_DELAY_MS");
+        hfs::rocksdb_adapter::setAsyncReadDelayMs(0);
         timeoutDeleter(timeoutHandle);
         return 12;
     }
@@ -301,14 +299,12 @@ int main(int argc, char **argv) {
      * rewrite the already published request status. */
     if (!fileSystem->AbortIO(timeoutHandles).ok() ||
         !timeoutRequest.status.IsTimedOut()) {
-        ::unsetenv("HFS_TEST_ASYNC_READ_DELAY_MS");
+        hfs::rocksdb_adapter::setAsyncReadDelayMs(0);
         timeoutDeleter(timeoutHandle);
         return 12;
     }
     timeoutDeleter(timeoutHandle);
-    if (::unsetenv("HFS_TEST_ASYNC_READ_DELAY_MS") != 0) {
-        return 12;
-    }
+    hfs::rocksdb_adapter::setAsyncReadDelayMs(0);
     /* Abort wins when it reaches the request before the timeout callback
      * boundary, even when the request also carries a short timeout. */
     rocksdb::IOOptions cancelTimeoutOptions;
@@ -320,9 +316,7 @@ int main(int argc, char **argv) {
     std::atomic<bool> cancelTimeoutCallback = false;
     void *cancelTimeoutHandle = nullptr;
     rocksdb::IOHandleDeleter cancelTimeoutDeleter;
-    if (::setenv("HFS_TEST_ASYNC_READ_DELAY_MS", "50", 1) != 0) {
-        return 12;
-    }
+    hfs::rocksdb_adapter::setAsyncReadDelayMs(50);
     status = random->ReadAsync(
         cancelTimeoutRequest, cancelTimeoutOptions,
         [&cancelTimeoutCallback](const rocksdb::FSReadRequest &, void *) {
@@ -333,16 +327,14 @@ int main(int argc, char **argv) {
         !fileSystem->AbortIO(cancelTimeoutHandles).ok() ||
         !fileSystem->Poll(cancelTimeoutHandles, 1).ok() ||
         cancelTimeoutCallback.load() || !cancelTimeoutRequest.status.IsAborted()) {
-        ::unsetenv("HFS_TEST_ASYNC_READ_DELAY_MS");
+        hfs::rocksdb_adapter::setAsyncReadDelayMs(0);
         if (cancelTimeoutHandle != nullptr && cancelTimeoutDeleter) {
             cancelTimeoutDeleter(cancelTimeoutHandle);
         }
         return 12;
     }
     cancelTimeoutDeleter(cancelTimeoutHandle);
-    if (::unsetenv("HFS_TEST_ASYNC_READ_DELAY_MS") != 0) {
-        return 12;
-    }
+    hfs::rocksdb_adapter::setAsyncReadDelayMs(0);
     /* Abort after callback entry must not rewrite callback-visible status. */
     char boundaryScratch[12]{};
     rocksdb::FSReadRequest boundaryRequest;
@@ -357,9 +349,7 @@ int main(int argc, char **argv) {
     /* The boundary test needs the callback to start before the caller polls,
      * which only the shared dispatcher guarantees; the delay injection routes
      * this read to the dispatcher even when worker-direct reads are enabled. */
-    if (::setenv("HFS_TEST_ASYNC_READ_DELAY_MS", "1", 1) != 0) {
-        return 12;
-    }
+    hfs::rocksdb_adapter::setAsyncReadDelayMs(1);
     status = random->ReadAsync(
         boundaryRequest, options.io_options,
         [&](const rocksdb::FSReadRequest &, void *) {
@@ -370,7 +360,7 @@ int main(int argc, char **argv) {
             boundaryCallback.store(true);
         }, nullptr, &boundaryHandle, &boundaryDeleter, &debug);
     if (!status.ok() || boundaryHandle == nullptr || !boundaryDeleter) {
-        ::unsetenv("HFS_TEST_ASYNC_READ_DELAY_MS");
+        hfs::rocksdb_adapter::setAsyncReadDelayMs(0);
         boundaryRelease.store(true);
         if (boundaryHandle != nullptr && boundaryDeleter) boundaryDeleter(boundaryHandle);
         return 12;
@@ -379,14 +369,14 @@ int main(int argc, char **argv) {
         std::this_thread::yield();
     }
     if (!boundaryEntered.load()) {
-        ::unsetenv("HFS_TEST_ASYNC_READ_DELAY_MS");
+        hfs::rocksdb_adapter::setAsyncReadDelayMs(0);
         boundaryRelease.store(true);
         boundaryDeleter(boundaryHandle);
         return 12;
     }
     std::vector<void *> boundaryHandles{boundaryHandle};
     if (!fileSystem->AbortIO(boundaryHandles).ok()) {
-        ::unsetenv("HFS_TEST_ASYNC_READ_DELAY_MS");
+        hfs::rocksdb_adapter::setAsyncReadDelayMs(0);
         boundaryRelease.store(true);
         boundaryDeleter(boundaryHandle);
         return 12;
@@ -394,14 +384,12 @@ int main(int argc, char **argv) {
     boundaryRelease.store(true);
     if (!fileSystem->Poll(boundaryHandles, 1).ok() || !boundaryCallback.load() ||
         !boundaryRequest.status.ok() || boundaryRequest.result.compare(payload) != 0) {
-        ::unsetenv("HFS_TEST_ASYNC_READ_DELAY_MS");
+        hfs::rocksdb_adapter::setAsyncReadDelayMs(0);
         boundaryDeleter(boundaryHandle);
         return 12;
     }
     boundaryDeleter(boundaryHandle);
-    if (::unsetenv("HFS_TEST_ASYNC_READ_DELAY_MS") != 0) {
-        return 12;
-    }
+    hfs::rocksdb_adapter::setAsyncReadDelayMs(0);
     rocksdb::FSReadRequest invalidRequest;
     invalidRequest.offset = 0;
     invalidRequest.len = 1;
@@ -422,9 +410,7 @@ int main(int argc, char **argv) {
     std::vector<void *> cancelHandleList;
     cancelHandleList.reserve(cancelCount);
     std::atomic<std::size_t> cancelCallbacks = 0;
-    if (::setenv("HFS_TEST_ASYNC_READ_DELAY_MS", "50", 1) != 0) {
-        return 12;
-    }
+    hfs::rocksdb_adapter::setAsyncReadDelayMs(50);
     for (std::size_t index = 0; index < cancelCount; ++index) {
         cancelRequests[index].offset = 0;
         cancelRequests[index].len = sizeof(cancelScratch[index]);
@@ -435,7 +421,7 @@ int main(int argc, char **argv) {
                 cancelCallbacks.fetch_add(1);
             }, nullptr, &cancelHandles[index], &cancelDeleters[index], &debug);
         if (!status.ok() || cancelHandles[index] == nullptr || !cancelDeleters[index]) {
-            ::unsetenv("HFS_TEST_ASYNC_READ_DELAY_MS");
+            hfs::rocksdb_adapter::setAsyncReadDelayMs(0);
             for (std::size_t cleanup = 0; cleanup < index; ++cleanup) {
                 cancelDeleters[cleanup](cancelHandles[cleanup]);
             }
@@ -446,18 +432,13 @@ int main(int argc, char **argv) {
     status = fileSystem->AbortIO(cancelHandleList);
     if (!status.ok() || !fileSystem->Poll(cancelHandleList, cancelCount).ok() ||
         cancelCallbacks.load() != 0) {
-        ::unsetenv("HFS_TEST_ASYNC_READ_DELAY_MS");
+        hfs::rocksdb_adapter::setAsyncReadDelayMs(0);
         for (std::size_t index = 0; index < cancelCount; ++index) {
             cancelDeleters[index](cancelHandles[index]);
         }
         return 12;
     }
-    if (::unsetenv("HFS_TEST_ASYNC_READ_DELAY_MS") != 0) {
-        for (std::size_t index = 0; index < cancelCount; ++index) {
-            cancelDeleters[index](cancelHandles[index]);
-        }
-        return 12;
-    }
+    hfs::rocksdb_adapter::setAsyncReadDelayMs(0);
     for (std::size_t index = 0; index < cancelCount; ++index) {
         if (!cancelRequests[index].status.IsAborted()) {
             for (std::size_t cleanup = 0; cleanup < cancelCount; ++cleanup) {

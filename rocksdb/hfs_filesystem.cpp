@@ -43,6 +43,37 @@ namespace hfs::rocksdb_adapter {
 
 namespace {
 
+/* Test-only async-read delay cache; see setAsyncReadDelayMs() in the header. */
+std::atomic<std::uint32_t> gAsyncReadDelayMs{0};
+std::atomic<bool> gAsyncReadDelayResolved{false};
+
+} // namespace
+
+void setAsyncReadDelayMs(std::uint32_t milliseconds) noexcept {
+    gAsyncReadDelayMs.store(milliseconds, std::memory_order_relaxed);
+    gAsyncReadDelayResolved.store(true, std::memory_order_release);
+}
+
+namespace {
+
+/* Resolves the test-only delay once so ReadAsync stays getenv-free. */
+std::uint32_t asyncReadDelayMs() noexcept {
+    if (!gAsyncReadDelayResolved.load(std::memory_order_acquire)) {
+        std::uint32_t value = 0;
+        const char *text = std::getenv("HFS_TEST_ASYNC_READ_DELAY_MS");
+        if (text != nullptr && *text != '\0') {
+            char *end = nullptr;
+            const unsigned long parsed = std::strtoul(text, &end, 10);
+            if (end != text && *end == '\0' && parsed <= 60000) {
+                value = static_cast<std::uint32_t>(parsed);
+            }
+        }
+        gAsyncReadDelayMs.store(value, std::memory_order_relaxed);
+        gAsyncReadDelayResolved.store(true, std::memory_order_release);
+    }
+    return gAsyncReadDelayMs.load(std::memory_order_relaxed);
+}
+
 /* Temporary P0 call-pattern counters (env HFS_ROCKSDB_IO_STATS=1). */
 std::atomic<std::uint64_t> gAppendCalls{0};
 std::atomic<std::uint64_t> gAppendBytes{0};
@@ -1281,14 +1312,12 @@ public:
             if (options.timeout.count() > 0) {
                 state->deadline = std::chrono::steady_clock::now() + options.timeout;
             }
-            const char *delayText = std::getenv("HFS_TEST_ASYNC_READ_DELAY_MS");
-            if (delayText != nullptr && *delayText != '\0') {
-                char *end = nullptr;
-                const unsigned long delay = std::strtoul(delayText, &end, 10);
-                if (end != delayText && *end == '\0' && delay <= 60000) {
-                    state->notBefore = std::chrono::steady_clock::now() +
-                                       std::chrono::milliseconds(delay);
-                }
+            /* Test-only delay injection: cached in an atomic so the read path
+             * never calls getenv; tests switch it at runtime. */
+            const std::uint32_t delayMs = asyncReadDelayMs();
+            if (delayMs != 0) {
+                state->notBefore = std::chrono::steady_clock::now() +
+                                   std::chrono::milliseconds(delayMs);
             }
 
             /* Experimental fast path: submit from the RocksDB worker itself so
