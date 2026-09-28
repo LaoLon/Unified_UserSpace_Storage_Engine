@@ -1,3 +1,4 @@
+#include <chrono>
 #include <cstdio>
 #include <random>
 #include <vector>
@@ -282,6 +283,49 @@ int main() {
         HFS_TEST_CHECK(stats.completes == kTotal);
         HFS_TEST_CHECK(stats.pendingPeak > 0);
         HFS_TEST_CHECK(stats.dependencyWaits > 0);
+    }
+
+    /* 8. trigger check for the unbalanced interval index (review P1-6):
+     * monotonically increasing offsets with a deep active window are the worst
+     * case for a degenerate BST. The per-file active set in production is
+     * bounded by concurrent operations on one file, so this only documents
+     * the cost; it must not blow up. */
+    {
+        constexpr std::size_t kTotal = 5000;
+        constexpr std::size_t kWindow = 4096;
+        hfs::InodeDependencyScheduler scheduler;
+        AdmissionLog log;
+        scheduler.setAdmitCallback(AdmissionLog::callback, &log);
+        std::vector<SchedulerNode> nodes(kTotal);
+        std::size_t next = 0;
+        std::size_t completed = 0;
+        const auto start = std::chrono::steady_clock::now();
+        while (completed < kTotal) {
+            if (next < kTotal && log.admitted.size() < kWindow) {
+                nodes[next] = makeNode(next * 64, next * 64 + 64, OperationKind::Write);
+                (void)scheduler.submit(nodes[next]);
+                ++next;
+                continue;
+            }
+            if (!log.admitted.empty()) {
+                SchedulerNode *node = log.admitted.back();
+                log.admitted.pop_back();
+                scheduler.complete(*node);
+                ++completed;
+                continue;
+            }
+            HFS_TEST_CHECK(false); /* no runnable node and nothing pending */
+            break;
+        }
+        const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                 std::chrono::steady_clock::now() - start)
+                                 .count();
+        HFS_TEST_CHECK(scheduler.activeCount() == 0);
+        HFS_TEST_CHECK(scheduler.pendingCount() == 0);
+        std::printf("scheduler monotonic: total=%zu window=%zu ns_per_node=%.0f\n",
+                    kTotal, kWindow,
+                    static_cast<double>(elapsed) / static_cast<double>(kTotal));
+        HFS_TEST_CHECK(elapsed / static_cast<long long>(kTotal) < 100000);
     }
 
     std::printf("scheduler_test: ok\n");
