@@ -682,6 +682,54 @@ RequestParentComplete→CqPush→FeReap` 的推导与 p50/p99；`trace-manifest.
 - 同步路径剩余的每 I/O 一对 `mutex/condvar` 交接（新 profile 的主要热点）
   属于 P0-8 的 parent latch 方案。
 
+## 13. Stage D 实施记录（2026-09-29）
+
+> 按 §8 阶段 D 执行 P0-7、P0-8 与 P1-6 的触发条件验证；P1-5 与 P2 设计修订仍未开始。
+
+### 13.1 已实施项
+
+| 项 | 内容 | 提交 |
+|---|---|---|
+| P0-7 | `ReadAsync` 每读不再 `make_unique<AsyncReadState>` + `std::function` 拷贝：新增 per-worker 有界状态池（maxOutstanding+32，溢出回退堆），并把缓存 File 查找、token 分配与 submit 合并到 `DirectWorkerEntry` 一次加锁；删除不再使用的 `directWorkerFile`。池只拥有空闲状态，在用状态由 opaque handle 拥有，release 先等 terminal 再入池 | `1b1aa25` |
+| P0-8 | `DataPath::execute` 的 4 个 `std::vector` 改为固定数组，每 child 的 mutex/condvar 改为每请求一个 `ParentLatch`：child 回调递减共享 pending，每个 phase 只做一次 condvar 交接；超时只报告一次但继续等迟到完成。 | `3fbb7e6` |
+| P1-6 | 新增单调区间 + 4096 深 active window 的 microbenchmark（`scheduler_test`）证明触发条件：**5.9 µs/node**；生产形状每文件并发窗口为几十，未触发，暂不重写 balanced tree | `d1c13c7` |
+
+### 13.2 验证证据
+
+- **P0-7 RocksDB readrandom A/B（Stage C → Stage D，同会话交错 3 轮）**：
+  32 线程、8 万 key × 1 KiB、16 MiB block cache、direct reads：
+
+  | 侧 | 中位 readrandom（ops/s） | timeouts |
+  |---|---:|---:|
+  | Stage C | 63638.0 | 0 |
+  | Stage D | 63912.0 | 0 |
+
+  `StageD/StageC = 1.0043`；该形状受设备延迟支配（~16 µs/read），
+  每读节省的分配/加锁不改变吞吐量级。`hfs_rocksdb_smoke`（含 timeout/abort/
+  错误注入与 free-space reclaim）通过。
+- **P0-8 同步路径 A/B（Stage C → Stage D）**：`hfs_async=0`、16 jobs × QD8、
+  4K randrw 10 s，中位 **45503 → 45686 IOPS（+0.4%）**；同 workload
+  task-clock 7578 → 7654 ms（噪声内）。该形状同样由设备往返支配，
+  收益为去掉每 I/O 的堆分配与 N−1 次 condvar 交接；`data_path_device_test`
+  （RMW/超时/sparse/direct-bounce）通过。
+- **回归**：完整 CTest **29/29** 通过（含真实 `Nvme0n1` 设备测试）；
+  `hfsctl check` 语义路径通过；测试后设备恢复内核 `nvme` 驱动。
+
+### 13.3 观测到的偶发事件
+
+- 在 P0-7 的首次大工作集 A/B 中，新构建某一轮 `fillrandom` 出现 27 次
+  `data path child timed out`（>5 s 无完成），其余轮次与随后 3 次复现尝试
+  均无超时；dmesg 无新增 NVMe 超时（设备由 SPDK 接管）。按 VM 已知的偶发
+  设备停顿归类为环境事件并保留记录；若后续复现，按 bug.md 流程定位。
+
+### 13.4 未包含在阶段 D 的内容
+
+- P1-5 hot/cold split（`RequestState` footprint）与 P1-6 balanced tree：
+  前者需要先有 footprint/分配证据；后者已由 §13.1 的 microbenchmark 判定未触发。
+- P2-1 zero-copy frontend、P2-2 增量 checkpoint、P2-3 metadata actor 收敛、
+  P2-4 arena 分区：均需先修订 `doc/design/hfs2.0.md` 或先有 profile 证据，
+  尚未开始。
+
 ## 附录 A：优化点 → 代码位置索引
 
 | 编号 | 主要位置 |
