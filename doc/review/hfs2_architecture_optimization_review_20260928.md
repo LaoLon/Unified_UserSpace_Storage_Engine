@@ -586,6 +586,57 @@ RequestParentComplete→CqPush→FeReap` 的推导与 p50/p99；`trace-manifest.
   File 缓存、P0-8 DataPath 有界数组：留给阶段 B/C，按 §8 分项设计、提交与 A/B。
 - P1/P2 各项不变。
 
+## 11. Stage B 实施记录（2026-09-29）
+
+> 按 §8 阶段 B 实施：有界池 + immutable data snapshot + 元数据 O(log)/dirty。
+> 与 Stage A 相同口径：未做的逐项 A/B 明确标注，组合 A/B 与专项证据分开列出。
+
+### 11.1 已实施项
+
+| 项 | 内容 | 提交 |
+|---|---|---|
+| P0-1 | `processValid()` 移除每 API 的 `getpid()`：缓存 pid + `pthread_atfork` child 标志（只存 lock-free flag），fork child 仍 fail closed | `6d586c4` |
+| P0-2/P0-3 | 新增 `BoundedIndexStack`（tagged head、预分配、ABA-safe）；`OperationPool` 去掉全局 mutex 并按 capacity 一次性预分配；`StatePool` 去掉 O(pool) CAS 扫描；`RequestState::reset` 只清本轮用到的 child/lease | `e714af3` |
+| P0-6 | `DmaArena` live 分配改地址有序 map（`ownsRange` O(log N)），`release` 仅在存在 waiter 时 notify | `b2a9c54` |
+| P1-1 | 新增 per-inode `dataVersionFast`（lock-free），`File::Impl::asyncSnapshot` 改以该版本为 key：其他文件增长不再使本文件快照失效；rename/link 等形状变更不失效；extent 提交/尺寸变化才失效。新增 `SnapHit`/`SnapBuild` trace 点与 snapshot 诊断计数 | `113f36f` |
+| P1-4 | `reserveExtents` 二分定位后只走区间内 descriptor（不再全量 snapshot）；`commitExtents` 用 `validateInsert` 原位校验后直接插入（不再整表拷贝）；`addExtents` 增加单调增长 append 快路径 | `113f36f` |
+| P1-7 | `publishDurableEpoch`/`prepareDurableEpoch`/`rollbackPreparedDurableEpoch` 只访问自上次发布以来 size 变化的 inode（dirty list + before-image） | `113f36f` |
+
+### 11.2 验证证据
+
+- **组合 A/B（Stage A → Stage B，同会话交错 5 轮）**：FIO 8j4 口径（4K `randrw`
+  50/50、256 MiB、8 jobs × iodepth 4、10 s）：
+
+  | 侧 | 中位 IOPS | p99 读/写（µs） | closure |
+  |---|---:|---|---|
+  | Stage A（`git HEAD` 单独构建） | 76851.1 | 667.6 / 667.6 | yes |
+  | Stage B | 81892.4 | 626.7 / 626.7 | yes |
+
+  `StageB/StageA = 1.0656`，p99 约 −6.1%，所有轮次 closure 完整。
+- **P0-1 专项**：同一 160k-op RocksDB workload 的 `syscalls:sys_enter_getpid`：
+  pre-A 5410、Stage A 5408、Stage B **258**（−95.2%）。
+- **P1-1 专项**（`snapshot_cache_device_test`，真实 NVMe）：
+  `hits=3 builds=2`，逐项断言：B 首次读 build、重复读 hit、**A 增长不使 B 失效**、
+  B 新 extent 使 B 失效、B 原地覆盖仍 hit。
+- **P1-7 专项**（`namespace_test`）：publish 平均耗时 1000 inode=58 ns、
+  20000 inode=45 ns（与 inode 数无关）；prepare/rollback/重复 prepare Busy 断言通过。
+- **P0-2/P0-3 专项**：`index_stack_test` 4 线程 × 200k 次 pop/push，
+  800000 次交付、0 次空、无重复交付、256 个索引全部归位；`data_plane_test`
+  并发池 churn 后 `liveCount==0`。
+- **P0-6 专项**：`io_planner_test` 既有边界断言（interior、跨界、foreign、
+  release 后失效）全部通过。
+- **回归**：完整 CTest **29/29** 通过（新增 `index_stack_test`、
+  `snapshot_cache_device_test`），含真实 `Nvme0n1` 设备测试与 `hfsctl check`
+  语义路径；测试后设备恢复内核 `nvme` 驱动。
+
+### 11.3 未包含在阶段 B 的内容
+
+- P0-2 的 `RequestState` footprint 进一步热/冷拆分、P0-7 RocksDB direct File
+  缓存/状态池、P0-8 `DataPath` 有界数组、P1-2 同步 ingress、P1-3 doorbell 无锁、
+  P1-5 hot/cold split、P1-6 scheduler：留给阶段 C/D，按 §8 分项实施。
+- P1-1 的快照发布仍持 per-File mutex（key 已改为 per-inode，失效范围问题已解决）；
+  无锁发布/RCU 留待有 profile 证据后再做。
+
 ## 附录 A：优化点 → 代码位置索引
 
 | 编号 | 主要位置 |
