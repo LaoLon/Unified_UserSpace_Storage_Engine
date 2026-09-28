@@ -140,6 +140,18 @@ struct AsyncDataPollerContext {
     std::uint32_t shard = 0;
 };
 
+/* Stops a mount-time trace session when mount fails before publishing. */
+struct MountTraceGuard {
+    bool active = false;
+    ~MountTraceGuard() {
+        if (active) {
+            trace::setEnabled(false);
+            trace::stop();
+        }
+    }
+    void release() noexcept { active = false; }
+};
+
 /* Runs only the owning shard actor from the data-reactor poll loop. Reports
  * work so idle detection keeps polling while async operations are in flight. */
 int pumpAsyncDataShard(void *context) noexcept {
@@ -302,6 +314,17 @@ Task<Result<void>> Engine::mount() {
     if (impl.mounted) {
         co_return Result<void>(Status::InvalidState, "engine already mounted");
     }
+    /* Start the observability session before the runtime and journal replay so
+     * mount/recovery trace points land in this session (hfs2.0.md §16.5). */
+    stats::setEnabled(impl.config.stats);
+    trace::setSample(impl.config.traceSample);
+    trace::stop();
+    if (impl.config.trace && !trace::start(impl.config.traceDir.c_str())) {
+        log::info("trace session unavailable; tracing disabled");
+    }
+    trace::setEnabled(impl.config.trace && trace::sessionActive());
+    MountTraceGuard traceGuard;
+    traceGuard.active = impl.config.trace && trace::sessionActive();
     auto &runtime = SpdkRuntime::instance();
     auto started = runtime.start(impl.config);
     if (!started.ok()) {
@@ -563,13 +586,7 @@ Task<Result<void>> Engine::mount() {
     impl.formatted = true;
     impl.uuid = volume.value().uuid;
     impl.mounted = true;
-    stats::setEnabled(impl.config.stats);
-    trace::setSample(impl.config.traceSample);
-    trace::stop();
-    if (impl.config.trace && !trace::start(impl.config.traceDir.c_str())) {
-        log::info("trace session unavailable; tracing disabled");
-    }
-    trace::setEnabled(impl.config.trace && trace::sessionActive());
+    traceGuard.release();
     log::info("engine mounted: generation=%llu clean=%d",
               static_cast<unsigned long long>(volume.value().generation),
               volume.value().cleanShutdown ? 1 : 0);
@@ -740,6 +757,8 @@ Result<void> Engine::syncMetadata(std::uint64_t epoch) {
             if (epoch <= impl_->namespaceState->durableEpoch() &&
                 !SpdkRuntime::instance().dataFlushPending()) {
                 stats::counters().syncEarlyReturns.fetch_add(1, std::memory_order_relaxed);
+                trace::event(trace::EventId::FsyncEnd, epoch,
+                             static_cast<std::uint64_t>(Status::Ok), 1ULL);
                 return Result<void>(Status::Ok);
             }
             if (impl_->syncBatch != nullptr && !impl_->syncBatch->completed) {
@@ -759,6 +778,8 @@ Result<void> Engine::syncMetadata(std::uint64_t epoch) {
             stats::counters().syncJoiners.fetch_add(1, std::memory_order_relaxed);
             if (epoch <= batch->frozenTargetEpoch &&
                 !SpdkRuntime::instance().dataFlushPending()) {
+                trace::event(trace::EventId::FsyncEnd, epoch,
+                             static_cast<std::uint64_t>(batch->status), 2ULL);
                 return Result<void>(batch->status, batch->message);
             }
             /* This waiter arrived after the batch target was frozen, or a data
@@ -783,6 +804,8 @@ Result<void> Engine::syncMetadata(std::uint64_t epoch) {
         Result<void> result(Status::Ok);
         stats::counters().syncBarriers.fetch_add(1, std::memory_order_relaxed);
         const auto barrierStart = std::chrono::steady_clock::now();
+        trace::event(trace::EventId::FsyncBegin, targetEpoch,
+                     static_cast<std::uint64_t>(epoch));
         const bool checkpointNeeded = targetEpoch > impl_->namespaceState->durableEpoch();
         bool prepared = false;
         /* Phase 1 (metadata, hfs2.0.md §9.3): namespace-shape changes and
@@ -880,6 +903,8 @@ Result<void> Engine::syncMetadata(std::uint64_t epoch) {
             batch->completed = true;
         }
         batch->condition.notify_all();
+        trace::event(trace::EventId::FsyncEnd, targetEpoch,
+                     static_cast<std::uint64_t>(result.status()), 3ULL);
         return result;
     }
 }

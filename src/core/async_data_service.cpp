@@ -401,6 +401,7 @@ public:
         }
         if (!sink.tryAcquireCredit()) {
             busy_.fetch_add(1, std::memory_order_relaxed);
+            trace::event(trace::EventId::BusyReject, 0, 1ULL);
             return makeError<IoHandle>(Status::Busy, "client outstanding credit exhausted");
         }
 
@@ -410,6 +411,7 @@ public:
         if (operation == nullptr) {
             sink.releaseCredit();
             busy_.fetch_add(1, std::memory_order_relaxed);
+            trace::event(trace::EventId::BusyReject, requestId, 2ULL);
             return makeError<IoHandle>(Status::Busy, "operation pool exhausted");
         }
         RequestState *state = statePool_.acquire();
@@ -417,6 +419,7 @@ public:
             operation->release();
             sink.releaseCredit();
             busy_.fetch_add(1, std::memory_order_relaxed);
+            trace::event(trace::EventId::BusyReject, requestId, 3ULL);
             return makeError<IoHandle>(Status::Busy, "async sidecar pool exhausted");
         }
 
@@ -467,6 +470,7 @@ public:
             operation->release();
             sink.releaseCredit();
             busy_.fetch_add(1, std::memory_order_relaxed);
+            trace::event(trace::EventId::BusyReject, requestId, 4ULL);
             return makeError<IoHandle>(Status::Busy, "frontend handle pool exhausted");
         }
 
@@ -480,6 +484,7 @@ public:
             operation->release();
             sink.releaseCredit();
             busy_.fetch_add(1, std::memory_order_relaxed);
+            trace::event(trace::EventId::BusyReject, requestId, 5ULL);
             return makeError<IoHandle>(Status::Busy, "shard ring is full");
         }
 
@@ -811,6 +816,9 @@ private:
 
         const Status dmaStatus = acquireLeases(state);
         if (dmaStatus == Status::Busy) {
+            /* DMA shortage stays bounded: the request is parked for an actor
+             * retry instead of holding a scheduler node or blocking a thread. */
+            trace::event(trace::EventId::Retry, state.requestId, 1ULL);
             if (!parkPreparing(state)) {
                 dmaFailures_.fetch_add(1, std::memory_order_relaxed);
                 finish(state, Status::NoMemory, ENOMEM);
@@ -1133,6 +1141,11 @@ private:
                                       : statusForBackendErrno(result.backendErrno);
             completeChild(state, childIndex, status, result.backendErrno, 0);
             return;
+        }
+        if (result.disposition == AsyncDataBackend::SubmitDisposition::WaitingForCredit) {
+            /* Accepted without a backend slot; the reactor-local pending list
+             * retries it after a slot releases. */
+            trace::event(trace::EventId::Retry, state.requestId, childIndex, 2ULL);
         }
         if (!child.counted) {
             /* Count each child once, regardless of how many RMW phases it needs,

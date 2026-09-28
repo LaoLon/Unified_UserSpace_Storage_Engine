@@ -13,6 +13,7 @@
 #include "common/log.hpp"
 #include "common/stats.hpp"
 #include "common/test_hooks.hpp"
+#include "common/trace.hpp"
 #include "hfs/core.hpp"
 #include "hfs/crc.hpp"
 #include "hfs/superblock.hpp"
@@ -852,7 +853,11 @@ Result<std::unique_ptr<Journal>> Journal::open(JournalDevice &device,
 
 Result<void> Journal::replay() {
     std::lock_guard<std::mutex> lock(impl_->mutex);
-    return replayLocked();
+    trace::event(trace::EventId::RecoveryBegin, impl_->tail, impl_->head);
+    auto replayed = replayLocked();
+    trace::event(trace::EventId::RecoveryEnd, impl_->validTransactions,
+                 static_cast<std::uint64_t>(replayed.status()), impl_->lastTxid);
+    return replayed;
 }
 
 Result<void> Journal::replayLocked() {
@@ -1115,6 +1120,10 @@ Result<std::uint64_t> Journal::appendLocked(std::span<const JournalRecord> recor
     }
     impl.lastTxid = txid;
     impl.refreshStats();
+    trace::event(trace::EventId::JournalAppend, txid,
+                 static_cast<std::uint64_t>(records.size()),
+                 static_cast<std::uint64_t>(slotCount) * impl.blockSize,
+                 flushDevice ? 1ULL : 0ULL);
     return txid;
 }
 
@@ -1134,31 +1143,47 @@ Result<void> Journal::checkpointLocked(bool deferFlush) {
     if (impl.target == nullptr) {
         return makeError(Status::InvalidState, "checkpoint requires a replay target");
     }
+    const std::uint64_t checkpointTxid = impl.lastTxid;
+    trace::event(trace::EventId::ChkptBegin, checkpointTxid, impl.head - impl.tail);
     std::vector<std::byte> snapshot;
     const auto snapshotStart = std::chrono::steady_clock::now();
     auto saved = impl.target->saveSnapshot(impl.lastTxid, snapshot);
     stats::counters().syncCheckpointSnapshot.record(elapsedNs(snapshotStart));
     if (!saved.ok()) {
+        trace::event(trace::EventId::ChkptEnd, checkpointTxid,
+                     static_cast<std::uint64_t>(saved.status()));
         return saved;
     }
+    trace::event(trace::EventId::ChkptBytes, checkpointTxid,
+                 static_cast<std::uint64_t>(snapshot.size()));
     if (impl.target->snapshotTxid() != impl.lastTxid) {
+        trace::event(trace::EventId::ChkptEnd, checkpointTxid,
+                     static_cast<std::uint64_t>(Status::Corrupt));
         return makeError(Status::Corrupt, "snapshot txid does not match the journal tail");
     }
     auto checkpoint = impl.buildCheckpointRecord(snapshot);
     if (!checkpoint.ok()) {
+        trace::event(trace::EventId::ChkptEnd, checkpointTxid,
+                     static_cast<std::uint64_t>(checkpoint.status()));
         return makeError(checkpoint.status(), checkpoint.message());
     }
     auto superblockRecord = impl.buildSuperblockRecord();
     if (!superblockRecord.ok()) {
+        trace::event(trace::EventId::ChkptEnd, checkpointTxid,
+                     static_cast<std::uint64_t>(superblockRecord.status()));
         return makeError(superblockRecord.status(), superblockRecord.message());
     }
     auto written = impl.writeCheckpointAndSuperblock(checkpoint.value(), superblockRecord.value(),
                                                      deferFlush);
     if (!written.ok()) {
+        trace::event(trace::EventId::ChkptEnd, checkpointTxid,
+                     static_cast<std::uint64_t>(written.status()));
         return written;
     }
     impl.tail = impl.head;
     impl.refreshStats();
+    trace::event(trace::EventId::ChkptEnd, checkpointTxid,
+                 static_cast<std::uint64_t>(Status::Ok));
     return Result<void>(Status::Ok);
 }
 
