@@ -45,6 +45,11 @@ if ! grep -q "Lazily create this thread's own client" \
   git -C "$SRC" apply --check "$PATCH_ROOT/hfs_seam_shard108_async_lazy.patch"
   git -C "$SRC" apply "$PATCH_ROOT/hfs_seam_shard108_async_lazy.patch"
 fi
+if ! grep -q 'AioBatchRequest' \
+     "$SRC/storage/innobase/os/hfs_vfs.h"; then
+  git -C "$SRC" apply --check "$PATCH_ROOT/hfs_seam_shard109_aio_batch.patch"
+  git -C "$SRC" apply "$PATCH_ROOT/hfs_seam_shard109_aio_batch.patch"
+fi
 
 cmake -S "$SRC" -B "$BUILD" -G Ninja \
   -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \

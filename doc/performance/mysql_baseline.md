@@ -328,3 +328,37 @@ async_fallbacks=47580`（异步覆盖 ~92%）。
 `/home/hfs/mysql-readonly-diag-20260928`（修复前定位与 perf）、
 `/home/hfs/mysql-readonly-lazyfix-20260928`（A/B）、
 `/home/hfs/mysql-large-1m-lazyfix-20260928`（修复后矩阵）。
+
+## 11. seam 批量提交优化（Shard-109，2026-09-28）
+
+### 11.1 实现
+
+`hfs_vfs::aioBatch`（`mysql/patches/hfs_seam_shard109_aio_batch.patch`）：一次把整批
+HFS I/O 通过本线程 client 提交（每批最多 16 条在途），再用一个 poll 循环收割全部
+完成，替代"每 I/O 一次提交+等待"；任何提交失败或请求错误都会 drain 已提交项后
+回退到原来的逐 slot 路径。调用点在 InnoDB 模拟 AIO 的合并批处理
+（`SimulatedAIOHandler::io()`）：当批内 ≥2 个 slot 且都是 HFS 句柄、非 punch-hole
+时走批量路径。
+
+### 11.2 覆盖与结果（HFS-only 大工作集，两次运行取均值）
+
+`async_batch_ios≈12.2k / 529k` 个异步 I/O（约 **2.3%**）：模拟 AIO 只在
+`merge_adjacent` 合并到同文件相邻 slot 时才形成批，随机读/点查多为单 slot，
+不进入批量路径。两次运行对比 Shard-108 基线：
+
+| 场景 | Shard-108 | Shard-109（两次均值） | 变化 |
+|---|---:|---:|---:|
+| read_only | 7947.85 | 8071.64 | +1.6% |
+| point_select | 203505.04 | 202513.22 | −0.5% |
+| write_only | 5270.95 | 5156.12 | −2.2% |
+| read_write | 2571.36 | 2568.20 | −0.1% |
+| seq_scan（平均秒） | 0.154 | 0.155 | +1.0% |
+
+结论：批处理实现正确，但在本负载下覆盖率低，端到端变化在会话噪声范围内
+（±2%），不作为独立性能结论；`read_only` 的 p99 略降（9.39→8.43/8.74 ms）。
+非相邻 slot 的扩展（`fill_batch`）已试验并回退：覆盖率提升到 7.5% 但读场景
+回退 2–5%（证据 `/home/hfs/mysql-large-1m-batchfill-20260928`），未保留。
+
+证据：`/home/hfs/mysql-large-1m-batch-20260928`、
+`/home/hfs/mysql-large-1m-batch2-20260928`（两次确认）；
+`mysql-large-1m-batchfill-20260928`（回退的扩展实验）。

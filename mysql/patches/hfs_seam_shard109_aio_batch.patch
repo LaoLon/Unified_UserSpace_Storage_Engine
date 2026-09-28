@@ -1,0 +1,176 @@
+--- a/storage/innobase/os/hfs_vfs.h	2026-09-28 07:20:40.882368892 +0000
++++ b/storage/innobase/os/hfs_vfs.h	2026-09-28 07:20:40.897214573 +0000
+@@ -46,6 +46,21 @@
+          std::size_t *out);
+ int write(int handle, const void *buf, std::size_t n, std::uint64_t offset,
+           std::size_t *out);
++
++/* One HFS I/O inside an adjacent AIO batch. */
++struct AioBatchRequest {
++  int handle{-1};
++  void *ptr{nullptr};
++  std::size_t len{0};
++  std::uint64_t offset{0};
++  bool write{false};
++};
++
++/* Runs a whole adjacent HFS AIO batch through this thread's client: submits
++ * every request, then polls once until all complete. Returns true only when
++ * the batch used the async path and every request succeeded; false means the
++ * caller must run the original per-slot path. */
++bool aioBatch(const AioBatchRequest *requests, std::size_t count);
+ int flush(int handle);
+ std::uint64_t size(int handle);
+ int setSize(int handle, std::uint64_t size, bool flush);
+--- a/storage/innobase/os/hfs_vfs.cc	2026-09-28 07:20:40.883412197 +0000
++++ b/storage/innobase/os/hfs_vfs.cc	2026-09-28 07:23:16.530222851 +0000
+@@ -73,6 +73,7 @@
+   std::atomic<std::uint64_t> asyncReads{0};
+   std::atomic<std::uint64_t> asyncWrites{0};
+   std::atomic<std::uint64_t> asyncFallbacks{0};
++  std::atomic<std::uint64_t> asyncBatchIos{0};
+   struct Entry {
+     std::shared_ptr<hfs::File> file;
+     std::uint64_t position = 0;
+@@ -456,6 +457,93 @@
+ 
+ } // namespace
+ 
++/* Runs a whole adjacent HFS AIO batch through this thread's client: every
++ * request is submitted before the first completion is reaped, so one io thread
++ * keeps several device I/Os in flight and pays one poll loop per batch instead
++ * of one wait per slot. Falls back to the per-slot path when the batch cannot
++ * be submitted or any request fails. */
++bool aioBatch(const AioBatchRequest *requests, std::size_t count) {
++  if (requests == nullptr || count == 0) {
++    return false;
++  }
++  ThreadClientHolder *holder = t_holder.get();
++  if (holder == nullptr || holder->client == nullptr) {
++    (void)threadClient();
++    holder = t_holder.get();
++  }
++  if (holder == nullptr || holder->client == nullptr) {
++    return false;
++  }
++  /* Keep each in-flight chunk below the client's outstanding credit. */
++  constexpr std::size_t kBatchChunk = 16;
++  const auto deadline =
++      std::chrono::steady_clock::now() + std::chrono::seconds(60);
++  std::size_t done = 0;
++  while (done < count) {
++    const std::size_t chunk = std::min(kBatchChunk, count - done);
++    std::array<std::uint64_t, kBatchChunk> ids{};
++    std::size_t submitted = 0;
++    bool abort = false;
++    for (std::size_t i = 0; i < chunk && !abort; ++i) {
++      const AioBatchRequest &request = requests[done + i];
++      auto file = lookupHandle(request.handle);
++      if (file == nullptr || request.ptr == nullptr || request.len == 0) {
++        abort = true;
++        break;
++      }
++      hfs::CompletionToken token{};
++      token.slot = static_cast<std::uint32_t>(i);
++      token.generation = ++holder->tokenGeneration;
++      if (token.generation == 0) {
++        token.generation = ++holder->tokenGeneration;
++      }
++      hfs::IoVec vec{static_cast<std::byte *>(request.ptr), request.len};
++      auto submittedResult =
++          request.write
++              ? holder->client->submitWrite(file, vec, request.offset, token)
++              : holder->client->submitRead(file, vec, request.offset, token);
++      if (!submittedResult.ok()) {
++        abort = true;
++        break;
++      }
++      ids[i] = submittedResult.value().requestId();
++      ++submitted;
++    }
++    /* Reap everything already submitted before reporting the fallback. */
++    std::size_t remaining = submitted;
++    bool ok = !abort;
++    std::array<hfs::CompletionEvent, 32> events{};
++    while (remaining > 0) {
++      auto polled = holder->client->poll(
++          std::span<hfs::CompletionEvent>(events.data(), events.size()), 1,
++          events.size(), std::chrono::microseconds(1000));
++      if (polled.status != hfs::Status::Ok) {
++        return false;
++      }
++      for (std::size_t e = 0; e < polled.count; ++e) {
++        for (std::size_t j = 0; j < submitted; ++j) {
++          if (ids[j] != 0 && ids[j] == events[e].requestId) {
++            ids[j] = 0;
++            --remaining;
++            if (events[e].status != hfs::Status::Ok) {
++              ok = false;
++            }
++          }
++        }
++      }
++      if (std::chrono::steady_clock::now() >= deadline) {
++        return false;
++      }
++    }
++    if (!ok) {
++      return false;
++    }
++    state().asyncBatchIos.fetch_add(submitted, std::memory_order_relaxed);
++    done += chunk;
++  }
++  return true;
++}
++
+ bool isHfsHandle(int handle) { return handle >= kHandleBase; }
+ 
+ /* Installs forwarding handlers when running inside mysqld. Called after
+@@ -593,7 +681,8 @@
+   std::fprintf(
+       stderr,
+       "hfs_vfs: shutdown complete (thread_clients=%llu fallback=%llu "
+-      "async_reads=%llu async_writes=%llu async_fallbacks=%llu)\n",
++      "async_reads=%llu async_writes=%llu async_fallbacks=%llu "
++      "async_batch_ios=%llu)\n",
+       static_cast<unsigned long long>(
+           bridge.threadClients.load(std::memory_order_relaxed)),
+       static_cast<unsigned long long>(
+@@ -603,7 +692,9 @@
+       static_cast<unsigned long long>(
+           bridge.asyncWrites.load(std::memory_order_relaxed)),
+       static_cast<unsigned long long>(
+-          bridge.asyncFallbacks.load(std::memory_order_relaxed)));
++          bridge.asyncFallbacks.load(std::memory_order_relaxed)),
++      static_cast<unsigned long long>(
++          bridge.asyncBatchIos.load(std::memory_order_relaxed)));
+   /* The engine object is intentionally kept alive until process exit so that
+    * late thread-local client destructors never observe a freed engine. */
+ }
+--- a/storage/innobase/os/os0file.cc	2026-09-28 07:20:40.884453189 +0000
++++ b/storage/innobase/os/os0file.cc	2026-09-28 07:29:36.439561148 +0000
+@@ -7403,6 +7403,24 @@
+ 
+   /** Do the I/O with ordinary, synchronous i/o functions: */
+   void io() {
++    /* HFS batch fast path: adjacent slots are submitted together and reaped
++     * with a single poll loop instead of one wait per slot. */
++    if (m_n_elems > 1 && !first_slot()->type.punch_hole() &&
++        hfs_vfs::isHfsHandle(first_slot()->file.m_file)) {
++      std::vector<hfs_vfs::AioBatchRequest> batch(m_n_elems);
++      const bool batch_write = first_slot()->type.is_write();
++      for (ulint i = 0; i < m_n_elems; ++i) {
++        Slot *slot = m_slots[i];
++        batch[i].handle = slot->file.m_file;
++        batch[i].ptr = slot->ptr;
++        batch[i].len = slot->len;
++        batch[i].offset = slot->offset;
++        batch[i].write = batch_write;
++      }
++      if (hfs_vfs::aioBatch(batch.data(), batch.size())) {
++        return;
++      }
++    }
+     if (first_slot()->type.is_write()) {
+       for (ulint i = 0; i < m_n_elems; ++i) {
+         write(m_slots[i]);
