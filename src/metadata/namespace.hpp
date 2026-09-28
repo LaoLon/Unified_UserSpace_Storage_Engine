@@ -88,6 +88,18 @@ public:
     Result<void> close(FileHandle handle);
     Stats stats() const;
 
+    /* Summed allocator state across data devices (diagnostics only). */
+    struct ExtentPoolStats {
+        std::uint64_t total = 0;
+        std::uint64_t capacity = 0;
+        std::uint64_t free = 0;
+        std::uint64_t reserved = 0;
+        std::uint64_t initialized = 0;
+        std::uint64_t committed = 0;
+        std::uint64_t freeRuns = 0;
+    };
+    ExtentPoolStats extentPoolStats() const;
+
     /* Reserves extents covering the unmapped parts of [offset, offset+length);
      * callers zero-initialize the runs and then commit (or release). */
     Result<std::vector<ExtentAllocation>> reserveExtents(FileHandle handle,

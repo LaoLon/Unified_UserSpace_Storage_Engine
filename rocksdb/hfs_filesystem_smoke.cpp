@@ -67,6 +67,14 @@ int main(int argc, char **argv) {
         return 5;
     }
     const uint64_t initialFreeSpace = freeSpace;
+    /* Per-step free-space trail for extent-reclaim diagnostics. */
+    auto printFreeSpace = [&](const char *label) {
+        uint64_t value = 0;
+        if (fileSystem->GetFreeSpace("/", options.io_options, &value, &debug).ok()) {
+            std::fprintf(stderr, "smoke free-space %s: %llu\n", label,
+                         static_cast<unsigned long long>(value));
+        }
+    };
     /* Every output-bearing FileSystem API must fail closed on a null output. */
     if (!fileSystem->NewSequentialFile("/rocksdb-missing", options, nullptr, &debug)
              .IsInvalidArgument() ||
@@ -108,6 +116,7 @@ int main(int argc, char **argv) {
     if (!status.ok() || freeSpace >= initialFreeSpace) {
         return 7;
     }
+    printFreeSpace("after-writable-close");
     const uint64_t allocatedFreeSpace = freeSpace;
     uint64_t missingSize = 0;
     auto missingSizeStatus =
@@ -345,6 +354,12 @@ int main(int argc, char **argv) {
     std::atomic<bool> boundaryCallback = false;
     void *boundaryHandle = nullptr;
     rocksdb::IOHandleDeleter boundaryDeleter;
+    /* The boundary test needs the callback to start before the caller polls,
+     * which only the shared dispatcher guarantees; the delay injection routes
+     * this read to the dispatcher even when worker-direct reads are enabled. */
+    if (::setenv("HFS_TEST_ASYNC_READ_DELAY_MS", "1", 1) != 0) {
+        return 12;
+    }
     status = random->ReadAsync(
         boundaryRequest, options.io_options,
         [&](const rocksdb::FSReadRequest &, void *) {
@@ -355,6 +370,7 @@ int main(int argc, char **argv) {
             boundaryCallback.store(true);
         }, nullptr, &boundaryHandle, &boundaryDeleter, &debug);
     if (!status.ok() || boundaryHandle == nullptr || !boundaryDeleter) {
+        ::unsetenv("HFS_TEST_ASYNC_READ_DELAY_MS");
         boundaryRelease.store(true);
         if (boundaryHandle != nullptr && boundaryDeleter) boundaryDeleter(boundaryHandle);
         return 12;
@@ -363,12 +379,14 @@ int main(int argc, char **argv) {
         std::this_thread::yield();
     }
     if (!boundaryEntered.load()) {
+        ::unsetenv("HFS_TEST_ASYNC_READ_DELAY_MS");
         boundaryRelease.store(true);
         boundaryDeleter(boundaryHandle);
         return 12;
     }
     std::vector<void *> boundaryHandles{boundaryHandle};
     if (!fileSystem->AbortIO(boundaryHandles).ok()) {
+        ::unsetenv("HFS_TEST_ASYNC_READ_DELAY_MS");
         boundaryRelease.store(true);
         boundaryDeleter(boundaryHandle);
         return 12;
@@ -376,10 +394,14 @@ int main(int argc, char **argv) {
     boundaryRelease.store(true);
     if (!fileSystem->Poll(boundaryHandles, 1).ok() || !boundaryCallback.load() ||
         !boundaryRequest.status.ok() || boundaryRequest.result.compare(payload) != 0) {
+        ::unsetenv("HFS_TEST_ASYNC_READ_DELAY_MS");
         boundaryDeleter(boundaryHandle);
         return 12;
     }
     boundaryDeleter(boundaryHandle);
+    if (::unsetenv("HFS_TEST_ASYNC_READ_DELAY_MS") != 0) {
+        return 12;
+    }
     rocksdb::FSReadRequest invalidRequest;
     invalidRequest.offset = 0;
     invalidRequest.len = 1;
@@ -469,6 +491,7 @@ int main(int argc, char **argv) {
     if (!fileSystem->DeleteFile("/rocksdb-error", options.io_options, &debug).ok()) {
         return 12;
     }
+    printFreeSpace("after-delete-error");
     /* RocksDB publishes CURRENT and MANIFEST through atomic namespace rename;
      * verify both the new name and the absence of the old name. */
     status = fileSystem->RenameFile("/rocksdb-smoke", "/rocksdb-renamed",
@@ -476,6 +499,7 @@ int main(int argc, char **argv) {
     if (!status.ok()) {
         return 13;
     }
+    printFreeSpace("after-rename");
     if (!fileSystem->FileExists("/rocksdb-renamed", options.io_options, &debug).ok()) {
         return 13;
     }
@@ -533,18 +557,24 @@ int main(int argc, char **argv) {
     directory.reset();
     /* Release the last open inode reference before checking extent reclaim. */
     random.reset();
+    printFreeSpace("before-cleanup-deletes");
     status = fileSystem->DeleteFile("/rocksdb-renamed", options.io_options, &debug);
     if (!status.ok()) {
         return 16;
     }
+    printFreeSpace("after-delete-renamed");
     status = fileSystem->DeleteFile("/rocksdb-link", options.io_options, &debug);
     if (!status.ok() ||
         !fileSystem->DeleteDir("/rocksdb-dir", options.io_options, &debug).ok() ||
         !fileSystem->DeleteDir("/rocksdb-dir-direct", options.io_options, &debug).ok()) {
         return 16;
     }
+    printFreeSpace("after-delete-link");
     status = fileSystem->GetFreeSpace("/", options.io_options, &freeSpace, &debug);
     if (!status.ok() || freeSpace != initialFreeSpace) {
+        std::fprintf(stderr, "smoke reclaim mismatch: initial=%llu final=%llu\n",
+                     static_cast<unsigned long long>(initialFreeSpace),
+                     static_cast<unsigned long long>(freeSpace));
         return 16;
     }
     std::printf("free-space reclaim: initial=%llu allocated=%llu final=%llu\n",

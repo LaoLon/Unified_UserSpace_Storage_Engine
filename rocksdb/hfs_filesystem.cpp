@@ -54,6 +54,15 @@ std::atomic<std::uint64_t> gReadCalls{0};
 std::atomic<std::uint64_t> gMultiReadCalls{0};
 std::atomic<std::uint64_t> gMultiReadRequests{0};
 std::atomic<std::uint64_t> gReadAsyncCalls{0};
+/* Extent-lifecycle diagnostics for the large-library NoSpace investigation. */
+std::atomic<std::uint64_t> gAllocateCalls{0};
+std::atomic<std::uint64_t> gDeleteCalls{0};
+std::atomic<std::uint64_t> gRenameCalls{0};
+/* Live adapter handle counts by file kind (destructor-decremented). */
+std::atomic<std::int64_t> gLiveWritable{0};
+std::atomic<std::int64_t> gLiveRandom{0};
+std::atomic<std::int64_t> gLiveSequential{0};
+std::atomic<std::int64_t> gLiveDirectory{0};
 bool ioStatsEnabled() {
     static const bool enabled = std::getenv("HFS_ROCKSDB_IO_STATS") != nullptr;
     return enabled;
@@ -64,7 +73,9 @@ void reportIoStats() {
                  "hfs-rocksdb io stats: append_calls=%llu append_bytes=%llu flush_calls=%llu "
                  "sync_calls=%llu buffer_flushes=%llu write_throughs=%llu "
                  "read_calls=%llu multiread_calls=%llu multiread_requests=%llu "
-                 "readasync_calls=%llu\n",
+                 "readasync_calls=%llu allocate_calls=%llu delete_calls=%llu "
+                 "rename_calls=%llu live_writable=%lld live_random=%lld "
+                 "live_sequential=%lld live_directory=%lld\n",
                  (unsigned long long)gAppendCalls.load(),
                  (unsigned long long)gAppendBytes.load(),
                  (unsigned long long)gFlushCalls.load(),
@@ -74,7 +85,14 @@ void reportIoStats() {
                  (unsigned long long)gReadCalls.load(),
                  (unsigned long long)gMultiReadCalls.load(),
                  (unsigned long long)gMultiReadRequests.load(),
-                 (unsigned long long)gReadAsyncCalls.load());
+                 (unsigned long long)gReadAsyncCalls.load(),
+                 (unsigned long long)gAllocateCalls.load(),
+                 (unsigned long long)gDeleteCalls.load(),
+                 (unsigned long long)gRenameCalls.load(),
+                 (long long)gLiveWritable.load(),
+                 (long long)gLiveRandom.load(),
+                 (long long)gLiveSequential.load(),
+                 (long long)gLiveDirectory.load());
 }
 struct IoStatsReporter {
     ~IoStatsReporter() { reportIoStats(); }
@@ -209,6 +227,9 @@ struct HfsContext {
     void unregisterDirectEntry(DirectWorkerEntry *entry) noexcept;
     /* Retires every live channel on the calling thread while engine is alive. */
     void retireAllDirectEntries() noexcept;
+    /* Drops the cached per-path File in every worker channel so unlinked or
+     * renamed files can close their handles and release extents. */
+    void dropDirectPath(const std::string &path) noexcept;
 
     /* Retire worker channels, then stop the frontend owner and the engine. */
     ~HfsContext();
@@ -235,7 +256,12 @@ rocksdb::IOStatus openFile(const std::shared_ptr<HfsContext> &context,
 
 class HfsSequentialFile final : public rocksdb::FSSequentialFile {
 public:
-    HfsSequentialFile(std::shared_ptr<hfs::File> file) : file_(std::move(file)) {}
+    HfsSequentialFile(std::shared_ptr<hfs::File> file) : file_(std::move(file)) {
+        gLiveSequential.fetch_add(1, std::memory_order_relaxed);
+    }
+    ~HfsSequentialFile() override {
+        gLiveSequential.fetch_sub(1, std::memory_order_relaxed);
+    }
 
     /* Reads from the current sequential offset into RocksDB scratch storage. */
     rocksdb::IOStatus Read(size_t n, const rocksdb::IOOptions &, rocksdb::Slice *result,
@@ -361,6 +387,13 @@ struct DirectWorkerEntry {
      * context teardown on the main thread. */
     void retire(bool fromOwnerThread) noexcept;
 
+    /* Drops one cached per-path File so a deleted/renamed file can close its
+     * namespace handle and release its extents (large-library NoSpace fix). */
+    void dropPath(const std::string &path) noexcept {
+        std::lock_guard<std::mutex> lock(mutex);
+        files.erase(path);
+    }
+
     ~DirectWorkerEntry() { retire(true); }
 };
 
@@ -435,6 +468,27 @@ void HfsContext::retireAllDirectEntries() noexcept {
     for (const auto &entry : entries) {
         if (entry != nullptr) {
             entry->retire(false);
+        }
+    }
+}
+
+/* Drops cached per-path handles across all worker channels. Called after a
+ * namespace unlink/rename so the orphaned inode's last reference closes and
+ * its extents return to the allocator (large-library NoSpace fix). The entry
+ * list is copied under directMutex and dropped outside it to keep the lock
+ * order directMutex -> entry mutex. */
+void HfsContext::dropDirectPath(const std::string &path) noexcept {
+    std::vector<std::shared_ptr<DirectWorkerEntry>> entries;
+    {
+        std::lock_guard<std::mutex> lock(directMutex);
+        entries.reserve(directEntries.size());
+        for (const auto &item : directEntries) {
+            entries.push_back(item.second);
+        }
+    }
+    for (const auto &entry : entries) {
+        if (entry != nullptr) {
+            entry->dropPath(path);
         }
     }
 }
@@ -602,6 +656,11 @@ public:
         return true;
     }
 
+    /* Open HFS handles held by the shared frontend client (diagnostics). */
+    std::size_t openFileCount() const noexcept {
+        return client_ != nullptr ? client_->openFileCount() : 0;
+    }
+
     rocksdb::IOStatus poll(const std::vector<void *> &handles,
                            std::size_t minCompletions) noexcept {
         const std::size_t required = std::min(minCompletions, handles.size());
@@ -690,8 +749,14 @@ public:
         if (state == nullptr) {
             return;
         }
-        std::lock_guard<std::mutex> lock(retiredMutex_);
-        retired_.push_back(state);
+        {
+            std::lock_guard<std::mutex> lock(retiredMutex_);
+            retired_.push_back(state);
+        }
+        /* Wake the dispatcher so retired states (and their open File handles)
+         * are released promptly instead of waiting for an unrelated wake. */
+        wakeEpoch_.fetch_add(1, std::memory_order_release);
+        condition_.notify_one();
     }
 
     void stop() noexcept {
@@ -1090,7 +1155,12 @@ public:
     HfsRandomAccessFile(std::shared_ptr<hfs::File> file,
                         std::shared_ptr<HfsContext> context,
                         std::string path)
-        : file_(std::move(file)), context_(std::move(context)), path_(std::move(path)) {}
+        : file_(std::move(file)), context_(std::move(context)), path_(std::move(path)) {
+        gLiveRandom.fetch_add(1, std::memory_order_relaxed);
+    }
+    ~HfsRandomAccessFile() override {
+        gLiveRandom.fetch_sub(1, std::memory_order_relaxed);
+    }
 
     /* Performs a synchronous facade over the shared asynchronous read path. */
     rocksdb::IOStatus Read(uint64_t offset, size_t n, const rocksdb::IOOptions &options,
@@ -1223,8 +1293,11 @@ public:
 
             /* Experimental fast path: submit from the RocksDB worker itself so
              * Client::submitRead publishes directly to a data-reactor ring.
-             * A failed direct setup falls back to the production dispatcher. */
-            if (request.len != 0 && context_->workerDirectReads) {
+             * A failed direct setup falls back to the production dispatcher.
+             * Timing-injection reads stay on the dispatcher path, which owns
+             * the notBefore delay used by the contract tests. */
+            if (request.len != 0 && context_->workerDirectReads &&
+                state->notBefore == std::chrono::steady_clock::time_point{}) {
                 DirectWorkerEntry *entry = directWorkerEntry(context_);
                 auto directFile = directWorkerFile(entry, path_);
                 if (entry != nullptr && directFile != nullptr) {
@@ -1301,6 +1374,7 @@ public:
     HfsWritableFile(std::shared_ptr<hfs::File> file, std::shared_ptr<HfsContext> context,
                     std::string path)
         : file_(std::move(file)), context_(std::move(context)), path_(std::move(path)) {
+        gLiveWritable.fetch_add(1, std::memory_order_relaxed);
         if (file_ != nullptr) {
             auto stat = file_->stat();
             if (stat.ok()) {
@@ -1311,6 +1385,7 @@ public:
     }
 
     ~HfsWritableFile() override {
+        gLiveWritable.fetch_sub(1, std::memory_order_relaxed);
         /* A close failure must not silently drop buffered bytes. */
         if (file_ != nullptr) {
             auto flushed = flushPendingBuffer();
@@ -1432,6 +1507,7 @@ public:
     /* Reserves and zero-initializes the requested HFS logical range. */
     rocksdb::IOStatus Allocate(uint64_t offset, uint64_t length,
                                const rocksdb::IOOptions &, rocksdb::IODebugContext *) override {
+        if (ioStatsEnabled()) gAllocateCalls.fetch_add(1, std::memory_order_relaxed);
         if (file_ == nullptr) {
             return rocksdb::IOStatus::InvalidArgument("writable file is closed");
         }
@@ -1567,7 +1643,12 @@ void dropPendingForPath(const std::shared_ptr<HfsContext> &context,
 
 class HfsDirectory final : public rocksdb::FSDirectory {
 public:
-    HfsDirectory(std::shared_ptr<hfs::File> file) : file_(std::move(file)) {}
+    HfsDirectory(std::shared_ptr<hfs::File> file) : file_(std::move(file)) {
+        gLiveDirectory.fetch_add(1, std::memory_order_relaxed);
+    }
+    ~HfsDirectory() override {
+        gLiveDirectory.fetch_sub(1, std::memory_order_relaxed);
+    }
 
     /* Commits directory metadata through the HFS durable epoch path. */
     rocksdb::IOStatus Fsync(const rocksdb::IOOptions &, rocksdb::IODebugContext *) override {
@@ -1726,6 +1807,7 @@ public:
      * buffer for it (the file is gone; buffered bytes are discarded). */
     rocksdb::IOStatus DeleteFile(const std::string &fname, const rocksdb::IOOptions &,
                                  rocksdb::IODebugContext *) override {
+        if (ioStatsEnabled()) gDeleteCalls.fetch_add(1, std::memory_order_relaxed);
         auto removed = context_->client->remove(hfsPath(fname)).wait();
         if (!removed.ok()) {
             return toIoStatus(removed);
@@ -1734,6 +1816,9 @@ public:
         if (!status.ok()) {
             return toIoStatus(status);
         }
+        /* Close cached worker handles before dropping the pending buffer so the
+         * unlinked inode can release its extents immediately. */
+        context_->dropDirectPath(hfsPath(fname));
         dropPendingForPath(context_, hfsPath(fname));
         return rocksdb::IOStatus::OK();
     }
@@ -1805,6 +1890,7 @@ public:
      * source are flushed first so the target observes the full content. */
     rocksdb::IOStatus RenameFile(const std::string &src, const std::string &target,
                                  const rocksdb::IOOptions &, rocksdb::IODebugContext *) override {
+        if (ioStatsEnabled()) gRenameCalls.fetch_add(1, std::memory_order_relaxed);
         auto flushedSource = flushPendingForPath(context_, hfsPath(src));
         if (!flushedSource.ok()) return flushedSource;
         auto flushedTarget = flushPendingForPath(context_, hfsPath(target));
@@ -1813,6 +1899,10 @@ public:
         if (!renamed.ok()) return toIoStatus(renamed);
         auto renameStatus = std::move(renamed).value();
         if (!renameStatus.ok()) return toIoStatus(renameStatus);
+        /* Source keys are stale and a replaced target may be unlinked; drop
+         * both cached worker handles so no orphan inode keeps its extents. */
+        context_->dropDirectPath(hfsPath(src));
+        context_->dropDirectPath(hfsPath(target));
         /* RocksDB uses rename for CURRENT and MANIFEST publication. */
         std::shared_ptr<hfs::File> file;
         auto opened = openFile(context_, target, hfs::OpenFlags::None, &file);
@@ -1929,6 +2019,30 @@ public:
     rocksdb::IOStatus GetFreeSpace(const std::string &, const rocksdb::IOOptions &,
                                    uint64_t *freeSpace, rocksdb::IODebugContext *) override {
         *freeSpace = context_->engine->freeDataBytes();
+        if (ioStatsEnabled()) {
+            std::fprintf(stderr, "hfs open files: frontend=%zu dispatcher=%zu\n",
+                         context_->client != nullptr ? context_->client->openFileCount() : 0,
+                         context_->asyncDispatcher != nullptr
+                             ? context_->asyncDispatcher->openFileCount()
+                             : 0);
+            auto stats = context_->engine->dataExtentStats();
+            if (stats.ok()) {
+                const auto &value = stats.value();
+                std::fprintf(stderr,
+                             "hfs extent stats: total=%llu free=%llu reserved=%llu "
+                             "initialized=%llu committed=%llu inodes=%llu orphans=%llu "
+                             "alloc=%llu freed=%llu\n",
+                             (unsigned long long)value.totalExtents,
+                             (unsigned long long)value.freeExtents,
+                             (unsigned long long)value.reservedExtents,
+                             (unsigned long long)value.initializedExtents,
+                             (unsigned long long)value.committedExtents,
+                             (unsigned long long)value.inodes,
+                             (unsigned long long)value.orphanInodes,
+                             (unsigned long long)value.allocatedExtents,
+                             (unsigned long long)value.freedExtents);
+            }
+        }
         return rocksdb::IOStatus::OK();
     }
 

@@ -760,6 +760,13 @@ std::size_t Client::maxOutstanding() const noexcept {
     return impl_->state->maxOutstandingValue;
 }
 
+std::size_t Client::openFileCount() const noexcept {
+    if (impl_ == nullptr || impl_->state == nullptr) {
+        return 0;
+    }
+    return impl_->state->openFiles.load(std::memory_order_acquire);
+}
+
 Task<Result<std::shared_ptr<File>>> Client::open(std::string_view path, OpenFlags flags) {
     auto &state = *impl_->state;
     auto valid = validateClient(state);

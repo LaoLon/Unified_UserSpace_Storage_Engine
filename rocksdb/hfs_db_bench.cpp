@@ -466,6 +466,25 @@ int runBenchmark(const BenchOptions &options, rocksdb::Env *sharedEnv = nullptr)
 
 } // namespace
 
+/* Prints the remaining data-device space after each benchmark; used by the
+ * large-library NoSpace investigation to correlate extent usage with phases. */
+void reportFreeSpace(rocksdb::Env *env, const std::string &dbPath) {
+    if (env == nullptr) {
+        return;
+    }
+    std::uint64_t freeBytes = 0;
+    rocksdb::FileOptions fileOptions;
+    rocksdb::IODebugContext debug;
+    auto status =
+        env->GetFileSystem()->GetFreeSpace(dbPath, fileOptions.io_options, &freeBytes,
+                                           &debug);
+    if (status.ok()) {
+        std::cout << "free_bytes: " << freeBytes << "\n";
+    } else {
+        std::cout << "free_bytes: unavailable (" << status.ToString() << ")\n";
+    }
+}
+
 int main(int argc, char **argv) {
     BenchOptions options;
     if (!parseArguments(argc, argv, &options)) {
@@ -498,6 +517,8 @@ int main(int argc, char **argv) {
         BenchOptions run = options;
         run.benchmark = benchmark;
         const int result = runBenchmark(run, sharedEnv.get());
+        reportFreeSpace(sharedEnv != nullptr ? sharedEnv.get() : rocksdb::Env::Default(),
+                        options.dbPath);
         if (result != 0) return result;
     }
     return 0;

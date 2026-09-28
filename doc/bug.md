@@ -46,6 +46,10 @@ Bug 等级：**致命 > 严重 > 一般**。
 - 35：已修复（Shard-81，异步路径杂项收口）。
 - 36：已修复（Shard-81，shard inode 槽位线性扫描导致每 I/O ~5ms 延迟）。
 - 37：已修复（RocksDB async dispatcher 在活动 I/O 时可能丢唤醒并永久休眠）。
+- 38：已修复（并发 syncMetadata 返回 Busy）。
+- 39：已修复（RMW 第二阶段复用已完成 wait state）。
+- 40：已修复（FIO namespace job 启动 SIGSEGV）。
+- 41：已修复（RocksDB worker-direct 读缓存句柄未随删除释放，大库 extent 提前耗尽）。
 
 ## Bug 记录
 
@@ -657,7 +661,7 @@ Bug 等级：**致命 > 严重 > 一般**。
 
 ### 41. RocksDB 大库在 HFS 上提前耗尽 extent（no allocatable extents）
 
-- **状态**：待处理（根因未定位；测试规避 = 单库 ≤1.2M key）
+- **状态**：已修复（RocksDB worker-direct 读缓存句柄未随文件删除释放）
 - **等级**：严重（大工作集在数据区远未写满时提前 NoSpace）
 - **时间**：2026-09-28
 - **现象**：`hfs_db_bench` 在 HFS 上跑 16 B key / 1 KiB value 的 RocksDB
@@ -672,14 +676,35 @@ Bug 等级：**致命 > 严重 > 一般**。
   allocator `allocatableExtents()==0`；`capacityExtents` 未配置覆盖
   （默认等于 totalExtents），不是容量上限配置。`seq` 阶段（fillseq+读）
   在 2M key 通过，失败只出现在高文件 churn 的 `rnd` 阶段，失败前
-  `append_bytes` 约 25 GB。
-- **根因**：未定位。候选：`prealloc_extents=64` 的按文件预留被大量
-  SST/临时文件同时占用；文件删除/压缩后的 extent 回收不及时；分配器
-  碎片化后 `reserveScattered` 找不到连续 run。
-- **修复**：未实施。
-- **验证结果**：1.2M key（64 MiB block cache）`rnd` 阶段 rc=0、`hfsctl check`
-  `corruption=none`；证据 `/home/hfs/rocksdb-large-cache64m-1_2m-20260928`、
-  `…-1_5m-20260928-aborted`、`…-20260928-aborted2m`。
+  `append_bytes` 约 25 GB。给 `Engine`/适配器加 extent/open-file 诊断后
+  复现（`/home/hfs/rocksdb-diag-1_5m-20260928`）：失败点 `committed=19266`、
+  `free=438`，其中 **`orphans=305`**（已 unlink 但 openCount>0 的 inode）
+  持有全部 extent；适配器包装对象 `live_writable/random/sequential=0`，
+  说明句柄被非包装对象持有。
+- **根因**：RocksDB worker-direct 读路径在 `DirectWorkerEntry::files`
+  中按路径缓存 `shared_ptr<hfs::File>`（`rocksdb/hfs_filesystem.cpp`），
+  文件被 `DeleteFile`/`RenameFile` 删除或改名后缓存不失效；已 unlink 的
+  inode 因缓存句柄保持 openCount>0，其 extent 永不回收。删除越多、库越大，
+  19.24 GiB 的 extent 池在 live 数据仅 2 GB 时被耗尽。次要问题：共享
+  dispatcher 的 `retireHandle` 不唤醒自身，已完成异步状态（及其 File 句柄）
+  在空闲时延迟释放，使 smoke 的回收断言失败。
+- **修复**：`DirectWorkerEntry::dropPath` + `HfsContext::dropDirectPath`
+  在 `DeleteFile`（remove 成功后）与 `RenameFile`（源/目标）后丢弃缓存
+  句柄；`AsyncReadDispatcher::retireHandle` 追加 `wakeEpoch_`/`notify_one`
+  及时释放退役状态。回归：`allocator_test` 增加“unlink while open 在最后
+  一次 close 才回收 extent”；`hfs_rocksdb_smoke` 增加分步 free-space
+  trail，并把“回调已进入后再 AbortIO”用例路由到 dispatcher（direct 路径
+  的回调本由提交线程 Poll 驱动，原测试在 direct 模式下互等挂起）。
+- **验证结果**：
+  - 修复后 1.5M key 与 2.0M key 的 `fillrandom,overwrite` 复现用例
+    `rc=0`、`orphans=0`、2M 库只占 ~2043 extents（`committed`），
+    证据 `/home/hfs/rocksdb-fix-verify-20260928`；
+  - 修复后 2M key 全矩阵（native/HFS 各两阶段）`cleanup: stage=complete
+    exit=0`，`hfsctl check` `corruption=none`，证据
+    `/home/hfs/rocksdb-large-2m-fix-20260928`；
+  - `hfs_rocksdb_smoke` 在 direct 与 shared 两种模式均 `rc=0`，
+    `free-space reclaim: initial=20661141504 ... final=20661141504`；
+  - CTest 26/26 通过。
 
 ## 记录模板
 

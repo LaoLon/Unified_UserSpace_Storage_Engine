@@ -125,6 +125,21 @@ public:
     Result<void> postToDataReactor(std::uint32_t index, std::function<void()> fn);
     std::uint64_t dataReactorThreadId(std::uint32_t index) const;
 
+    /* Extent-pool diagnostics (large-library NoSpace investigation): namespace
+     * counters plus the summed per-device allocator state. */
+    struct DataExtentStats {
+        std::uint64_t inodes = 0;
+        std::uint64_t orphanInodes = 0;
+        std::uint64_t allocatedExtents = 0;
+        std::uint64_t freedExtents = 0;
+        std::uint64_t totalExtents = 0;
+        std::uint64_t freeExtents = 0;
+        std::uint64_t reservedExtents = 0;
+        std::uint64_t initializedExtents = 0;
+        std::uint64_t committedExtents = 0;
+    };
+    Result<DataExtentStats> dataExtentStats() const;
+
 private:
     explicit Engine(Config config);
     friend class Client;
@@ -170,6 +185,8 @@ public:
                     std::size_t max, std::chrono::microseconds timeout);
     std::size_t outstanding() const noexcept;
     std::size_t maxOutstanding() const noexcept;
+    /* Open File handles owned by this client (extent-reclaim diagnostics). */
+    std::size_t openFileCount() const noexcept;
 
     /* Path API; data operations on the returned File land with Shard-77. */
     Task<Result<std::shared_ptr<File>>> open(std::string_view path,

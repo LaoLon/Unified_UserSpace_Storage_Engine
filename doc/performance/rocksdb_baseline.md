@@ -176,22 +176,39 @@ ALLOW_FORMAT=1 RESULT=/home/hfs/rocksdb-native-vs-hfs-<date> \
 随机读 1.8× native；写入仍受 flush/compaction CPU 限制，两侧 ≈100%；
 `overwrite` 90.1%。这与 §5.1 的结论一致：HFS 的优势只在设备受限读路径兑现。
 
-### 8.1 大库 extent 边界（待查）
+### 8.1 大库 extent 边界（已修复）与 2M key 复测
 
-同一脚本在更大数据集上可复现 HFS 提前 `NoSpace`：
+同一脚本在更大数据集上曾可复现 HFS 提前 `NoSpace`：
 
-| 数据集 | native | HFS |
-|---|---|---|
-| 1.2M key | 两阶段通过 | 两阶段通过（上表） |
-| 1.5M key | 两阶段通过 | `seq` 通过；`rnd` 阶段 `fillrandom`+`overwrite` 完成后 Flush/Compact 失败（rc=7） |
-| 2.0M key | 两阶段通过 | `seq` 通过；`rnd` 阶段 `overwrite` 中 `Put failed: no allocatable extents across data devices`（rc=5） |
+| 数据集 | native | HFS（修复前） | HFS（修复后） |
+|---|---|---|---|
+| 1.2M key | 两阶段通过 | 两阶段通过（上表） | — |
+| 1.5M key | 两阶段通过 | `rnd` 阶段 Flush/Compact 失败（rc=7） | `rc=0`，`orphans=0` |
+| 2.0M key | 两阶段通过 | `overwrite` 中 `Put failed: no allocatable extents`（rc=5） | 全矩阵 `rc=0`，`orphans=0` |
 
-- 数据区约 19.24 GiB（`hfsctl info`），失败时 live 数据仅 1.2–2 GB；
-  `capacityExtents` 未配置覆盖（默认等于全区），错误来自
-  `namespace.cpp` `reserveExtents` → allocator 无可用 extent。
-- 失败只出现在高文件 churn 的 `rnd` 阶段（fillrandom/overwrite/压缩），
-  失败前 `append_bytes` 约 25 GB；疑似与按文件预分配（`prealloc_extents=64`）
-  或删除/压缩后的 extent 回收有关，根因未定位，已登记到 `doc/bug.md`。
-- 测试规避：单库 ≤1.2M key。证据目录：
-  `/home/hfs/rocksdb-large-cache64m-20260928-aborted2m`、
-  `…-1_5m-20260928-aborted`、`…-1_2m-20260928`（成功）。
+根因（bug.md #41）：RocksDB worker-direct 读路径在
+`DirectWorkerEntry::files` 里按路径缓存 `shared_ptr<hfs::File>`，文件删除/
+改名后缓存不失效，已 unlink 的 inode（orphans）因缓存句柄保持
+`openCount>0`，其 extent 永不回收；19.24 GiB 的 extent 池在 live 数据仅
+2 GB 时被 ~300 个孤儿 inode 耗尽。修复：`DeleteFile`/`RenameFile` 后
+`dropDirectPath` 丢弃缓存句柄，并让 dispatcher 的 `retireHandle` 及时
+唤醒释放退役状态（详见 bug.md #41）。
+
+修复后 2M key（约 2 GB 数据、64 MiB cache、32 线程）复测：
+
+| 工作负载 | native ext4 | HFS | HFS/native |
+|---|---:|---:|---:|
+| fillseq（顺序写） | 96463 | 102997 | **106.8%** |
+| readseq（顺序读） | 61137 | 264775 | **433.1%** |
+| readrandom（随机读） | 46527 | 59964 | **128.9%** |
+| fillrandom（随机写） | 95168 | 99246 | **104.3%** |
+| overwrite（覆盖写+校验） | 79716 | 89271 | **112.0%** |
+| readwhilewriting（混合） | 2018137 | 2564877 | **127.1%** |
+
+修复后 HFS 侧 `committed` 仅 ~2043/19704 extents、`orphans=0`、alloc/freed
+平衡，`hfsctl check` `corruption=none`；4/4 阶段
+`cleanup: stage=complete exit=0`。证据：
+`/home/hfs/rocksdb-large-2m-fix-20260928`（修复后矩阵）、
+`/home/hfs/rocksdb-fix-verify-20260928`（1.5M/2M 复现验证）、
+`/home/hfs/rocksdb-diag-1_5m-20260928`（orphans 诊断）、
+`…-aborted2m`、`…-1_5m-20260928-aborted`（修复前失败证据）。

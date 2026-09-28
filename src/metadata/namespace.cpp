@@ -1484,4 +1484,20 @@ Namespace::Stats Namespace::stats() const {
     return stats;
 }
 
+Namespace::ExtentPoolStats Namespace::extentPoolStats() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    ExtentPoolStats result;
+    for (const auto &allocator : allocators_) {
+        const Allocator::Stats stats = allocator->stats();
+        result.total += stats.total;
+        result.capacity += stats.capacity;
+        result.free += stats.free;
+        result.reserved += stats.reserved;
+        result.initialized += stats.initialized;
+        result.committed += stats.committed;
+        result.freeRuns += stats.freeRuns;
+    }
+    return result;
+}
+
 } // namespace hfs::metadata

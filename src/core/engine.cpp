@@ -972,6 +972,28 @@ std::uint64_t Engine::freeDataBytes() const noexcept {
     return impl_->namespaceState->freeDataBytes();
 }
 
+/* Reports namespace and per-device allocator counters for extent diagnostics. */
+Result<Engine::DataExtentStats> Engine::dataExtentStats() const {
+    if (impl_ == nullptr || !impl_->mounted || impl_->namespaceState == nullptr) {
+        return makeError<DataExtentStats>(Status::InvalidState,
+                                          "engine durability path is not mounted");
+    }
+    const metadata::Namespace::Stats ns = impl_->namespaceState->stats();
+    const metadata::Namespace::ExtentPoolStats pool =
+        impl_->namespaceState->extentPoolStats();
+    DataExtentStats stats;
+    stats.inodes = ns.inodes;
+    stats.orphanInodes = ns.orphanInodes;
+    stats.allocatedExtents = ns.allocatedExtents;
+    stats.freedExtents = ns.freedExtents;
+    stats.totalExtents = pool.total;
+    stats.freeExtents = pool.free;
+    stats.reservedExtents = pool.reserved;
+    stats.initializedExtents = pool.initialized;
+    stats.committedExtents = pool.committed;
+    return stats;
+}
+
 /* Acquires one contiguous buffer from the mount-level DMA arena. */
 Result<std::span<std::byte>> Engine::acquireDmaBuffer(std::size_t size,
                                                       std::uint32_t timeoutMs) {

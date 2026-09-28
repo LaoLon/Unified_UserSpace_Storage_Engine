@@ -395,6 +395,37 @@ int main() {
         HFS_TEST_CHECK(!overflow.ok() && overflow.status() == Status::InvalidArgument);
     }
 
+    /* 9b. unlink while open reclaims extents only at the last close */
+    {
+        NamespaceConfig config;
+        config.maxInodes = 64;
+        config.maxNamespaceBytes = 1ULL << 20;
+        config.extentBytes = 4096;
+        config.deviceExtents = {16};
+        config.deviceStartExtents = {2};
+        config.maxReserveExtents = 4;
+        config.capacityOverrideExtents = 4;
+        auto created = Namespace::create(config, fixedClock, nullptr);
+        HFS_TEST_CHECK(created.ok());
+        Namespace &ns = *created.value();
+        auto handle = ns.create("/open-unlinked", false, false, false);
+        HFS_TEST_CHECK(handle.ok());
+        const std::uint64_t freeBefore = ns.freeDataBytes();
+        auto reservations = ns.reserveExtents(handle.value(), 0, 2 * 4096);
+        HFS_TEST_CHECK(reservations.ok());
+        HFS_TEST_CHECK(ns.commitExtents(handle.value(), reservations.value()).ok());
+        HFS_TEST_CHECK(ns.freeDataBytes() < freeBefore);
+
+        HFS_TEST_CHECK(ns.remove("/open-unlinked").ok());
+        HFS_TEST_CHECK(ns.stats().orphanInodes == 1);
+        /* The orphan keeps its extents while a handle is still open. */
+        HFS_TEST_CHECK(ns.freeDataBytes() < freeBefore);
+        HFS_TEST_CHECK(ns.close(handle.value()).ok());
+        /* The last close frees the unlinked inode and returns its extents. */
+        HFS_TEST_CHECK(ns.stats().orphanInodes == 0);
+        HFS_TEST_CHECK(ns.freeDataBytes() == freeBefore);
+    }
+
     /* 10. multi-device placement keeps every run device-local */
     {
         NamespaceConfig config;
