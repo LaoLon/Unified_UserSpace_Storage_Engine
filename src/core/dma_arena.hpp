@@ -4,9 +4,9 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <mutex>
 #include <span>
-#include <unordered_map>
 #include <vector>
 
 #include "hfs/types.hpp"
@@ -92,14 +92,21 @@ private:
         std::vector<void *> free;
     };
 
+    /* One live allocation; classIndex == kClassCount marks a large block. */
+    struct LiveEntry {
+        std::size_t bytes = 0;
+        std::uint8_t classIndex = kClassCount;
+    };
+
     mutable std::mutex mutex_;
     std::condition_variable cv_;
     std::size_t capacityBytes_ = 0;
     std::size_t bytes_ = 0;
     std::size_t highWatermark_ = 0;
     std::array<SizeClass, kClassCount> classes_;
-    std::unordered_map<void *, std::size_t> largeLive_;
-    std::unordered_map<void *, std::size_t> live_;
+    /* Ordered by address so ownership checks are O(log N) instead of a scan. */
+    std::map<std::uintptr_t, LiveEntry> live_;
+    std::size_t waiters_ = 0; /* waiters blocked on the capacity cap */
     Allocator allocator_ = nullptr;
     Deallocator deallocator_ = nullptr;
     void *allocatorCtx_ = nullptr;

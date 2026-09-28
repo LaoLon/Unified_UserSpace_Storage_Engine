@@ -85,13 +85,20 @@ Result<std::span<std::byte>> DmaArena::acquire(std::size_t size, std::uint32_t t
                                                            "DMA allocation failed");
                 }
                 lock.lock();
-                largeLive_.emplace(buffer, size);
+                live_.emplace(reinterpret_cast<std::uintptr_t>(buffer),
+                              LiveEntry{size, static_cast<std::uint8_t>(kClassCount)});
                 lock.unlock();
                 return std::span<std::byte>(static_cast<std::byte *>(buffer), size);
             }
             ++busy_;
             trace::event(trace::EventId::DmaBusy, size, timeoutMs);
-            if (timeoutMs == 0 || cv_.wait_until(lock, deadline) == std::cv_status::timeout) {
+            if (timeoutMs == 0) {
+                return makeError<std::span<std::byte>>(Status::Busy, "DMA arena exhausted");
+            }
+            ++waiters_;
+            const bool timedOut = cv_.wait_until(lock, deadline) == std::cv_status::timeout;
+            --waiters_;
+            if (timedOut) {
                 return makeError<std::span<std::byte>>(Status::Busy, "DMA arena exhausted");
             }
         }
@@ -111,7 +118,8 @@ Result<std::span<std::byte>> DmaArena::acquire(std::size_t size, std::uint32_t t
             void *buffer = sizeClass.free.back();
             sizeClass.free.pop_back();
             ++acquires_;
-            live_.emplace(buffer, classSize);
+            live_.emplace(reinterpret_cast<std::uintptr_t>(buffer),
+                          LiveEntry{classSize, static_cast<std::uint8_t>(classIndex)});
             trace::event(trace::EventId::DmaAcquire, classSize, bytes_);
             return std::span<std::byte>(static_cast<std::byte *>(buffer), classSize);
         }
@@ -135,13 +143,20 @@ Result<std::span<std::byte>> DmaArena::acquire(std::size_t size, std::uint32_t t
                                                        "DMA allocation failed");
             }
             lock.lock();
-            live_.emplace(buffer, classSize);
+            live_.emplace(reinterpret_cast<std::uintptr_t>(buffer),
+                          LiveEntry{classSize, static_cast<std::uint8_t>(classIndex)});
             lock.unlock();
             return std::span<std::byte>(static_cast<std::byte *>(buffer), classSize);
         }
         ++busy_;
         trace::event(trace::EventId::DmaBusy, classSize, timeoutMs);
-        if (timeoutMs == 0 || cv_.wait_until(lock, deadline) == std::cv_status::timeout) {
+        if (timeoutMs == 0) {
+            return makeError<std::span<std::byte>>(Status::Busy, "DMA arena exhausted");
+        }
+        ++waiters_;
+        const bool timedOut = cv_.wait_until(lock, deadline) == std::cv_status::timeout;
+        --waiters_;
+        if (timedOut) {
             return makeError<std::span<std::byte>>(Status::Busy, "DMA arena exhausted");
         }
     }
@@ -151,57 +166,44 @@ void DmaArena::release(std::span<std::byte> buffer) noexcept {
     if (buffer.empty()) {
         return;
     }
-    /* Look up the recorded allocation size: callers may release with the
-     * requested size instead of the rounded span size. */
+    /* Look up the recorded allocation: callers may release with the requested
+     * size instead of the rounded span size. */
     void *pointer = buffer.data();
     Deallocator deallocator = nullptr;
     void *allocatorCtx = nullptr;
     bool large = false;
+    bool notifyWaiter = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        auto largeFound = largeLive_.find(pointer);
-        if (largeFound != largeLive_.end()) {
-            const std::size_t allocationSize = largeFound->second;
-            bytes_ -= allocationSize;
-            largeLive_.erase(largeFound);
-            ++releases_;
+        auto found = live_.find(reinterpret_cast<std::uintptr_t>(pointer));
+        if (found == live_.end()) {
+            return; /* foreign pointer: not owned by this arena */
+        }
+        const LiveEntry entry = found->second;
+        live_.erase(found);
+        if (entry.classIndex < kClassCount) {
+            classes_[entry.classIndex].free.push_back(pointer);
+        } else {
+            bytes_ -= entry.bytes;
             deallocator = deallocator_;
             allocatorCtx = allocatorCtx_;
             large = true;
-        } else {
-            auto liveFound = live_.find(pointer);
-            if (liveFound == live_.end()) {
-                return; /* foreign pointer: not owned by this arena */
-            }
-            const std::size_t allocationSize = liveFound->second;
-            std::size_t classIndex = kClassCount;
-            for (std::size_t i = 0; i < kClassCount; ++i) {
-                if (kClassSizes[i] == allocationSize) {
-                    classIndex = i;
-                    break;
-                }
-            }
-            if (classIndex == kClassCount) {
-                return; /* corrupt bookkeeping: never hand out a wrong class */
-            }
-            classes_[classIndex].free.push_back(pointer);
-            live_.erase(liveFound);
-            ++releases_;
         }
+        ++releases_;
+        notifyWaiter = waiters_ != 0;
     }
-    if (large) {
-        if (deallocator != nullptr) {
-            deallocator(pointer, allocatorCtx);
-        }
+    if (large && deallocator != nullptr) {
+        deallocator(pointer, allocatorCtx);
+    }
+    if (notifyWaiter) {
+        cv_.notify_one();
     }
     trace::event(trace::EventId::DmaRelease, buffer.size());
-    cv_.notify_one();
 }
 
 bool DmaArena::owns(const void *buffer) const {
     std::lock_guard<std::mutex> lock(mutex_);
-    void *address = const_cast<void *>(buffer);
-    return live_.count(address) != 0 || largeLive_.count(address) != 0;
+    return live_.count(reinterpret_cast<std::uintptr_t>(buffer)) != 0;
 }
 
 bool DmaArena::ownsRange(const void *ptr, std::size_t bytes) const {
@@ -210,19 +212,14 @@ bool DmaArena::ownsRange(const void *ptr, std::size_t bytes) const {
     }
     const auto rangeStart = reinterpret_cast<std::uintptr_t>(ptr);
     std::lock_guard<std::mutex> lock(mutex_);
-    for (const auto &[allocation, allocationBytes] : live_) {
-        if (containsRange(reinterpret_cast<std::uintptr_t>(allocation), allocationBytes,
-                          rangeStart, bytes)) {
-            return true;
-        }
+    /* Ordered index: the only candidate is the allocation at or before the
+     * range start. */
+    auto found = live_.upper_bound(rangeStart);
+    if (found == live_.begin()) {
+        return false;
     }
-    for (const auto &[allocation, allocationBytes] : largeLive_) {
-        if (containsRange(reinterpret_cast<std::uintptr_t>(allocation), allocationBytes,
-                          rangeStart, bytes)) {
-            return true;
-        }
-    }
-    return false;
+    --found;
+    return containsRange(found->first, found->second.bytes, rangeStart, bytes);
 }
 
 Result<void> DmaArena::tryAcquireBatch(std::span<const std::size_t> sizes,
@@ -261,9 +258,9 @@ DmaArena::~DmaArena() {
     if (deallocator_ == nullptr) {
         return;
     }
-    /* Free every block the arena still owns: cached class blocks, class
-     * allocations whose lease was never returned, and outstanding large
-     * allocations. A later lease release becomes a harmless no-op. */
+    /* Free every block the arena still owns: cached class blocks and any
+     * allocation whose lease was never returned. A later lease release
+     * becomes a harmless no-op. */
     for (auto &sizeClass : classes_) {
         for (void *block : sizeClass.free) {
             deallocator_(block, allocatorCtx_);
@@ -271,13 +268,9 @@ DmaArena::~DmaArena() {
         sizeClass.free.clear();
     }
     for (const auto &entry : live_) {
-        deallocator_(entry.first, allocatorCtx_);
+        deallocator_(reinterpret_cast<void *>(entry.first), allocatorCtx_);
     }
     live_.clear();
-    for (const auto &entry : largeLive_) {
-        deallocator_(entry.first, allocatorCtx_);
-    }
-    largeLive_.clear();
 }
 
 DmaArena::Stats DmaArena::stats() const {    std::lock_guard<std::mutex> lock(mutex_);
