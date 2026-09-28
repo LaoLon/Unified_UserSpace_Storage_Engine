@@ -637,6 +637,51 @@ RequestParentComplete→CqPush→FeReap` 的推导与 p50/p99；`trace-manifest.
 - P1-1 的快照发布仍持 per-File mutex（key 已改为 per-inode，失效范围问题已解决）；
   无锁发布/RCU 留待有 profile 证据后再做。
 
+## 12. Stage C 实施记录（2026-09-29）
+
+> 按 §8 阶段 C 实施同步 ingress 与 runtime 生命周期；P0-7/P0-8/P1-5/P1-6 仍留在阶段 D。
+
+### 12.1 已实施项
+
+| 项 | 内容 | 提交 |
+|---|---|---|
+| P1-2 | 新增 `BoundedMpscQueue`（Vyukov 有界 MPSC）+ per-data-reactor ingress：`submitDataRead/Write` 常见路径不再 `new DataIoCall`、不再 `spdk_thread_send_msg`；reactor poll 批量 drain 后直接提交；`DataIoHolder` 改为 per-reactor 池（reactor 线程私有 free list，溢出回退堆分配）；ingress 满时保留原消息路径作为罕见回退；stop() 在 join 后把未 drain 的条目以 `-ECANCELED` 交还回调 | `e843c6d` |
+| P1-3 | doorbell 表改为无锁：`wakeEntries_`（`atomic<Reactor*>`）+ reader gate（enabled 位 + 读者计数，与 poller reader mask 同协议）；`wakeDataReactor` 不再取 runtime mutex、不再拷贝 `shared_ptr`；`disableWakeTable` 在停 reactor 前等待读者归零 | `e843c6d` |
+| 生命周期 | reactor 空闲重检（`waitDataReactorIdle`）与循环退出条件加入 ingress pending；reactor 循环统计 `ingested` 工作；启动时在 data reactor 线程运行前初始化 ingress/holder 池/doorbell 表 | `e843c6d` |
+
+### 12.2 验证证据
+
+- **同步路径 A/B（Stage B → Stage C，同会话交错 3 轮）**：
+  `hfs_async=0`、4K `randrw` 50/50、256 MiB、16 jobs × iodepth 8、10 s：
+
+  | 侧 | 中位 IOPS | closure |
+  |---|---:|---|
+  | Stage B（消息路径） | 37553.8 | yes |
+  | Stage C（有界 ingress） | 46126.8 | yes |
+
+  `StageC/StageB = 1.2283`（+22.8%）；4-job 形状为 +0.65%（低并发下收益小）。
+- **perf 归因**（同 workload、16 jobs）：Stage B 采样中
+  `spdk_ring_enqueue` + `rte_wait_until_equal_32` 自旋占 **55.4% + 33.7%**；
+  Stage C 中 `spdk_ring_enqueue`/`rte_wait_until_equal`/`spdk_thread_send_msg`
+  **完全消失**（剩余热点为同步路径固有的 futex/condvar 等待与 NVMe 完成）。
+- **正确性**：`hfs_async=0` + `--verify=crc32c --verify_fatal=1` 64 MiB randwrite
+  校验通过（fio exit 0、`error=0`）；`data_path_device_test`（RMW/超时/sparse）
+  与全量 CTest **29/29** 通过。
+- **异步回归**：8j4 口径 Stage B → Stage C 中位 IOPS 81707 → 82233（+0.64%），
+  p99 643.1 → 634.9 µs，closure 全部完整（doorbell 无锁化的直接收益有限，
+  与 ring 转换频率一致）。
+- 测试后设备恢复内核 `nvme` 驱动。
+
+### 12.3 未包含在阶段 C 的内容
+
+- **MySQL 增长写回归本轮未跑**：同步路径已由 `hfs_async=0` 的 verify 与
+  16 线程 A/B 覆盖；MySQL 端到端矩阵（`doc/performance/mysql_baseline.md` 口径）
+  留待阶段 D 与 P0-8 一起复测。
+- P0-7 RocksDB direct File 缓存/状态池、P0-8 `DataPath` 有界数组与 parent latch、
+  P1-5 hot/cold split、P1-6 scheduler：阶段 D。
+- 同步路径剩余的每 I/O 一对 `mutex/condvar` 交接（新 profile 的主要热点）
+  属于 P0-8 的 parent latch 方案。
+
 ## 附录 A：优化点 → 代码位置索引
 
 | 编号 | 主要位置 |
