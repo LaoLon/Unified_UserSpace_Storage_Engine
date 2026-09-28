@@ -50,6 +50,7 @@ Bug 等级：**致命 > 严重 > 一般**。
 - 39：已修复（RMW 第二阶段复用已完成 wait state）。
 - 40：已修复（FIO namespace job 启动 SIGSEGV）。
 - 41：已修复（RocksDB worker-direct 读缓存句柄未随删除释放，大库 extent 提前耗尽）。
+- 42：已修复（MySQL seam 异步快路径未惰性建线程 client，范围读回退同步消息环塌陷）。
 
 ## Bug 记录
 
@@ -705,6 +706,35 @@ Bug 等级：**致命 > 严重 > 一般**。
   - `hfs_rocksdb_smoke` 在 direct 与 shared 两种模式均 `rc=0`，
     `free-space reclaim: initial=20661141504 ... final=20661141504`；
   - CTest 26/26 通过。
+
+### 42. MySQL seam 异步快路径未惰性创建线程 client，高并发范围读塌陷
+
+- **状态**：已修复
+- **等级**：严重（大工作集 `read_only` 32 线程只有 native 的 15.1%）
+- **时间**：2026-09-28
+- **现象**：10 表 × 10 万行、64 MiB buffer pool + O_DIRECT 下，
+  `oltp_read_only` 32 线程 HFS 1250.58 TPS（native 8287.09），p95/p99 达
+  167/493 ms；而 1/8 线程两侧持平，`--range_selects=off`（纯点查）
+  22k TPS 正常。
+- **排查过程**：seam 计数器显示 `async_reads=28621 async_fallbacks=294533`
+  （约 91% I/O 回退同步路径）；`perf` 显示 connection 线程 64.2% 采样在
+  `spdk_ring_enqueue`，其中 63.9% 在 `rte_wait_until_equal_32` 自旋。
+- **根因**：`hfs_vfs::asyncIo` 要求当前线程已有 `t_holder`（线程 client），
+  而 `threadClient()` 只在文件 open/create 路径调用；32 个连接线程大多没有
+  client，异步快路径不可用，全部走同步面 `file->read().wait()`——每个 I/O
+  一次 `spdk_thread_send_msg` 投递到单一 data reactor，高并发下消息环饱和，
+  生产者自旋等待，形成百毫秒级长尾与 CPU 空转。
+- **修复**：`asyncIo` 首次 I/O 时惰性调用 `threadClient()` 创建本线程 client
+  （`hfs_seam_shard108_async_lazy.patch`，由 `build_mysql_vm.sh` 按标记应用）；
+  共享溢出 client 仍仅服务元数据，不参与异步 poll。
+- **验证结果**：同会话 A/B：32 线程 `read_only` 4556.19 → **8752.81 TPS**，
+  p99 147.61 → **7.98 ms**，max 889.92 → 18.82 ms（native 8440.49 /
+  p99 6.67）；大工作集矩阵 `read_only` 15.1% → **95.7%**（7947.85 vs
+  8309.30），`point_select` 99.2%、`write_only` 93.6%、`seq_scan` 104.1%；
+  异步覆盖 ~92%（`async_reads=315801/fallbacks=47580`），`hfsctl check`
+  `corruption=none`。证据 `/home/hfs/mysql-readonly-diag-20260928`、
+  `/home/hfs/mysql-readonly-lazyfix-20260928`、
+  `/home/hfs/mysql-large-1m-lazyfix-20260928`。
 
 ## 记录模板
 

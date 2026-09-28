@@ -40,6 +40,11 @@ if ! grep -q 'Async fast-path counters' \
   git -C "$SRC" apply --check "$PATCH_ROOT/hfs_seam_shard106_async.patch"
   git -C "$SRC" apply "$PATCH_ROOT/hfs_seam_shard106_async.patch"
 fi
+if ! grep -q "Lazily create this thread's own client" \
+     "$SRC/storage/innobase/os/hfs_vfs.cc"; then
+  git -C "$SRC" apply --check "$PATCH_ROOT/hfs_seam_shard108_async_lazy.patch"
+  git -C "$SRC" apply "$PATCH_ROOT/hfs_seam_shard108_async_lazy.patch"
+fi
 
 cmake -S "$SRC" -B "$BUILD" -G Ninja \
   -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \

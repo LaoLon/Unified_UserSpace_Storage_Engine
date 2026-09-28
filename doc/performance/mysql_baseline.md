@@ -263,10 +263,68 @@ HFS `hfsctl check` 均 `corruption=none`。
 - **范围读再次塌陷且更差（15.1%，p95/p99 达 167/493 ms）**，而本轮
   **没有任何内核 NVMe timeout**：说明这是 HFS seam 范围读路径自身的
   间歇性长尾（p50 4.25 ms 与 native 3.62 ms 接近，差距集中在尾部），
-  不是设备停顿或 extent 压力；列为后续优化项（批量/范围读路径）。
+  不是设备停顿或 extent 压力；已在 §10 定位并修复。
 - 2M 行规模仍不重测：§8 已记录 native O_DIRECT 随机写在该规模下伴随
   设备 timeout 塌陷，需单独方法学。
 
 证据：`/home/hfs/mysql-native-vs-hfs-20260928/`（标准矩阵 4 阶段）、
 `/home/hfs/mysql-large-1m-20260928/`（大工作集 2 阶段）；
 均为 `cleanup: stage=complete exit=0`。
+
+## 10. `read_only` 根因定位与修复（Shard-108，2026-09-28）
+
+### 10.1 现象与定位
+
+大工作集（64 MiB buffer pool + O_DIRECT）下 HFS `read_only` 只有 native 的
+15.1%，而线程缩放实验给出关键线索（`/home/hfs/mysql-readonly-diag-20260928`）：
+
+| 线程 | HFS TPS | HFS avg/p50/p95/p99/max ms | native TPS | native p99/max ms |
+|---:|---:|---|---:|---|
+| 1 | 820.84 | 1.22 / 1.16 / 1.70 / 2.07 / 4.29 | 849.19 | 2.14 / 5.95 |
+| 8 | 6511.64 | 1.23 / 1.18 / 2.03 / 2.48 / 11.65 | 8026.55 | 2.22 / 5.66 |
+| 32 | **4556.19** | 7.00 / 3.30 / 5.99 / **147.61 / 889.92** | 8440.49 | 6.67 / 16.43 |
+| 32，`--range_selects=off` | 22087.03 | 1.45 / 1.32 / 2.48 / 3.43 / 8.7 | 20764.71 | 2.91 / 10.46 |
+
+- 1/8 线程两侧持平；32 线程 + 范围扫描才塌陷，纯点查（范围开关关闭）正常
+  → 问题在"高并发范围读"的 I/O 提交路径，不在设备或单次读成本。
+- seam 计数器：`async_reads=28621 async_writes=34532 async_fallbacks=294533`
+  → **约 91% 的 I/O 走了同步回退**。
+- `perf`（32 线程）：connection 线程 **64.2% 采样在 `spdk_ring_enqueue`**，
+  其中 63.9% 在 `rte_wait_until_equal_32` 自旋——同步回退路径每个 I/O 调用
+  一次 `spdk_thread_send_msg` 投递到单一 data reactor，消息环满后生产者自旋
+  等待，造成 CPU 空转与百毫秒级长尾。
+- 代码根因：`hfs_vfs::asyncIo` 要求当前线程已有 `t_holder`（线程 client），
+  而 `threadClient()` 只在文件 open/create 路径被调用；32 个连接线程大多
+  没有 client，异步快路径不可用，全部落到 `file->read().wait()` 同步面。
+
+### 10.2 修复与验证
+
+修复（`mysql/patches/hfs_seam_shard108_async_lazy.patch`，`build_mysql_vm.sh`
+按标记应用）：`asyncIo` 在首次 I/O 时惰性调用 `threadClient()` 建立本线程
+client；共享溢出 client 仅服务元数据，不参与异步 poll，因此超限线程仍安全
+回退。修复后 `thread_clients=140`、`async_reads=315801 async_writes=228960
+async_fallbacks=47580`（异步覆盖 ~92%）。
+
+同会话 A/B（同一 HFS datadir，1/8/32 线程）：
+
+| 线程 | 修复前 TPS | 修复后 TPS | 修复前 p99 / max ms | 修复后 p99 / max ms |
+|---:|---:|---:|---|---|
+| 1 | 820.84 | 823.02 | 2.07 / 4.29 | 2.03 / 3.15 |
+| 8 | 6511.64 | 7025.40 | 2.48 / 11.65 | 2.39 / 4.32 |
+| 32 | 4556.19 | **8752.81** | **147.61 / 889.92** | **7.98 / 18.82** |
+
+修复后大工作集矩阵（10 表 × 10 万行、64 MiB pool + O_DIRECT、32 线程）：
+
+| 场景 | HFS（修复前） | HFS（修复后） | native | 修复后比值 |
+|---|---:|---:|---:|---:|
+| read_only | 1250.58（15.1%） | **7947.85** | 8309.30 | **95.7%** |
+| point_select | 236302.67 | 203505.04 | 205061.74 | 99.2% |
+| write_only | 4915.24 | 5270.95 | 5628.51 | 93.6% |
+| read_write | 2533.81 | 2571.36 | 536.70（30 s 设备停顿，不可比） | — |
+| seq_scan（平均秒） | 0.157 | 0.154 | 0.148 | 104.1%（HFS 慢 4%） |
+
+修复后 `read_only` 的 p95/p99（6.91/9.39 ms）与 native（5.67/8.13 ms）同档；
+`hfsctl check` 仍为 `corruption=none`。证据：
+`/home/hfs/mysql-readonly-diag-20260928`（修复前定位与 perf）、
+`/home/hfs/mysql-readonly-lazyfix-20260928`（A/B）、
+`/home/hfs/mysql-large-1m-lazyfix-20260928`（修复后矩阵）。
