@@ -730,6 +730,60 @@ RequestParentComplete→CqPush→FeReap` 的推导与 p50/p99；`trace-manifest.
   P2-4 arena 分区：均需先修订 `doc/design/hfs2.0.md` 或先有 profile 证据，
   尚未开始。
 
+## 14. 实施状态总表（2026-09-29）
+
+> 状态口径：✅ 完成（有实现 + 证据）；⚠️ 部分完成（列出剩余子项）；❌ 未开始。
+> 详细证据见 §10–§13；提交号对应 `main` 分支。
+
+### 14.1 P0（9 组局部优化）
+
+| 项 | 状态 | 实现/证据 | 剩余 |
+|---|---|---|---|
+| P0-1 getpid | ✅ | `6d586c4`；同 workload getpid 5410→258 | — |
+| P0-2 OperationPool | ✅ | `8b9c288`（移除 64-child 死数组）+ `e714af3`（tagged index freelist、预分配存储、无锁） | — |
+| P0-3 Sidecar 池 | ✅ | `e714af3`（O(1) free stack + 按用量 reset） | — |
+| P0-4 Backend slot | ✅ | `8b9c288`（actor 私有 free list，O(maxInFlight) CAS → O(1)） | — |
+| P0-5 extent lookup | ✅ | `8b9c288` + `inode_map_test`；661.6 → 69.4 ns/lookup | — |
+| P0-6 DmaArena | ✅ 主体 | `b2a9c54`（地址有序 index、O(log N) 归属、按 waiter 通知） | 子项：`reusableReadLease` 收敛为 per-shard cache 未评估 |
+| P0-7 RocksDB 读路径 | ✅ | `29a3429`（getenv 缓存）+ `1b1aa25`（状态池 + 单锁 submit） | — |
+| P0-8 FIO/DataPath | ✅ | `29a3429`（FIO free stack）+ `3fbb7e6`（固定数组 + parent latch） | — |
+| P0-9 小项 | ⚠️ 部分 | stats-off guard（`8b9c288`） | ① sink/handle shared_ptr 改 intrusive ref；② `File::read/write` 每次重建 `extentMapFor`（`client.cpp:994/1115`）；③ `isBufferDmaCapable` 双调用 |
+
+### 14.2 P1（7 项结构修复）
+
+| 项 | 状态 | 实现/证据 | 剩余 |
+|---|---|---|---|
+| P1-1 per-inode 快照 | ✅ 主体 | `113f36f` + `snapshot_cache_device_test`（hits=3/builds=2 契约） | 子项：无锁发布/RCU 未做（per-File mutex 保留，§11.3） |
+| P1-2 同步 ingress | ✅ | `e843c6d`；16 线程 +22.8%，`spdk_ring_enqueue` 自旋消失 | — |
+| P1-3 doorbell 无锁 | ✅ | `e843c6d`（reader gate + atomic 表） | — |
+| P1-4 namespace O(E) | ✅ | `113f36f`（二分区间 + 原位校验，不再整表拷贝） | — |
+| P1-5 footprint | ⚠️ 部分 | Stage B：reset 只清实际用量（`e714af3`） | hot/cold split、`kMaxChildren` 4+有界溢出块 未做 |
+| P1-6 scheduler | ⚠️ 触发验证 | `d1c13c7`：4096 深窗口 5.9 µs/node，生产窗口几十 → 未触发 | balanced active index 未实施（microbenchmark 作为触发门禁保留） |
+| P1-7 dirty epoch | ✅ | `113f36f` + `namespace_test` 缩放验证（58/45 ns per publish） | — |
+
+### 14.3 P2（4 项设计决策）
+
+| 项 | 状态 | 前置 |
+|---|---|---|
+| P2-1 zero-copy DMA | ❌ | 先修订 `hfs2.0.md` §11.2/§20（InnoDB buffer pool / RocksDB kFSBuffer 契约） |
+| P2-2 增量 checkpoint | ❌ | 先修订 §10.2 与磁盘格式版本 |
+| P2-3 metadata actor 收敛 | ❌ | 阶段级实现（设计已定，无需先改边界） |
+| P2-4 per-shard/per-class arena | ❌ | profile-gated：P0-6 后仍证明 central arena 是瓶颈才启动 |
+
+### 14.4 Trace 点位（§7）
+
+| 项 | 状态 | 说明 |
+|---|---|---|
+| §7.2 已定义未发射点 | ✅ | `d872c6a`：JournalAppend/Chkpt×3/Fsync×2/Recovery×2/Retry/BusyReject 已在生产路径发射并验证 |
+| §7.3 新点位 | ⚠️ 部分 | 已实现 `SnapHit`(53)/`SnapBuild`(54)；未实现 `FeSubmitBegin`/`MetaLockWait`/`OpPoolAcquire`/`DmaOwns` |
+
+### 14.5 门禁状态（2026-09-29）
+
+- CTest 29/29、`hfsctl check` `corruption=none`、closure 全闭合；
+- 同形状 FIO gate（§16.2 修订后）：1j32 HFS/raw 90.6%、p99 1.00；8j4 120.8%、p99 0.19；
+- RocksDB/MySQL 缩减回归与既有基线一致（见 `hfs2_stage_abcd_regression_20260929.md`）；
+- 未闭合：P2 全部、P0-9/P1-1/P1-5/P1-6 的剩余子项、§7.3 的 4 个点位。
+
 ## 附录 A：优化点 → 代码位置索引
 
 | 编号 | 主要位置 |
