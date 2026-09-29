@@ -144,6 +144,13 @@ public:
     double usageRatio() const;
     bool needsCheckpoint() const;
     bool checkpointForced() const;
+    /* True when the next checkpoint writes a full base (no base yet or the
+     * replay window reached force_percent). The barrier may then skip
+     * journaling staged records because the snapshot covers them. */
+    bool nextCheckpointWillBeFull() const;
+    /* Forces the next checkpoint to write a full base; used for namespace
+     * shape changes, which the journal record format cannot replay. */
+    void requireFullCheckpoint() noexcept;
     Stats stats() const;
 
     /* Instances are created by open(); the constructor is public only so the
@@ -158,7 +165,7 @@ private:
     /* Unlocked bodies shared by the public serialized entry points. */
     Result<std::uint64_t> appendLocked(std::span<const JournalRecord> records,
                                        bool flushDevice, bool applyToTarget);
-    Result<void> checkpointLocked(bool deferFlush);
+    Result<void> checkpointLocked(bool deferFlush, bool forceFullBase = false);
     Result<void> replayLocked();
 
     /* Internal factory shared by the two open() overloads. */

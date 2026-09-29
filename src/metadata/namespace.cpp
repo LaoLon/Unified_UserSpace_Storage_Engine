@@ -1140,10 +1140,14 @@ Namespace::StagedBatch Namespace::takeStagedRecords() {
     return batch;
 }
 
-/* Stages one journal record for the next durable barrier (§9.3). */
+/* Stages one journal record for the next durable barrier (§9.3). Shape changes
+ * set checkpointRequired_ and force the next checkpoint to be a full snapshot
+ * (the journal record format cannot carry names), so staged records are skipped
+ * while that full is pending: it covers every staged mutation. Journal-backed
+ * deltas therefore only cover windows without shape changes. */
 void Namespace::stageRecord(JournalRecord record) {
     if (checkpointRequired_) {
-        return; /* the checkpoint snapshot covers every staged mutation */
+        return; /* the pending full snapshot covers every staged mutation */
     }
     pendingRecords_.push_back(record);
     pendingEpoch_ = std::max(pendingEpoch_, logicalEpoch_);

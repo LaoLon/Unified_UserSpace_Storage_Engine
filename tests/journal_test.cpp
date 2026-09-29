@@ -205,11 +205,15 @@ int main() {
         HFS_TEST_CHECK(journal != nullptr);
         writer.values[7] = 100;
         HFS_TEST_CHECK(journal->checkpoint().ok());
-        writer.values[7] = 200;
+        /* Journal-backed delta: the second checkpoint keeps the first full
+         * snapshot as its base and retains the journal for the difference, so
+         * the change must be journaled (the mock applies it via append). */
+        HFS_TEST_CHECK(journal->append({setSize(7, 200)}, true).ok());
         HFS_TEST_CHECK(journal->checkpoint().ok());
         MemoryTarget reader;
         auto reopened = fixture.open(&reader);
         HFS_TEST_CHECK(reopened != nullptr);
+        HFS_TEST_CHECK(reopened->replay().ok());
         HFS_TEST_CHECK(reader.values[7] == 200);
     }
 

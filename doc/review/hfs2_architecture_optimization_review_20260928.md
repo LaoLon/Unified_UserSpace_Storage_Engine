@@ -788,7 +788,7 @@ RequestParentComplete→CqPush→FeReap` 的推导与 p50/p99；`trace-manifest.
 | 项 | 状态 | 前置 |
 |---|---|---|
 | P2-1 zero-copy DMA | ✅ MySQL + RocksDB | Shard-110 `321bc9c`：InnoDB buffer pool 从 HFS arena 分配（`read_direct_user_children` 917–1308、copy-out 显著下降、崩溃矩阵通过、pre/post 吞吐噪声内）；Shard-111：RocksDB kFSBuffer 读路径（`read_direct_user_children=170098`、bounce/copy-out=0、post/pre ops=1.0016）+ core dword 对齐修复；见 `hfs2_zero_copy_frontend_review_20260929.md`、`hfs2_mysql_zero_copy_20260929.md`、`hfs2_rocksdb_kfsbuffer_review_20260929.md`、`hfs2_rocksdb_kfsbuffer_20260929.md` |
-| P2-2 增量 checkpoint | ⚠️ (a) 已实施 | (a) 冻结视图 + 锁外编码：`Namespace::freezeCheckpointViewLocked` + `encodeCheckpointView`，新增 `ChkptFreeze`/`syncCheckpointFreeze`（RocksDB 50k keys 实测冻结 7µs / 总 13µs / 设备写 115µs）；CTest 29/29 + 崩溃矩阵；见 `hfs2_incremental_checkpoint_review_20260929.md`；(b) dirty 增量待格式版本 +1 |
+| P2-2 增量 checkpoint | ✅ (a)(b) | (a) 冻结视图 + 锁外编码（`ChkptFreeze`/`syncCheckpointFreeze`）；(b) journal-backed delta：`CheckpointHeader.kind`+v2、delta 1 块、tail 保持 base、shape 变更强制 full、staged 记录先入 journal；MySQL 矩阵 361 delta/442 full 且 SIGKILL 恢复通过，1M 状态 fresh 恢复 2.05 s；见 `hfs2_incremental_checkpoint_review_20260929.md`、`hfs2_checkpoint_freeze_20260929.md`、`hfs2_incremental_checkpoint_20260929.md` |
 | P2-3 metadata actor 收敛 | ❌ | 阶段级实现（设计已定，无需先改边界） |
 | P2-4 per-shard/per-class arena | ❌ | profile-gated：P0-6 后仍证明 central arena 是瓶颈才启动 |
 

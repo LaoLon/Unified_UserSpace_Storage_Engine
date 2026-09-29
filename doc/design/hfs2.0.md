@@ -828,18 +828,26 @@ RocksDB 回调映射：`Append`=buffered；`Flush`=logical（**不** durable）�
 - 度量：新增 `syncCheckpointFreeze` 计数与 `ChkptFreeze` trace，报告冻结/编码
   占比；`syncCheckpointSnapshot` 保持为总时间。
 
-**(b) dirty-object 增量 checkpoint（格式版本 +1）**
+**(b) journal-backed 增量 checkpoint（格式版本 +1）**
 
-- dirty 集合：inode 标量版本、目录项增删、extent 变更、allocator 位图范围；
-- checkpoint 链：最近一次 base（全量）+ 自 base 以来的 delta 序列（带 base txid
-  与 sequence）；达到容量阈值触发新 base；
-- 恢复：装载最新有效 base，按 sequence 应用 delta，再从 base txid 之后的
-  journal 记录 replay；superblock 指向链头；
-- journal 保留：delta 未 durable 前 `tail` 不得推进到链覆盖的 sequence 之前，
-  `journal_mb` 预算覆盖该窗口；
-- 发布顺序：delta 记录 → superblock → 一次设备 flush；失败时链不变；
-- 兼容：格式版本 +1 只在 mount 时按版本分派；旧卷可被新二进制读取，新卷对旧
-  二进制 fail-closed。
+- checkpoint 有两种记录：**full base**（全量快照，沿用 (a) 的冻结/编码）与
+  **delta**（仅 header + `DeltaPayload{base slot/txid/sequence}`，不写快照）；
+- journal 就是 delta：delta 只把当前 `head` 记入 checkpoint，`tail` 保持在上一个
+  base 的 sequence；恢复 = 装载 base 快照 + 从 base txid 起 replay 现有 journal
+  （无需 per-object dirty 跟踪）；
+- **shape 变更约束**：journal 记录格式（objectId/arg0/arg1）不能携带名字，
+  Create/Link/Unlink/Rename 不写 journal（原设计由全量快照覆盖）；因此 shape 变更
+  置 `checkpointRequired` 并强制下一次 checkpoint 写 **full base**，delta 只覆盖
+  无 shape 变更的窗口（SetSize/Alloc/Free/Truncate/SetTimes 可 replay）；
+- 写 full base 的时机：无有效 base、窗口 `head - baseSequence` ≥ 75% ring、或
+  ring 将满（append 内部触发）；其余 checkpoint 写 delta；
+- 写槽位：始终写**非 base**槽位，保证 base 槽位在任何 delta 之后仍有效；
+- 触发节奏：`needsCheckpoint()` 改为“自上次 checkpoint 起的 append 量 ≥
+  triggerPercent% ring”（不再是 tail 占用率，因为 delta 不推进 tail）；
+- 发布顺序：checkpoint 记录 → superblock → 一次设备 flush；失败时 base/delta
+  状态不变（`tail` 不推进）；
+- 兼容：`CheckpointHeader.kind` 字段 + `formatVersion=2`；v1 槽位按 full 读取，
+  旧卷可被新二进制 mount；新卷对旧二进制 fail-closed。
 
 ## 11. RocksDB 8.9.1 adapter
 

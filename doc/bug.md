@@ -54,6 +54,7 @@ Bug 等级：**致命 > 严重 > 一般**。
 - 43：已修复（checkpoint 控制写批上限导致大 namespace 无法 sync）。
 - 44：已修复（replay 每事务 before-image 导致 O(T×N) 重挂载）。
 - 45：待处理（client 未 close 时析构崩溃）。
+- 46：待处理（同进程 remount 在重 sync 负载后崩溃，非 P2-2(b) 引入）。
 
 ## Bug 记录
 
@@ -784,6 +785,23 @@ Bug 等级：**致命 > 严重 > 一般**。
 - **排查过程**：待查（疑似 client/engine 析构顺序或 async 服务关闭竞态）。
 - **根因**：待定。
 - **修复**：未修复。
+- **验证结果**：不适用。
+
+### 46. 同进程 remount（stop 后重新 mount）在重 sync 负载后崩溃（待处理）
+
+- **状态**：待处理
+- **等级**：严重（进程 SIGSEGV；影响同一进程内 stop→mount 的工具/测试）
+- **时间**：2026-09-29（P2-2(b) 验证期间发现）
+- **现象**：`hfs_meta_bench` 在 200k inode + 2000 次 fsync 的工作负载后，
+  `engine->stop()` 再 `Engine::create`+`mount()` 时进程 SIGSEGV（exit 139）；
+  日志最后为 `spdk runtime active` 后
+  `nvme_pcie_qpair_abort_trackers ... DESTROYING aborting outstanding command`。
+- **排查过程**：同负载下 gdb 未复现（时序相关）；把 `journal.cpp`/`journal.hpp`
+  回退到 P2-2(b) 之前的 HEAD 版本仍复现 → **非 P2-2(b) 引入**；轻负载
+  （200 sync、20k inode）不触发；单独进程 mount（`--mount-only=1`）正常。
+- **根因**：待定（疑似第二次 mount 期间的控制 I/O 与 runtime 重启/停止竞态）。
+- **修复**：未修复；生产路径（每进程 mount 一次）不受影响，但同进程 remount
+  的工具/测试需规避。
 - **验证结果**：不适用。
 
 ## 记录模板

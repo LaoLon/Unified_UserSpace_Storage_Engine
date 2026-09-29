@@ -856,10 +856,33 @@ Result<void> Engine::syncMetadata(std::uint64_t epoch) {
             checkpointNeeded && (impl_->namespaceState->checkpointRequired() ||
                                  impl_->journal->needsCheckpoint());
         const auto checkpointPhase = [&]() {
+            /* Namespace shape changes cannot be replayed from the journal record
+             * format, so they force a full base; journal-backed deltas only
+             * cover windows without shape changes (hfs2.0.md §10.4 b). */
+            const bool shapeChanged = impl_->namespaceState->checkpointRequired();
+            if (shapeChanged) {
+                impl_->journal->requireFullCheckpoint();
+            }
+            const bool fullCheckpoint =
+                shapeChanged || impl_->journal->nextCheckpointWillBeFull();
+            auto staged = impl_->namespaceState->takeStagedRecords();
             impl_->namespaceState->clearPendingRecords();
-            auto staged = impl_->namespaceState->prepareDurableEpoch(targetEpoch);
-            if (!staged.ok()) {
-                result = staged;
+            if (!fullCheckpoint && !staged.records.empty()) {
+                auto appended = impl_->journal->append(staged.records,
+                                                       /*flushDevice=*/false,
+                                                       /*applyToTarget=*/false);
+                if (!appended.ok()) {
+                    impl_->namespaceState->requireCheckpoint();
+                    result = makeError(appended.status(), appended.message());
+                    return;
+                }
+                stats::counters().journalTransactions.fetch_add(1,
+                                                                std::memory_order_relaxed);
+            }
+            auto durable = impl_->namespaceState->prepareDurableEpoch(targetEpoch);
+            if (!durable.ok()) {
+                impl_->namespaceState->requireCheckpoint();
+                result = durable;
                 return;
             }
             prepared = true;

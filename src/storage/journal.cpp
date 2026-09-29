@@ -34,7 +34,14 @@ std::uint64_t elapsedNs(std::chrono::steady_clock::time_point start) noexcept {
 constexpr std::uint64_t kJournalSlotMagic = 0x484653324a524e4cULL; /* "HFS2JRNL" */
 constexpr std::uint32_t kJournalFormatVersion = 1;
 constexpr std::uint64_t kCheckpointMagic = 0x4846533243505431ULL; /* "HFS2CPT1" */
-constexpr std::uint32_t kCheckpointFormatVersion = 1;
+constexpr std::uint32_t kCheckpointFormatVersion = 2;
+/* v1 checkpoint slots have no kind field and are always full snapshots. */
+constexpr std::uint32_t kCheckpointVersionFullOnly = 1;
+constexpr std::uint32_t kCheckpointKindFull = 0;
+constexpr std::uint32_t kCheckpointKindDelta = 1;
+/* A journal-backed delta keeps the window (base, head]; a full base is written
+ * once the window reaches force_percent of the ring (or the ring is about to
+ * fill). The window is what a crash replays, so this bounds replay time. */
 constexpr std::size_t kControlIoLimit = 1U << 20;
 
 /* One journal slot; every slot is a metadata block. */
@@ -73,8 +80,17 @@ struct CheckpointHeader {
     std::uint64_t generation;
     std::array<std::uint8_t, 16> uuid;
     std::uint32_t crc; /* over bytes before this field + payload */
-    std::uint32_t reserved;
+    std::uint32_t kind; /* kCheckpointKindFull / kCheckpointKindDelta */
 };
+
+/* Delta checkpoint payload: the full base slot this delta anchors to. */
+struct DeltaPayload {
+    std::uint64_t baseTxid;
+    std::uint64_t baseSequence;
+    std::uint8_t baseSlotIsA;
+    std::uint8_t padding[7];
+};
+static_assert(sizeof(DeltaPayload) == 24, "delta payload layout is frozen");
 
 std::uint64_t bytesToBlocks(std::uint64_t bytes, std::uint64_t blockSize) {
     return (bytes + blockSize - 1) / blockSize;
@@ -140,6 +156,19 @@ struct Journal::Impl {
     std::uint64_t tail = 0;
     std::uint64_t lastTxid = 0;
     std::uint32_t validTransactions = 0;
+    /* Journal-backed delta checkpoint state (format v2): the current full base
+     * slot plus the sequence of the last checkpoint write (delta or full). */
+    bool baseValid = false;
+    bool baseSlotIsA = false;
+    std::uint64_t baseTxid = 0;
+    std::uint64_t baseSequence = 0;
+    std::uint64_t lastCheckpointSequence = 0;
+    /* Set by requireFullCheckpoint(): the next checkpoint must write a full
+     * base because the window contains a shape change the journal cannot
+     * replay. Cleared once that base is written. */
+    bool forceFullPending = false;
+    std::uint64_t fullCheckpoints = 0;
+    std::uint64_t deltaCheckpoints = 0;
     bool checkpointAValid = false;
     bool checkpointBValid = false;
     std::uint64_t checkpointATxid = 0;
@@ -302,6 +331,7 @@ struct Journal::Impl {
         std::uint64_t txid = 0;
         std::uint64_t sequence = 0;
         std::uint64_t generation = 0;
+        std::uint32_t kind = kCheckpointKindFull;
     };
 
     /* One superblock record ready to be written. */
@@ -328,6 +358,7 @@ struct Journal::Impl {
 
     Result<void> readCheckpoint(std::uint64_t slotStart, bool *valid, std::uint64_t *txid,
                                 std::uint64_t *sequence, std::uint64_t *generation,
+                                std::uint32_t *kind, DeltaPayload *delta,
                                 std::vector<std::byte> *payload) {
         const std::uint64_t slotBlocks = checkpointBlocks / 2;
         std::vector<std::byte> first(blockSize, std::byte{0});
@@ -338,8 +369,10 @@ struct Journal::Impl {
         CheckpointHeader header{};
         std::memcpy(&header, first.data(), sizeof(header));
         *valid = false;
+        *kind = kCheckpointKindFull;
         if (header.magic != kCheckpointMagic ||
-            header.formatVersion != kCheckpointFormatVersion ||
+            (header.formatVersion != kCheckpointFormatVersion &&
+             header.formatVersion != kCheckpointVersionFullOnly) ||
             header.uuid != superblock.uuid) {
             return Result<void>(Status::Ok);
         }
@@ -363,15 +396,30 @@ struct Journal::Impl {
         if (header.crc != expectedWithPayload) {
             return Result<void>(Status::Ok);
         }
+        const std::uint32_t checkpointKind =
+            header.formatVersion == kCheckpointVersionFullOnly ? kCheckpointKindFull
+                                                              : header.kind;
+        if (checkpointKind == kCheckpointKindDelta) {
+            if (header.payloadSize < sizeof(DeltaPayload)) {
+                return Result<void>(Status::Ok);
+            }
+            std::memcpy(delta, record.data() + sizeof(CheckpointHeader), sizeof(DeltaPayload));
+            payload->clear();
+        } else {
+            payload->assign(record.begin() + sizeof(CheckpointHeader), record.end());
+        }
         *valid = true;
+        *kind = checkpointKind;
         *txid = header.txid;
         *sequence = header.sequence;
         *generation = header.generation;
-        payload->assign(record.begin() + sizeof(CheckpointHeader), record.end());
         return Result<void>(Status::Ok);
     }
 
-    Result<CheckpointRecord> buildCheckpointRecord(std::span<const std::byte> snapshot) {
+    /* Full base checkpoint: freeze/encode already happened; the record carries
+     * the whole namespace snapshot. Always written to the non-base slot so any
+     * delta that follows can still reach its base. */
+    Result<CheckpointRecord> buildFullCheckpointRecord(std::span<const std::byte> snapshot) {
         const std::uint64_t slotBlocks = checkpointBlocks / 2;
         const std::uint64_t totalBytes = sizeof(CheckpointHeader) + snapshot.size();
         if (bytesToBlocks(totalBytes, blockSize) > slotBlocks) {
@@ -388,20 +436,61 @@ struct Journal::Impl {
         header.sequence = head;
         header.generation = superblock.generation;
         header.uuid = superblock.uuid;
+        header.kind = kCheckpointKindFull;
         std::memcpy(built.record.data(), &header, sizeof(header));
         std::memcpy(built.record.data() + sizeof(header), snapshot.data(), snapshot.size());
         auto *headerView = reinterpret_cast<CheckpointHeader *>(built.record.data());
         headerView->crc = crc32c(built.record.data() + sizeof(CheckpointHeader), snapshot.size(),
                                  crc32c(built.record.data(), offsetof(CheckpointHeader, crc)));
 
-        /* Rotate to the inactive slot; once both are valid, replace the older
-         * sequence so one complete checkpoint remains available on failure. */
-        built.writeA = !checkpointAValid ||
-                       (checkpointBValid && checkpointASequence < checkpointBSequence);
+        /* The non-base slot keeps the current base intact for deltas. */
+        built.writeA = !baseValid || !baseSlotIsA;
         built.offsetBlocks = built.writeA ? checkpointAStart : checkpointBStart;
         built.txid = lastTxid;
         built.sequence = head;
         built.generation = superblock.generation;
+        built.kind = kCheckpointKindFull;
+        return built;
+    }
+
+    /* Delta checkpoint: points at the current full base and records the ring
+     * head; the journal keeps (base, head] so recovery replays the difference. */
+    Result<CheckpointRecord> buildDeltaCheckpointRecord() {
+        const std::uint64_t slotBlocks = checkpointBlocks / 2;
+        const std::uint64_t totalBytes = sizeof(CheckpointHeader) + sizeof(DeltaPayload);
+        if (bytesToBlocks(totalBytes, blockSize) > slotBlocks) {
+            return makeError<CheckpointRecord>(Status::NoSpace,
+                                               "delta checkpoint does not fit the slot");
+        }
+        CheckpointRecord built;
+        built.record.assign(bytesToBlocks(totalBytes, blockSize) * blockSize, std::byte{0});
+        CheckpointHeader header{};
+        header.magic = kCheckpointMagic;
+        header.formatVersion = kCheckpointFormatVersion;
+        header.payloadSize = sizeof(DeltaPayload);
+        header.txid = lastTxid;
+        header.sequence = head;
+        header.generation = superblock.generation;
+        header.uuid = superblock.uuid;
+        header.kind = kCheckpointKindDelta;
+        DeltaPayload delta{};
+        delta.baseTxid = baseTxid;
+        delta.baseSequence = baseSequence;
+        delta.baseSlotIsA = baseSlotIsA ? 1 : 0;
+        std::memcpy(built.record.data(), &header, sizeof(header));
+        std::memcpy(built.record.data() + sizeof(header), &delta, sizeof(delta));
+        auto *headerView = reinterpret_cast<CheckpointHeader *>(built.record.data());
+        headerView->crc = crc32c(built.record.data() + sizeof(CheckpointHeader),
+                                 sizeof(DeltaPayload),
+                                 crc32c(built.record.data(), offsetof(CheckpointHeader, crc)));
+
+        /* Deltas always replace the non-base slot. */
+        built.writeA = !baseSlotIsA;
+        built.offsetBlocks = built.writeA ? checkpointAStart : checkpointBStart;
+        built.txid = lastTxid;
+        built.sequence = head;
+        built.generation = superblock.generation;
+        built.kind = kCheckpointKindDelta;
         return built;
     }
 
@@ -444,11 +533,22 @@ struct Journal::Impl {
             checkpointBGeneration = checkpoint.generation;
         }
         sbSlot = superblockRecord.slot;
-        log::info("checkpoint written: slot=%c txid=%llu sequence=%llu bytes=%zu",
-                  checkpoint.writeA ? 'A' : 'B',
-                  static_cast<unsigned long long>(checkpoint.txid),
-                  static_cast<unsigned long long>(checkpoint.sequence),
-                  checkpoint.record.size());
+        if (checkpoint.kind == kCheckpointKindDelta) {
+            ++deltaCheckpoints;
+            log::info("checkpoint written: slot=%c kind=delta txid=%llu sequence=%llu "
+                      "bytes=%zu base=%c",
+                      checkpoint.writeA ? 'A' : 'B',
+                      static_cast<unsigned long long>(checkpoint.txid),
+                      static_cast<unsigned long long>(checkpoint.sequence),
+                      checkpoint.record.size(), baseSlotIsA ? 'A' : 'B');
+        } else {
+            ++fullCheckpoints;
+            log::info("checkpoint written: slot=%c kind=full txid=%llu sequence=%llu bytes=%zu",
+                      checkpoint.writeA ? 'A' : 'B',
+                      static_cast<unsigned long long>(checkpoint.txid),
+                      static_cast<unsigned long long>(checkpoint.sequence),
+                      checkpoint.record.size());
+        }
         return Result<void>(Status::Ok);
     }
 
@@ -513,7 +613,9 @@ Result<std::unique_ptr<Journal>> Journal::create(std::unique_ptr<JournalDevice> 
     impl.tail = impl.superblock.journalTail;
     impl.lastTxid = 0;
 
-    /* Newest valid checkpoint wins; its sequence resumes the ring scan. */
+    /* Newest valid checkpoint wins; its sequence resumes the ring scan. A
+     * delta record resolves to the full base it points at, and the journal
+     * replay then starts from the base txid (hfs2.0.md §10.4 b). */
     std::vector<std::byte> payloadA;
     std::vector<std::byte> payloadB;
     std::uint64_t sequenceA = 0;
@@ -522,13 +624,17 @@ Result<std::unique_ptr<Journal>> Journal::create(std::unique_ptr<JournalDevice> 
     std::uint64_t txidB = 0;
     std::uint64_t generationA = 0;
     std::uint64_t generationB = 0;
+    std::uint32_t kindA = kCheckpointKindFull;
+    std::uint32_t kindB = kCheckpointKindFull;
+    DeltaPayload deltaA{};
+    DeltaPayload deltaB{};
     auto readA = impl.readCheckpoint(impl.checkpointAStart, &impl.checkpointAValid, &txidA,
-                                     &sequenceA, &generationA, &payloadA);
+                                     &sequenceA, &generationA, &kindA, &deltaA, &payloadA);
     if (!readA.ok()) {
         return makeError<std::unique_ptr<Journal>>(readA.status(), readA.message());
     }
     auto readB = impl.readCheckpoint(impl.checkpointBStart, &impl.checkpointBValid, &txidB,
-                                     &sequenceB, &generationB, &payloadB);
+                                     &sequenceB, &generationB, &kindB, &deltaB, &payloadB);
     if (!readB.ok()) {
         return makeError<std::unique_ptr<Journal>>(readB.status(), readB.message());
     }
@@ -546,18 +652,64 @@ Result<std::unique_ptr<Journal>> Journal::create(std::unique_ptr<JournalDevice> 
                            std::tuple{impl.checkpointBGeneration, impl.checkpointBTxid,
                                       impl.checkpointBSequence});
     const bool useB = impl.checkpointBValid && !useA;
-    const std::uint64_t checkpointSequence = useA ? sequenceA : sequenceB;
-    const std::uint64_t checkpointTxid = useA ? impl.checkpointATxid : impl.checkpointBTxid;
-    const std::vector<std::byte> &payload = useA ? payloadA : payloadB;
-    if ((useA || useB) && checkpointSequence >= impl.tail) {
-        impl.tail = checkpointSequence;
-        impl.lastTxid = checkpointTxid;
-        if (impl.target != nullptr) {
-            auto loaded = impl.target->loadSnapshot(payload);
-            if (!loaded.ok()) {
-                return makeError<std::unique_ptr<Journal>>(loaded.status(),
-                                                           "checkpoint snapshot rejected: " +
-                                                               loaded.message());
+    if (useA || useB) {
+        const bool newestIsA = useA;
+        const std::uint32_t newestKind = newestIsA ? kindA : kindB;
+        const std::uint64_t newestTxid = newestIsA ? txidA : txidB;
+        const std::uint64_t newestSequence = newestIsA ? sequenceA : sequenceB;
+        std::uint64_t baseTxid = newestTxid;
+        std::uint64_t baseSequence = newestSequence;
+        bool baseSlotIsA = newestIsA;
+        const std::vector<std::byte> *basePayload = newestIsA ? &payloadA : &payloadB;
+        if (newestKind == kCheckpointKindDelta) {
+            const DeltaPayload &delta = newestIsA ? deltaA : deltaB;
+            const bool candidateIsA = delta.baseSlotIsA != 0;
+            const bool candidateValid = candidateIsA ? impl.checkpointAValid
+                                                     : impl.checkpointBValid;
+            const std::uint32_t candidateKind = candidateIsA ? kindA : kindB;
+            const std::uint64_t candidateTxid = candidateIsA ? txidA : txidB;
+            const std::uint64_t candidateSequence = candidateIsA ? sequenceA : sequenceB;
+            if (candidateValid && candidateKind == kCheckpointKindFull &&
+                candidateTxid == delta.baseTxid &&
+                candidateSequence == delta.baseSequence) {
+                baseTxid = delta.baseTxid;
+                baseSequence = delta.baseSequence;
+                baseSlotIsA = candidateIsA;
+                basePayload = candidateIsA ? &payloadA : &payloadB;
+            } else {
+                /* Dangling delta: fall back to the other slot when it is a
+                 * usable full snapshot; otherwise the volume is corrupt. */
+                const bool otherIsA = !candidateIsA;
+                const bool otherValid = otherIsA ? impl.checkpointAValid
+                                                 : impl.checkpointBValid;
+                const std::uint32_t otherKind = otherIsA ? kindA : kindB;
+                const std::uint64_t otherTxid = otherIsA ? txidA : txidB;
+                const std::uint64_t otherSequence = otherIsA ? sequenceA : sequenceB;
+                if (!otherValid || otherKind != kCheckpointKindFull) {
+                    return makeError<std::unique_ptr<Journal>>(
+                        Status::Corrupt, "delta checkpoint base is missing");
+                }
+                baseTxid = otherTxid;
+                baseSequence = otherSequence;
+                baseSlotIsA = otherIsA;
+                basePayload = otherIsA ? &payloadA : &payloadB;
+            }
+        }
+        if (baseSequence >= impl.tail) {
+            impl.tail = baseSequence;
+            impl.lastTxid = baseTxid;
+            impl.baseValid = true;
+            impl.baseSlotIsA = baseSlotIsA;
+            impl.baseTxid = baseTxid;
+            impl.baseSequence = baseSequence;
+            impl.lastCheckpointSequence = newestSequence;
+            if (impl.target != nullptr) {
+                auto loaded = impl.target->loadSnapshot(*basePayload);
+                if (!loaded.ok()) {
+                    return makeError<std::unique_ptr<Journal>>(
+                        loaded.status(),
+                        "checkpoint snapshot rejected: " + loaded.message());
+                }
             }
         }
     }
@@ -1019,7 +1171,7 @@ Result<std::uint64_t> Journal::appendLocked(std::span<const JournalRecord> recor
         static_cast<double>(impl.head - impl.tail) * 100.0 >=
             static_cast<double>(impl.forcePercent) * static_cast<double>(impl.journalBlocks);
     if (forced) {
-        auto checkpointResult = checkpointLocked(/*deferFlush=*/false);
+        auto checkpointResult = checkpointLocked(/*deferFlush=*/false, /*forceFullBase=*/true);
         if (!checkpointResult.ok()) {
             return makeError<std::uint64_t>(Status::NoSpace,
                                             "journal full and checkpoint failed: " +
@@ -1028,7 +1180,7 @@ Result<std::uint64_t> Journal::appendLocked(std::span<const JournalRecord> recor
     }
     const std::uint64_t needed = 2 + records.size();
     if ((impl.head - impl.tail) + needed > impl.journalBlocks) {
-        auto checkpointResult = checkpointLocked(/*deferFlush=*/false);
+        auto checkpointResult = checkpointLocked(/*deferFlush=*/false, /*forceFullBase=*/true);
         if (!checkpointResult.ok()) {
             return makeError<std::uint64_t>(Status::NoSpace,
                                             "journal full and checkpoint failed: " +
@@ -1130,35 +1282,49 @@ Result<void> Journal::checkpoint(bool deferFlush) {
     return checkpointLocked(deferFlush);
 }
 
-Result<void> Journal::checkpointLocked(bool deferFlush) {
+Result<void> Journal::checkpointLocked(bool deferFlush, bool forceFullBase) {
     auto &impl = *impl_;
     if (impl.target == nullptr) {
         return makeError(Status::InvalidState, "checkpoint requires a replay target");
     }
     const std::uint64_t checkpointTxid = impl.lastTxid;
     trace::event(trace::EventId::ChkptBegin, checkpointTxid, impl.head - impl.tail);
+    /* Journal-backed delta (hfs2.0.md §10.4 b): a delta only points at the
+     * current full base; the journal keeps (base, head] for recovery. A full
+     * base is written when none exists, when the replay window grows past
+     * force_percent of the ring, or when the ring is about to fill (append
+     * forces it). */
+    const std::uint64_t window = impl.head - impl.baseSequence;
+    const std::uint64_t fullWindow = impl.journalBlocks * impl.forcePercent / 100;
+    const bool writeFullBase =
+        forceFullBase || impl.forceFullPending || !impl.baseValid || window >= fullWindow;
     std::vector<std::byte> snapshot;
-    const auto snapshotStart = std::chrono::steady_clock::now();
-    auto saved = impl.target->saveSnapshot(impl.lastTxid, snapshot);
-    stats::counters().syncCheckpointSnapshot.record(elapsedNs(snapshotStart));
-    if (!saved.ok()) {
-        trace::event(trace::EventId::ChkptEnd, checkpointTxid,
-                     static_cast<std::uint64_t>(saved.status()));
-        return saved;
+    if (writeFullBase) {
+        const auto snapshotStart = std::chrono::steady_clock::now();
+        auto saved = impl.target->saveSnapshot(impl.lastTxid, snapshot);
+        stats::counters().syncCheckpointSnapshot.record(elapsedNs(snapshotStart));
+        if (!saved.ok()) {
+            trace::event(trace::EventId::ChkptEnd, checkpointTxid,
+                         static_cast<std::uint64_t>(saved.status()));
+            return saved;
+        }
+        if (impl.target->snapshotTxid() != impl.lastTxid) {
+            trace::event(trace::EventId::ChkptEnd, checkpointTxid,
+                         static_cast<std::uint64_t>(Status::Corrupt));
+            return makeError(Status::Corrupt,
+                             "snapshot txid does not match the journal tail");
+        }
     }
-    trace::event(trace::EventId::ChkptBytes, checkpointTxid,
-                 static_cast<std::uint64_t>(snapshot.size()));
-    if (impl.target->snapshotTxid() != impl.lastTxid) {
-        trace::event(trace::EventId::ChkptEnd, checkpointTxid,
-                     static_cast<std::uint64_t>(Status::Corrupt));
-        return makeError(Status::Corrupt, "snapshot txid does not match the journal tail");
-    }
-    auto checkpoint = impl.buildCheckpointRecord(snapshot);
+    auto checkpoint = writeFullBase ? impl.buildFullCheckpointRecord(snapshot)
+                                    : impl.buildDeltaCheckpointRecord();
     if (!checkpoint.ok()) {
         trace::event(trace::EventId::ChkptEnd, checkpointTxid,
                      static_cast<std::uint64_t>(checkpoint.status()));
         return makeError(checkpoint.status(), checkpoint.message());
     }
+    trace::event(trace::EventId::ChkptBytes, checkpointTxid,
+                 writeFullBase ? static_cast<std::uint64_t>(snapshot.size())
+                               : static_cast<std::uint64_t>(sizeof(DeltaPayload)));
     auto superblockRecord = impl.buildSuperblockRecord();
     if (!superblockRecord.ok()) {
         trace::event(trace::EventId::ChkptEnd, checkpointTxid,
@@ -1172,7 +1338,16 @@ Result<void> Journal::checkpointLocked(bool deferFlush) {
                      static_cast<std::uint64_t>(written.status()));
         return written;
     }
-    impl.tail = impl.head;
+    if (writeFullBase) {
+        impl.baseValid = true;
+        impl.baseSlotIsA = checkpoint.value().writeA;
+        impl.baseTxid = checkpointTxid;
+        impl.baseSequence = impl.head;
+        /* The base covers everything up to head; older records can be reused. */
+        impl.tail = impl.head;
+        impl.forceFullPending = false;
+    }
+    impl.lastCheckpointSequence = impl.head;
     impl.refreshStats();
     trace::event(trace::EventId::ChkptEnd, checkpointTxid,
                  static_cast<std::uint64_t>(Status::Ok));
@@ -1195,7 +1370,33 @@ double Journal::usageRatio() const {
 }
 
 bool Journal::needsCheckpoint() const {
-    return usageRatio() * 100.0 >= static_cast<double>(impl_->triggerPercent);
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    const auto &impl = *impl_;
+    if (impl.journalBlocks == 0) {
+        return false;
+    }
+    /* Journal-backed deltas do not advance tail, so the trigger counts appends
+     * since the last checkpoint instead of tail occupancy (hfs2.0.md §10.4).
+     * Deltas are O(1) records, so the cadence is half the configured trigger:
+     * a full base is still bounded by force_percent of the ring. */
+    const std::uint64_t appended = impl.head - impl.lastCheckpointSequence;
+    const std::uint64_t cadence = std::max<std::uint64_t>(impl.triggerPercent / 2, 1);
+    return appended * 100 >= impl.journalBlocks * cadence;
+}
+
+bool Journal::nextCheckpointWillBeFull() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    const auto &impl = *impl_;
+    if (impl.journalBlocks == 0 || !impl.baseValid || impl.forceFullPending) {
+        return true;
+    }
+    const std::uint64_t window = impl.head - impl.baseSequence;
+    return window >= impl.journalBlocks * impl.forcePercent / 100;
+}
+
+void Journal::requireFullCheckpoint() noexcept {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    impl_->forceFullPending = true;
 }
 
 bool Journal::checkpointForced() const {
