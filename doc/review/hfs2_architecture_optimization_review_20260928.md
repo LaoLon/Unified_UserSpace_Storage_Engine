@@ -789,7 +789,7 @@ RequestParentComplete→CqPush→FeReap` 的推导与 p50/p99；`trace-manifest.
 |---|---|---|
 | P2-1 zero-copy DMA | ✅ MySQL + RocksDB | Shard-110 `321bc9c`：InnoDB buffer pool 从 HFS arena 分配（`read_direct_user_children` 917–1308、copy-out 显著下降、崩溃矩阵通过、pre/post 吞吐噪声内）；Shard-111：RocksDB kFSBuffer 读路径（`read_direct_user_children=170098`、bounce/copy-out=0、post/pre ops=1.0016）+ core dword 对齐修复；见 `hfs2_zero_copy_frontend_review_20260929.md`、`hfs2_mysql_zero_copy_20260929.md`、`hfs2_rocksdb_kfsbuffer_review_20260929.md`、`hfs2_rocksdb_kfsbuffer_20260929.md` |
 | P2-2 增量 checkpoint | ✅ (a)(b) | (a) 冻结视图 + 锁外编码（`ChkptFreeze`/`syncCheckpointFreeze`）；(b) journal-backed delta：`CheckpointHeader.kind`+v2、delta 1 块、tail 保持 base、shape 变更强制 full、staged 记录先入 journal；MySQL 矩阵 361 delta/442 full 且 SIGKILL 恢复通过，1M 状态 fresh 恢复 2.05 s；见 `hfs2_incremental_checkpoint_review_20260929.md`、`hfs2_checkpoint_freeze_20260929.md`、`hfs2_incremental_checkpoint_20260929.md` |
-| P2-3 metadata actor 收敛 | ❌ | 阶段级实现（设计已定，无需先改边界） |
+| P2-3 metadata actor 收敛 | ⚠️ 阶段级（门禁未触发） | 设计符合性项（§4.2/§6.4/§7.2 ownership 表）；2026-09-29 性能门禁：`MetaLockWait ≥1 µs` 仅 99/66k 提交（0.15%，MySQL 写负载；RocksDB trace 为 0）→ 无实质争用，不按性能项启动；迁移计划与边界见 `hfs2_p23_metadata_actor_evaluation_20260929.md` | 按 §3 计划在后续阶段分批实施 |
 | P2-4 per-shard/per-class arena | ✅ 门禁未满足 | 零拷贝后 arena mutex 占用 ≈2–4% 单核、`DmaBusy`/`dma_fail` 全为 0 → 不启动；见 `hfs2_p24_p09_gate_evaluation_20260929.md` | 按再评估条件保留 |
 
 ### 14.4 Trace 点位（§7）
@@ -808,8 +808,9 @@ RequestParentComplete→CqPush→FeReap` 的推导与 p50/p99；`trace-manifest.
   口径（HFS 在 NVMe、native 在 VM 根盘 ext4），同盘口径下差距消失；
 - **RocksDB 同盘对照**（32 线程，1.28M keys）：fillseq 105.4%、fillrandom 102.2%、
   overwrite 110.0%（历史 −18% 差距消失）；读侧受缓存/预取口径影响不直接可比；
-- 未闭合：P2-3（metadata actor 收敛，阶段级）；P1-6 / P0-6 / P2-4 / P0-9①
-  已按证据收口（`hfs2_p16_p06_evaluation_20260929.md`、
+- 未闭合：P2-3（metadata actor 收敛，阶段级设计符合性；性能门禁未触发 —
+  `MetaLockWait` 99/66k 提交 = 0.15%，见 `hfs2_p23_metadata_actor_evaluation_20260929.md`）；
+  P1-6 / P0-6 / P2-4 / P0-9① 已按证据收口（`hfs2_p16_p06_evaluation_20260929.md`、
   `hfs2_p24_p09_gate_evaluation_20260929.md`）；
 - **MySQL 写 p99**：已归因并实施 Shard-112（seam 增长写先 `allocate` 再异步写）：
   同会话 A/B 写 TPS **+17.1%**、p99 **−11.0%**、`async_fallbacks` 16k–20k → **0**
