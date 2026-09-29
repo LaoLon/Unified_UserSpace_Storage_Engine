@@ -53,8 +53,8 @@ Bug 等级：**致命 > 严重 > 一般**。
 - 42：已修复（MySQL seam 异步快路径未惰性建线程 client，范围读回退同步消息环塌陷）。
 - 43：已修复（checkpoint 控制写批上限导致大 namespace 无法 sync）。
 - 44：已修复（replay 每事务 before-image 导致 O(T×N) 重挂载）。
-- 45：待处理（client 未 close 时析构崩溃）。
-- 46：待处理（同进程 remount 在重 sync 负载后崩溃，非 P2-2(b) 引入）。
+- 45：已修复（engine 未 stop 时析构崩溃：析构兜底停止 runtime）。
+- 46：已修复（同进程 remount 崩溃，与 #45 同源）。
 
 ## Bug 记录
 
@@ -774,35 +774,38 @@ Bug 等级：**致命 > 严重 > 一般**。
   直接返回 Corrupt（mount abort，内存状态随进程丢弃）。
 - **验证结果**：同一基准重挂载 **0.503 s**（78.8 s → 0.503 s）。
 
-### 45. client 未 close 时析构崩溃（待处理）
+### 45. engine 未 stop 时析构崩溃（已修复）
 
-- **状态**：待处理
-- **等级**：一般（工具/测试早退路径 SIGSEGV；正常关闭路径不受影响）
+- **状态**：已修复
+- **等级**：严重（进程 SIGSEGV；工具/测试的早退路径）
 - **时间**：2026-09-29
 - **现象**：`hfs_meta_bench` 在 sync 失败早退（client 未 close）后打印
   `client destroyed without close after drain` 随即 SIGSEGV（exit 139）；
   `snapshot_cache_device_test` 断言失败早退时 CTest 同样报 SegFault。
-- **排查过程**：待查（疑似 client/engine 析构顺序或 async 服务关闭竞态）。
-- **根因**：待定。
-- **修复**：未修复。
-- **验证结果**：不适用。
+- **排查过程**：在测试中插入失败断言构造确定复现，用 gdb 取回溯：主线程在
+  `munmap`（engine 状态释放）时，data reactor 线程仍在
+  `hfs::AsyncDataService::pump` 访问已释放内存。
+- **根因**：`Engine::~Engine` 只释放进程锁，不停止 `SpdkRuntime`；reactor 线程
+  存活到进程退出（单例析构时才停止），期间 engine 的 service 状态已被释放。
+- **修复**：`Engine::~Engine` 在 runtime 仍 active 时调用
+  `SpdkRuntime::instance().stop()`（幂等、有界；显式 `Engine::stop()` 仍是设计契约）。
+- **验证结果**：确定复现（插入失败断言）不再 SIGSEGV、干净退出（exit 1）；
+  CTest 29/29。
 
-### 46. 同进程 remount（stop 后重新 mount）在重 sync 负载后崩溃（待处理）
+### 46. 同进程 remount 在重 sync 负载后崩溃（已修复）
 
-- **状态**：待处理
-- **等级**：严重（进程 SIGSEGV；影响同一进程内 stop→mount 的工具/测试）
-- **时间**：2026-09-29（P2-2(b) 验证期间发现）
-- **现象**：`hfs_meta_bench` 在 200k inode + 2000 次 fsync 的工作负载后，
-  `engine->stop()` 再 `Engine::create`+`mount()` 时进程 SIGSEGV（exit 139）；
-  日志最后为 `spdk runtime active` 后
-  `nvme_pcie_qpair_abort_trackers ... DESTROYING aborting outstanding command`。
-- **排查过程**：同负载下 gdb 未复现（时序相关）；把 `journal.cpp`/`journal.hpp`
-  回退到 P2-2(b) 之前的 HEAD 版本仍复现 → **非 P2-2(b) 引入**；轻负载
-  （200 sync、20k inode）不触发；单独进程 mount（`--mount-only=1`）正常。
-- **根因**：待定（疑似第二次 mount 期间的控制 I/O 与 runtime 重启/停止竞态）。
-- **修复**：未修复；生产路径（每进程 mount 一次）不受影响，但同进程 remount
-  的工具/测试需规避。
-- **验证结果**：不适用。
+- **状态**：已修复
+- **等级**：严重（进程 SIGSEGV；影响同进程 stop→mount 的工具/测试）
+- **时间**：2026-09-29
+- **现象**：`hfs_meta_bench` 在 200k inode + 2000 次 fsync 后 `stop()` 再
+  `Engine::create`+`mount()` 时 SIGSEGV（exit 139）；日志为 `spdk runtime active`
+  后 `nvme_pcie_qpair_abort_trackers ... DESTROYING aborting outstanding command`。
+- **排查过程**：gdb 下未复现（时序相关）；把 journal 回退到 P2-2(b) 之前仍复现 →
+  非 P2-2(b) 引入；#45 修复后连续 3 次复现脚本全部通过（remount 0.99–1.27 s）。
+- **根因**：与 #45 同源——engine 停止/析构路径让 reactor 线程在 engine 状态释放后
+  继续运行，remount 期间与 mount 的控制 I/O 竞争。
+- **修复**：同 #45（`Engine::~Engine` 兜底停止 runtime）。
+- **验证结果**：3/3 通过，remount 0.99–1.27 s；CTest 29/29。
 
 ## 记录模板
 

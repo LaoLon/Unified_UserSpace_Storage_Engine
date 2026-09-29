@@ -230,6 +230,13 @@ Engine::Engine(Config config) : impl_(std::make_unique<Impl>()) {
 }
 
 Engine::~Engine() {
+    /* A destroyed-but-not-stopped engine must not leave reactor pollers running
+     * against freed engine state (bug #45): stop the runtime first. stop() is
+     * idempotent and bounded, and the design still requires an explicit
+     * Engine::stop() before destruction. */
+    if (impl_ != nullptr && SpdkRuntime::instance().active()) {
+        (void)SpdkRuntime::instance().stop();
+    }
     if (impl_ && impl_->lockFd >= 0) {
         ::flock(impl_->lockFd, LOCK_UN);
         ::close(impl_->lockFd);
