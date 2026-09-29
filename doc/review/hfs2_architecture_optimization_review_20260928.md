@@ -799,17 +799,20 @@ RequestParentComplete→CqPush→FeReap` 的推导与 p50/p99；`trace-manifest.
 | §7.2 已定义未发射点 | ✅ | `d872c6a`：JournalAppend/Chkpt×3/Fsync×2/Recovery×2/Retry/BusyReject 已在生产路径发射并验证 |
 | §7.3 新点位 | ✅ | `SnapHit`(53)/`SnapBuild`(54)/`ChkptFreeze`(55)/`MetaLockWait`(56)/`OpPoolAcquire`(57)/`DmaOwns`(58)/`FeSubmitBegin`(59) 全部发射；`hfs_trace_dump` 新增 `frontend_fixed_latency`；trace off 快路径改为 TLS cached bool + 版本号（§16.5）；验证 run 520081 records / dropped=0，event 55–59 均有计数 |
 
-### 14.5 门禁状态（2026-09-29）
+### 14.5 门禁状态（2026-09-29，含同盘重测）
 
 - CTest 29/29、`hfsctl check` `corruption=none`、closure 全闭合；
 - 同形状 FIO gate（§16.2 修订后）：1j32 HFS/raw 90.6%、p99 1.00；8j4 120.8%、p99 0.19；
-- RocksDB/MySQL 缩减回归与既有基线一致（见 `hfs2_stage_abcd_regression_20260929.md`）；
-- 未闭合：P2-2(b) 增量格式、P2-3、P2-4、P0-9①、P1-1 无锁发布子项、
-  P1-5 剩余子项、P1-6 balanced index、P0-6 `reusableReadLease` 子项；
-- 待补量化：MySQL 8j4 HFS/native 比值（历史 65.2%）与 RocksDB 大工作集 native
-  差距需在当前树（Stage A–D + P2-1/P0-9/P2-2a）上重测；§17.1 的 1M inode
-  metadata microbenchmark 与 mount/replay 预算已完成（create 437,758 ops/s、
-  remount 1.103 s，见 `doc/performance/hfs2_meta_bench_20260929.md`）。
+- **MySQL 同盘门禁**（`run_shard105_samedisk_vm.sh`）：读 96.4%/98.9%、写 98.6%/91.2%
+  → 吞吐达标（≥85%）；写 p99 117.6%/128.7% 未达标（≤110%）；历史 65.2% 是非对称
+  口径（HFS 在 NVMe、native 在 VM 根盘 ext4），同盘口径下差距消失；
+- **RocksDB 同盘对照**（32 线程，1.28M keys）：fillseq 105.4%、fillrandom 102.2%、
+  overwrite 110.0%（历史 −18% 差距消失）；读侧受缓存/预取口径影响不直接可比；
+- 未闭合：P2-3、P2-4、P0-9①、P1-1 无锁发布子项、P1-5 剩余子项、
+  P1-6 balanced index、P0-6 `reusableReadLease` 子项、MySQL 写 p99 门禁；
+- 已补量化：§17.1 1M inode metadata microbenchmark 与 mount/replay
+  （`hfs2_meta_bench_20260929.md`）；同盘门禁重测
+  （`hfs2_gate_remeasure_20260929.md`）。
 
 ## 附录 A：优化点 → 代码位置索引
 
@@ -841,9 +844,8 @@ RequestParentComplete→CqPush→FeReap` 的推导与 p50/p99；`trace-manifest.
 - P0/P1 均按实现层改动规划：不改 public header 契约、不升 `HFS_CORE_ABI_MAJOR`、不改 `.conf`
   schema、不改 on-disk format；如果 metadata actor 收敛改变 public Task 完成/取消/关闭语义，
   则该具体变化必须先修订设计。
-- P2-1 的 frontend buffer 契约：MySQL 已按 §20.8 实施（Shard-110，默认开启，arena
-  预算计入 `dma_arena_mb`）；RocksDB 的读路径切换（kFSBuffer + 非 direct 读）仍需
-  `hfs2.0.md` §11.2 修订与单独评审（Shard-111）。P2-2 的增量格式需要 §10.2 修订与
-  单独评审；zero-copy 只作为可选模式，默认行为不得改变 RocksDB/FIO 既有验收口径。
-  P2-3 是既有设计的实现收敛；P2-4 是 profile-gated 内部布局优化，不自动要求 public
-  ABI 或磁盘格式变化。
+- P2-1 的 frontend buffer 契约：MySQL 按 §20.8（Shard-110）、RocksDB 按 §11.2
+  kFSBuffer（Shard-111）均已实施；P2-2 的增量 checkpoint 按 §10.4 实施
+  （journal-backed delta + checkpoint 格式版本 2，v1 卷可读）；zero-copy 只作为
+  可选模式，默认行为不得改变 RocksDB/FIO 既有验收口径。P2-3 是既有设计的实现收敛；
+  P2-4 是 profile-gated 内部布局优化，不自动要求 public ABI 或磁盘格式变化。
