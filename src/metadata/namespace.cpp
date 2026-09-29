@@ -1295,18 +1295,67 @@ void Namespace::rollbackPreparedDurableEpoch() noexcept {
     preparedDurableSizes_.clear();
 }
 
-Result<void> Namespace::saveSnapshot(std::uint64_t txid, std::vector<std::byte> &out) {
-    std::lock_guard<std::mutex> lock(mutex_);
+/* P2-2(a): copies every field the snapshot encoder needs into a flat view so
+ * the encoding runs without holding the namespace lock. Mutations after this
+ * capture cannot change the view. */
+void Namespace::freezeCheckpointViewLocked(std::uint64_t txid, CheckpointView &view) {
+    view.txid = txid;
+    view.logicalEpoch = logicalEpoch_;
+    view.durableEpoch = durableEpoch_;
+    view.namespaceBytes = namespaceBytes_;
+    view.inodes.clear();
+    view.entries.clear();
+    view.extents.clear();
+    view.freeSlots.clear();
+    view.allocators.clear();
+    view.inodes.reserve(inodes_.size());
+    for (const Inode &inode : inodes_) {
+        CheckpointInode frozen;
+        frozen.id = inode.id;
+        frozen.generation = inode.generation;
+        frozen.directory = inode.directory;
+        frozen.linkCount = inode.linkCount;
+        frozen.logicalSize = inode.logicalSize;
+        frozen.durableSize = inode.durableSize;
+        frozen.logicalEpoch = inode.logicalEpoch;
+        frozen.mtimeNs = inode.mtimeNs;
+        frozen.ctimeNs = inode.ctimeNs;
+        frozen.parent = inode.parent;
+        frozen.childCount = inode.childCount;
+        if (inode.directory && inode.index != nullptr) {
+            frozen.entryBegin = view.entries.size();
+            for (const auto &[name, child] : inode.index->ordered) {
+                view.entries.push_back(CheckpointEntry{name, child});
+            }
+            frozen.entryCount = view.entries.size() - frozen.entryBegin;
+        }
+        frozen.extentBegin = view.extents.size();
+        const std::vector<ExtentDescriptor> descriptors = inode.extents.snapshot();
+        view.extents.insert(view.extents.end(), descriptors.begin(), descriptors.end());
+        frozen.extentCount = view.extents.size() - frozen.extentBegin;
+        view.inodes.push_back(std::move(frozen));
+    }
+    view.freeSlots = freeSlots_;
+    view.allocators.reserve(allocators_.size());
+    for (const auto &allocator : allocators_) {
+        view.allocators.push_back(allocator->serialize());
+    }
+}
+
+/* Encodes one frozen view in the on-disk snapshot format; field order must
+ * stay identical to kNamespaceSnapshotVersion. */
+Result<void> Namespace::encodeCheckpointView(const CheckpointView &view,
+                                             std::vector<std::byte> &out) {
     out.clear();
     appendSnapshotField(out, kNamespaceSnapshotMagic);
     appendSnapshotField(out, kNamespaceSnapshotVersion);
-    appendSnapshotField(out, txid);
-    appendSnapshotField(out, static_cast<std::uint64_t>(inodes_.size()));
-    appendSnapshotField(out, static_cast<std::uint64_t>(freeSlots_.size()));
-    appendSnapshotField(out, namespaceBytes_);
-    appendSnapshotField(out, logicalEpoch_);
-    appendSnapshotField(out, durableEpoch_);
-    for (const Inode &inode : inodes_) {
+    appendSnapshotField(out, view.txid);
+    appendSnapshotField(out, static_cast<std::uint64_t>(view.inodes.size()));
+    appendSnapshotField(out, static_cast<std::uint64_t>(view.freeSlots.size()));
+    appendSnapshotField(out, view.namespaceBytes);
+    appendSnapshotField(out, view.logicalEpoch);
+    appendSnapshotField(out, view.durableEpoch);
+    for (const CheckpointInode &inode : view.inodes) {
         appendSnapshotField(out, inode.id);
         appendSnapshotField(out, inode.generation);
         appendSnapshotField(out, static_cast<std::uint8_t>(inode.directory ? 1 : 0));
@@ -1318,37 +1367,54 @@ Result<void> Namespace::saveSnapshot(std::uint64_t txid, std::vector<std::byte> 
         appendSnapshotField(out, inode.ctimeNs);
         appendSnapshotField(out, inode.parent);
         appendSnapshotField(out, inode.childCount);
-        const std::uint64_t entryCount =
-            inode.directory ? static_cast<std::uint64_t>(inode.index->ordered.size()) : 0;
-        appendSnapshotField(out, entryCount);
-        if (inode.directory) {
-            for (const auto &[name, child] : inode.index->ordered) {
-                if (!appendSnapshotString(out, name)) {
-                    return makeError(Status::NoMemory, "directory name is too large");
-                }
-                appendSnapshotField(out, child);
+        appendSnapshotField(out, static_cast<std::uint64_t>(inode.entryCount));
+        for (std::size_t index = 0; index < inode.entryCount; ++index) {
+            const CheckpointEntry &entry = view.entries[inode.entryBegin + index];
+            if (!appendSnapshotString(out, entry.name)) {
+                return makeError(Status::NoMemory, "directory name is too large");
             }
+            appendSnapshotField(out, entry.child);
         }
-        const auto descriptors = inode.extents.snapshot();
-        appendSnapshotField(out, static_cast<std::uint64_t>(descriptors.size()));
-        for (const ExtentDescriptor &descriptor : descriptors) {
+        appendSnapshotField(out, static_cast<std::uint64_t>(inode.extentCount));
+        for (std::size_t index = 0; index < inode.extentCount; ++index) {
+            const ExtentDescriptor &descriptor = view.extents[inode.extentBegin + index];
             appendSnapshotField(out, descriptor.logicalExtent);
             appendSnapshotField(out, descriptor.physicalExtent);
             appendSnapshotField(out, descriptor.count);
             appendSnapshotField(out, descriptor.deviceId);
         }
     }
-    for (const std::uint64_t slot : freeSlots_) {
+    for (const std::uint64_t slot : view.freeSlots) {
         appendSnapshotField(out, slot);
     }
-    appendSnapshotField(out, static_cast<std::uint64_t>(allocators_.size()));
-    for (const auto &allocator : allocators_) {
-        const auto encoded = allocator->serialize();
+    appendSnapshotField(out, static_cast<std::uint64_t>(view.allocators.size()));
+    for (const auto &encoded : view.allocators) {
         appendSnapshotField(out, static_cast<std::uint64_t>(encoded.size()));
         out.insert(out.end(), encoded.begin(), encoded.end());
     }
-    snapshotTxid_ = txid;
     return Result<void>(Status::Ok);
+}
+
+Result<void> Namespace::saveSnapshot(std::uint64_t txid, std::vector<std::byte> &out) {
+    CheckpointView view;
+    const auto freezeStart = std::chrono::steady_clock::now();
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        freezeCheckpointViewLocked(txid, view);
+        snapshotTxid_ = txid;
+    }
+    if (checkpointFreezeObserver_ != nullptr) {
+        CheckpointFreezeStats freezeStats;
+        freezeStats.txid = txid;
+        freezeStats.inodes = static_cast<std::uint64_t>(view.inodes.size());
+        freezeStats.entries = static_cast<std::uint64_t>(view.entries.size());
+        freezeStats.freezeNs =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - freezeStart)
+                .count();
+        checkpointFreezeObserver_(freezeStats);
+    }
+    return encodeCheckpointView(view, out);
 }
 
 Result<void> Namespace::loadSnapshot(std::span<const std::byte> data) {

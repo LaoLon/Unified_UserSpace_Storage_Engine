@@ -63,6 +63,8 @@ enum class EventId : std::uint16_t {
     /* Appended for per-inode snapshot-cache attribution. */
     SnapHit = 53,
     SnapBuild = 54,
+    /* Appended for checkpoint freeze/encode attribution (P2-2). */
+    ChkptFreeze = 55,
 };
 
 inline constexpr std::uint16_t kTraceFormatVersion = 2;

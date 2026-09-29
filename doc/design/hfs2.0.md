@@ -805,6 +805,42 @@ RocksDB 回调映射：`Append`=buffered；`Flush`=logical（**不** durable）�
 - checksum、generation、namespace、extent bitmap 和 file size 必须相互守恒；
 - mount 发现不可修复 corruption 返回 Corrupt，保留现场给 `hfsctl check`，不强行 mount。
 
+### 10.4 checkpoint 增量与停顿（P2-2）
+
+> 评审：`doc/review/hfs2_incremental_checkpoint_review_20260929.md`。
+> 现状：`Namespace::saveSnapshot` 持 namespace 全局锁完成全量序列化，由 barrier
+> 线程在 checkpoint 路径调用（设备写已在锁外）。目标：1M active inode 下把
+> checkpoint 的 stop-the-world 从 O(N) 编码降为 O(N) 冻结拷贝（(a)，不改格式），
+> 并在下一个格式版本实现 O(dirty) 增量（(b)）。
+
+**(a) 冻结视图 + 锁外编码（格式版本不变）**
+
+- `Namespace::freezeCheckpointViewLocked(txid)` 在锁内把所有 checkpoint 需要的
+  状态捕获为扁平 `CheckpointView`：header（txid/logicalEpoch/durableEpoch/
+  namespaceBytes）、inode 标量数组（含 entries/extents 的 begin/count）、
+  目录项（name+child）、extent 描述符、`freeSlots`、allocator 位图字节；
+- `snapshotTxid_` 在冻结时发布；
+- `encodeCheckpointView(view, out)` 在锁外按现有字段顺序编码，磁盘格式与
+  `kNamespaceSnapshotVersion` 不变；
+- 一致性：view 是一次性深拷贝，冻结后的 mutation 不影响它；失败路径沿用
+  `rollbackPreparedDurableEpoch` + `requireCheckpoint`；
+- 内存：峰值 ≈ view + 编码缓冲（同阶），编码后 view 立即释放；
+- 度量：新增 `syncCheckpointFreeze` 计数与 `ChkptFreeze` trace，报告冻结/编码
+  占比；`syncCheckpointSnapshot` 保持为总时间。
+
+**(b) dirty-object 增量 checkpoint（格式版本 +1）**
+
+- dirty 集合：inode 标量版本、目录项增删、extent 变更、allocator 位图范围；
+- checkpoint 链：最近一次 base（全量）+ 自 base 以来的 delta 序列（带 base txid
+  与 sequence）；达到容量阈值触发新 base；
+- 恢复：装载最新有效 base，按 sequence 应用 delta，再从 base txid 之后的
+  journal 记录 replay；superblock 指向链头；
+- journal 保留：delta 未 durable 前 `tail` 不得推进到链覆盖的 sequence 之前，
+  `journal_mb` 预算覆盖该窗口；
+- 发布顺序：delta 记录 → superblock → 一次设备 flush；失败时链不变；
+- 兼容：格式版本 +1 只在 mount 时按版本分派；旧卷可被新二进制读取，新卷对旧
+  二进制 fail-closed。
+
 ## 11. RocksDB 8.9.1 adapter
 
 ### 11.1 接入原则
@@ -835,7 +871,7 @@ Status s = DB::Open(options, db_path, &db);
 | 8.9.1 契约 | HFS 2.0 实现 |
 |---|---|
 | `FSSupportedOps::kAsyncIO` | 声明并实现 |
-| `FSSupportedOps::kFSBuffer` | v1 不声明；它只适用于 non-direct MultiRead |
+| `FSSupportedOps::kFSBuffer` | 声明（Shard-111，2026-09-29）；读文件非 direct，FS 用 arena 对齐 `fs_scratch`，见本节读侧 zero-copy 段 |
 | `kFSPrefetch` | 不存在，禁止声明 |
 | `FSRandomAccessFile::ReadAsync(FSReadRequest&, ..., void** io_handle, IOHandleDeleter*, IODebugContext*)` | 按完整真实签名实现 |
 | `FileSystem::AbortIO()` | 必须实现，遵守 core cancel boundary |

@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -156,6 +157,19 @@ public:
     Result<void> loadSnapshot(std::span<const std::byte> data);
     std::uint64_t snapshotTxid() const noexcept;
 
+    /* P2-2(a): checkpoint freeze attribution; the engine wires this to
+     * stats/trace so the metadata layer keeps no common dependencies. */
+    struct CheckpointFreezeStats {
+        std::uint64_t txid = 0;
+        std::uint64_t inodes = 0;
+        std::uint64_t entries = 0;
+        std::uint64_t freezeNs = 0;
+    };
+    void setCheckpointFreezeObserver(
+        std::function<void(const CheckpointFreezeStats &)> observer) {
+        checkpointFreezeObserver_ = std::move(observer);
+    }
+
     std::uint64_t extentBytes() const noexcept { return config_.extentBytes; }
     std::uint64_t deviceStartExtent(std::uint32_t deviceId) const noexcept;
     /* Returns the currently allocatable data capacity in bytes. */
@@ -209,6 +223,46 @@ private:
     void releaseDescriptor(const ExtentDescriptor &descriptor) noexcept;
     static Result<std::vector<std::string_view>> splitPath(std::string_view path);
 
+    /* P2-2(a): immutable checkpoint view captured under mutex_ so the field
+     * encoding runs without holding the namespace lock. */
+    struct CheckpointInode {
+        std::uint64_t id = 0;
+        std::uint32_t generation = 1;
+        bool directory = false;
+        std::uint32_t linkCount = 0;
+        std::uint64_t logicalSize = 0;
+        std::uint64_t durableSize = 0;
+        std::uint64_t logicalEpoch = 0;
+        std::uint64_t mtimeNs = 0;
+        std::uint64_t ctimeNs = 0;
+        std::uint64_t parent = 0;
+        std::uint64_t childCount = 0;
+        std::size_t entryBegin = 0;
+        std::size_t entryCount = 0;
+        std::size_t extentBegin = 0;
+        std::size_t extentCount = 0;
+    };
+    struct CheckpointEntry {
+        std::string name;
+        std::uint64_t child = 0;
+    };
+    struct CheckpointView {
+        std::uint64_t txid = 0;
+        std::uint64_t logicalEpoch = 0;
+        std::uint64_t durableEpoch = 0;
+        std::uint64_t namespaceBytes = 0;
+        std::vector<CheckpointInode> inodes;
+        std::vector<CheckpointEntry> entries;
+        std::vector<ExtentDescriptor> extents;
+        std::vector<std::uint64_t> freeSlots;
+        std::vector<std::vector<std::byte>> allocators;
+    };
+    /* Captures the view and publishes snapshotTxid_; mutex_ must be held. */
+    void freezeCheckpointViewLocked(std::uint64_t txid, CheckpointView &view);
+    /* Encodes one frozen view in the existing snapshot format (no lock). */
+    static Result<void> encodeCheckpointView(const CheckpointView &view,
+                                             std::vector<std::byte> &out);
+
     mutable std::mutex mutex_;
     NamespaceConfig config_;
     Clock clock_ = nullptr;
@@ -220,6 +274,8 @@ private:
     std::atomic<std::uint64_t> logicalEpochPublished_{0};
     std::uint64_t durableEpoch_ = 0;
     std::uint64_t snapshotTxid_ = 0;
+    /* Optional P2-2(a) attribution hook; set once by the engine at mount. */
+    std::function<void(const CheckpointFreezeStats &)> checkpointFreezeObserver_;
     /* Before-image of the dirty inodes staged by prepareDurableEpoch. */
     struct PreparedDurableSize {
         std::uint64_t inodeId = 0;

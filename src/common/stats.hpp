@@ -89,6 +89,8 @@ struct Counters {
     PhaseTimer syncBarrier;
     PhaseTimer syncDeviceFlush;
     PhaseTimer syncCheckpointSnapshot;
+    /* P2-2(a): namespace-lock hold time to capture the immutable view. */
+    PhaseTimer syncCheckpointFreeze;
     PhaseTimer syncCheckpointWrite;
     PhaseTimer syncCheckpointFlush;
 };

@@ -413,6 +413,14 @@ Task<Result<void>> Engine::mount() {
         co_return makeError(namespaceState.status(), namespaceState.message());
     }
     impl.namespaceState = std::move(namespaceState).value();
+    /* P2-2(a): keep checkpoint-freeze attribution in the engine so the
+     * metadata layer stays free of stats/trace dependencies. */
+    impl.namespaceState->setCheckpointFreezeObserver(
+        [](const metadata::Namespace::CheckpointFreezeStats &freeze) {
+            stats::counters().syncCheckpointFreeze.record(freeze.freezeNs);
+            trace::event(trace::EventId::ChkptFreeze, freeze.txid, freeze.inodes,
+                         freeze.entries);
+        });
 
     /* Mount the metadata journal against the resident checkpoint target. */
     impl.metadataTarget = std::make_unique<NamespaceJournalTarget>(*impl.namespaceState);
@@ -738,11 +746,13 @@ Task<Result<void>> Engine::stop() {
         const auto maxUs = [](const stats::PhaseTimer &timer) {
             return std::to_string(timer.maxNs.load() / 1000);
         };
-        log::info("sync phases us avg/max: barrier=%s/%s device_flush=%s/%s ckpt_snapshot=%s/%s "
-                  "meta_write=%s/%s ckpt_flush=%s/%s",
+        log::info("sync phases us avg/max: barrier=%s/%s device_flush=%s/%s ckpt_freeze=%s/%s "
+                  "ckpt_snapshot=%s/%s meta_write=%s/%s ckpt_flush=%s/%s",
                   averageUs(counters.syncBarrier).c_str(), maxUs(counters.syncBarrier).c_str(),
                   averageUs(counters.syncDeviceFlush).c_str(),
                   maxUs(counters.syncDeviceFlush).c_str(),
+                  averageUs(counters.syncCheckpointFreeze).c_str(),
+                  maxUs(counters.syncCheckpointFreeze).c_str(),
                   averageUs(counters.syncCheckpointSnapshot).c_str(),
                   maxUs(counters.syncCheckpointSnapshot).c_str(),
                   averageUs(counters.syncCheckpointWrite).c_str(),
