@@ -127,6 +127,9 @@ private:
         bool submitted = false;
         /* True once this child has one accepted backend submission. */
         bool counted = false;
+        /* True when the direct user-buffer span already passed the backend
+         * DMA-capability probe in acquireLeases(). */
+        bool directVerified = false;
         std::atomic<bool> terminal{false};
         std::atomic<bool> readyQueued{false};
         std::atomic<int> completionStatus{static_cast<int>(Status::IoError)};
@@ -143,6 +146,7 @@ private:
             phase = Phase::Idle;
             submitted = false;
             counted = false;
+            directVerified = false;
             terminal.store(false, std::memory_order_relaxed);
             readyQueued.store(false, std::memory_order_relaxed);
             completionStatus.store(static_cast<int>(Status::IoError),
@@ -892,6 +896,7 @@ private:
             const bool directCapable =
                 arena_.ownsRange(userBuffer, plan.spanBytes) && backend != nullptr &&
                 backend->isBufferDmaCapable(userBuffer, plan.spanBytes);
+            child.directVerified = directCapable;
             const bool needsBounce = isRmw(plan.kind) || !directCapable;
             if (!needsBounce) {
                 if (!state.request.write) {
@@ -1102,6 +1107,9 @@ private:
         request.spanBytes = child.plan.spanBytes;
         request.spanOffset = child.plan.spanOffset;
         request.childIndex = static_cast<std::uint32_t>(&child - state.children.data());
+        /* A verified direct child keeps its probe result; lease-backed and RMW
+         * children are validated by the backend as before. */
+        request.dmaVerified = child.directVerified && child.lease == nullptr;
         if (child.lease != nullptr) {
             request.buffer = child.lease->span().data();
             request.bufferBytes = child.lease->span().size();

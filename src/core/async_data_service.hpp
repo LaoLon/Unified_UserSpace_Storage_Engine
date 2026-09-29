@@ -32,6 +32,9 @@ public:
         std::uint32_t childIndex = 0;
         std::byte *buffer = nullptr;
         std::size_t bufferBytes = 0;
+        /* Set when the service already validated this exact span with
+         * isBufferDmaCapable; the backend may then skip the vtophys probe. */
+        bool dmaVerified = false;
     };
 
     enum class SubmitDisposition : std::uint8_t {

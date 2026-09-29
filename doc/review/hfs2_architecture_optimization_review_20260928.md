@@ -235,12 +235,17 @@ FE_SUBMIT → [validate → snapshot → credit → Operation → sidecar → ri
   现有 `handleCount`：frontend IoHandle 可以在 terminal completion 前释放，而 sink 仍必须存活。
   若 profile 证明有收益，应增加独立的 intrusive in-flight sink ref，并用关闭/提前释放用例验证。
 - `File::read`（同步路径）每次调用重建 `extentMapFor`（`src/core/client.cpp:986` → O(E) 双拷贝），
-  与 P1-4 一并处理。
+  与 P1-4 一并处理。**已实施（2026-09-29）**：`File::read/write/append` 复用 per-inode
+  快照（`cachedSnapshot`/`syncSnapshot`，churn 时回落 `buildSnapshot`）；见
+  `hfs2_p09_remainder_20260929.md`。
 - `AsyncDataService::prepare` 在 `stats=false` 时仍执行 planner 统计累加循环
   （`src/core/async_data_service.cpp:749-790`；`recordDataReadPlan` 内部才判开关）：
   加 `diagnostics::profilingEnabled()` 守卫；同步 `DataPath::execute` 的同类统计循环也要一起处理。
 - `isBufferDmaCapable` 在 direct 路径被调用两次（`async_data_service.cpp:878` 与
   `spdk_async_backend.cpp:239`），可把 `spdk_vtophys` 结果缓存在 lease/snapshot 上。
+  **已实施（2026-09-29）**：`Request::dmaVerified` + `ChildState::directVerified`，
+  backend 对已验证的 direct 子请求跳过第二次 vtophys；见
+  `hfs2_p09_remainder_20260929.md`。
 
 ## 4. P1：结构性修复（影响 8j4 与多线程口径）
 
@@ -747,7 +752,7 @@ RequestParentComplete→CqPush→FeReap` 的推导与 p50/p99；`trace-manifest.
 | P0-6 DmaArena | ✅ 主体 | `b2a9c54`（地址有序 index、O(log N) 归属、按 waiter 通知） | 子项：`reusableReadLease` 收敛为 per-shard cache 未评估 |
 | P0-7 RocksDB 读路径 | ✅ | `29a3429`（getenv 缓存）+ `1b1aa25`（状态池 + 单锁 submit） | — |
 | P0-8 FIO/DataPath | ✅ | `29a3429`（FIO free stack）+ `3fbb7e6`（固定数组 + parent latch） | — |
-| P0-9 小项 | ⚠️ 部分 | stats-off guard（`8b9c288`） | ① sink/handle shared_ptr 改 intrusive ref；② `File::read/write` 每次重建 `extentMapFor`（`client.cpp:994/1115`）；③ `isBufferDmaCapable` 双调用 |
+| P0-9 小项 | ✅ ②③ | `8b9c288`（stats-off guard）；本轮 `File::read/write/append` 复用 per-inode 快照（`syncSnapshot`/`cachedSnapshot`）+ direct 子请求 `dmaVerified` 缓存 vtophys；CTest 29/29、sync16 +0.09%、1j32 +0.18%（噪声内，无回退）；见 `hfs2_p09_remainder_20260929.md` | ① sink/handle intrusive ref 仍需 profile 证据 |
 
 ### 14.2 P1（7 项结构修复）
 

@@ -96,24 +96,28 @@ int main() {
     HFS_TEST_CHECK(diagnostics::snapshot().snapshotBuilds == 1);
     HFS_TEST_CHECK(diagnostics::snapshot().snapshotHits == 1);
 
-    /* 3. Growing another file must not invalidate B's snapshot. */
+    /* 3. Growing another file must not invalidate B's snapshot. The append to A
+     * rebuilds A's own map once after its commit; B's read still hits. */
     HFS_TEST_CHECK(writeBytes(fileA, overlay, 4096));
     HFS_TEST_CHECK(readOnce(client, fileB, buffer, 4096));
-    HFS_TEST_CHECK(diagnostics::snapshot().snapshotBuilds == 1);
+    HFS_TEST_CHECK(diagnostics::snapshot().snapshotBuilds == 2);
     HFS_TEST_CHECK(diagnostics::snapshot().snapshotHits == 2);
 
-    /* 4. A new extent in B itself invalidates its snapshot. */
+    /* 4. A new extent in B itself invalidates its snapshot: the pre-write size
+     * hits B's cache, the post-commit map rebuild caches the committed map,
+     * then the setSize that follows the data write bumps the version once more,
+     * so the next read rebuilds and re-caches (builds +2, hits +1). */
     HFS_TEST_CHECK(writeBytes(fileB, overlay, 1ULL << 20));
     HFS_TEST_CHECK(readOnce(client, fileB, buffer, 4096));
-    HFS_TEST_CHECK(diagnostics::snapshot().snapshotBuilds == 2);
-    HFS_TEST_CHECK(diagnostics::snapshot().snapshotHits == 2);
+    HFS_TEST_CHECK(diagnostics::snapshot().snapshotBuilds == 4);
+    HFS_TEST_CHECK(diagnostics::snapshot().snapshotHits == 3);
 
-    /* 5. A fixed in-place overwrite keeps the data map valid, so it still
-     * hits the cache (no size/extent change). */
+    /* 5. A fixed in-place overwrite keeps both the data map and the size valid,
+     * so the write (pre/post) and the read all hit the cache. */
     HFS_TEST_CHECK(writeBytes(fileB, overlay, 0));
     HFS_TEST_CHECK(readOnce(client, fileB, buffer, 4096));
-    HFS_TEST_CHECK(diagnostics::snapshot().snapshotBuilds == 2);
-    HFS_TEST_CHECK(diagnostics::snapshot().snapshotHits == 3);
+    HFS_TEST_CHECK(diagnostics::snapshot().snapshotBuilds == 4);
+    HFS_TEST_CHECK(diagnostics::snapshot().snapshotHits == 6);
 
     engine->releaseDmaBuffer(buffer, dma.value().size());
     const auto finalStats = diagnostics::snapshot();

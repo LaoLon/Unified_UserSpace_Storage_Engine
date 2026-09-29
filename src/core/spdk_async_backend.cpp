@@ -245,7 +245,8 @@ AsyncDataBackend::SubmitResult SpdkAsyncDataBackend::submit(
                                geometry.capacityBytes, native)) {
         return SubmitResult{SubmitDisposition::Rejected, EINVAL};
     }
-    if (!runtime_.isDmaCapable(request.buffer, native.spanBytes)) {
+    if (!request.dmaVerified &&
+        !runtime_.isDmaCapable(request.buffer, native.spanBytes)) {
         return SubmitResult{SubmitDisposition::Rejected, EINVAL};
     }
 
@@ -313,7 +314,8 @@ void SpdkAsyncDataBackend::submitPending() noexcept {
         const Geometry &geometry = geometry_[request.deviceId];
         if (!convertPlannerRequest(request, plannerBlockSize_, geometry.nativeBlockSize,
                                    geometry.capacityBytes, native) ||
-            !runtime_.isDmaCapable(request.buffer, native.spanBytes)) {
+            (!request.dmaVerified &&
+             !runtime_.isDmaCapable(request.buffer, native.spanBytes))) {
             (void)releaseSlot(*slot);
             if (callback != nullptr) {
                 callback(context, request.childIndex, Status::InvalidArgument, EINVAL, 0);

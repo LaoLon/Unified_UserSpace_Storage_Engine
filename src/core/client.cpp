@@ -459,21 +459,31 @@ struct File::Impl {
     mutable std::mutex asyncCacheMutex;
     mutable std::shared_ptr<const AsyncFileSnapshot> asyncCache;
 
+    /* Returns the cached snapshot when this inode's data version is current.
+     * Records the hit counters; returns null on a miss or unavailable state. */
+    std::shared_ptr<const AsyncFileSnapshot> cachedSnapshot() const {
+        if (state == nullptr || state->namespaceState == nullptr) {
+            return nullptr;
+        }
+        const std::uint64_t currentVersion =
+            state->namespaceState->dataVersionFast(handle);
+        std::lock_guard<std::mutex> lock(asyncCacheMutex);
+        if (asyncCache != nullptr && asyncCache->dataVersion == currentVersion) {
+            diagnostics::recordSnapshotHit();
+            trace::event(trace::EventId::SnapHit, handle.inodeId, currentVersion);
+            return asyncCache;
+        }
+        return nullptr;
+    }
+
     /* Refresh metadata only when this inode's data-map version changes. */
     Result<std::shared_ptr<const AsyncFileSnapshot>> asyncSnapshot() const {
         if (state == nullptr || state->namespaceState == nullptr) {
             return makeError<std::shared_ptr<const AsyncFileSnapshot>>(
                 Status::InvalidState, "file namespace is unavailable");
         }
-        const std::uint64_t currentVersion =
-            state->namespaceState->dataVersionFast(handle);
-        {
-            std::lock_guard<std::mutex> lock(asyncCacheMutex);
-            if (asyncCache != nullptr && asyncCache->dataVersion == currentVersion) {
-                diagnostics::recordSnapshotHit();
-                trace::event(trace::EventId::SnapHit, handle.inodeId, currentVersion);
-                return asyncCache;
-            }
+        if (auto cached = cachedSnapshot(); cached != nullptr) {
+            return cached;
         }
 
         /* A retry closes the stat/extents race with a concurrent metadata
@@ -510,6 +520,41 @@ struct File::Impl {
         }
         return makeError<std::shared_ptr<const AsyncFileSnapshot>>(
             Status::Busy, "namespace changed while building asynchronous snapshot");
+    }
+
+    /* Builds one snapshot directly from the namespace without touching the
+     * cache; used when concurrent churn outruns the retry loop above. */
+    Result<std::shared_ptr<const AsyncFileSnapshot>> buildSnapshot() const {
+        if (state == nullptr || state->namespaceState == nullptr) {
+            return makeError<std::shared_ptr<const AsyncFileSnapshot>>(
+                Status::InvalidState, "file namespace is unavailable");
+        }
+        auto stat = state->namespaceState->stat(handle);
+        if (!stat.ok()) {
+            return makeError<std::shared_ptr<const AsyncFileSnapshot>>(
+                stat.status(), stat.message());
+        }
+        auto map = extentMapFor(*state, handle);
+        if (!map.ok()) {
+            return makeError<std::shared_ptr<const AsyncFileSnapshot>>(
+                map.status(), map.message());
+        }
+        auto built = std::make_shared<AsyncFileSnapshot>();
+        built->stat = stat.value();
+        built->extentMap = std::move(map).value();
+        built->dataVersion = state->namespaceState->dataVersionFast(handle);
+        return std::shared_ptr<const AsyncFileSnapshot>(std::move(built));
+    }
+
+    /* Snapshot accessor for the synchronous paths: cached while the per-inode
+     * data version is current, with a direct build fallback so they keep the
+     * always-succeed behavior of the previous stat + extentMapFor path. */
+    Result<std::shared_ptr<const AsyncFileSnapshot>> syncSnapshot() const {
+        auto snapshot = asyncSnapshot();
+        if (snapshot.ok()) {
+            return snapshot;
+        }
+        return buildSnapshot();
     }
 
     ~Impl() {
@@ -982,19 +1027,15 @@ Task<Result<ReadResult>> File::read(std::span<IoVec> buffers, std::uint64_t offs
     if (total == 0) {
         co_return ReadResult{0};
     }
-    auto stat = state.namespaceState->stat(impl_->handle);
-    if (!stat.ok()) {
-        co_return makeError<ReadResult>(stat.status(), stat.message());
+    auto snapshot = impl_->syncSnapshot();
+    if (!snapshot.ok()) {
+        co_return makeError<ReadResult>(snapshot.status(), snapshot.message());
     }
-    const std::uint64_t size = stat.value().logicalSize;
+    const std::uint64_t size = snapshot.value()->stat.logicalSize;
     if (offset >= size) {
         co_return ReadResult{0};
     }
     const std::uint64_t length = std::min<std::uint64_t>(total, size - offset);
-    auto map = extentMapFor(state, impl_->handle);
-    if (!map.ok()) {
-        co_return makeError<ReadResult>(map.status(), map.message());
-    }
     std::uint64_t cursor = offset;
     std::uint64_t remaining = length;
     for (const IoVec &vec : buffers) {
@@ -1003,7 +1044,7 @@ Task<Result<ReadResult>> File::read(std::span<IoVec> buffers, std::uint64_t offs
         }
         const std::size_t take =
             static_cast<std::size_t>(std::min<std::uint64_t>(vec.size, remaining));
-        auto read = state.dataPlane->read(map.value(),
+        auto read = state.dataPlane->read(snapshot.value()->extentMap,
                                           std::span<std::byte>(vec.data, take), cursor,
                                           take);
         if (!read.ok()) {
@@ -1052,12 +1093,19 @@ Task<Result<WriteResult>> File::write(std::span<const IoVec> buffers, std::uint6
 
     /* The pre-write logical size marks the append frontier: device blocks at
      * or beyond it hold no committed bytes, so the data path can skip the RMW
-     * refresh read for them. */
-    auto beforeWrite = state.namespaceState->stat(impl_->handle);
-    if (!beforeWrite.ok()) {
-        co_return makeError<WriteResult>(beforeWrite.status(), beforeWrite.message());
+     * refresh read for them. Reuse the cached snapshot on a hit; a miss only
+     * needs the cheap stat, because an append rebuilds the map after commit. */
+    std::uint64_t knownEof = 0;
+    if (auto cached = impl_->cachedSnapshot(); cached != nullptr) {
+        knownEof = cached->stat.logicalSize;
+    } else {
+        auto beforeWrite = state.namespaceState->stat(impl_->handle);
+        if (!beforeWrite.ok()) {
+            co_return makeError<WriteResult>(beforeWrite.status(),
+                                             beforeWrite.message());
+        }
+        knownEof = beforeWrite.value().logicalSize;
     }
-    const std::uint64_t knownEof = beforeWrite.value().logicalSize;
 
     /* Allocate missing extents, zero-initialize them, then commit. Extents are
      * invisible until COMMITTED (hfs2.0.md §9.4). */
@@ -1112,9 +1160,9 @@ Task<Result<WriteResult>> File::write(std::span<const IoVec> buffers, std::uint6
         }
     }
 
-    auto map = extentMapFor(state, impl_->handle);
-    if (!map.ok()) {
-        co_return makeError<WriteResult>(map.status(), map.message());
+    auto snapshot = impl_->syncSnapshot();
+    if (!snapshot.ok()) {
+        co_return makeError<WriteResult>(snapshot.status(), snapshot.message());
     }
     std::uint64_t cursor = offset;
     for (const IoVec &vec : buffers) {
@@ -1122,7 +1170,8 @@ Task<Result<WriteResult>> File::write(std::span<const IoVec> buffers, std::uint6
             continue;
         }
         auto written = state.dataPlane->write(
-            map.value(), std::span<const std::byte>(vec.data, vec.size), cursor, vec.size,
+            snapshot.value()->extentMap,
+            std::span<const std::byte>(vec.data, vec.size), cursor, vec.size,
             knownEof);
         if (!written.ok()) {
             co_return makeError<WriteResult>(written.status(), written.message());
@@ -1146,11 +1195,11 @@ Task<Result<WriteResult>> File::append(std::span<const IoVec> buffers,
     if (state.namespaceState == nullptr) {
         co_return Result<WriteResult>(Status::InvalidState, "engine is not mounted");
     }
-    auto stat = state.namespaceState->stat(impl_->handle);
-    if (!stat.ok()) {
-        co_return makeError<WriteResult>(stat.status(), stat.message());
+    auto snapshot = impl_->syncSnapshot();
+    if (!snapshot.ok()) {
+        co_return makeError<WriteResult>(snapshot.status(), snapshot.message());
     }
-    auto outer = co_await write(buffers, stat.value().logicalSize, stop);
+    auto outer = co_await write(buffers, snapshot.value()->stat.logicalSize, stop);
     if (!outer.ok()) {
         co_return makeError<WriteResult>(outer.status(), outer.message());
     }
