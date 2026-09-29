@@ -2422,6 +2422,12 @@ bool SpdkRuntime::isDmaCapable(const void *buffer, std::size_t bytes) const noex
     if (buffer == nullptr || bytes == 0) {
         return false;
     }
+    /* SPDK builds PRP lists from the payload address and rejects anything that
+     * is not dword aligned; classify those spans as bounce-only instead of
+     * letting the device submission fail. */
+    if ((reinterpret_cast<std::uintptr_t>(buffer) & 0x3U) != 0) {
+        return false;
+    }
     std::uint64_t size = bytes;
     const std::uint64_t physical = spdk_vtophys(buffer, &size);
     return physical != SPDK_VTOPHYS_ERROR && size >= bytes;

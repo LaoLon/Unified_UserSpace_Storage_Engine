@@ -861,14 +861,30 @@ Status s = DB::Open(options, db_path, &db);
 `File::sync()` 触发 durable epoch；`use_direct_io_for_flush_and_compaction`
 对 HFS 无效，基准口径需声明。`PositionedAppend`/`Allocate`/`PrepareWrite` 保留实现。
 
-读侧 zero-copy（2026-09-29 评审，见
-`doc/review/hfs2_zero_copy_frontend_review_20260929.md`）：RocksDB 9.11.2 的
+读侧 zero-copy（Shard-111，2026-09-29 实施；评审见
+`doc/review/hfs2_rocksdb_kfsbuffer_review_20260929.md`）：RocksDB 9.11.2 的
 `BlockFetcher` 在 direct 读下读入自分配的 `AlignedBuf`，`memory_allocator` 只覆盖
-读后的 `heap_buf_`，不能消除设备路径 bounce。因此读侧 zero-copy 的唯一路径是
-**声明 `FSSupportedOps::kFSBuffer` 且读文件 `use_direct_io()==false`**：`MultiRead`
-由 adapter 用 arena 分配 `fs_scratch`，设备直接读入 arena；RocksDB 仍会做一次
-`fs_scratch→heap_buf_` 的内部拷贝。该切换属 Shard-111 设计项，需先评审通过；
-在此之前保持 direct 读 + bounce，不得声称 RocksDB zero-copy。
+读后的 `heap_buf_`，不能消除设备路径 bounce。读侧 zero-copy 因此走 kFSBuffer 契约：
+
+- `HfsFileSystem::SupportedOps` 声明 `kAsyncIO | kFSBuffer`；
+- 读文件（`HfsRandomAccessFile`）`use_direct_io() == false`，`BlockFetcher` 走
+  `MultiRead` 的 `fs_scratch` 分支（顺序文件保持 direct，其调用方自带 scratch）；
+- `MultiRead`/`ReadAsync` 在 `scratch == nullptr && len != 0` 时先按 512 对齐
+  span（RocksDB 只在 direct 时自行对齐），≤1 MiB 时用
+  `Engine::acquireDmaBuffer`（class 池）分配 arena buffer，写 `fs_scratch`
+  （deleter 捕获 engine + size 归还 arena），读完后 `result` 指向调用方原始
+  偏移；>1 MiB（预取 readahead）或 arena 不可用时回落 `new char[len]`，
+  设备路径自动 bounce，功能不回退；
+- core `SpdkRuntime::isDmaCapable` 要求 dword 对齐（SPDK PRP 要求），非对齐
+  候选一律 bounce（2026-09-29 修复：kFSBuffer 的非对齐预取偏移曾导致设备提交
+  `not dword aligned` 失败）；
+- RocksDB 仍会做一次 `fs_scratch→heap_buf_` 的内部 memcpy（BlockContents 所有权），
+  收益 = 去掉 HFS arena bounce lease + copy-out；
+- 预取路径（`FilePrefetchBuffer::FSBufferDirectRead`）同样取 `fs_scratch`，但
+  >1 MiB 的 readahead 走 heap 回落（bounce），基准口径必须声明；
+- 验收：`read_direct_user_children > 0`、copy-out 归零、大工作集 readrandom 同会话
+  A/B 无回退、校验和与 `hfsctl check corruption=none` 通过；实测 post/pre
+  ops=1.0016、p50=0.982、p99=1.016（`hfs2_rocksdb_kfsbuffer_20260929.md`）。
 
 ### 11.3 文件类型
 

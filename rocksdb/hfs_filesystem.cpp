@@ -18,6 +18,7 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <optional>
 #include <span>
 #include <string>
@@ -375,6 +376,10 @@ struct AsyncReadState {
     hfs::IoHandle ioHandle;
     std::uint64_t requestId = 0;
     hfs::CompletionToken token{};
+    /* kFSBuffer result adjustment: bytes to skip in the FS buffer and the
+     * caller's requested length (0 when RocksDB provided the scratch). */
+    std::uint64_t resultOffset = 0;
+    std::size_t requestedBytes = 0;
     bool submitted = false;
     bool callbackDone = false;
     bool terminal = false;
@@ -1237,8 +1242,18 @@ private:
             std::lock_guard<std::mutex> lock(state->mutex);
             if (!state->aborted && !state->callbackStarted) {
                 if (successful) {
-                    state->request->result = rocksdb::Slice(state->request->scratch,
-                                                             completedBytes);
+                    /* kFSBuffer reads cover an aligned span; hand back the slice
+                     * that starts at the caller's original offset. */
+                    const std::size_t skipped =
+                        static_cast<std::size_t>(state->resultOffset);
+                    const std::size_t available =
+                        completedBytes > skipped ? completedBytes - skipped : 0;
+                    const std::size_t usable =
+                        state->requestedBytes != 0 && available > state->requestedBytes
+                            ? state->requestedBytes
+                            : available;
+                    state->request->result = rocksdb::Slice(
+                        state->request->scratch + skipped, usable);
                 }
                 state->request->status = status;
                 state->callbackStarted = true;
@@ -1405,8 +1420,11 @@ public:
         return firstError;
     }
 
-    /* HFS requires aligned offsets, lengths, and scratch buffers for direct I/O. */
-    bool use_direct_io() const override { return true; }
+    /* Shard-111: non-direct random reads take the kFSBuffer path so this file
+     * system can hand out an HFS arena buffer (fs_scratch) instead of an
+     * aligned copy. Sequential files keep direct IO; their callers always pass
+     * a scratch buffer. */
+    bool use_direct_io() const override { return false; }
 
     /* Expose the NVMe sector granularity for random direct reads; the HFS
      * read planner still keeps 4 KiB layout geometry for writes and metadata. */
@@ -1425,8 +1443,14 @@ public:
         if (ioHandle == nullptr || deleter == nullptr || callback == nullptr) {
             return rocksdb::IOStatus::InvalidArgument("invalid async read handle");
         }
+        /* Shard-111: direct ReadAsync calls on the kFSBuffer path get an
+         * FS-allocated, block-aligned buffer (arena first). */
+        std::uint64_t resultOffset = 0;
+        std::size_t requestedBytes = 0;
         if (request.scratch == nullptr && request.len != 0) {
-            return rocksdb::IOStatus::InvalidArgument("null async read buffer");
+            if (!prepareFsScratch(request, &resultOffset, &requestedBytes)) {
+                return request.status;
+            }
         }
         if (ioStatsEnabled()) gReadAsyncCalls.fetch_add(1, std::memory_order_relaxed);
         *ioHandle = nullptr;
@@ -1458,6 +1482,8 @@ public:
             state.callback = std::move(callback);
             state.callbackArg = callbackArg;
             state.dispatcher = context_->asyncDispatcher.get();
+            state.resultOffset = resultOffset;
+            state.requestedBytes = requestedBytes;
             if (hfs::diagnostics::profilingEnabled()) {
                 state.enqueuedAt = std::chrono::steady_clock::now();
             }
@@ -1511,6 +1537,57 @@ public:
     }
 
 private:
+    /* Shard-111 kFSBuffer path: RocksDB leaves FSReadRequest::scratch null and
+     * takes ownership of whatever fs_scratch points at. Allocate an arena
+     * buffer for the block-aligned span (RocksDB skips its own alignment when
+     * the file is not direct), read the aligned span, and report the caller's
+     * slice through the result offset. Falls back to a heap buffer (the core
+     * then bounces) when the arena cannot serve; returns false with
+     * request.status set when even the fallback fails. */
+    bool prepareFsScratch(rocksdb::FSReadRequest &request, std::uint64_t *resultOffset,
+                          std::size_t *requestedBytes) {
+        const std::uint64_t alignment =
+            static_cast<std::uint64_t>(GetRequiredBufferAlignment());
+        const std::uint64_t alignedOffset = request.offset & ~(alignment - 1);
+        const std::uint64_t end = request.offset + request.len;
+        const std::uint64_t alignedEnd = (end + alignment - 1) & ~(alignment - 1);
+        const std::size_t readLen = static_cast<std::size_t>(alignedEnd - alignedOffset);
+        void *buffer = nullptr;
+        /* Arena classes are pooled up to 1 MiB; larger requests (prefetch
+         * readahead) would take the unpooled large path and pay a zeroed
+         * spdk_dma_zmalloc/free per refill, so they use the heap fallback and
+         * let the core bounce them. */
+        if (readLen <= (1U << 20) && context_ != nullptr &&
+            context_->engine != nullptr) {
+            auto acquired = context_->engine->acquireDmaBuffer(readLen, 0);
+            if (acquired.ok()) {
+                buffer = acquired.value().data();
+                const std::size_t bytes = readLen;
+                std::shared_ptr<hfs::Engine> engine = context_->engine;
+                request.fs_scratch = rocksdb::FSAllocationPtr(
+                    buffer, [engine, bytes](void *pointer) {
+                        engine->releaseDmaBuffer(pointer, bytes);
+                    });
+            }
+        }
+        if (buffer == nullptr) {
+            buffer = new (std::nothrow) char[readLen];
+            if (buffer == nullptr) {
+                request.status =
+                    rocksdb::IOStatus::IOError("HFS read buffer allocation failed");
+                return false;
+            }
+            request.fs_scratch = rocksdb::FSAllocationPtr(
+                buffer, [](void *pointer) { delete[] static_cast<char *>(pointer); });
+        }
+        *resultOffset = request.offset - alignedOffset;
+        *requestedBytes = request.len;
+        request.scratch = static_cast<char *>(buffer);
+        request.offset = alignedOffset;
+        request.len = readLen;
+        return true;
+    }
+
     std::shared_ptr<hfs::File> file_;
     std::shared_ptr<HfsContext> context_;
     std::string path_;
@@ -1829,9 +1906,11 @@ public:
     /* Identifies this implementation to RocksDB's Customizable registry. */
     const char *Name() const override { return "HfsFileSystem"; }
 
-    /* Advertises the implemented callback, poll, and abort async contract. */
+    /* Advertises the async contract plus FS-allocated read buffers: kFSBuffer
+     * lets BlockFetcher take fs_scratch from the HFS arena (Shard-111). */
     void SupportedOps(int64_t &supported_ops) override {
-        supported_ops = (1LL << rocksdb::FSSupportedOps::kAsyncIO);
+        supported_ops = (1LL << rocksdb::FSSupportedOps::kAsyncIO) |
+                        (1LL << rocksdb::FSSupportedOps::kFSBuffer);
     }
 
     /* Waits until the requested number of submitted reads have completed. */

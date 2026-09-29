@@ -770,7 +770,7 @@ RequestParentComplete→CqPush→FeReap` 的推导与 p50/p99；`trace-manifest.
 
 | 项 | 状态 | 前置 |
 |---|---|---|
-| P2-1 zero-copy DMA | ⚠️ MySQL 已实施 | Shard-110 `321bc9c`：InnoDB buffer pool 从 HFS arena 分配（`read_direct_user_children` 917–1308、copy-out 显著下降、崩溃矩阵通过、pre/post 吞吐噪声内）；RocksDB 改为 Shard-111 设计项（direct 读不经过 `memory_allocator`，需 kFSBuffer 读路径），见 `hfs2_zero_copy_frontend_review_20260929.md` 与 `hfs2_mysql_zero_copy_20260929.md` |
+| P2-1 zero-copy DMA | ✅ MySQL + RocksDB | Shard-110 `321bc9c`：InnoDB buffer pool 从 HFS arena 分配（`read_direct_user_children` 917–1308、copy-out 显著下降、崩溃矩阵通过、pre/post 吞吐噪声内）；Shard-111：RocksDB kFSBuffer 读路径（`read_direct_user_children=170098`、bounce/copy-out=0、post/pre ops=1.0016）+ core dword 对齐修复；见 `hfs2_zero_copy_frontend_review_20260929.md`、`hfs2_mysql_zero_copy_20260929.md`、`hfs2_rocksdb_kfsbuffer_review_20260929.md`、`hfs2_rocksdb_kfsbuffer_20260929.md` |
 | P2-2 增量 checkpoint | ❌ | 先修订 §10.2 与磁盘格式版本 |
 | P2-3 metadata actor 收敛 | ❌ | 阶段级实现（设计已定，无需先改边界） |
 | P2-4 per-shard/per-class arena | ❌ | profile-gated：P0-6 后仍证明 central arena 是瓶颈才启动 |
