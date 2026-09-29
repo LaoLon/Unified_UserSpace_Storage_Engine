@@ -68,7 +68,39 @@
    MySQL 纯写受 barrier 限制。
 4. 缩减回归不能替代 §16.2 的完整矩阵与多盘 gate。
 
-## 6. 证据
+## 6. 与 `fio_baseline.md` 的对照（2026-09-29 追加）
+
+**同会话回退检查（权威口径）**：pre-Stage-A 树（`/root/code-baseline`，即
+`fio_baseline.md` 同代代码）vs 当前树，HFS-only、1 job × QD32、5/3 轮交错：
+
+| 形状 | pre-A IOPS | 当前 IOPS | 当前/pre-A | p99 读/写比值 |
+|---|---:|---:|---:|---:|
+| 4K QD32 | 98478.6 | 102887.4 | **+4.5%** | 0.96 / 0.95 |
+| 16K QD32 | 82698.4 | 84570.2 | **+2.3%** | 0.99 / 0.98 |
+
+**跨会话与文档数字对照（仅趋势）**：
+
+| 形状 | 文档 HFS | 当前 HFS | 文档 raw | 当前 raw | 文档 HFS/raw | 当前 HFS/raw |
+|---|---:|---:|---:|---:|---:|---:|
+| 4K QD32 | 91081 | ~103000 | 95986 | 114737 | 94.9% | ~90–91% |
+| 4K QD64 | 96534 | 109312 | 94092 | 103224 | 102.6% | 105.9% |
+
+结论：
+
+1. **HFS 没有下降**：同会话 A/B 显示当前树比 pre-A 树快 4.5%（4K）/2.3%（16K），
+   p99 同步改善 2–5%；Stage A–D 的净效果为正。
+2. 文档与本会话的绝对值都上升（HFS +13%、raw +10–20%），说明设备/会话状态不同；
+   4K QD32 比值从 94.9% 降到约 90–91% 是 raw 在本会话增益更大造成的跨会话假象
+   （同代 pre-A 代码在本会话测得的 HFS 也从 91.1k 升到 98.5k），不构成回退证据。
+3. 4K QD64 的比值反而从 102.6% 升到 105.9%，p99 比值从 ~0.88 改善到 ~0.81。
+4. `fio_baseline.md` 自身已声明"不同会话或 VM 的绝对 IOPS 不直接比较回退"；
+   本节对照只用于趋势判断，正式验收仍按 §2 的同会话口径。
+
+证据：`/home/hfs/regression-check-preA-20260929`（pre-A vs 当前同会话 A/B）、
+`/home/hfs/retest-1j32-20260929`（1j32 读写分离）、`/home/hfs/retest-2j32-20260929`
+（QD64 2j32）。
+
+## 7. 证据
 
 - `/home/hfs/regression-stageabcd-fio-20260929/`：10 个计时 JSON + prep、closure stderr、`environment.txt`、`spdk-nvme.json`
 - `/home/hfs/regression-stageabcd-rocksdb-20260929/`：4 个阶段 stdout/stderr、format 日志、`*-check.log`
