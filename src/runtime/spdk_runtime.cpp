@@ -1910,9 +1910,29 @@ struct SpdkRuntime::Impl {
 
     /* Submits several control writes together and waits for all of them; the
      * metadata reactor keeps them in flight concurrently so the device can
-     * overlap the round trips. Each range must be block-aligned and <= 1 MiB. */
+     * overlap the round trips. Each range must be block-aligned and <= 1 MiB.
+     * Logical batches larger than one device batch (checkpoint snapshots can
+     * be many megabytes) are split into bounded sequential chunks; a crash
+     * between chunks leaves a partial record that the existing CRC/generation
+     * validation rejects. */
     Result<void> controlWriteBatch(std::size_t index,
                                    std::span<const ControlWriteRange> writes) {
+        std::size_t offset = 0;
+        while (offset < writes.size()) {
+            const std::size_t count =
+                std::min(kMaxControlBatchWrites, writes.size() - offset);
+            auto chunk = controlWriteBatchChunk(index, writes.subspan(offset, count));
+            if (!chunk.ok()) {
+                return chunk;
+            }
+            offset += count;
+        }
+        return Result<void>(Status::Ok);
+    }
+
+    /* Submits one bounded control write batch; see controlWriteBatch. */
+    Result<void> controlWriteBatchChunk(std::size_t index,
+                                        std::span<const ControlWriteRange> writes) {
         if (!activeFlag.load(std::memory_order_acquire) ||
             stoppingFlag.load(std::memory_order_acquire)) {
             return makeError(Status::Busy, "SPDK runtime is not active");

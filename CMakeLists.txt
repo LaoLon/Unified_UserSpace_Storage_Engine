@@ -201,6 +201,11 @@ add_executable(hfs_lock_probe tools/hfs_lock_probe.cpp)
 target_link_libraries(hfs_lock_probe PRIVATE hfs_core)
 target_compile_options(hfs_lock_probe PRIVATE -fno-exceptions -fno-rtti)
 
+# Metadata microbenchmark for the design §17.1 budgets (1M inode / mount).
+add_executable(hfs_meta_bench tools/hfs_meta_bench.cpp)
+target_link_libraries(hfs_meta_bench PRIVATE hfs_core)
+target_compile_options(hfs_meta_bench PRIVATE -fno-exceptions -fno-rtti)
+
 add_executable(hfs_trace_dump tools/hfs_trace_dump.cpp)
 target_include_directories(hfs_trace_dump PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/include

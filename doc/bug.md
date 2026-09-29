@@ -51,6 +51,9 @@ Bug 等级：**致命 > 严重 > 一般**。
 - 40：已修复（FIO namespace job 启动 SIGSEGV）。
 - 41：已修复（RocksDB worker-direct 读缓存句柄未随删除释放，大库 extent 提前耗尽）。
 - 42：已修复（MySQL seam 异步快路径未惰性建线程 client，范围读回退同步消息环塌陷）。
+- 43：已修复（checkpoint 控制写批上限导致大 namespace 无法 sync）。
+- 44：已修复（replay 每事务 before-image 导致 O(T×N) 重挂载）。
+- 45：待处理（client 未 close 时析构崩溃）。
 
 ## Bug 记录
 
@@ -735,6 +738,53 @@ Bug 等级：**致命 > 严重 > 一般**。
   `corruption=none`。证据 `/home/hfs/mysql-readonly-diag-20260928`、
   `/home/hfs/mysql-readonly-lazyfix-20260928`、
   `/home/hfs/mysql-large-1m-lazyfix-20260928`。
+
+### 43. checkpoint 控制写批上限导致大 namespace 无法 sync
+
+- **状态**：已修复
+- **等级**：严重（checkpoint 无法写入，sync/fsync 全部失败，卷对大 namespace 不可 durable）
+- **时间**：2026-09-29（§17.1 metadata microbenchmark）
+- **现象**：`hfs_meta_bench` 在 200k inode 时 periodic sync 返回
+  `sync barrier failed: status=1 message=control write batch is too large`；
+  首次失败后每次 sync 都失败。
+- **排查过程**：`JournalDevice::writeBatch` 把 checkpoint 记录（10+ MiB）按
+  `kControlIoLimit` 切成 chunk 后放进**一个** `controlWriteBatch`；runtime 侧
+  `SpdkRuntime::controlWriteBatch` 限制 `writes.size() <= kMaxControlBatchWrites(8)`
+  （`src/runtime/spdk_runtime.cpp`）。
+- **根因**：快照大小超过 `8 x kControlIoLimit` 后 checkpoint 写入被批上限拒绝；
+  该上限对 journal 小事务合理，但 checkpoint 记录可达数百 MB。
+- **修复**：`controlWriteBatch` 内部按 `kMaxControlBatchWrites` 分批顺序提交；
+  崩溃落在批间时由 checkpoint CRC/generation 校验拒绝旧槽位。
+- **验证结果**：200k/1M inode 基准 sync 与 checkpoint 正常；见
+  `doc/performance/hfs2_meta_bench_20260929.md`。
+
+### 44. replay 每事务 before-image 导致 O(事务数 × namespace) 重挂载
+
+- **状态**：已修复
+- **等级**：严重（1M inode 目标下 mount 预算不可达）
+- **时间**：2026-09-29（§17.1 metadata microbenchmark）
+- **现象**：200k inode 卷重挂载 78.8 s（设计 §17.1 目标 mount ≤10 s、replay ≤2 s）。
+- **排查过程**：`Journal::replay` 对每个事务先
+  `target->saveSnapshot(lastTxid, beforeImage)` 作为回滚镜像（约 20 MiB），
+  2000+ 事务 → 40+ GiB 拷贝；记录被拒时立即 `return Corrupt`（mount 失败），
+  回滚结果只用于拼接错误消息。
+- **根因**：回滚镜像是死代码 + 每事务 O(N) 快照 → replay O(T×N)。
+- **修复**：replay 不再捕获 before-image；CRC 有效的已提交记录被 target 拒绝
+  直接返回 Corrupt（mount abort，内存状态随进程丢弃）。
+- **验证结果**：同一基准重挂载 **0.503 s**（78.8 s → 0.503 s）。
+
+### 45. client 未 close 时析构崩溃（待处理）
+
+- **状态**：待处理
+- **等级**：一般（工具/测试早退路径 SIGSEGV；正常关闭路径不受影响）
+- **时间**：2026-09-29
+- **现象**：`hfs_meta_bench` 在 sync 失败早退（client 未 close）后打印
+  `client destroyed without close after drain` 随即 SIGSEGV（exit 139）；
+  `snapshot_cache_device_test` 断言失败早退时 CTest 同样报 SegFault。
+- **排查过程**：待查（疑似 client/engine 析构顺序或 async 服务关闭竞态）。
+- **根因**：待定。
+- **修复**：未修复。
+- **验证结果**：不适用。
 
 ## 记录模板
 

@@ -961,14 +961,10 @@ Result<void> Journal::replayLocked() {
             break;
         }
         if (impl.target != nullptr) {
-            std::vector<std::byte> beforeImage;
-            auto saved = impl.target->saveSnapshot(impl.lastTxid, beforeImage);
-            if (!saved.ok()) {
-                impl.corruption = "target snapshot failed before txid " +
-                                   std::to_string(begin.txid);
-                impl.refreshStats();
-                return makeError(Status::Corrupt, impl.corruption);
-            }
+            /* Replay applies CRC-validated committed records; a rejected record
+             * is unrecoverable corruption and aborts the mount, so no
+             * per-transaction before-image is captured (it made replay
+             * O(transactions x namespace)). */
             for (const auto &payload : records) {
                 JournalRecord record;
                 record.type = static_cast<JournalRecordType>(payload.type);
@@ -977,15 +973,11 @@ Result<void> Journal::replayLocked() {
                 record.arg1 = payload.arg1;
                 auto applied = impl.target->apply(record);
                 if (!applied.ok()) {
-                    auto restored = impl.target->loadSnapshot(beforeImage);
                     impl.corruption = "target rejected txid " + std::to_string(begin.txid) +
                                       " record type " + std::to_string(payload.type) +
                                       " object " + std::to_string(payload.objectId) +
                                       " args " + std::to_string(payload.arg0) + "/" +
                                       std::to_string(payload.arg1) + ": " + applied.message();
-                    if (!restored.ok()) {
-                        impl.corruption += "; target after-image restore failed";
-                    }
                     impl.refreshStats();
                     return makeError(Status::Corrupt, impl.corruption);
                 }
