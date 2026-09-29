@@ -765,7 +765,7 @@ RequestParentComplete→CqPush→FeReap` 的推导与 p50/p99；`trace-manifest.
 
 | 项 | 状态 | 前置 |
 |---|---|---|
-| P2-1 zero-copy DMA | ❌ | 先修订 `hfs2.0.md` §11.2/§20（InnoDB buffer pool / RocksDB kFSBuffer 契约） |
+| P2-1 zero-copy DMA | ⚠️ MySQL 已实施 | Shard-110 `321bc9c`：InnoDB buffer pool 从 HFS arena 分配（`read_direct_user_children` 917–1308、copy-out 显著下降、崩溃矩阵通过、pre/post 吞吐噪声内）；RocksDB 改为 Shard-111 设计项（direct 读不经过 `memory_allocator`，需 kFSBuffer 读路径），见 `hfs2_zero_copy_frontend_review_20260929.md` 与 `hfs2_mysql_zero_copy_20260929.md` |
 | P2-2 增量 checkpoint | ❌ | 先修订 §10.2 与磁盘格式版本 |
 | P2-3 metadata actor 收敛 | ❌ | 阶段级实现（设计已定，无需先改边界） |
 | P2-4 per-shard/per-class arena | ❌ | profile-gated：P0-6 后仍证明 central arena 是瓶颈才启动 |
@@ -814,6 +814,9 @@ RequestParentComplete→CqPush→FeReap` 的推导与 p50/p99；`trace-manifest.
 - P0/P1 均按实现层改动规划：不改 public header 契约、不升 `HFS_CORE_ABI_MAJOR`、不改 `.conf`
   schema、不改 on-disk format；如果 metadata actor 收敛改变 public Task 完成/取消/关闭语义，
   则该具体变化必须先修订设计。
-- P2-1 的 frontend buffer 契约和 P2-2 的增量格式需要 `hfs2.0.md` 修订与单独评审；zero-copy
-  只作为可选模式，默认行为不得改变 RocksDB/FIO 既有验收口径。P2-3 是既有设计的实现收敛；
-  P2-4 是 profile-gated 内部布局优化，不自动要求 public ABI 或磁盘格式变化。
+- P2-1 的 frontend buffer 契约：MySQL 已按 §20.8 实施（Shard-110，默认开启，arena
+  预算计入 `dma_arena_mb`）；RocksDB 的读路径切换（kFSBuffer + 非 direct 读）仍需
+  `hfs2.0.md` §11.2 修订与单独评审（Shard-111）。P2-2 的增量格式需要 §10.2 修订与
+  单独评审；zero-copy 只作为可选模式，默认行为不得改变 RocksDB/FIO 既有验收口径。
+  P2-3 是既有设计的实现收敛；P2-4 是 profile-gated 内部布局优化，不自动要求 public
+  ABI 或磁盘格式变化。
