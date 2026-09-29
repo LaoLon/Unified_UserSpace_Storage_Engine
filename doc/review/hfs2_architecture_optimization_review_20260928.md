@@ -766,7 +766,7 @@ RequestParentComplete→CqPush→FeReap` 的推导与 p50/p99；`trace-manifest.
 | P0-3 Sidecar 池 | ✅ | `e714af3`（O(1) free stack + 按用量 reset） | — |
 | P0-4 Backend slot | ✅ | `8b9c288`（actor 私有 free list，O(maxInFlight) CAS → O(1)） | — |
 | P0-5 extent lookup | ✅ | `8b9c288` + `inode_map_test`；661.6 → 69.4 ns/lookup | — |
-| P0-6 DmaArena | ✅ 主体 | `b2a9c54`（地址有序 index、O(log N) 归属、按 waiter 通知） | 子项：`reusableReadLease` 收敛为 per-shard cache 未评估 |
+| P0-6 DmaArena | ✅ | `b2a9c54`（地址有序 index、O(log N) 归属、按 waiter 通知）；2026-09-29 评估：`reusableReadLease` 不收敛为 per-shard cache（零拷贝后 direct 读不取 lease，剩余 bounce 流量 ≈0.1–0.2 M/s → central mutex ≈1–2% 单核），见 `hfs2_p16_p06_evaluation_20260929.md` | 按再评估条件保留 |
 | P0-7 RocksDB 读路径 | ✅ | `29a3429`（getenv 缓存）+ `1b1aa25`（状态池 + 单锁 submit） | — |
 | P0-8 FIO/DataPath | ✅ | `29a3429`（FIO free stack）+ `3fbb7e6`（固定数组 + parent latch） | — |
 | P0-9 小项 | ✅ ②③ | `8b9c288`（stats-off guard）；本轮 `File::read/write/append` 复用 per-inode 快照（`syncSnapshot`/`cachedSnapshot`）+ direct 子请求 `dmaVerified` 缓存 vtophys；CTest 29/29、sync16 +0.09%、1j32 +0.18%（噪声内，无回退）；见 `hfs2_p09_remainder_20260929.md` | ① sink/handle intrusive ref 仍需 profile 证据 |
@@ -780,7 +780,7 @@ RequestParentComplete→CqPush→FeReap` 的推导与 p50/p99；`trace-manifest.
 | P1-3 doorbell 无锁 | ✅ | `e843c6d`（reader gate + atomic 表） | — |
 | P1-4 namespace O(E) | ✅ | `113f36f`（二分区间 + 原位校验，不再整表拷贝） | — |
 | P1-5 footprint | ✅ | Stage B：reset 只清实际用量（`e714af3`）；2026-09-29 证据闭合：namespace **297 B/inode**（预算 ≤1 KiB，1M inode 实测 + `namespace_test` 断言守卫）、request-state 池 **16,232 B × 4096 ≈ 66.5 MB**（有界，启动日志守卫）；hot/cold split 与 `kMaxChildren` 溢出块**不需要**（见 `hfs2_metadata_footprint_20260929.md`） | — |
-| P1-6 scheduler | ⚠️ 触发验证 | `d1c13c7`：4096 深窗口 5.9 µs/node，生产窗口几十 → 未触发 | balanced active index 未实施（microbenchmark 作为触发门禁保留） |
+| P1-6 scheduler | ✅ 触发门禁未满足 | `d1c13c7`：4096 深窗口 5.9 µs/node；2026-09-29 复核 6.3 µs/node，生产窗口几十 → 未触发（`hfs2_p16_p06_evaluation_20260929.md`） | balanced active index 按门禁保留未做 |
 | P1-7 dirty epoch | ✅ | `113f36f` + `namespace_test` 缩放验证（58/45 ns per publish） | — |
 
 ### 14.3 P2（4 项设计决策）
@@ -808,7 +808,8 @@ RequestParentComplete→CqPush→FeReap` 的推导与 p50/p99；`trace-manifest.
   口径（HFS 在 NVMe、native 在 VM 根盘 ext4），同盘口径下差距消失；
 - **RocksDB 同盘对照**（32 线程，1.28M keys）：fillseq 105.4%、fillrandom 102.2%、
   overwrite 110.0%（历史 −18% 差距消失）；读侧受缓存/预取口径影响不直接可比；
-- 未闭合：P2-3、P2-4、P0-9①、P1-6 balanced index、P0-6 `reusableReadLease` 子项；
+- 未闭合：P2-3（metadata actor 收敛，阶段级）；P2-4 与 P0-9① 保持
+  profile-gated；P1-6 / P0-6 子项已按证据收口（`hfs2_p16_p06_evaluation_20260929.md`）；
 - **MySQL 写 p99**：已归因并实施 Shard-112（seam 增长写先 `allocate` 再异步写）：
   同会话 A/B 写 TPS **+17.1%**、p99 **−11.0%**、`async_fallbacks` 16k–20k → **0**
   （`hfs2_mysql_async_append_20260929.md`）；**完整同盘门禁复测
