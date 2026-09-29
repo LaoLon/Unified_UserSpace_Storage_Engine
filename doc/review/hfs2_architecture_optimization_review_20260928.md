@@ -809,7 +809,9 @@ RequestParentComplete→CqPush→FeReap` 的推导与 p50/p99；`trace-manifest.
 - **RocksDB 同盘对照**（32 线程，1.28M keys）：fillseq 105.4%、fillrandom 102.2%、
   overwrite 110.0%（历史 −18% 差距消失）；读侧受缓存/预取口径影响不直接可比；
 - 未闭合：P2-3、P2-4、P0-9①、P1-1 无锁发布子项、P1-5 剩余子项、
-  P1-6 balanced index、P0-6 `reusableReadLease` 子项、MySQL 写 p99 门禁；
+  P1-6 balanced index、P0-6 `reusableReadLease` 子项、MySQL 写 p99 门禁
+  （已归因：约 20% 的 InnoDB 追加写走同步回退 → 消息环；
+  见 `hfs2_mysql_write_p99_attribution_20260929.md`）；
 - 已补量化：§17.1 1M inode metadata microbenchmark 与 mount/replay
   （`hfs2_meta_bench_20260929.md`）；同盘门禁重测
   （`hfs2_gate_remeasure_20260929.md`）。
