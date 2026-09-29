@@ -861,6 +861,15 @@ Status s = DB::Open(options, db_path, &db);
 `File::sync()` 触发 durable epoch；`use_direct_io_for_flush_and_compaction`
 对 HFS 无效，基准口径需声明。`PositionedAppend`/`Allocate`/`PrepareWrite` 保留实现。
 
+读侧 zero-copy（2026-09-29 评审，见
+`doc/review/hfs2_zero_copy_frontend_review_20260929.md`）：RocksDB 9.11.2 的
+`BlockFetcher` 在 direct 读下读入自分配的 `AlignedBuf`，`memory_allocator` 只覆盖
+读后的 `heap_buf_`，不能消除设备路径 bounce。因此读侧 zero-copy 的唯一路径是
+**声明 `FSSupportedOps::kFSBuffer` 且读文件 `use_direct_io()==false`**：`MultiRead`
+由 adapter 用 arena 分配 `fs_scratch`，设备直接读入 arena；RocksDB 仍会做一次
+`fs_scratch→heap_buf_` 的内部拷贝。该切换属 Shard-111 设计项，需先评审通过；
+在此之前保持 direct 读 + bounce，不得声称 RocksDB zero-copy。
+
 ### 11.3 文件类型
 
 ```text
@@ -1883,3 +1892,23 @@ native AIO、页压缩/punch hole、clone、MyISAM/Aria 数据路径、`--daemon
 恢复通过；同机重建改动前 core 的五组 8j4 对照未见本次统计改动造成
 >5% 吞吐回退。HFS/raw 中位数约 65.2% 和 p99 约 114.5% 仍未达到
 §16.2 总体性能目标，完整进程级 CPU gate 本轮未采集。
+
+### 20.8 前端 zero-copy DMA（buffer pool 来自 HFS arena）
+
+> 设计评审：`doc/review/hfs2_zero_copy_frontend_review_20260929.md`（P2-1）。
+> 目标：消除 InnoDB 页读写的 bounce + copy-in/copy-out，使 `ownsRange` 与
+> `spdk_vtophys` 对 buffer pool 直接成立。
+
+- seam 增加 `hfs_vfs::allocDmaBuffer(size)` / `freeDmaBuffer(ptr)`，包装
+  `Engine::acquireDmaBuffer`/`releaseDmaBuffer`；
+- `buf_pool_t::allocate_chunk` 优先从 arena 申请整块 chunk；失败（bridge 未激活、
+  预算不足或非 hugepage 环境）回落到 `ut::malloc_large_page_withkey`，行为不变；
+- HFS-backed chunk 在 `deallocate_chunk` 走 arena 释放，并跳过 `madvise_dont_dump`/
+  `madvise_dump` 与 `srv_numa_interleave` 的 `ut::large_page_low_level_info` 路径
+  （这些路径只对 ut 自身分配有效）；
+- `config/hfs_mysql.conf` 的 `dma_arena_mb` 必须覆盖 buffer pool 与在途 bounce 的总和，
+  preflight 按总和校验；当前验证口径为单 NUMA node；
+- 释放顺序：InnoDB 必须在 engine stop 前归还全部 HFS chunk；bridge 未激活时
+  `freeDmaBuffer` 为 no-op，arena 析构负责兜底释放，不 double free；
+- 验收：`read_direct_user_children > 0`、copy-out 字节显著下降、`hfsctl check`
+  `corruption=none`、MySQL 功能/恢复矩阵与 §16.3 门禁不回退。

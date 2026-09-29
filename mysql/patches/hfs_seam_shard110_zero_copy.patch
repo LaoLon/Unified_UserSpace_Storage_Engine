@@ -1,0 +1,192 @@
+diff --git a/storage/innobase/buf/buf0buf.cc b/storage/innobase/buf/buf0buf.cc
+index 5dee8070..8602ca54 100644
+--- a/storage/innobase/buf/buf0buf.cc
++++ b/storage/innobase/buf/buf0buf.cc
+@@ -42,6 +42,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
+ 
+ #include "btr0btr.h"
+ #include "buf0buf.h"
++#include "os/hfs_vfs.h"
+ #include "fil0fil.h"
+ #include "fsp0sysspace.h"
+ #include "ha_prototypes.h"
+@@ -899,6 +900,10 @@ static bool buf_pool_should_madvise = false;
+ Emits a warning to the log if could not succeed.
+ @return true iff succeeded, false if no OS support or failed */
+ bool buf_chunk_t::madvise_dump() {
++  if (hfs_dma) {
++    /* HFS hugepage memory has no ut large-page metadata to advise. */
++    return true;
++  }
+ #ifdef HAVE_MADV_DONTDUMP
+   const auto low_level_info =
+       ut::large_page_low_level_info(this->mem, ut::fallback_to_normal_page_t{});
+@@ -919,6 +924,10 @@ bool buf_chunk_t::madvise_dump() {
+ Emits a warning to the log if could not succeed.
+ @return true iff succeeded, false if no OS support or failed */
+ bool buf_chunk_t::madvise_dont_dump() {
++  if (hfs_dma) {
++    /* HFS hugepage memory has no ut large-page metadata to advise. */
++    return true;
++  }
+ #ifdef HAVE_MADV_DONTDUMP
+   const auto low_level_info =
+       ut::large_page_low_level_info(this->mem, ut::fallback_to_normal_page_t{});
+@@ -943,20 +952,30 @@ bool buf_chunk_t::madvise_dont_dump() {
+ 
+ bool buf_pool_t::allocate_chunk(ulonglong mem_size, buf_chunk_t *chunk) {
+   ut_ad(mutex_own(&chunks_mutex));
+-  chunk->mem = static_cast<uint8_t *>(ut::malloc_large_page_withkey(
+-      ut::make_psi_memory_key(mem_key_buf_buf_pool), mem_size,
+-      ut::fallback_to_normal_page_t{}));
++  /* Prefer HFS arena memory (Shard-110): the frames become DMA-capable and
++   * the device path serves them without bounce copies. */
++  chunk->hfs_dma = false;
++  chunk->hfs_bytes = 0;
++  chunk->mem = static_cast<uint8_t *>(hfs_vfs::allocDmaBuffer(mem_size));
++  if (chunk->mem != nullptr) {
++    chunk->hfs_dma = true;
++    chunk->hfs_bytes = mem_size;
++  } else {
++    chunk->mem = static_cast<uint8_t *>(ut::malloc_large_page_withkey(
++        ut::make_psi_memory_key(mem_key_buf_buf_pool), mem_size,
++        ut::fallback_to_normal_page_t{}));
++  }
+   if (chunk->mem == nullptr) {
+     return false;
+   }
+   /* Dump core without large memory buffers */
+-  if (buf_pool_should_madvise) {
++  if (!chunk->hfs_dma && buf_pool_should_madvise) {
+     if (!chunk->madvise_dont_dump()) {
+       innobase_disable_core_dump();
+     }
+   }
+ #ifdef HAVE_LIBNUMA
+-  if (srv_numa_interleave) {
++  if (!chunk->hfs_dma && srv_numa_interleave) {
+     const auto low_level_info = ut::large_page_low_level_info(
+         chunk->mem, ut::fallback_to_normal_page_t{});
+     struct bitmask *numa_nodes = numa_get_mems_allowed();
+@@ -977,6 +996,14 @@ bool buf_pool_t::allocate_chunk(ulonglong mem_size, buf_chunk_t *chunk) {
+ 
+ void buf_pool_t::deallocate_chunk(buf_chunk_t *chunk) {
+   ut_ad(mutex_own(&chunks_mutex));
++  if (chunk->hfs_dma) {
++    /* Return the chunk to the HFS arena; the arena owns the bookkeeping. */
++    hfs_vfs::freeDmaBuffer(chunk->mem, chunk->hfs_bytes);
++    chunk->mem = nullptr;
++    chunk->hfs_dma = false;
++    chunk->hfs_bytes = 0;
++    return;
++  }
+   /* Undo the effect of the earlier MADV_DONTDUMP */
+   if (buf_pool_should_madvise) {
+     if (!chunk->madvise_dump()) {
+@@ -1087,10 +1114,13 @@ static buf_chunk_t *buf_chunk_init(
+   it is bigger, we may allocate more blocks than requested. */
+ 
+   frame = (byte *)ut_align(chunk->mem, UNIV_PAGE_SIZE);
+-  chunk->size = ut::large_page_allocation_size(
+-                    chunk->mem, ut::fallback_to_normal_page_t{}) /
+-                    UNIV_PAGE_SIZE -
+-                (frame != chunk->mem);
++  /* HFS arena chunks have no ut large-page header; use the requested size. */
++  const size_t mem_bytes =
++      chunk->hfs_dma
++          ? chunk->hfs_bytes
++          : ut::large_page_allocation_size(chunk->mem,
++                                           ut::fallback_to_normal_page_t{});
++  chunk->size = mem_bytes / UNIV_PAGE_SIZE - (frame != chunk->mem);
+ 
+   /* Subtract the space needed for block descriptors. */
+   {
+diff --git a/storage/innobase/include/buf0buf.ic b/storage/innobase/include/buf0buf.ic
+index 0e8710db..e8c1c616 100644
+--- a/storage/innobase/include/buf0buf.ic
++++ b/storage/innobase/include/buf0buf.ic
+@@ -55,9 +55,13 @@ struct buf_chunk_t {
+   unsigned char *mem;  /*!< pointer to the memory area which
+                        was allocated for the frames */
+   buf_block_t *blocks; /*!< array of buffer control blocks */
++  bool hfs_dma;        /*!< true when mem came from the HFS DMA arena */
++  size_t hfs_bytes;    /*!< requested HFS arena size in bytes */
+ 
+   /** Get the size of 'mem' in bytes. */
+-  size_t mem_size() const { return ut::large_page_allocation_size(mem); }
++  size_t mem_size() const {
++    return hfs_dma ? hfs_bytes : ut::large_page_allocation_size(mem);
++  }
+ 
+   /** Advices the OS that this chunk should not be dumped to a core file.
+   Emits a warning to the log if could not succeed.
+diff --git a/storage/innobase/os/hfs_vfs.cc b/storage/innobase/os/hfs_vfs.cc
+index ada0d37d..246ef1c7 100644
+--- a/storage/innobase/os/hfs_vfs.cc
++++ b/storage/innobase/os/hfs_vfs.cc
+@@ -671,6 +671,14 @@ void shutdown() {
+                  static_cast<unsigned long long>(io.bdevDataReadBytes),
+                  static_cast<unsigned long long>(io.bdevDataWriteOps),
+                  static_cast<unsigned long long>(io.bdevDataWriteBytes));
++    std::fprintf(stderr,
++                 "hfs_vfs: zero_copy read_direct_user_children=%llu "
++                 "read_bounce_children=%llu read_copy_out_ops=%llu "
++                 "read_copy_out_bytes=%llu\n",
++                 static_cast<unsigned long long>(io.readDirectUserChildren),
++                 static_cast<unsigned long long>(io.readBounceChildren),
++                 static_cast<unsigned long long>(io.readCopyOutOps),
++                 static_cast<unsigned long long>(io.readCopyOutBytes));
+   }
+   auto stopped = bridge.engine->stop().wait().value();
+   if (!stopped.ok()) {
+@@ -1175,6 +1183,32 @@ std::uint64_t freeSpace() {
+   return bridge.engine->freeDataBytes();
+ }
+ 
++/* Allocates one large DMA-capable block for the InnoDB buffer pool. */
++void *allocDmaBuffer(std::size_t size) {
++  BridgeState &bridge = state();
++  if (!bridge.enabled || bridge.engine == nullptr || size == 0) {
++    return nullptr;
++  }
++  auto result = bridge.engine->acquireDmaBuffer(size, 0);
++  if (!result.ok()) {
++    std::fprintf(stderr,
++                 "hfs_vfs: dma pool allocation failed (%zu bytes): %s\n", size,
++                 result.message().c_str());
++    return nullptr;
++  }
++  return result.value().data();
++}
++
++/* Returns a block obtained from allocDmaBuffer() to the engine arena. */
++void freeDmaBuffer(void *ptr, std::size_t size) {
++  BridgeState &bridge = state();
++  if (!bridge.enabled || bridge.engine == nullptr || ptr == nullptr ||
++      size == 0) {
++    return;
++  }
++  bridge.engine->releaseDmaBuffer(ptr, size);
++}
++
+ /* --- mysys (server layer) helpers --- */
+ 
+ void fillStat(const hfs::FileStat &source, struct stat *st) {
+diff --git a/storage/innobase/os/hfs_vfs.h b/storage/innobase/os/hfs_vfs.h
+index 1ee1ca03..43e6de59 100644
+--- a/storage/innobase/os/hfs_vfs.h
++++ b/storage/innobase/os/hfs_vfs.h
+@@ -47,6 +47,13 @@ int read(int handle, void *buf, std::size_t n, std::uint64_t offset,
+ int write(int handle, const void *buf, std::size_t n, std::uint64_t offset,
+           std::size_t *out);
+ 
++/* Zero-copy buffer pool (Shard-110): allocates/frees large DMA-capable blocks
++ * from the HFS arena so InnoDB frames are directly usable by the device path.
++ * alloc returns nullptr when the bridge is inactive or the arena cannot serve
++ * the request; callers fall back to their normal allocator. */
++void *allocDmaBuffer(std::size_t size);
++void freeDmaBuffer(void *ptr, std::size_t size);
++
+ /* One HFS I/O inside an adjacent AIO batch. */
+ struct AioBatchRequest {
+   int handle{-1};

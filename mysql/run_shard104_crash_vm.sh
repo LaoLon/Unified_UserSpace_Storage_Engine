@@ -51,6 +51,7 @@ trap 'stop_server || true' EXIT
 
 # A larger table keeps index creation active long enough to interrupt it.
 start_server prepare
+sql -e "CREATE DATABASE IF NOT EXISTS hfs_matrix"
 sql -e "CREATE TABLE IF NOT EXISTS hfs_matrix.crash_data(
   id INT AUTO_INCREMENT PRIMARY KEY, payload VARCHAR(120) NOT NULL)
   ENGINE=InnoDB"

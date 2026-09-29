@@ -50,6 +50,11 @@ if ! grep -q 'AioBatchRequest' \
   git -C "$SRC" apply --check "$PATCH_ROOT/hfs_seam_shard109_aio_batch.patch"
   git -C "$SRC" apply "$PATCH_ROOT/hfs_seam_shard109_aio_batch.patch"
 fi
+if ! grep -q 'hfs_vfs::allocDmaBuffer' \
+     "$SRC/storage/innobase/buf/buf0buf.cc"; then
+  git -C "$SRC" apply --check "$PATCH_ROOT/hfs_seam_shard110_zero_copy.patch"
+  git -C "$SRC" apply "$PATCH_ROOT/hfs_seam_shard110_zero_copy.patch"
+fi
 
 cmake -S "$SRC" -B "$BUILD" -G Ninja \
   -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
