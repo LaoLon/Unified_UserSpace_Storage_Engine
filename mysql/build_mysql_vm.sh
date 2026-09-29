@@ -55,6 +55,11 @@ if ! grep -q 'hfs_vfs::allocDmaBuffer' \
   git -C "$SRC" apply --check "$PATCH_ROOT/hfs_seam_shard110_zero_copy.patch"
   git -C "$SRC" apply "$PATCH_ROOT/hfs_seam_shard110_zero_copy.patch"
 fi
+if ! grep -q 'Growth writes (redo appends)' \
+     "$SRC/storage/innobase/os/hfs_vfs.cc"; then
+  git -C "$SRC" apply --check "$PATCH_ROOT/hfs_seam_shard112_async_append.patch"
+  git -C "$SRC" apply "$PATCH_ROOT/hfs_seam_shard112_async_append.patch"
+fi
 
 cmake -S "$SRC" -B "$BUILD" -G Ninja \
   -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
