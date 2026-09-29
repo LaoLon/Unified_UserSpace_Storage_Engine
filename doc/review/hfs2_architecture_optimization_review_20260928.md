@@ -787,7 +787,12 @@ RequestParentComplete→CqPush→FeReap` 的推导与 p50/p99；`trace-manifest.
 - CTest 29/29、`hfsctl check` `corruption=none`、closure 全闭合；
 - 同形状 FIO gate（§16.2 修订后）：1j32 HFS/raw 90.6%、p99 1.00；8j4 120.8%、p99 0.19；
 - RocksDB/MySQL 缩减回归与既有基线一致（见 `hfs2_stage_abcd_regression_20260929.md`）；
-- 未闭合：P2 全部、P0-9/P1-1/P1-5/P1-6 的剩余子项、§7.3 的 4 个点位。
+- 未闭合：P2-2(b) 增量格式、P2-3、P2-4、P0-9①、P1-1 无锁发布子项、
+  P1-5 剩余子项、P1-6 balanced index、P0-6 `reusableReadLease` 子项、
+  §7.3 的 4 个点位（`FeSubmitBegin`/`MetaLockWait`/`OpPoolAcquire`/`DmaOwns`）；
+- 待补量化：设计 §17.1 的 1M inode metadata microbenchmark 与 mount/replay 预算；
+  MySQL 8j4 HFS/native 比值（历史 65.2%）与 RocksDB 大工作集 native 差距
+  需在当前树（Stage A–D + P2-1/P0-9/P2-2a）上重测。
 
 ## 附录 A：优化点 → 代码位置索引
 
