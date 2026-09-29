@@ -1340,9 +1340,18 @@ bs:      4K, 16K, 64K, 1M
 2026-09-18 旧 VM 的正式性能口径固定：8 vCPU、真实 NVMe BDF `0000:0b:00.0`、`Nvme0n1`、O_DIRECT、256 MiB、
 shared-file、randrw 50/50、4K/8K/16K/32K/64K、合计 QD=32（HFS 8 jobs × iodepth 4，
 raw 1 job × iodepth 32）、10 秒、5-run median、trace/stats off。2026-09-18 优化复测前
-的 32 jobs × iodepth 1 口径保留为历史对比，不再作为主 gate 形状。HFS 正式 `.conf`
-的 reactor/CPU 必须与测试 cpuset 对齐（`config/hfs_nvme.conf`：`metadata_cpus=2`、
-`data_reactors=1`、`data_cpus=3`），避免越界 pin 覆盖 `taskset`。raw 对照使用同一设备
+的 32 jobs × iodepth 1 口径保留为历史对比，不再作为主 gate 形状。
+2026-09-29 gate 形状修订（依据 `doc/performance/hfs2_8j4_shape_attribution_20260929.md`
+和 `doc/review/hfs2_gate_shape_revision_review_20260929.md`）：原口径把 HFS 的
+8 jobs × QD4 与 raw 的 1 job × QD32 跨形状相比，但 shape sweep 证明 raw 在同一
+8j4 形状自身塌陷约 43%（113.9k → 65.0k IOPS，p99 3.46 ms），HFS 反而快约 26%；
+因此正式 gate 改为**同形状对照**：主形状为双侧 1 job × QD32（raw 可持续的形状），
+扩展性形状为双侧 8 jobs × QD4，两个形状分别判定并同时报告 HFS/raw 与 p99 比值。
+raw 在 8j4 形状的塌陷作为已知边界记录，不用跨形状比值给任一侧加分。
+HFS 正式 `.conf`
+的 reactor/CPU 必须与测试 cpuset 对齐（`config/hfs_nvme.conf`：`metadata_cpus=0`、
+`data_reactors=1`、`data_cpus=1`、`frontend_cpus=3`，当前 VM 为 6 vCPU），避免越界 pin
+覆盖 `taskset`。raw 对照使用同一设备
 的 SPDK bdevperf 或官方 fio SPDK plugin，固定相同 bs/iodepth/jobs。报告 HFS/raw、
 read/write p50/p99、CPU%、RSS、errors、submit/complete、journal bytes/op。
 
@@ -1350,9 +1359,12 @@ read/write p50/p99、CPU%、RSS、errors、submit/complete、journal bytes/op。
 `metadata_devices`、`data_devices`、placement、每盘容量和每盘 submit/complete。任一
 配置设备不可用、未被正确独占或数据落到了未声明设备时，功能验收失败。
 
-主 gate：4K shared-file randrw 的 HFS/raw ≥85%，CPU ≤500%（8 vCPU 口径），errors=0，
-submit/complete 闭合，HFS p99 不高于 raw 基线的 110%。如果结构/恢复门禁失败，即使
-IOPS 更高也不接受。
+主 gate（2026-09-29 起为同形状对照）：4K shared-file randrw 在**同一 jobs×iodepth
+形状**下 HFS/raw ≥85%，CPU ≤500%（8 vCPU 口径），errors=0，submit/complete 闭合，
+HFS p99 不高于 raw 基线的 110%。主形状 1 job × QD32，扩展性形状 8 jobs × QD4，
+两个形状分别判定、同时报告。当前同会话结果（2026-09-29，6 vCPU VM、真实 `Nvme0n1`）：
+1j32 HFS/raw = 90.6%、p99 比值 1.00；8j4 HFS/raw = 120.8%、p99 比值 0.19
+（raw 在该形状 p99 3.46 ms）。如果结构/恢复门禁失败，即使 IOPS 更高也不接受。
 
 ### 16.3 RocksDB 验收
 
