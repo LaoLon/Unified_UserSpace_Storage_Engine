@@ -33,8 +33,9 @@ hfs: sync phases us avg/max: barrier=168/340 device_flush=33/82 ckpt_freeze=7/17
 
   - 锁内冻结 ≈7 µs（max 17 µs），快照总时间 ≈13 µs → 编码 ≈6 µs 已移出锁；
   - `meta_write`（checkpoint 记录 + superblock 设备写）≈115 µs，本就在锁外；
-  - 对比改动前 `syncCheckpointSnapshot` 即锁内全量（≈13 µs 同口径），
-    锁内时间约降一半；数据集越大，冻结拷贝与编码的差距按同一比例放大；
+  - 与改动前的定性对比：锁内时间由“全量编码”变为“冻结拷贝”，总量略增（多一次
+    标量/索引拷贝），这是 (a) 的既定权衡（§10.4：总字节仍为 O(N)）；本轮未在
+    同会话重建 pre 库做绝对对比，占比口径以 `ckpt_freeze`/`ckpt_snapshot` 为准；
 - **崩溃矩阵**（MySQL SIGKILL：在线 DDL 中断 + torn page 中断）：
   `rows=131072` 一致、两次 `hfsctl check` 均
   `corruption=none`（checkpointA/B valid、journal head=tail）。
