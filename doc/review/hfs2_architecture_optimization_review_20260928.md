@@ -779,7 +779,7 @@ RequestParentComplete→CqPush→FeReap` 的推导与 p50/p99；`trace-manifest.
 | P1-2 同步 ingress | ✅ | `e843c6d`；16 线程 +22.8%，`spdk_ring_enqueue` 自旋消失 | — |
 | P1-3 doorbell 无锁 | ✅ | `e843c6d`（reader gate + atomic 表） | — |
 | P1-4 namespace O(E) | ✅ | `113f36f`（二分区间 + 原位校验，不再整表拷贝） | — |
-| P1-5 footprint | ⚠️ 部分 | Stage B：reset 只清实际用量（`e714af3`） | hot/cold split、`kMaxChildren` 4+有界溢出块 未做 |
+| P1-5 footprint | ✅ | Stage B：reset 只清实际用量（`e714af3`）；2026-09-29 证据闭合：namespace **297 B/inode**（预算 ≤1 KiB，1M inode 实测 + `namespace_test` 断言守卫）、request-state 池 **16,232 B × 4096 ≈ 66.5 MB**（有界，启动日志守卫）；hot/cold split 与 `kMaxChildren` 溢出块**不需要**（见 `hfs2_metadata_footprint_20260929.md`） | — |
 | P1-6 scheduler | ⚠️ 触发验证 | `d1c13c7`：4096 深窗口 5.9 µs/node，生产窗口几十 → 未触发 | balanced active index 未实施（microbenchmark 作为触发门禁保留） |
 | P1-7 dirty epoch | ✅ | `113f36f` + `namespace_test` 缩放验证（58/45 ns per publish） | — |
 
@@ -808,8 +808,8 @@ RequestParentComplete→CqPush→FeReap` 的推导与 p50/p99；`trace-manifest.
   口径（HFS 在 NVMe、native 在 VM 根盘 ext4），同盘口径下差距消失；
 - **RocksDB 同盘对照**（32 线程，1.28M keys）：fillseq 105.4%、fillrandom 102.2%、
   overwrite 110.0%（历史 −18% 差距消失）；读侧受缓存/预取口径影响不直接可比；
-- 未闭合：P2-3、P2-4、P0-9①、P1-1 无锁发布子项、P1-5 剩余子项、
-  P1-6 balanced index、P0-6 `reusableReadLease` 子项；
+- 未闭合：P2-3、P2-4、P0-9①、P1-1 无锁发布子项、P1-6 balanced index、
+  P0-6 `reusableReadLease` 子项；
 - **MySQL 写 p99**：已归因并实施 Shard-112（seam 增长写先 `allocate` 再异步写）：
   同会话 A/B 写 TPS **+17.1%**、p99 **−11.0%**、`async_fallbacks` 16k–20k → **0**
   （`hfs2_mysql_async_append_20260929.md`）；**完整同盘门禁复测

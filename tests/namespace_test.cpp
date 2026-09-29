@@ -1,6 +1,8 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
+#include <fstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -15,6 +17,18 @@ using namespace hfs::metadata;
 namespace {
 
 std::uint64_t gNowNs = 1'000'000'000ULL;
+
+/* Reads this process's resident set size in KiB (Linux /proc). */
+std::uint64_t residentSetKb() {
+    std::ifstream status("/proc/self/status");
+    std::string line;
+    while (std::getline(status, line)) {
+        if (line.rfind("VmRSS:", 0) == 0) {
+            return std::strtoull(line.c_str() + 6, nullptr, 10);
+        }
+    }
+    return 0;
+}
 
 std::uint64_t fakeClock(void *) { return gNowNs; }
 
@@ -484,6 +498,43 @@ int main() {
                     "large_inodes=%lld\n",
                     static_cast<long long>(small), static_cast<long long>(large));
         HFS_TEST_CHECK(large < 1000000); /* sanity: must not be O(inode count^2) */
+    }
+
+    /* P1-5 footprint: 1M inode namespace memory (design §17.1 budget
+     * <=1 KiB/active inode, excluding the DMA arena). */
+    {
+        NamespaceConfig config = testConfig(1000000 + 1024, 2ULL << 30);
+        config.extentBytes = 1ULL << 20;
+        config.deviceExtents = {500000};
+        config.deviceStartExtents = {0};
+        auto created = Namespace::create(config, fakeClock, nullptr);
+        HFS_TEST_CHECK(created.ok());
+        Namespace &ns = *created.value();
+        HFS_TEST_CHECK(ns.create("/d", false, false, /*directory=*/true).ok());
+        const std::uint64_t before = residentSetKb();
+        constexpr std::uint64_t kFiles = 1000000;
+        for (std::uint64_t index = 0; index < kFiles; ++index) {
+            char name[32];
+            std::snprintf(name, sizeof(name), "/d/f%07llu",
+                          static_cast<unsigned long long>(index));
+            auto handle = ns.create(name, false, false, false);
+            if (!handle.ok()) {
+                std::printf("footprint create failed at %llu: status=%u message=%s\n",
+                            static_cast<unsigned long long>(index),
+                            static_cast<unsigned>(handle.status()),
+                            handle.message().c_str());
+                HFS_TEST_CHECK(false);
+                return 1;
+            }
+        }
+        const std::uint64_t after = residentSetKb();
+        const double perInodeBytes =
+            static_cast<double>(after - before) * 1024.0 / static_cast<double>(kFiles);
+        std::printf("namespace footprint: inodes=%llu rss_delta_kb=%llu "
+                    "per_inode_bytes=%.0f\n",
+                    static_cast<unsigned long long>(kFiles),
+                    static_cast<unsigned long long>(after - before), perInodeBytes);
+        HFS_TEST_CHECK(perInodeBytes < 1024.0); /* design §17.1 budget */
     }
 
     std::printf("namespace_test: ok\n");

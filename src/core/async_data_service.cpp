@@ -13,6 +13,7 @@
 #include <new>
 
 #include "core/actor.hpp"
+#include "common/log.hpp"
 #include "common/trace.hpp"
 #include "core/dma_arena.hpp"
 #include "core/extent_map.hpp"
@@ -337,6 +338,11 @@ public:
             !statePool_.initialize(config_.maxOperations)) {
             return;
         }
+        /* P1-5 footprint: report the fixed per-request state cost at startup. */
+        log::info("async data service: request_state_bytes=%zu operations=%zu "
+                  "children=%zu",
+                  sizeof(RequestState), config_.maxOperations,
+                  static_cast<std::size_t>(IoPlanner::Plan::kMaxChildren));
 
         shards_ = std::unique_ptr<ShardState[]>(new (std::nothrow)
                                                      ShardState[config_.shardCount]);
