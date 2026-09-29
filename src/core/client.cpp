@@ -696,6 +696,12 @@ bool Client::fileBelongsToEngine(Engine &engine, const std::shared_ptr<File> &fi
 Result<IoHandle> Client::submitRead(const std::shared_ptr<File> &file, IoVec buffer,
                                     std::uint64_t offset, CompletionToken token) {
     auto &state = *impl_->state;
+    if (file != nullptr && trace::enabled()) {
+        /* Review §7.3: frontend fixed cost before validate + snapshot + submit;
+         * pairs with FeSubmit on the same source. */
+        trace::event(trace::EventId::FeSubmitBegin, file->handle().inodeId, 0, offset,
+                     buffer.size);
+    }
     auto valid = validateAsyncClient(state);
     if (!valid.ok()) {
         return makeError<IoHandle>(valid.status(), valid.message());
@@ -728,6 +734,11 @@ Result<IoHandle> Client::submitRead(const std::shared_ptr<File> &file, IoVec buf
 Result<IoHandle> Client::submitWrite(const std::shared_ptr<File> &file, IoVec buffer,
                                      std::uint64_t offset, CompletionToken token) {
     auto &state = *impl_->state;
+    if (file != nullptr && trace::enabled()) {
+        /* Review §7.3: pairs with the FeSubmit emitted after submission. */
+        trace::event(trace::EventId::FeSubmitBegin, file->handle().inodeId, 1, offset,
+                     buffer.size);
+    }
     auto valid = validateAsyncClient(state);
     if (!valid.ok()) {
         return makeError<IoHandle>(valid.status(), valid.message());

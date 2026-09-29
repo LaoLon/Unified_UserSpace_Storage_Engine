@@ -210,16 +210,30 @@ bool DmaArena::ownsRange(const void *ptr, std::size_t bytes) const {
     if (ptr == nullptr || bytes == 0) {
         return false;
     }
+    /* Review §7.3: attribute the ownership lookup only while tracing. */
+    const bool measure = trace::enabled();
+    const auto start = measure ? std::chrono::steady_clock::now()
+                               : std::chrono::steady_clock::time_point{};
     const auto rangeStart = reinterpret_cast<std::uintptr_t>(ptr);
-    std::lock_guard<std::mutex> lock(mutex_);
-    /* Ordered index: the only candidate is the allocation at or before the
-     * range start. */
-    auto found = live_.upper_bound(rangeStart);
-    if (found == live_.begin()) {
-        return false;
+    bool owned = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        /* Ordered index: the only candidate is the allocation at or before the
+         * range start. */
+        auto found = live_.upper_bound(rangeStart);
+        if (found != live_.begin()) {
+            --found;
+            owned = containsRange(found->first, found->second.bytes, rangeStart, bytes);
+        }
     }
-    --found;
-    return containsRange(found->first, found->second.bytes, rangeStart, bytes);
+    if (measure) {
+        trace::event(trace::EventId::DmaOwns, bytes, owned ? 1 : 0,
+                     static_cast<std::uint64_t>(
+                         std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::steady_clock::now() - start)
+                             .count()));
+    }
+    return owned;
 }
 
 Result<void> DmaArena::tryAcquireBatch(std::span<const std::size_t> sizes,

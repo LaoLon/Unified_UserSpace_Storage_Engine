@@ -65,6 +65,12 @@ enum class EventId : std::uint16_t {
     SnapBuild = 54,
     /* Appended for checkpoint freeze/encode attribution (P2-2). */
     ChkptFreeze = 55,
+    /* Appended for metadata lock, operation pool, DMA ownership and frontend
+     * submit attribution (review §7.3). */
+    MetaLockWait = 56,
+    OpPoolAcquire = 57,
+    DmaOwns = 58,
+    FeSubmitBegin = 59,
 };
 
 inline constexpr std::uint16_t kTraceFormatVersion = 2;

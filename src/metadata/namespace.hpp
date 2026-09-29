@@ -170,6 +170,24 @@ public:
         checkpointFreezeObserver_ = std::move(observer);
     }
 
+    /* Namespace lock-wait attribution (review §7.3): the engine installs this
+     * only while tracing is active, so the disabled path is one null check;
+     * kind identifies the instrumented call site. */
+    using MetaLockWaitObserver =
+        void (*)(void *context, std::uint64_t kind, std::uint64_t waitNs);
+    enum class MetaLockKind : std::uint64_t {
+        Stat = 1,
+        Extents = 2,
+        ReserveExtents = 3,
+        CommitExtents = 4,
+        SetSize = 5,
+        ApplyJournal = 6,
+    };
+    void setMetaLockWaitObserver(MetaLockWaitObserver observer, void *context) noexcept {
+        metaLockWaitObserver_ = observer;
+        metaLockWaitContext_ = context;
+    }
+
     std::uint64_t extentBytes() const noexcept { return config_.extentBytes; }
     std::uint64_t deviceStartExtent(std::uint32_t deviceId) const noexcept;
     /* Returns the currently allocatable data capacity in bytes. */
@@ -276,6 +294,9 @@ private:
     std::uint64_t snapshotTxid_ = 0;
     /* Optional P2-2(a) attribution hook; set once by the engine at mount. */
     std::function<void(const CheckpointFreezeStats &)> checkpointFreezeObserver_;
+    /* Optional §7.3 lock-wait hook; installed only while tracing is active. */
+    MetaLockWaitObserver metaLockWaitObserver_ = nullptr;
+    void *metaLockWaitContext_ = nullptr;
     /* Before-image of the dirty inodes staged by prepareDurableEpoch. */
     struct PreparedDurableSize {
         std::uint64_t inodeId = 0;

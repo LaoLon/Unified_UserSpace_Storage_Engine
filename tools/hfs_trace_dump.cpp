@@ -223,6 +223,10 @@ int main(int argc, char **argv) {
     std::unordered_map<RequestChildKey, std::uint64_t, RequestChildHash> bdevSubmit;
     std::unordered_map<std::uint64_t, std::uint64_t> actorPickup;
     std::unordered_map<std::uint64_t, std::uint64_t> planReady;
+    /* FeSubmitBegin carries no request id; pair it with the next FeSubmit on
+     * the same trace source (review §7.3). */
+    std::unordered_map<std::uint32_t, std::uint64_t> feSubmitBegin;
+    std::vector<std::uint64_t> frontendFixedLatency;
     std::vector<std::uint64_t> requestLatency;
     std::vector<std::uint64_t> parentLatency;
     std::vector<std::uint64_t> planLatency;
@@ -237,7 +241,15 @@ int main(int argc, char **argv) {
         return static_cast<std::uint16_t>(id);
     };
     for (const hfs::trace::TraceRecord &record : records) {
-        if (record.eventId == eventId(hfs::trace::EventId::FeSubmit)) {
+        if (record.eventId == eventId(hfs::trace::EventId::FeSubmitBegin)) {
+            feSubmitBegin[record.sourceId] = record.timestamp;
+        } else if (record.eventId == eventId(hfs::trace::EventId::FeSubmit)) {
+            const auto beginFound = feSubmitBegin.find(record.sourceId);
+            if (beginFound != feSubmitBegin.end() &&
+                record.timestamp >= beginFound->second) {
+                frontendFixedLatency.push_back(record.timestamp - beginFound->second);
+            }
+            feSubmitBegin.erase(record.sourceId);
             if (record.arg0 != 0) {
                 requestSubmit[record.arg0] = record.timestamp;
             }
@@ -311,6 +323,7 @@ int main(int argc, char **argv) {
                 manifestFormat, manifestRecorded, manifestDropped, manifestTscHz,
                 manifestClosed ? "true" : "false");
     printLatency("request_latency", requestLatency, manifestTscHz);
+    printLatency("frontend_fixed_latency", frontendFixedLatency, manifestTscHz);
     printLatency("parent_latency", parentLatency, manifestTscHz);
     printLatency("plan_latency", planLatency, manifestTscHz);
     printLatency("ring_wait_latency", ringWaitLatency, manifestTscHz);

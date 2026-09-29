@@ -1,11 +1,13 @@
 #include "core/operation.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <limits>
 #include <mutex>
 #include <new>
 
+#include "common/trace.hpp"
 #include "core/index_stack.hpp"
 #include "hfs/types.hpp"
 
@@ -38,16 +40,32 @@ public:
 
     Operation *create(std::uint64_t requestId) noexcept {
         ensureStorage();
+        /* Review §7.3: time the lock-free acquire only while tracing. */
+        const bool measure = trace::enabled();
+        const auto start = measure ? std::chrono::steady_clock::now()
+                                   : std::chrono::steady_clock::time_point{};
+        const auto emit = [&](std::uint64_t contended) {
+            if (!measure) {
+                return;
+            }
+            trace::event(trace::EventId::OpPoolAcquire, requestId, contended,
+                         static_cast<std::uint64_t>(
+                             std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                 std::chrono::steady_clock::now() - start)
+                                 .count()));
+        };
         const std::size_t live = live_.fetch_add(1, std::memory_order_acq_rel);
         if (live >= capacity_) {
             live_.fetch_sub(1, std::memory_order_acq_rel);
             overflow_.fetch_add(1, std::memory_order_relaxed);
+            emit(1);
             return nullptr;
         }
         std::uint32_t index = 0;
         if (!freeStack_.pop(index)) {
             live_.fetch_sub(1, std::memory_order_acq_rel);
             overflow_.fetch_add(1, std::memory_order_relaxed);
+            emit(1);
             return nullptr;
         }
         Operation *operation = storage_ + index;
@@ -57,6 +75,7 @@ public:
                !highWatermark_.compare_exchange_weak(high, live + 1,
                                                      std::memory_order_relaxed)) {
         }
+        emit(0);
         return operation;
     }
 

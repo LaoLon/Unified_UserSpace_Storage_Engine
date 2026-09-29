@@ -475,6 +475,23 @@ retry/busy 点位仍需在真实生产路径补齐。
 | `OpPoolAcquire` | 57 | requestId, contended, ns | 高频采样 | P0-2 池争用；当前池不执行 wait |
 | `DmaOwns` | 58 | bytes, found, ns | 高频采样 | P0-6 归属判定成本 |
 
+实施状态（2026-09-29，全部已发射）：实际 id 为 `SnapHit=53`、`SnapBuild=54`、
+`ChkptFreeze=55`（P2-2a 追加）、`MetaLockWait=56`、`OpPoolAcquire=57`、
+`DmaOwns=58`、`FeSubmitBegin=59`。
+
+- `FeSubmitBegin` 在 submit 入口没有 requestId，参数改为
+  `(fileId, write, offset, size)`；`hfs_trace_dump` 按 trace source 与随后的
+  `FeSubmit` 配对，输出 `frontend_fixed_latency`；
+- `MetaLockWait` 由 engine 在 `trace=true` 时注入 observer（metadata 层不依赖
+  stats/trace），阈值 1000 ns，覆盖 `stat/extents/reserveExtents/commitExtents/
+  setSize/applyJournalRecord` 六个入口；
+- `trace::event()` 的 off 快路径改为 **TLS cached bool + 版本号**（§16.5：
+  off 时无 per-event RMW/分配/锁）；
+- 验证 run（RocksDB 20k keys，trace=true）：`manifest_recorded=520081`、
+  `manifest_dropped=0`；`event=55/57/58/59` 均有计数，
+  `frontend_fixed_latency p50=0.80 µs / p99=10.5 µs`；`MetaLockWait` 在 1 µs
+  阈值下本 workload 未触发（0 阈值验证 380 次，说明锁基本无争用）。
+
 配套工具改动：`tools/hfs_trace_dump.cpp` 的分段表增加
 `FeSubmitBegin→FeSubmit→RequestShardSubmit→RequestBdevSubmit→RequestBdevComplete→
 RequestParentComplete→CqPush→FeReap` 的推导与 p50/p99；`trace-manifest.json` 校验规则不变。
@@ -780,7 +797,7 @@ RequestParentComplete→CqPush→FeReap` 的推导与 p50/p99；`trace-manifest.
 | 项 | 状态 | 说明 |
 |---|---|---|
 | §7.2 已定义未发射点 | ✅ | `d872c6a`：JournalAppend/Chkpt×3/Fsync×2/Recovery×2/Retry/BusyReject 已在生产路径发射并验证 |
-| §7.3 新点位 | ⚠️ 部分 | 已实现 `SnapHit`(53)/`SnapBuild`(54)；未实现 `FeSubmitBegin`/`MetaLockWait`/`OpPoolAcquire`/`DmaOwns` |
+| §7.3 新点位 | ✅ | `SnapHit`(53)/`SnapBuild`(54)/`ChkptFreeze`(55)/`MetaLockWait`(56)/`OpPoolAcquire`(57)/`DmaOwns`(58)/`FeSubmitBegin`(59) 全部发射；`hfs_trace_dump` 新增 `frontend_fixed_latency`；trace off 快路径改为 TLS cached bool + 版本号（§16.5）；验证 run 520081 records / dropped=0，event 55–59 均有计数 |
 
 ### 14.5 门禁状态（2026-09-29）
 
@@ -788,8 +805,7 @@ RequestParentComplete→CqPush→FeReap` 的推导与 p50/p99；`trace-manifest.
 - 同形状 FIO gate（§16.2 修订后）：1j32 HFS/raw 90.6%、p99 1.00；8j4 120.8%、p99 0.19；
 - RocksDB/MySQL 缩减回归与既有基线一致（见 `hfs2_stage_abcd_regression_20260929.md`）；
 - 未闭合：P2-2(b) 增量格式、P2-3、P2-4、P0-9①、P1-1 无锁发布子项、
-  P1-5 剩余子项、P1-6 balanced index、P0-6 `reusableReadLease` 子项、
-  §7.3 的 4 个点位（`FeSubmitBegin`/`MetaLockWait`/`OpPoolAcquire`/`DmaOwns`）；
+  P1-5 剩余子项、P1-6 balanced index、P0-6 `reusableReadLease` 子项；
 - 待补量化：设计 §17.1 的 1M inode metadata microbenchmark 与 mount/replay 预算；
   MySQL 8j4 HFS/native 比值（历史 65.2%）与 RocksDB 大工作集 native 差距
   需在当前树（Stage A–D + P2-1/P0-9/P2-2a）上重测。

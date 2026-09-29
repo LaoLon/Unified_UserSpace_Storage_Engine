@@ -31,6 +31,43 @@ bool readSnapshotField(std::span<const std::byte> data, std::size_t &cursor, T *
     return true;
 }
 
+/* Emits one MetaLockWait through the injected observer when the acquisition
+ * waited at least kMetaLockWaitThresholdNs (review §7.3). The observer is only
+ * installed while tracing is active, so the disabled path is one null check. */
+constexpr std::uint64_t kMetaLockWaitThresholdNs = 1000;
+
+struct MetaLockWait {
+    MetaLockWait(Namespace::MetaLockWaitObserver observer, void *context,
+                 Namespace::MetaLockKind kind) noexcept
+        : observer_(observer), context_(context), kind_(static_cast<std::uint64_t>(kind)) {
+        if (observer_ != nullptr) {
+            startNs_ = steadyNs();
+        }
+    }
+
+    void acquired() noexcept {
+        if (observer_ == nullptr) {
+            return;
+        }
+        const std::uint64_t waited = steadyNs() - startNs_;
+        if (waited >= kMetaLockWaitThresholdNs) {
+            observer_(context_, kind_, waited);
+        }
+    }
+
+    static std::uint64_t steadyNs() noexcept {
+        return static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count());
+    }
+
+    Namespace::MetaLockWaitObserver observer_ = nullptr;
+    void *context_ = nullptr;
+    std::uint64_t kind_ = 0;
+    std::uint64_t startNs_ = 0;
+};
+
 /* Encodes a bounded directory name. */
 bool appendSnapshotString(std::vector<std::byte> &out, std::string_view value) {
     if (value.size() > std::numeric_limits<std::uint32_t>::max()) {
@@ -701,7 +738,9 @@ Result<DirectoryPage> Namespace::getChildren(std::string_view path,
 }
 
 Result<FileStat> Namespace::stat(FileHandle handle) const {
+    MetaLockWait metaWait(metaLockWaitObserver_, metaLockWaitContext_, MetaLockKind::Stat);
     std::lock_guard<std::mutex> lock(mutex_);
+    metaWait.acquired();
     auto inodeResult = lookupInode(handle);
     if (!inodeResult.ok()) {
         return makeError<FileStat>(inodeResult.status(), inodeResult.message());
@@ -759,7 +798,10 @@ void Namespace::releaseDescriptor(const ExtentDescriptor &descriptor) noexcept {
 Result<std::vector<ExtentAllocation>> Namespace::reserveExtents(FileHandle handle,
                                                                 std::uint64_t offset,
                                                                 std::uint64_t length) {
+    MetaLockWait metaWait(metaLockWaitObserver_, metaLockWaitContext_,
+                          MetaLockKind::ReserveExtents);
     std::lock_guard<std::mutex> lock(mutex_);
+    metaWait.acquired();
     auto inodeResult = lookupInode(handle);
     if (!inodeResult.ok()) {
         return makeError<std::vector<ExtentAllocation>>(inodeResult.status(),
@@ -856,7 +898,10 @@ Result<std::vector<ExtentAllocation>> Namespace::reserveExtents(FileHandle handl
 
 Result<void> Namespace::commitExtents(FileHandle handle,
                                       std::span<const ExtentAllocation> allocations) {
+    MetaLockWait metaWait(metaLockWaitObserver_, metaLockWaitContext_,
+                          MetaLockKind::CommitExtents);
     std::lock_guard<std::mutex> lock(mutex_);
+    metaWait.acquired();
     auto inodeResult = lookupInode(handle);
     if (!inodeResult.ok()) {
         return makeError(inodeResult.status(), inodeResult.message());
@@ -996,7 +1041,10 @@ Result<void> Namespace::releaseExtents(FileHandle handle,
 }
 
 Result<std::vector<ExtentDescriptor>> Namespace::extents(FileHandle handle) const {
+    MetaLockWait metaWait(metaLockWaitObserver_, metaLockWaitContext_,
+                          MetaLockKind::Extents);
     std::lock_guard<std::mutex> lock(mutex_);
+    metaWait.acquired();
     auto inodeResult = lookupInode(handle);
     if (!inodeResult.ok()) {
         return makeError<std::vector<ExtentDescriptor>>(inodeResult.status(),
@@ -1047,7 +1095,10 @@ Result<void> Namespace::truncateFile(FileHandle handle, std::uint64_t size) {
 }
 
 Result<void> Namespace::setSize(FileHandle handle, std::uint64_t size) {
+    MetaLockWait metaWait(metaLockWaitObserver_, metaLockWaitContext_,
+                          MetaLockKind::SetSize);
     std::lock_guard<std::mutex> lock(mutex_);
+    metaWait.acquired();
     auto inodeResult = lookupInode(handle);
     if (!inodeResult.ok()) {
         return makeError(inodeResult.status(), inodeResult.message());
@@ -1110,7 +1161,10 @@ Inode *Namespace::inodeById(std::uint64_t inodeId) noexcept {
  * that already contains their effect; Alloc/Free tolerate a committed or
  * released run because Journal::append may checkpoint before writing. */
 Result<void> Namespace::applyJournalRecord(const JournalRecord &record) {
+    MetaLockWait metaWait(metaLockWaitObserver_, metaLockWaitContext_,
+                          MetaLockKind::ApplyJournal);
     std::lock_guard<std::mutex> lock(mutex_);
+    metaWait.acquired();
     switch (record.type) {
     case JournalRecordType::Checkpoint:
         return Result<void>(Status::Ok);

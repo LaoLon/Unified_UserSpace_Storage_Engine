@@ -49,6 +49,35 @@ struct TraceChannel {
 
 std::array<TraceChannel, kMaxChannels> g_channels;
 std::atomic<bool> g_enabled{false};
+/* Bumped on every enable/disable so each thread refreshes its TLS cache once. */
+std::atomic<std::uint64_t> g_enabledVersion{1};
+
+/* Per-thread cached enable state (hfs2.0.md §16.5): the off fast path is one
+ * TLS bool read plus a relaxed version read; no per-event RMW, allocation or
+ * lock. A thread that has seen the current version keeps its cached verdict. */
+thread_local bool t_enabledCached = false;
+thread_local std::uint64_t t_enabledVersion = 0;
+
+/* Publishes a new enable state and invalidates every thread's TLS cache. */
+void storeEnabled(bool value) noexcept {
+    g_enabled.store(value, std::memory_order_release);
+    g_enabledVersion.fetch_add(1, std::memory_order_relaxed);
+}
+
+/* Returns the cached enable state, refreshing it once per version change. */
+bool enabledFast() noexcept {
+    if (t_enabledCached) {
+        return true;
+    }
+    const std::uint64_t version = g_enabledVersion.load(std::memory_order_relaxed);
+    if (t_enabledVersion == version) {
+        return false;
+    }
+    t_enabledVersion = version;
+    t_enabledCached = g_enabled.load(std::memory_order_relaxed);
+    return t_enabledCached;
+}
+
 std::atomic<bool> g_sessionActive{false};
 std::atomic<bool> g_writerStop{false};
 std::atomic<bool> g_writerStarted{false};
@@ -96,6 +125,9 @@ bool isHighFrequency(EventId id) noexcept {
     case EventId::RequestParentComplete:
     case EventId::SnapHit:
     case EventId::SnapBuild:
+    case EventId::OpPoolAcquire:
+    case EventId::DmaOwns:
+    case EventId::FeSubmitBegin:
         return true;
     default:
         return false;
@@ -405,9 +437,9 @@ std::uint64_t requestSamplingKey(EventId id, std::uint64_t a0, std::uint64_t a1,
 
 } // namespace
 
-bool enabled() noexcept { return g_enabled.load(std::memory_order_relaxed); }
+bool enabled() noexcept { return enabledFast(); }
 
-void setEnabled(bool value) noexcept { g_enabled.store(value, std::memory_order_release); }
+void setEnabled(bool value) noexcept { storeEnabled(value); }
 
 void setSample(std::uint32_t sample) noexcept {
     g_sample.store(sample == 0 ? 1 : sample, std::memory_order_relaxed);
@@ -418,7 +450,7 @@ bool start(const char *directory) noexcept {
         return false;
     }
     stop();
-    g_enabled.store(false, std::memory_order_release);
+    storeEnabled(false);
 
     if (::mkdir(directory, 0755) != 0 && errno != EEXIST) {
         return false;
@@ -484,7 +516,7 @@ bool start(const char *directory) noexcept {
 }
 
 void stop() noexcept {
-    g_enabled.store(false, std::memory_order_release);
+    storeEnabled(false);
     /* Bounded wait for producers that already passed the enabled check, so the
      * final manifest and file set contain every recorded event. */
     for (int attempt = 0; attempt < 1000; ++attempt) {
@@ -523,7 +555,7 @@ struct ActiveProducerGuard {
 
 void event(EventId id, std::uint64_t a0, std::uint64_t a1, std::uint64_t a2,
            std::uint64_t a3) noexcept {
-    if (!g_enabled.load(std::memory_order_relaxed)) {
+    if (!enabledFast()) {
         return;
     }
     ActiveProducerGuard producer;

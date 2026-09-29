@@ -421,6 +421,15 @@ Task<Result<void>> Engine::mount() {
             trace::event(trace::EventId::ChkptFreeze, freeze.txid, freeze.inodes,
                          freeze.entries);
         });
+    /* §7.3: install the namespace lock-wait hook only while tracing is active
+     * so the metadata fast path stays a single null check otherwise. */
+    if (impl.config.trace) {
+        impl.namespaceState->setMetaLockWaitObserver(
+            [](void *, std::uint64_t kind, std::uint64_t waitNs) {
+                trace::event(trace::EventId::MetaLockWait, kind, waitNs);
+            },
+            nullptr);
+    }
 
     /* Mount the metadata journal against the resident checkpoint target. */
     impl.metadataTarget = std::make_unique<NamespaceJournalTarget>(*impl.namespaceState);
