@@ -102,10 +102,15 @@
   `SMOKE2_PASS live=3 free=189 used=4784128`（64K/512K/4M 写入+CRC、COW 版本递增、
   update/commit 语义（自动递增版本、陈旧版本拒绝、commit 持久化）、删除不复活、
   journal 重放守恒）。
-- 接线状态：`storage_main` 已带 UUSE 后端构建通过；UUSE target 由
+- 接线状态（2026-10-05）：`storage_main` 已带 UUSE 后端构建通过；UUSE target 由
   `target.toml` 的 `use_uuse_engine = true` + `uuse_conf` 选择，数据落在 UUSE
-  卷的 `/uuse-store/t<targetId>`；**读路径尚未接线**（`aioPrepareRead` 返回明确
-  错误，待 AioStatus 分支）；单 storage 节点 E2E 待做。
+  卷的 `/uuse-store/t<targetId>`；读路径已在 `AioStatus::collect` 内联直读
+  （无 fd，替代 io_uring；`aioPrepareRead` 准备元数据，`readUuseChunk` 读入
+  `localbuf`）。服务级验证：新 `storage_main` 同时加载 2 个 chunk_engine
+  target + 1 个 UUSE target（日志 `uuse store loaded target 101000100103`，
+  `Load storage target TargetId(101000100103)`），稳定运行后恢复 systemd 服务。
+- 待做：单链 E2E（客户端写读经 UUSE target）+ 崩溃恢复；`StorageTargets::create`
+  路径（admin `create-target`）尚未带 UUSE 选项。
 
 ## 部署说明
 

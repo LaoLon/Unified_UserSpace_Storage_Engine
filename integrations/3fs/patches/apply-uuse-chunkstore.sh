@@ -345,4 +345,120 @@ if 'StorageTarget::openUuse' not in t:
 
 print('uuse chunkstore wiring installed')
 PY
+
+# ---- M2.2 read path ----
+python3 - "$ROOT" <<'PY'
+import sys
+root = sys.argv[1]
+
+def read(p):
+    return open(p, encoding='utf-8', errors='replace').read()
+
+def write(p, t):
+    open(p, 'w', encoding='utf-8', errors='replace').write(t)
+
+def rep(path, old, new):
+    t = read(path)
+    if new in t:
+        return
+    assert old in t, ('anchor missing in %s: %s' % (path, old[:70]))
+    write(path, t.replace(old, new, 1))
+
+p = root + '/src/storage/store/StorageTarget.h'
+rep(p, '  Result<uint32_t> updateUuseChunk(UpdateJob &job);\n',
+    '  Result<uint32_t> updateUuseChunk(UpdateJob &job);\n  Result<uint32_t> readUuseChunk(AioReadJob &job);\n')
+
+p = root + '/src/storage/store/StorageTarget.cc'
+rep(p, '''  } else if (useUuseEngine()) {
+    return makeError(StorageCode::kChunkReadFailed, "uuse read path is not wired yet");
+  } else {''',
+    '''  } else if (useUuseEngine()) {
+    if (!uuseStore_) {
+      return makeError(StorageCode::kStorageInitFailed, "uuse store not loaded");
+    }
+    auto &result = job.result();
+    auto &state = job.state();
+    const auto &chunkId = job.readIO().key.chunkId;
+    auto info = uuseStore_->get(chunkId);
+    if (!info) {
+      return makeError(std::move(info.error()));
+    }
+    const ChunkMetadata &meta = info.value().meta;
+    result.commitVer = meta.commitVer;
+    result.updateVer = meta.updateVer;
+    result.commitChainVer = meta.chainVer;
+    state.chunkLen = meta.size;
+    state.chunkChecksum = meta.checksum();
+    if (UNLIKELY(result.commitVer != result.updateVer && !state.readUncommitted)) {
+      return makeError(StorageCode::kChunkNotCommit, "uuse chunk not committed");
+    }
+    state.readLength = job.alignedLength();
+    state.readOffset = meta.innerOffset + job.alignedOffset();
+    state.readFd = -1;
+    return Void{};
+  } else {''')
+
+helpers = '''
+Result<uint32_t> StorageTarget::readUuseChunk(AioReadJob &job) {
+  if (!uuseStore_) {
+    return makeError(StorageCode::kStorageInitFailed, "uuse store not loaded");
+  }
+  const auto &chunkId = job.readIO().key.chunkId;
+  auto info = uuseStore_->get(chunkId);
+  if (!info) {
+    return makeError(std::move(info.error()));
+  }
+  const auto &meta = info.value().meta;
+  auto &state = job.state();
+  const uint64_t alignedOffset = job.alignedOffset();
+  if (alignedOffset >= meta.size) {
+    return 0;
+  }
+  const uint32_t available = static_cast<uint32_t>(meta.size - alignedOffset);
+  const uint32_t toRead = std::min(state.readLength, available);
+  if (toRead == 0) {
+    return 0;
+  }
+  auto read = uuseStore_->readChunk(info.value(), reinterpret_cast<uint8_t *>(state.localbuf.ptr()), toRead,
+                                    static_cast<uint32_t>(alignedOffset));
+  if (!read) {
+    return makeError(std::move(read.error()));
+  }
+  return toRead;
+}
+
+}  // namespace hf3fs::storage
+'''
+close = '}  // namespace hf3fs::storage\n'
+t = read(p)
+if 'StorageTarget::readUuseChunk' not in t:
+    assert t.endswith(close)
+    write(p, t[: -len(close)] + helpers)
+
+p = root + '/src/storage/aio/AioStatus.cc'
+rep(p, '''    auto result = job.state().storageTarget->aioPrepareRead(job);
+    if (UNLIKELY(!result)) {
+      job.setResult(makeError(std::move(result.error())));
+      continue;
+    }
+
+    ++readyToSubmit_;''',
+    '''    auto result = job.state().storageTarget->aioPrepareRead(job);
+    if (UNLIKELY(!result)) {
+      job.setResult(makeError(std::move(result.error())));
+      continue;
+    }
+    if (UNLIKELY(job.state().storageTarget->useUuseEngine())) {
+      auto readResult = job.state().storageTarget->readUuseChunk(job);
+      if (UNLIKELY(!readResult)) {
+        job.setResult(makeError(std::move(readResult.error())));
+        continue;
+      }
+      setReadJobResult(&job, static_cast<int64_t>(readResult.value()));
+      continue;
+    }
+
+    ++readyToSubmit_;''')
+print('uuse read path installed')
+PY
 echo "apply-uuse-chunkstore done"

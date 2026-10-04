@@ -126,7 +126,11 @@ UUSE `.conf` 指向该 BDF。
     `UuseChunkStore::update/commit` 并通过 smoke（自动递增版本、陈旧版本拒绝、
     commit 持久化、跨进程恢复）；`StorageTarget` 第三后端接线已完成并构建出带 UUSE
     后端的 `storage_main`（create/load/update/commit/query 分支；UUSE target 由
-    `target.toml` 的 `use_uuse_engine/uuse_conf` 选择）。读路径与单节点 E2E 为下一步。
+    `target.toml` 的 `use_uuse_engine/uuse_conf` 选择）。读路径已在
+    `AioStatus::collect` 内联直读（无 fd）；服务级验证通过——新 `storage_main`
+    同时加载 2 个 chunk_engine target + 1 个 UUSE target 并稳定运行。
+  - 待做：单链 E2E（客户端写读经 UUSE target）+ 崩溃恢复；`StorageTargets::create`
+    路径尚未带 UUSE 选项。
 - **M2.3**：接 3FS 集群（单链单副本或替换一个副本），FUSE 写读、SIGKILL 恢复、
   `hfsctl`/`list-targets` 检查。
 
