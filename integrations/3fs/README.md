@@ -96,9 +96,10 @@
   uuse_chunkstore_smoke <uuse.conf> /uuse-store/t<targetId> 2   # 新进程重放 journal 校验恢复
   ```
 
-- 实测（2026-10-05，.251 NVME_0002）：`SMOKE1_PASS live=2 free=190 used=4718592`、
-  `SMOKE2_PASS live=2 free=190 used=4718592`（64K/512K/4M 写入+CRC、COW 版本递增、
-  删除不复活、journal 重放守恒）。
+- 实测（2026-10-05，.251 NVME_0002）：`SMOKE1_PASS live=3 free=189 used=4784128`、
+  `SMOKE2_PASS live=3 free=189 used=4784128`（64K/512K/4M 写入+CRC、COW 版本递增、
+  update/commit 语义（自动递增版本、陈旧版本拒绝、commit 持久化）、删除不复活、
+  journal 重放守恒）。
 
 ## 部署说明
 

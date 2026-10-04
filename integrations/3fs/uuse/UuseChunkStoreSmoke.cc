@@ -151,6 +151,34 @@ int main(int argc, char **argv) {
     if (!queried.hasValue()) return fail("query", queried.error());
     std::printf("phase1: query returned %zu chunks\n", queried.value().size());
 
+    /* update()/commit() semantics on a fresh chunk. */
+    {
+      std::vector<uint8_t> data(64u << 10);
+      fillPattern(data, 77);
+      UuseChunkStore::UpdateInput input;
+      input.chunkId = ChunkId(chunkIdFor(4));
+      input.chunkSize = 64u << 10;
+      input.offset = 0;
+      input.length = static_cast<uint32_t>(data.size());
+      input.updateVer = 0;
+      input.chainVer = 1;
+      input.data = data.data();
+      ChecksumInfo::MemoryDataIterator iter(data.data(), data.size());
+      input.checksum = ChecksumInfo::create(ChecksumType::CRC32C, &iter, data.size());
+
+      auto updated = store->update(input);
+      if (!updated.hasValue()) return fail("update create", updated.error());
+      if (updated.value().updateVer.toUnderType() != 1 || updated.value().commitVer.toUnderType() != 0) {
+        return failMsg("update version wrong");
+      }
+      auto stale = store->update(input);
+      if (stale.hasValue()) return failMsg("stale update accepted");
+      auto committed = store->commit(input.chunkId, 1, 1);
+      if (!committed.hasValue()) return fail("commit", committed.error());
+      if (verifyChunk(*store, 4, 64u << 10, 1)) return 1;
+      std::printf("phase1: update/commit semantics ok\n");
+    }
+
     auto syncResult = store->sync();
     if (!syncResult.hasValue()) return fail("sync", syncResult.error());
     std::printf("SMOKE1_PASS live=%zu free=%zu used=%llu\n", store->liveChunks(), store->freeSlotCount(),
@@ -158,10 +186,11 @@ int main(int argc, char **argv) {
     return 0;
   }
 
-  if (store->liveChunks() != 2) {
-    return failMsg("replayed live count != 2");
+  if (store->liveChunks() != 3) {
+    return failMsg("replayed live count != 3");
   }
-  if (verifyChunk(*store, 1, 512u << 10, 2) || verifyChunk(*store, 3, 4u << 20, 1)) {
+  if (verifyChunk(*store, 1, 512u << 10, 2) || verifyChunk(*store, 3, 4u << 20, 1) ||
+      verifyChunk(*store, 4, 64u << 10, 1)) {
     return 1;
   }
   ChunkId bId(chunkIdFor(2));

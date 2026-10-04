@@ -66,6 +66,30 @@ class UuseChunkStore {
     bool create = false;
   };
 
+  /* Input of one update (mirrors the UpdateIO fields the storage service
+   * passes to ChunkReplica::update). */
+  struct UpdateInput {
+    ChunkId chunkId;
+    uint32_t chunkSize = 0;
+    uint32_t offset = 0;
+    uint32_t length = 0;
+    uint64_t updateVer = 0; /* 0 = auto-increment */
+    uint32_t chainVer = 0;
+    const uint8_t *data = nullptr;
+    ChecksumInfo checksum;
+    bool isSyncing = false; /* commit the write in this request */
+    bool isRemove = false;
+    bool isTruncate = false;
+  };
+
+  struct UpdateOutput {
+    ChunkVer commitVer;
+    ChunkVer updateVer;
+    ChainVer chainVer;
+    ChecksumInfo checksum;
+    uint32_t length = 0;
+  };
+
   static constexpr uint32_t kClassCount = 3;
   static constexpr uint32_t kFilesPerClass = 2;
   static constexpr uint32_t kSlotsPerFile = 32;
@@ -93,6 +117,14 @@ class UuseChunkStore {
 
   /* Journal delete + slot release. */
   Result<Void> remove(const ChunkId &chunkId, ChunkInfo &chunkInfo);
+
+  /* ChunkReplica::update semantics on UUSE (M2.2 step 1): version checks,
+   * COW allocation for new chunks, gap zero-fill, checksum verification and
+   * full-chunk CRC32C recompute, optional commit in the same request. */
+  Result<UpdateOutput> update(const UpdateInput &input);
+
+  /* Commit an update version (commitVer/chainVer) and persist it. */
+  Result<Void> commit(const ChunkId &chunkId, uint64_t commitVer, uint32_t chainVer);
 
   /* Chunks inside [range.begin, range.end], reverse lexicographic order. */
   Result<std::vector<std::pair<ChunkId, ChunkMetadata>>> queryChunks(const ChunkIdRange &range) const;

@@ -400,6 +400,176 @@ Result<Void> UuseChunkStore::remove(const ChunkId &chunkId, ChunkInfo &chunkInfo
   return Void{};
 }
 
+Result<UuseChunkStore::UpdateOutput> UuseChunkStore::update(const UpdateInput &input) {
+  if (input.chunkId.data().size() != 16) {
+    return makeError(StatusCode::kInvalidArg, "uuse chunk id must be 16 bytes");
+  }
+  if (input.isTruncate) {
+    return makeError(StatusCode::kNotImplemented, "uuse truncate update not implemented yet");
+  }
+  if (!input.isRemove &&
+      (input.offset >= input.chunkSize || input.offset + input.length > input.chunkSize)) {
+    return makeError(StatusCode::kInvalidArg, "uuse write offset exceeds chunk size");
+  }
+
+  std::lock_guard lock(mutex_);
+  UpdateOutput output;
+  auto existing = chunks_.find(input.chunkId.data());
+  if (existing == chunks_.end() && input.isRemove) {
+    output.commitVer = ChunkVer{static_cast<uint32_t>(input.updateVer)};
+    output.updateVer = ChunkVer{static_cast<uint32_t>(input.updateVer)};
+    output.chainVer = ChainVer{input.chainVer};
+    return output;
+  }
+
+  ChunkInfo info;
+  bool needCreate = false;
+  if (existing != chunks_.end()) {
+    info = existing->second;
+    if (input.chunkSize != 0 && info.meta.innerFileId.chunkSize != input.chunkSize) {
+      return makeError(StorageCode::kChunkSizeMismatch, "uuse chunk size mismatch");
+    }
+  } else {
+    needCreate = true;
+    info.meta.chainVer = ChainVer{input.chainVer};
+    info.meta.chunkState = ChunkState::CLEAN;
+  }
+  auto &meta = info.meta;
+
+  output.commitVer = meta.commitVer;
+  output.updateVer = meta.updateVer;
+  output.chainVer = meta.chainVer;
+  output.checksum = meta.checksum();
+  output.length = meta.size;
+
+  if (input.isRemove) {
+    const uint32_t next = input.updateVer != 0 ? static_cast<uint32_t>(input.updateVer)
+                                               : meta.updateVer.toUnderType() + 1;
+    meta.updateVer = ChunkVer{next};
+    meta.chainVer = ChainVer{input.chainVer};
+    meta.recycleState = RecycleState::REMOVAL_IN_PROGRESS;
+    auto record = makeRecord(kOpPut, input.chunkId, info);
+    auto appended = appendRecord(record);
+    if (!appended) {
+      return folly::makeUnexpected(appended.error());
+    }
+    chunks_[input.chunkId.data()] = info;
+    output.updateVer = meta.updateVer;
+    output.chainVer = meta.chainVer;
+    return output;
+  }
+
+  uint32_t nextUpdate = meta.updateVer.toUnderType();
+  if (input.isSyncing) {
+    nextUpdate = static_cast<uint32_t>(input.updateVer);
+    meta.commitVer = ChunkVer{nextUpdate};
+  } else if (input.updateVer > 0) {
+    const uint32_t commitVer = meta.commitVer.toUnderType();
+    if (input.updateVer <= commitVer) {
+      return makeError(StorageCode::kChunkCommittedUpdate, "uuse committed update");
+    }
+    if (input.updateVer <= nextUpdate) {
+      return makeError(StorageCode::kChunkStaleUpdate, "uuse stale update");
+    }
+    if (input.updateVer > nextUpdate + 1) {
+      return makeError(StorageCode::kChunkMissingUpdate, "uuse missing update");
+    }
+    nextUpdate = static_cast<uint32_t>(input.updateVer);
+  } else {
+    nextUpdate += 1;
+    if (nextUpdate > meta.commitVer.toUnderType() + 1) {
+      return makeError(StorageCode::kChunkAdvanceUpdate, "uuse advance update");
+    }
+  }
+
+  if (needCreate) {
+    const std::size_t cls = classForSize(input.chunkSize);
+    if (cls >= kClassCount) {
+      return makeError(StatusCode::kInvalidArg, "uuse chunk size above max class");
+    }
+    auto slotResult = allocateSlot(cls);
+    if (!slotResult) {
+      return folly::makeUnexpected(slotResult.error());
+    }
+    info.slot = slotResult.value();
+    info.meta.innerFileId.chunkSize = static_cast<uint32_t>(kClassSize[cls]);
+    info.meta.innerFileId.chunkIdx = info.slot.fileId;
+    info.meta.innerOffset = static_cast<uint64_t>(info.slot.slot) * kClassSize[cls];
+  }
+
+  auto &updated = info.meta;
+  updated.updateVer = ChunkVer{nextUpdate};
+  updated.chainVer = ChainVer{input.chainVer};
+  updated.chunkState = ChunkState::DIRTY;
+  updated.recycleState = RecycleState::NORMAL;
+
+  if (input.checksum.type != ChecksumType::NONE && input.length != 0) {
+    ChecksumInfo::MemoryDataIterator iter(input.data, input.length);
+    const auto computed = ChecksumInfo::create(input.checksum.type, &iter, input.length);
+    if (computed != input.checksum) {
+      return makeError(StorageCode::kChecksumMismatch, "uuse client checksum mismatch");
+    }
+  }
+
+  auto fileIt = slotFiles_.find(info.slot.fileId);
+  if (fileIt == slotFiles_.end()) {
+    return makeError(StatusCode::kInvalidArg, "uuse slot file missing");
+  }
+  static const std::vector<uint8_t> zeros(kClassSize[kClassCount - 1], 0);
+  if (input.length != 0) {
+    if (updated.size < input.offset) {
+      auto filled = writeAt(*fileIt->second, zeros.data(), input.offset - updated.size,
+                            updated.innerOffset + updated.size);
+      if (!filled) {
+        return folly::makeUnexpected(filled.error());
+      }
+    }
+    auto written = writeAt(*fileIt->second, input.data, input.length, updated.innerOffset + input.offset);
+    if (!written) {
+      return folly::makeUnexpected(written.error());
+    }
+    updated.size = std::max<uint32_t>(updated.size, input.offset + input.length);
+  }
+
+  std::vector<uint8_t> chunkData(updated.size);
+  auto readBack = readAt(*fileIt->second, chunkData.data(), chunkData.size(), updated.innerOffset);
+  if (!readBack) {
+    return folly::makeUnexpected(readBack.error());
+  }
+  ChecksumInfo::MemoryDataIterator fullIter(chunkData.data(), chunkData.size());
+  const auto fullChecksum = ChecksumInfo::create(ChecksumType::CRC32C, &fullIter, chunkData.size());
+  updated.checksumType = fullChecksum.type;
+  updated.checksumValue = fullChecksum.value;
+  updated.chunkState = ChunkState::CLEAN;
+
+  auto record = makeRecord(kOpPut, input.chunkId, info);
+  auto appended = appendRecord(record);
+  if (!appended) {
+    return folly::makeUnexpected(appended.error());
+  }
+  chunks_[input.chunkId.data()] = info;
+
+  output.commitVer = updated.commitVer;
+  output.updateVer = updated.updateVer;
+  output.chainVer = updated.chainVer;
+  output.checksum = updated.checksum();
+  output.length = updated.size;
+  return output;
+}
+
+Result<Void> UuseChunkStore::commit(const ChunkId &chunkId, uint64_t commitVer, uint32_t chainVer) {
+  std::lock_guard lock(mutex_);
+  auto it = chunks_.find(chunkId.data());
+  if (it == chunks_.end()) {
+    return makeError(StorageCode::kChunkMetadataNotFound, "uuse chunk not found");
+  }
+  it->second.meta.commitVer = ChunkVer{static_cast<uint32_t>(commitVer)};
+  it->second.meta.chainVer = ChainVer{chainVer};
+  it->second.meta.chunkState = ChunkState::COMMIT;
+  const auto record = makeRecord(kOpPut, chunkId, it->second);
+  return appendRecord(record);
+}
+
 Result<std::vector<std::pair<ChunkId, ChunkMetadata>>> UuseChunkStore::queryChunks(const ChunkIdRange &range) const {
   std::lock_guard lock(mutex_);
   std::vector<std::pair<ChunkId, ChunkMetadata>> result;

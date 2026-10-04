@@ -122,6 +122,9 @@ UUSE `.conf` 指向该 BDF。
     `integrations/3fs/uuse/` 与 `integrations/3fs/README.md`。
 - **M2.2**：`StorageTarget` 第三分支 + `engine_type` 开关 + 异步读；单 storage
   节点创建 UUSE target，直连 storage client 写读通过。
+  - 进展（2026-10-05）：`ChunkReplica::update` 的版本/COW/校验和/commit 语义已移植到
+    `UuseChunkStore::update/commit` 并通过 smoke（自动递增版本、陈旧版本拒绝、
+    commit 持久化、跨进程恢复）；`StorageTarget` 接线与读路径为下一步。
 - **M2.3**：接 3FS 集群（单链单副本或替换一个副本），FUSE 写读、SIGKILL 恢复、
   `hfsctl`/`list-targets` 检查。
 
