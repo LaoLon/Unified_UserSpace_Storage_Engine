@@ -71,10 +71,34 @@
 ## 补丁集
 
 - `patches/apply-lab-compat.sh`：源码级兼容补丁（clang-17 flags、Boost 1.90
-  Boost.System 移除、SerDeser trivially-copyable、UsrbIo uuid API、liburing
-  `open_how` 兼容）。
+  Boost.System 移除、SerDeser trivially-copyable、UsrbIo/Uuid/ResyncWorker uuid
+  API、liburing `open_how` 兼容、clang-format 回退）。
 - `patches/build-fixes.sh`：构建期修复（Arrow bundled deps 的
   `cmake_minimum_required` 提升、thrift 0.16.0 tarball 下载），失败后重跑构建。
+- `patches/apply-uuse-chunkstore.sh`：安装 M2.1 的 `UuseChunkStore` 核心与
+  smoke 目标（源码在 `uuse/`）。
+
+## M2.1 UuseChunkStore（已通过）
+
+- 源码：`uuse/UuseChunkStore.{h,cc}`、`uuse/UuseChunkStoreSmoke.cc`、
+  `uuse/CMake.uuse-chunkstore.cmake`。
+- 构建（.251，需 `/root/code-uuse` 的 UUSE 头文件与 `libuuse_core.so`）：
+
+  ```bash
+  bash integrations/3fs/patches/apply-uuse-chunkstore.sh /build/3fs
+  cd /build/3fs && cmake -S . -B build && cmake --build build -j3 --target uuse_chunkstore_smoke
+  ```
+
+- 运行（目标 NVMe 绑 uio + hugepages；.251 用 `dma_arena_mb = 256` 的配置）：
+
+  ```bash
+  uuse_chunkstore_smoke <uuse.conf> /uuse-store/t<targetId> 1   # 写入+COW+删除+query+sync
+  uuse_chunkstore_smoke <uuse.conf> /uuse-store/t<targetId> 2   # 新进程重放 journal 校验恢复
+  ```
+
+- 实测（2026-10-05，.251 NVME_0002）：`SMOKE1_PASS live=2 free=190 used=4718592`、
+  `SMOKE2_PASS live=2 free=190 used=4718592`（64K/512K/4M 写入+CRC、COW 版本递增、
+  删除不复活、journal 重放守恒）。
 
 ## 部署说明
 

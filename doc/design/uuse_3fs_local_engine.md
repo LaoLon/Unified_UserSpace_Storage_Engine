@@ -117,6 +117,9 @@ UUSE `.conf` 指向该 BDF。
 **分阶段与验收**：
 - **M2.1**：`UuseChunkStore` 核心 + smoke（put/get/COW/remove/query/跨进程恢复）
   在 .251 真实 NVMe 上通过 → 目标：语义正确性。
+  - 已完成（2026-10-05）：`SMOKE1_PASS`/`SMOKE2_PASS`（64K/512K/4M 写入+CRC、
+    COW 版本递增、删除不复活、journal 重放守恒）；源码与运行说明见
+    `integrations/3fs/uuse/` 与 `integrations/3fs/README.md`。
 - **M2.2**：`StorageTarget` 第三分支 + `engine_type` 开关 + 异步读；单 storage
   节点创建 UUSE target，直连 storage client 写读通过。
 - **M2.3**：接 3FS 集群（单链单副本或替换一个副本），FUSE 写读、SIGKILL 恢复、
