@@ -1,7 +1,7 @@
-# UUSE_BASE_SPDK
+# UUSE (unified user-space storage engine)
 
 > 状态（2026-09-16）：UUSE 正在按 `doc/design/uuse.md` 做 clean-break 重构（C++20
-> coroutine-first、raw SPDK bdev、`.conf` 配置）。下方 README 描述的是 UUSE 1.x
+> coroutine-first、raw SPDK bdev、`.conf` 配置）。下方 README 描述的是 HFS 1.x
 > 冻结线（Blobstore/preload）的构建与使用方式，仅用于旧线复现，不代表 UUSE 2.0。
 
 An experimental filesystem built on SPDK Blobstore. The initial implementation is migrated from
@@ -13,7 +13,7 @@ SPDK official project: <https://github.com/spdk/spdk>
 
 ```bash
 git clone --recurse-submodules <repository-url>
-cd UUSE_BASE_SPDK
+cd uuse
 ```
 
 For an existing checkout:
