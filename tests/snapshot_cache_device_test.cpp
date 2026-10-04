@@ -12,12 +12,12 @@
 #include <vector>
 
 #include "common/stats.hpp"
-#include "hfs/core.hpp"
-#include "hfs/diagnostics.hpp"
-#include "hfs/file.hpp"
+#include "uuse/core.hpp"
+#include "uuse/diagnostics.hpp"
+#include "uuse/file.hpp"
 #include "test_support.hpp"
 
-using namespace hfs;
+using namespace uuse;
 
 namespace {
 
@@ -50,74 +50,74 @@ bool readOnce(const std::shared_ptr<Client> &client, const std::shared_ptr<File>
 
 int main() {
     const std::string lockPath =
-        "/tmp/hfs2-snapshot-" + std::to_string(::getpid()) + ".lock";
+        "/tmp/uuse-snapshot-" + std::to_string(::getpid()) + ".lock";
     auto parsed = parseConfig(validConfigText(lockPath), "snapshot_cache_device_test");
-    HFS_TEST_CHECK(parsed.ok());
+    UUSE_TEST_CHECK(parsed.ok());
 
     auto created = Engine::create(parsed.value());
-    HFS_TEST_CHECK(created.ok());
+    UUSE_TEST_CHECK(created.ok());
     auto engine = std::move(created).value();
-    HFS_TEST_CHECK(engine->format({true}).wait().value().ok());
-    HFS_TEST_CHECK(engine->mount().wait().value().ok());
+    UUSE_TEST_CHECK(engine->format({true}).wait().value().ok());
+    UUSE_TEST_CHECK(engine->mount().wait().value().ok());
 
     ClientOptions options;
     options.maxOutstanding = 8;
     auto clientCreated = Client::create(*engine, options);
-    HFS_TEST_CHECK(clientCreated.ok());
+    UUSE_TEST_CHECK(clientCreated.ok());
     auto client = std::move(clientCreated).value();
 
     auto openA = client->open("/snap-a", OpenFlags::Create | OpenFlags::Truncate).wait();
-    HFS_TEST_CHECK(openA.ok() && openA.value().ok());
+    UUSE_TEST_CHECK(openA.ok() && openA.value().ok());
     auto fileA = std::move(openA).value().value();
     auto openB = client->open("/snap-b", OpenFlags::Create | OpenFlags::Truncate).wait();
-    HFS_TEST_CHECK(openB.ok() && openB.value().ok());
+    UUSE_TEST_CHECK(openB.ok() && openB.value().ok());
     auto fileB = std::move(openB).value().value();
 
     std::vector<std::byte> payload(4096, std::byte{0x5A});
     std::vector<std::byte> overlay(4096, std::byte{0x33});
-    HFS_TEST_CHECK(writeBytes(fileA, payload, 0));
-    HFS_TEST_CHECK(writeBytes(fileB, payload, 0));
+    UUSE_TEST_CHECK(writeBytes(fileA, payload, 0));
+    UUSE_TEST_CHECK(writeBytes(fileB, payload, 0));
 
     /* Count snapshot cache behavior only for this phase. */
     stats::setEnabled(true);
     diagnostics::reset();
 
     auto dma = engine->acquireDmaBuffer(4096, 0);
-    HFS_TEST_CHECK(dma.ok());
+    UUSE_TEST_CHECK(dma.ok());
     std::byte *buffer = dma.value().data();
 
     /* 1. First read of B builds the immutable snapshot. */
-    HFS_TEST_CHECK(readOnce(client, fileB, buffer, 4096));
-    HFS_TEST_CHECK(diagnostics::snapshot().snapshotBuilds == 1);
-    HFS_TEST_CHECK(diagnostics::snapshot().snapshotHits == 0);
+    UUSE_TEST_CHECK(readOnce(client, fileB, buffer, 4096));
+    UUSE_TEST_CHECK(diagnostics::snapshot().snapshotBuilds == 1);
+    UUSE_TEST_CHECK(diagnostics::snapshot().snapshotHits == 0);
 
     /* 2. An unchanged file hits the cached snapshot. */
-    HFS_TEST_CHECK(readOnce(client, fileB, buffer, 4096));
-    HFS_TEST_CHECK(diagnostics::snapshot().snapshotBuilds == 1);
-    HFS_TEST_CHECK(diagnostics::snapshot().snapshotHits == 1);
+    UUSE_TEST_CHECK(readOnce(client, fileB, buffer, 4096));
+    UUSE_TEST_CHECK(diagnostics::snapshot().snapshotBuilds == 1);
+    UUSE_TEST_CHECK(diagnostics::snapshot().snapshotHits == 1);
 
     /* 3. Growing another file must not invalidate B's snapshot. The append to A
      * rebuilds A's own map once after its commit; B's read still hits. */
-    HFS_TEST_CHECK(writeBytes(fileA, overlay, 4096));
-    HFS_TEST_CHECK(readOnce(client, fileB, buffer, 4096));
-    HFS_TEST_CHECK(diagnostics::snapshot().snapshotBuilds == 2);
-    HFS_TEST_CHECK(diagnostics::snapshot().snapshotHits == 2);
+    UUSE_TEST_CHECK(writeBytes(fileA, overlay, 4096));
+    UUSE_TEST_CHECK(readOnce(client, fileB, buffer, 4096));
+    UUSE_TEST_CHECK(diagnostics::snapshot().snapshotBuilds == 2);
+    UUSE_TEST_CHECK(diagnostics::snapshot().snapshotHits == 2);
 
     /* 4. A new extent in B itself invalidates its snapshot: the pre-write size
      * hits B's cache, the post-commit map rebuild caches the committed map,
      * then the setSize that follows the data write bumps the version once more,
      * so the next read rebuilds and re-caches (builds +2, hits +1). */
-    HFS_TEST_CHECK(writeBytes(fileB, overlay, 1ULL << 20));
-    HFS_TEST_CHECK(readOnce(client, fileB, buffer, 4096));
-    HFS_TEST_CHECK(diagnostics::snapshot().snapshotBuilds == 4);
-    HFS_TEST_CHECK(diagnostics::snapshot().snapshotHits == 3);
+    UUSE_TEST_CHECK(writeBytes(fileB, overlay, 1ULL << 20));
+    UUSE_TEST_CHECK(readOnce(client, fileB, buffer, 4096));
+    UUSE_TEST_CHECK(diagnostics::snapshot().snapshotBuilds == 4);
+    UUSE_TEST_CHECK(diagnostics::snapshot().snapshotHits == 3);
 
     /* 5. A fixed in-place overwrite keeps both the data map and the size valid,
      * so the write (pre/post) and the read all hit the cache. */
-    HFS_TEST_CHECK(writeBytes(fileB, overlay, 0));
-    HFS_TEST_CHECK(readOnce(client, fileB, buffer, 4096));
-    HFS_TEST_CHECK(diagnostics::snapshot().snapshotBuilds == 4);
-    HFS_TEST_CHECK(diagnostics::snapshot().snapshotHits == 6);
+    UUSE_TEST_CHECK(writeBytes(fileB, overlay, 0));
+    UUSE_TEST_CHECK(readOnce(client, fileB, buffer, 4096));
+    UUSE_TEST_CHECK(diagnostics::snapshot().snapshotBuilds == 4);
+    UUSE_TEST_CHECK(diagnostics::snapshot().snapshotHits == 6);
 
     engine->releaseDmaBuffer(buffer, dma.value().size());
     const auto finalStats = diagnostics::snapshot();
@@ -129,7 +129,7 @@ int main() {
     fileA.reset();
     fileB.reset();
     auto closed = client->close().wait();
-    HFS_TEST_CHECK(closed.ok() && closed.value().ok());
-    HFS_TEST_CHECK(engine->stop().wait().value().ok());
+    UUSE_TEST_CHECK(closed.ok() && closed.value().ok());
+    UUSE_TEST_CHECK(engine->stop().wait().value().ok());
     return 0;
 }

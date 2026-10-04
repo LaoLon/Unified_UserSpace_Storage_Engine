@@ -1,5 +1,7 @@
 # HFS 2.0 FIO 三层性能基线（ext4+libaio / SPDK raw / HFS）
 
+> 注：项目已于 2026-10-04 由 HFS 更名为 UUSE；本文为历史记录，正文与证据路径保留 HFS 时期名称。
+
 日期：2026-09-27 会话（UTC 16:21:40–16:35:33，本地 2026-09-28 00:21–00:35）。
 范围：同一块 NVMe 控制器上 ext4+libaio、SPDK raw bdev 与 HFS 的 `randrw` 50/50
 三方矩阵，4K/16K/64K × 总队列深度 QD32/64，每格 3 次取中位数；HFS 与 SPDK raw

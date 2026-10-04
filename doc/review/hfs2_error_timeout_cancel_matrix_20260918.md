@@ -1,5 +1,7 @@
 # HFS 2.0 Shard-79/83/84 错误、超时、取消组合矩阵
 
+> 注：项目已于 2026-10-04 由 HFS 更名为 UUSE；本文为历史记录，正文与证据路径保留 HFS 时期名称。
+
 日期：2026-09-18  
 设备口径：单盘真实 NVMe `Nvme0n1`，PCI BDF `0000:0b:00.0`，配置
 `config/hfs_nvme.conf`。测试前将设备临时绑定 SPDK，测试结束恢复内核 `nvme`
@@ -43,4 +45,3 @@ python E:\Code\test_script\run_error_cancel_matrix_vm.py
 结果：`file_data_test: ok`、`data_path_device_test: ok`、`format_mount_test: ok`、
 RocksDB filesystem smoke `exit_code=0`；最终 free-space reclaim 为
 `initial=31398559744`、`allocated=31397511168`、`final=31398559744`。
-

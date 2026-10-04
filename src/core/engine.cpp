@@ -1,4 +1,4 @@
-#include "hfs/core.hpp"
+#include "uuse/core.hpp"
 
 #include <algorithm>
 #include <cerrno>
@@ -29,18 +29,18 @@
 #include "core/spdk_async_backend.hpp"
 #include "metadata/namespace.hpp"
 #include "runtime/spdk_runtime.hpp"
-#include "hfs/journal.hpp"
+#include "uuse/journal.hpp"
 #include "storage/volume.hpp"
 
-#if defined(HFS_WITH_SPDK)
+#if defined(UUSE_WITH_SPDK)
 #include <spdk/env.h>
 #endif
 
-namespace hfs {
+namespace uuse {
 
 namespace {
 
-#if defined(HFS_WITH_SPDK)
+#if defined(UUSE_WITH_SPDK)
 void *dataDmaAlloc(std::size_t size, void *context) {
     (void)context;
     return spdk_dma_zmalloc(size, 4096, nullptr);
@@ -93,7 +93,7 @@ HugepageInfo readHugepageInfo() { return {}; }
 
 /* Test-only boundary between durable data and metadata publication. */
 bool testMetadataCommitFailureRequested() {
-    const char *value = std::getenv("HFS_TEST_FAIL_METADATA_COMMIT");
+    const char *value = std::getenv("UUSE_TEST_FAIL_METADATA_COMMIT");
     return value != nullptr && std::string(value) == "1";
 }
 
@@ -123,7 +123,7 @@ public:
     explicit NamespaceJournalTarget(metadata::Namespace &namespaceState)
         : namespaceState_(namespaceState) {}
 
-    /* Applies one replayed metadata transaction record (hfs2.0.md §9.3). */
+    /* Applies one replayed metadata transaction record (uuse.md §9.3). */
     Result<void> apply(const JournalRecord &record) override {
         return namespaceState_.applyJournalRecord(record);
     }
@@ -343,7 +343,7 @@ Task<Result<void>> Engine::mount() {
         co_return Result<void>(Status::InvalidState, "engine already mounted");
     }
     /* Start the observability session before the runtime and journal replay so
-     * mount/recovery trace points land in this session (hfs2.0.md §16.5). */
+     * mount/recovery trace points land in this session (uuse.md §16.5). */
     stats::setEnabled(impl.config.stats);
     trace::setSample(impl.config.traceSample);
     trace::stop();
@@ -381,7 +381,7 @@ Task<Result<void>> Engine::mount() {
                                     : metadata::PlacementPolicy::CapacityWeighted;
     namespaceConfig.maxReserveExtents = std::max<std::uint64_t>(1, impl.config.preallocExtents);
     if (namespaceConfig.maxReserveExtents > 64) {
-        namespaceConfig.maxReserveExtents = 64; /* hfs2.0.md §9.4 per-transaction cap */
+        namespaceConfig.maxReserveExtents = 64; /* uuse.md §9.4 per-transaction cap */
     }
     const std::uint32_t metaBlock = impl.config.metadataBlockSize;
     if (metaBlock == 0 || impl.config.extentMb == 0 ||
@@ -658,7 +658,7 @@ Task<Result<void>> Engine::stop() {
         co_return Result<void>(Status::Ok);
     }
     /* Active clients/open files keep the namespace alive; callers must close
-     * them first (hfs2.0.md §14.3). */
+     * them first (uuse.md §14.3). */
     if (impl.metadataUsers.load(std::memory_order_acquire) != 0) {
         co_return Result<void>(Status::Busy, "clients or open files are still active");
     }
@@ -743,7 +743,7 @@ Task<Result<void>> Engine::stop() {
     trace::stop();
     stats::setEnabled(false);
     /* Diagnostic dump used to verify the fsync coverage contract. */
-    if (const char *flag = std::getenv("HFS_DIAG_SYNC_STATS"); flag != nullptr && *flag != '\0') {
+    if (const char *flag = std::getenv("UUSE_DIAG_SYNC_STATS"); flag != nullptr && *flag != '\0') {
         const auto &counters = stats::counters();
         log::info("sync stats: calls=%llu early=%llu joiners=%llu barriers=%llu flushes=%llu "
                   "flush_skips=%llu checkpoints=%llu journal_txns=%llu",
@@ -800,7 +800,7 @@ Result<void> Engine::syncMetadata(std::uint64_t epoch) {
             std::unique_lock<std::mutex> syncLock(impl_->syncMutex);
             /* A repeated barrier needs no checkpoint when the epoch is already
              * published, and no device flush when no completed data write is
-             * pending (hfs2.0.md 10.2/20.3). */
+             * pending (uuse.md 10.2/20.3). */
             if (epoch <= impl_->namespaceState->durableEpoch() &&
                 !SpdkRuntime::instance().dataFlushPending()) {
                 stats::counters().syncEarlyReturns.fetch_add(1, std::memory_order_relaxed);
@@ -855,7 +855,7 @@ Result<void> Engine::syncMetadata(std::uint64_t epoch) {
                      static_cast<std::uint64_t>(epoch));
         const bool checkpointNeeded = targetEpoch > impl_->namespaceState->durableEpoch();
         bool prepared = false;
-        /* Phase 1 (metadata, hfs2.0.md §9.3): namespace-shape changes and
+        /* Phase 1 (metadata, uuse.md §9.3): namespace-shape changes and
          * journal compaction write the full snapshot; journaled mutations are
          * appended after the data flush so a failed flush cannot leave durable
          * metadata ahead of non-durable data. */
@@ -865,7 +865,7 @@ Result<void> Engine::syncMetadata(std::uint64_t epoch) {
         const auto checkpointPhase = [&]() {
             /* Namespace shape changes cannot be replayed from the journal record
              * format, so they force a full base; journal-backed deltas only
-             * cover windows without shape changes (hfs2.0.md §10.4 b). */
+             * cover windows without shape changes (uuse.md §10.4 b). */
             const bool shapeChanged = impl_->namespaceState->checkpointRequired();
             if (shapeChanged) {
                 impl_->journal->requireFullCheckpoint();
@@ -928,7 +928,7 @@ Result<void> Engine::syncMetadata(std::uint64_t epoch) {
         }
         /* Phase 3 (durability): one device flush covers every write completed
          * before it was submitted - user data, journal slots, the checkpoint
-         * record and the superblock (hfs2.0.md 10.2/20.3). */
+         * record and the superblock (uuse.md 10.2/20.3). */
         if (result.ok()) {
             const auto deviceFlushStart = std::chrono::steady_clock::now();
             for (std::size_t i = 0; i < impl_->config.devices.size(); ++i) {
@@ -1199,11 +1199,11 @@ std::uint64_t Engine::dataReactorThreadId(std::uint32_t index) const {
 }
 
 std::uint32_t coreAbiMajor() noexcept {
-#ifdef HFS_CORE_ABI_MAJOR
-    return HFS_CORE_ABI_MAJOR;
+#ifdef UUSE_CORE_ABI_MAJOR
+    return UUSE_CORE_ABI_MAJOR;
 #else
     return 0;
 #endif
 }
 
-} // namespace hfs
+} // namespace uuse

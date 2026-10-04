@@ -1,14 +1,14 @@
-#include "hfs/crc.hpp"
+#include "uuse/crc.hpp"
 
 #include <array>
 #include <cstring>
 
 #if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
 #include <immintrin.h>
-#define HFS_CRC32C_X86 1
+#define UUSE_CRC32C_X86 1
 #endif
 
-namespace hfs {
+namespace uuse {
 
 namespace {
 
@@ -35,7 +35,7 @@ std::uint32_t crc32cTable(const std::uint8_t *bytes, std::size_t length,
     return ~crc;
 }
 
-#if HFS_CRC32C_X86
+#if UUSE_CRC32C_X86
 /* SSE4.2 CRC32 instruction; same polynomial and seed convention as the table
  * path, so on-disk and journal values are unchanged. */
 __attribute__((target("sse4.2"))) std::uint32_t crc32cSse42(const std::uint8_t *bytes,
@@ -59,7 +59,7 @@ __attribute__((target("sse4.2"))) std::uint32_t crc32cSse42(const std::uint8_t *
 
 std::uint32_t crc32c(const void *data, std::size_t length, std::uint32_t seed) noexcept {
     const auto *bytes = static_cast<const std::uint8_t *>(data);
-#if HFS_CRC32C_X86
+#if UUSE_CRC32C_X86
     static const bool useSse42 = __builtin_cpu_supports("sse4.2");
     if (useSse42 && length != 0) {
         return crc32cSse42(bytes, length, seed);
@@ -68,4 +68,4 @@ std::uint32_t crc32c(const void *data, std::size_t length, std::uint32_t seed) n
     return crc32cTable(bytes, length, seed);
 }
 
-} // namespace hfs
+} // namespace uuse

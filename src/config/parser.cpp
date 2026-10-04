@@ -1,4 +1,4 @@
-#include "hfs/config.hpp"
+#include "uuse/config.hpp"
 
 #include <algorithm>
 #include <charconv>
@@ -13,12 +13,12 @@
 #include <utility>
 #include <vector>
 
-namespace hfs {
+namespace uuse {
 
 namespace {
 
 constexpr std::uint32_t kSupportedSchemaVersion = 1;
-constexpr const char *kDefaultTraceDir = "/mnt/hfs-data";
+constexpr const char *kDefaultTraceDir = "/mnt/uuse-data";
 
 /* ── text helpers ─────────────────────────────────────────────────────── */
 
@@ -102,7 +102,7 @@ struct SectionSpec {
 };
 
 const std::vector<SectionSpec> kSections = {
-    {"hfs", {"schema_version", "instance_name", "volume_uuid", "process_lock", "process_lock_path"}},
+    {"uuse", {"schema_version", "instance_name", "volume_uuid", "process_lock", "process_lock_path"}},
     {"spdk", {"env_driver", "hugepages"}},
     {"storage",
      {"metadata_devices", "data_devices", "placement", "metadata_replication",
@@ -373,16 +373,16 @@ Result<Config> parseConfig(const std::string &text, const std::string &origin) {
         return "device." + id + "." + key;
     };
 
-    /* [hfs] */
-    if (!store.requireUint32("hfs.schema_version", config.schemaVersion, error)) {
+    /* [uuse] */
+    if (!store.requireUint32("uuse.schema_version", config.schemaVersion, error)) {
         return fail(error);
     }
-    if (!store.requireString("hfs.instance_name", config.instanceName, error) ||
-        !store.requireString("hfs.volume_uuid", config.volumeUuid, error) ||
-        !store.requireString("hfs.process_lock", config.processLock, error)) {
+    if (!store.requireString("uuse.instance_name", config.instanceName, error) ||
+        !store.requireString("uuse.volume_uuid", config.volumeUuid, error) ||
+        !store.requireString("uuse.process_lock", config.processLock, error)) {
         return fail(error);
     }
-    if (const Entry *entry = store.find("hfs.process_lock_path"); entry != nullptr) {
+    if (const Entry *entry = store.find("uuse.process_lock_path"); entry != nullptr) {
         config.processLockPath = entry->value;
     }
 
@@ -770,4 +770,4 @@ Result<void> validateConfig(const Config &config) {
     return Result<void>(Status::Ok);
 }
 
-} // namespace hfs
+} // namespace uuse

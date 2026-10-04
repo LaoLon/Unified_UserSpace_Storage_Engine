@@ -1,10 +1,10 @@
-#include "hfs/superblock.hpp"
+#include "uuse/superblock.hpp"
 
 #include <cstring>
 
-#include "hfs/crc.hpp"
+#include "uuse/crc.hpp"
 
-namespace hfs {
+namespace uuse {
 
 namespace {
 
@@ -66,15 +66,15 @@ Result<DeviceGeometry> computeGeometry(std::uint64_t deviceBytes,
     return geometry;
 }
 
-std::uint32_t superblockCrc(const Hfs2Superblock &superblock) noexcept {
-    return crc32c(&superblock, offsetof(Hfs2Superblock, crc32c));
+std::uint32_t superblockCrc(const UuseSuperblock &superblock) noexcept {
+    return crc32c(&superblock, offsetof(UuseSuperblock, crc32c));
 }
 
-void superblockFinalize(Hfs2Superblock &superblock) noexcept {
+void superblockFinalize(UuseSuperblock &superblock) noexcept {
     superblock.crc32c = superblockCrc(superblock);
 }
 
-bool superblockValid(const Hfs2Superblock &superblock) noexcept {
+bool superblockValid(const UuseSuperblock &superblock) noexcept {
     if (superblock.magic != kSuperblockMagic ||
         superblock.formatVersion != kSuperblockFormatVersion) {
         return false;
@@ -105,4 +105,4 @@ bool superblockValid(const Hfs2Superblock &superblock) noexcept {
     return true;
 }
 
-} // namespace hfs
+} // namespace uuse

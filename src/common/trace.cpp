@@ -28,7 +28,7 @@
 
 #include "common/stats.hpp"
 
-namespace hfs::trace {
+namespace uuse::trace {
 
 namespace {
 
@@ -52,7 +52,7 @@ std::atomic<bool> g_enabled{false};
 /* Bumped on every enable/disable so each thread refreshes its TLS cache once. */
 std::atomic<std::uint64_t> g_enabledVersion{1};
 
-/* Per-thread cached enable state (hfs2.0.md §16.5): the off fast path is one
+/* Per-thread cached enable state (uuse.md §16.5): the off fast path is one
  * TLS bool read plus a relaxed version read; no per-event RMW, allocation or
  * lock. A thread that has seen the current version keeps its cached verdict. */
 thread_local bool t_enabledCached = false;
@@ -608,4 +608,4 @@ std::uint64_t recorded() noexcept { return g_recorded.load(std::memory_order_rel
 
 std::uint64_t dropped() noexcept { return g_dropped.load(std::memory_order_relaxed); }
 
-} // namespace hfs::trace
+} // namespace uuse::trace

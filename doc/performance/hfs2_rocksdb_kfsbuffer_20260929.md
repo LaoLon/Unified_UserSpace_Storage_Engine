@@ -1,5 +1,7 @@
 # HFS 2.0 RocksDB kFSBuffer 读路径（Shard-111）实施与验收（2026-09-29）
 
+> 注：项目已于 2026-10-04 由 HFS 更名为 UUSE；本文为历史记录，正文与证据路径保留 HFS 时期名称。
+
 > 设计：`doc/design/hfs2.0.md` §11.2；评审：`doc/review/hfs2_rocksdb_kfsbuffer_review_20260929.md`。
 > 实现：`rocksdb/hfs_filesystem.cpp`（kFSBuffer + 对齐 arena `fs_scratch`）、
 > `src/runtime/spdk_runtime.cpp`（direct DMA 对齐校验）。

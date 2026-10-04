@@ -6,7 +6,7 @@
 #include <cstdint>
 #include <mutex>
 
-namespace hfs {
+namespace uuse {
 
 /* Bounded size-class allocator for coroutine frames. Pool memory is retained
  * on free; allocations beyond the cap fall back to the system allocator and
@@ -60,4 +60,4 @@ private:
     std::atomic<std::uint64_t> overflowAllocations_{0};
 };
 
-} // namespace hfs
+} // namespace uuse

@@ -1,0 +1,24 @@
+diff --git a/storage/innobase/os/uuse_vfs.cc b/storage/innobase/os/uuse_vfs.cc
+index e4d32c85..6d001c2e 100644
+--- a/storage/innobase/os/uuse_vfs.cc
++++ b/storage/innobase/os/uuse_vfs.cc
+@@ -884,6 +884,19 @@ int write(int handle, const void *buf, std::size_t n, std::uint64_t offset,
+     return -1;
+   }
+   {
++    /* Growth writes (redo appends) must reserve their extents and publish the
++     * new logical size before the fixed-overwrite async path can accept them;
++     * otherwise every append falls back to the synchronous message ring. The
++     * reservation and size update match what the synchronous write does, so
++     * file-size semantics are unchanged. */
++    auto stat = file->stat();
++    if (stat.ok() && offset + n > stat.value().logicalSize) {
++      auto grown = file->allocate(offset, n).wait().value();
++      if (!grown.ok()) {
++        setErrno(grown.status());
++        return -1;
++      }
++    }
+     std::size_t done = 0;
+     int error = 0;
+     if (asyncIo(file, const_cast<void *>(buf), n, offset, true, &done, &error)) {

@@ -1,0 +1,1246 @@
+diff --git a/storage/innobase/CMakeLists.txt b/storage/innobase/CMakeLists.txt
+index 926a3672..207a5ec0 100644
+--- a/storage/innobase/CMakeLists.txt
++++ b/storage/innobase/CMakeLists.txt
+@@ -71,6 +71,15 @@ SET(INNOBASE_ZIP_DECOMPRESS_SOURCES
+   ut/ut.cc
+   ut/ut0new.cc)
+ 
++SET(UUSE_CORE_ROOT "" CACHE PATH "UUSE core library dir (Phase 7)")
++SET(UUSE_CORE_INCLUDE "" CACHE PATH "UUSE public headers (Phase 7)")
++IF(UUSE_CORE_ROOT)
++  SET(UUSE_CORE_LIB ${UUSE_CORE_ROOT}/libuuse_core.so)
++  SET_SOURCE_FILES_PROPERTIES(os/uuse_vfs.cc PROPERTIES COMPILE_FLAGS "-std=c++20 -fcoroutines")
++  INCLUDE_DIRECTORIES(${UUSE_CORE_INCLUDE})
++  LINK_DIRECTORIES(${UUSE_CORE_ROOT})
++ENDIF()
++
+ SET(INNOBASE_SOURCES
+   api/api0api.cc
+   api/api0misc.cc
+@@ -194,6 +203,7 @@ SET(INNOBASE_SOURCES
+   mtr/mtr0log.cc
+   mtr/mtr0mtr.cc
+   os/os0file.cc
++  os/uuse_vfs.cc
+   os/os0enc.cc
+   os/os0proc.cc
+   os/os0event.cc
+@@ -342,7 +352,7 @@ MYSQL_ADD_PLUGIN(innobase
+   MANDATORY
+   MODULE_OUTPUT_NAME ha_innodb
+   LINK_LIBRARIES sql_dd sql_gis ext::zlib ext::lz4 ${NUMA_LIBRARY}
+-                 extra::rapidjson)
++                 extra::rapidjson ${UUSE_CORE_LIB})
+ 
+ # On linux: /usr/include/stdio.h:#define BUFSIZ 8192
+ # On Solaris: /usr/include/iso/stdio_iso.h:#define    BUFSIZ  1024
+diff --git a/storage/innobase/handler/ha_innodb.cc b/storage/innobase/handler/ha_innodb.cc
+index aa6af051..7953d90f 100644
+--- a/storage/innobase/handler/ha_innodb.cc
++++ b/storage/innobase/handler/ha_innodb.cc
+@@ -123,6 +123,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
+ #include "fts0priv.h"
+ #include "fts0types.h"
+ #include "ha_innodb.h"
++#include "os/uuse_vfs.h"
+ #include "ha_innopart.h"
+ #include "ha_prototypes.h"
+ #include "handler0alter.h"  //alter_stats_rebuild()
+@@ -1626,6 +1627,8 @@ static int innodb_shutdown(handlerton *, ha_panic_function) {
+     os_event_global_destroy();
+   }
+ 
++  uuse_vfs::shutdown();
++
+   innobase::component_services::deinitialize_service_handles();
+ 
+   return 0;
+@@ -5139,6 +5142,8 @@ static void innobase_post_ddl(THD *thd) {
+ static int innodb_init(void *p) {
+   DBUG_TRACE;
+ 
++  uuse_vfs::init();
++
+   acquire_plugin_services();
+ 
+   handlerton *innobase_hton = (handlerton *)p;
+diff --git a/storage/innobase/os/uuse_vfs.cc b/storage/innobase/os/uuse_vfs.cc
+new file mode 100644
+index 00000000..37667e75
+--- /dev/null
++++ b/storage/innobase/os/uuse_vfs.cc
+@@ -0,0 +1,698 @@
++/* UUSE-backed InnoDB os_file seam implementation (Phase 7, Shard-101). */
++#include "uuse_vfs.h"
++
++#include <cerrno>
++#include <cstdio>
++#include <cstdlib>
++#include <memory>
++#include <mutex>
++#include <string>
++#include <string_view>
++#include <unistd.h>
++#include <vector>
++
++#include "uuse/config.hpp"
++#include "uuse/core.hpp"
++#include "uuse/file.hpp"
++
++namespace uuse_vfs {
++namespace {
++
++/* os_file_create_t values are a frozen ABI in MySQL 8.0; keep them local so
++ * this module does not depend on the InnoDB headers. */
++constexpr unsigned long kModeOpen = 51;
++constexpr unsigned long kModeCreate = 52;
++constexpr unsigned long kModeOpenRaw = 53;
++constexpr unsigned long kModeCreatePath = 54;
++constexpr unsigned long kModeOpenRetry = 55;
++/* Pseudo mode used by os_file_create_simple_no_error_handling: create the file
++ * when missing without O_EXCL semantics. */
++constexpr unsigned long kModeCreateIfMissing = 0;
++constexpr unsigned long kModeOnErrorNoExit = 128;
++constexpr unsigned long kModeOnErrorSilent = 256;
++
++/* os_file_type_t values used by os_file_status_posix. */
++constexpr int kTypeFailed = 0;
++constexpr int kTypeMissing = 3;
++constexpr int kTypeFile = 5;
++constexpr int kTypeDir = 6;
++
++struct BridgeState {
++  bool enabled = false;
++  std::string prefix = "/uuse";
++  std::unique_ptr<uuse::Engine> engine;
++  std::once_flag initOnce;
++  std::mutex mutex;
++  std::vector<std::shared_ptr<uuse::File>> handles;
++  std::vector<int> freeHandles;
++};
++
++BridgeState &state() {
++  static BridgeState bridge;
++  return bridge;
++}
++
++thread_local std::shared_ptr<uuse::Client> t_client;
++
++void setErrno(uuse::Status status) {
++  switch (status) {
++    case uuse::Status::NotFound:
++      errno = ENOENT;
++      break;
++    case uuse::Status::AlreadyExists:
++      errno = EEXIST;
++      break;
++    case uuse::Status::NoSpace:
++      errno = ENOSPC;
++      break;
++    case uuse::Status::NoMemory:
++      errno = ENOMEM;
++      break;
++    case uuse::Status::InvalidArgument:
++      errno = EINVAL;
++      break;
++    case uuse::Status::Busy:
++      errno = EBUSY;
++      break;
++    case uuse::Status::Cancelled:
++      errno = ECANCELED;
++      break;
++    case uuse::Status::TimedOut:
++      errno = ETIMEDOUT;
++      break;
++    case uuse::Status::NotSupported:
++      errno = EOPNOTSUPP;
++      break;
++    default:
++      errno = EIO;
++      break;
++  }
++}
++
++/* Maps a host path below UUSE_MYSQL_PREFIX to its UUSE namespace path. Relative
++ * paths are resolved against the current working directory because MySQL
++ * chdir()s to the datadir before InnoDB opens its files. */
++bool toNamespacePath(const char *path, std::string &out) {
++  BridgeState &bridge = state();
++  if (!bridge.enabled || path == nullptr) {
++    return false;
++  }
++  std::string host;
++  if (path[0] == '/') {
++    host.assign(path);
++  } else {
++    char cwd[4096];
++    if (::getcwd(cwd, sizeof(cwd)) == nullptr) {
++      return false;
++    }
++    host.assign(cwd);
++    if (host.empty() || host.back() != '/') {
++      host += '/';
++    }
++    host += path;
++  }
++  /* Normalize: collapse duplicate slashes, drop "." and resolve "..". */
++  std::string norm;
++  norm.reserve(host.size());
++  std::size_t start = 0;
++  while (start <= host.size()) {
++    std::size_t slash = host.find('/', start);
++    if (slash == std::string::npos) {
++      slash = host.size();
++    }
++    const std::string_view part(host.data() + start, slash - start);
++    if (part.empty() || part == ".") {
++      /* skip */
++    } else if (part == "..") {
++      const std::size_t pos = norm.find_last_of('/');
++      norm.resize(pos == std::string::npos ? 0 : pos);
++    } else {
++      norm += '/';
++      norm.append(part);
++    }
++    if (slash == host.size()) {
++      break;
++    }
++    start = slash + 1;
++  }
++  if (norm.empty()) {
++    norm = "/";
++  }
++  const std::string_view prefix(bridge.prefix);
++  if (norm.size() < prefix.size() ||
++      norm.compare(0, prefix.size(), prefix) != 0) {
++    return false;
++  }
++  if (norm.size() != prefix.size() && norm[prefix.size()] != '/') {
++    return false;
++  }
++  out.assign(norm.substr(prefix.size()));
++  if (out.empty()) {
++    out = "/";
++  }
++  return true;
++}
++
++std::shared_ptr<uuse::Client> threadClient() {
++  if (t_client) {
++    return t_client;
++  }
++  BridgeState &bridge = state();
++  if (!bridge.enabled || bridge.engine == nullptr) {
++    return nullptr;
++  }
++  auto created = uuse::Client::create(*bridge.engine, uuse::ClientOptions{});
++  if (!created.ok()) {
++    return nullptr;
++  }
++  t_client = created.value();
++  return t_client;
++}
++
++int registerHandle(const std::shared_ptr<uuse::File> &file) {
++  BridgeState &bridge = state();
++  std::lock_guard<std::mutex> lock(bridge.mutex);
++  int index = 0;
++  if (!bridge.freeHandles.empty()) {
++    index = bridge.freeHandles.back();
++    bridge.freeHandles.pop_back();
++    bridge.handles[static_cast<std::size_t>(index)] = file;
++  } else {
++    index = static_cast<int>(bridge.handles.size());
++    bridge.handles.push_back(file);
++  }
++  return kHandleBase + index;
++}
++
++std::shared_ptr<uuse::File> lookupHandle(int handle) {
++  BridgeState &bridge = state();
++  if (handle < kHandleBase) {
++    return nullptr;
++  }
++  const int index = handle - kHandleBase;
++  std::lock_guard<std::mutex> lock(bridge.mutex);
++  if (index < 0 || static_cast<std::size_t>(index) >= bridge.handles.size()) {
++    return nullptr;
++  }
++  return bridge.handles[static_cast<std::size_t>(index)];
++}
++
++void releaseHandle(int handle) {
++  BridgeState &bridge = state();
++  if (handle < kHandleBase) {
++    return;
++  }
++  const int index = handle - kHandleBase;
++  std::lock_guard<std::mutex> lock(bridge.mutex);
++  if (index < 0 || static_cast<std::size_t>(index) >= bridge.handles.size()) {
++    return;
++  }
++  bridge.handles[static_cast<std::size_t>(index)].reset();
++  bridge.freeHandles.push_back(index);
++}
++
++std::string parentPath(const std::string &path) {
++  const std::size_t slash = path.find_last_of('/');
++  if (slash == std::string::npos || slash == 0) {
++    return "/";
++  }
++  return path.substr(0, slash);
++}
++
++} // namespace
++
++bool isUuseHandle(int handle) { return handle >= kHandleBase; }
++
++bool init() {
++  std::call_once(state().initOnce, [] {
++    BridgeState &bridge = state();
++    const char *config = std::getenv("UUSE_MYSQL_CONFIG");
++    if (config == nullptr || *config == '\0') {
++      bridge.enabled = false;
++      return;
++    }
++    const char *prefix = std::getenv("UUSE_MYSQL_PREFIX");
++    if (prefix != nullptr && *prefix != '\0') {
++      bridge.prefix = prefix;
++    }
++    while (bridge.prefix.size() > 1 && bridge.prefix.back() == '/') {
++      bridge.prefix.pop_back();
++    }
++    auto parsed = uuse::parseConfigFile(config);
++    if (!parsed.ok()) {
++      std::fprintf(stderr, "uuse_vfs: config %s rejected: %s\n", config,
++                   parsed.message().c_str());
++      bridge.enabled = false;
++      return;
++    }
++    auto created = uuse::Engine::create(parsed.value());
++    if (!created.ok()) {
++      std::fprintf(stderr, "uuse_vfs: engine create failed: %s\n",
++                   created.message().c_str());
++      bridge.enabled = false;
++      return;
++    }
++    bridge.engine = std::move(created).value();
++    auto mounted = bridge.engine->mount().wait().value();
++    if (!mounted.ok()) {
++      std::fprintf(stderr, "uuse_vfs: mount failed: %s\n",
++                   mounted.message().c_str());
++      bridge.engine.reset();
++      bridge.enabled = false;
++      return;
++    }
++    bridge.enabled = true;
++    std::fprintf(stderr, "uuse_vfs: mounted %s (prefix %s)\n", config,
++                 bridge.prefix.c_str());
++  });
++  return state().enabled;
++}
++
++void shutdown() {
++  BridgeState &bridge = state();
++  if (!bridge.enabled || bridge.engine == nullptr) {
++    return;
++  }
++  if (t_client) {
++    t_client->close().wait();
++    t_client.reset();
++  }
++  {
++    std::lock_guard<std::mutex> lock(bridge.mutex);
++    bridge.handles.clear();
++    bridge.freeHandles.clear();
++  }
++  auto stopped = bridge.engine->stop().wait().value();
++  if (!stopped.ok()) {
++    std::fprintf(stderr, "uuse_vfs: engine stop failed: %s\n",
++                 stopped.message().c_str());
++  }
++  bridge.enabled = false;
++  /* The engine object is intentionally kept alive until process exit so that
++   * late thread-local client destructors never observe a freed engine. */
++}
++
++bool pathIsUuse(const char *path) {
++  if (!init()) {
++    return false;
++  }
++  std::string namespacePath;
++  return toNamespacePath(path, namespacePath);
++}
++
++int createFile(const char *path, unsigned long create_mode, bool read_only,
++               int *handle) {
++  (void)read_only;
++  BridgeState &bridge = state();
++  if (!bridge.enabled) {
++    errno = ENOENT;
++    return -1;
++  }
++  create_mode &= ~kModeOnErrorNoExit;
++  create_mode &= ~kModeOnErrorSilent;
++  std::string namespacePath;
++  if (!toNamespacePath(path, namespacePath)) {
++    errno = ENOENT;
++    return -1;
++  }
++  auto client = threadClient();
++  if (!client) {
++    errno = EIO;
++    return -1;
++  }
++  uuse::OpenFlags flags = uuse::OpenFlags::None;
++  if (create_mode == kModeOpen || create_mode == kModeOpenRetry) {
++    flags = uuse::OpenFlags::None;
++  } else if (create_mode == kModeCreateIfMissing) {
++    flags = uuse::OpenFlags::Create;
++  } else if (create_mode == kModeCreate) {
++    flags = uuse::OpenFlags::Create | uuse::OpenFlags::Exclusive;
++  } else if (create_mode == kModeCreatePath) {
++    flags = uuse::OpenFlags::Create | uuse::OpenFlags::Exclusive;
++    auto made = client->createDirectories(parentPath(namespacePath)).wait().value();
++    if (!made.ok()) {
++      setErrno(made.status());
++      return -1;
++    }
++  } else {
++    (void)kModeOpenRaw;
++    errno = EINVAL; /* raw devices are not supported on UUSE */
++    return -1;
++  }
++  auto opened = client->open(namespacePath, flags).wait().value();
++  if (!opened.ok() && opened.status() == uuse::Status::NotFound &&
++      static_cast<std::uint32_t>(flags) != 0) {
++    /* MySQL creates the host datadir itself; mirror the namespace parents on
++     * the first create below a missing directory (e.g. the datadir root). */
++    auto made =
++        client->createDirectories(parentPath(namespacePath)).wait().value();
++    if (made.ok()) {
++      opened = client->open(namespacePath, flags).wait().value();
++    }
++  }
++  if (!opened.ok()) {
++    setErrno(opened.status());
++    return -1;
++  }
++  auto stat = opened.value()->stat();
++  if (stat.ok() && stat.value().directory) {
++    errno = EISDIR;
++    return -1;
++  }
++  *handle = registerHandle(opened.value());
++  return 0;
++}
++
++int close(int handle) {
++  if (lookupHandle(handle) == nullptr) {
++    errno = EBADF;
++    return -1;
++  }
++  releaseHandle(handle);
++  return 0;
++}
++
++int read(int handle, void *buf, std::size_t n, std::uint64_t offset,
++         std::size_t *out) {
++  auto file = lookupHandle(handle);
++  if (!file) {
++    errno = EBADF;
++    return -1;
++  }
++  uuse::IoVec vec{static_cast<std::byte *>(buf), n};
++  auto result =
++      file->read(std::span<uuse::IoVec>(&vec, 1), offset, std::stop_token{})
++          .wait()
++          .value();
++  if (!result.ok()) {
++    setErrno(result.status());
++    return -1;
++  }
++  *out = result.value().bytes;
++  return 0;
++}
++
++int write(int handle, const void *buf, std::size_t n, std::uint64_t offset,
++          std::size_t *out) {
++  auto file = lookupHandle(handle);
++  if (!file) {
++    errno = EBADF;
++    return -1;
++  }
++  uuse::IoVec vec{const_cast<std::byte *>(static_cast<const std::byte *>(buf)), n};
++  auto result =
++      file->write(std::span<const uuse::IoVec>(&vec, 1), offset, std::stop_token{})
++          .wait()
++          .value();
++  if (!result.ok()) {
++    setErrno(result.status());
++    return -1;
++  }
++  *out = result.value().bytes;
++  return 0;
++}
++
++int flush(int handle) {
++  auto file = lookupHandle(handle);
++  if (!file) {
++    errno = EBADF;
++    return -1;
++  }
++  auto result = file->sync().wait().value();
++  if (!result.ok()) {
++    setErrno(result.status());
++    return -1;
++  }
++  return 0;
++}
++
++std::uint64_t size(int handle) {
++  auto file = lookupHandle(handle);
++  if (!file) {
++    errno = EBADF;
++    return static_cast<std::uint64_t>(-1);
++  }
++  auto stat = file->stat();
++  if (!stat.ok()) {
++    setErrno(stat.status());
++    return static_cast<std::uint64_t>(-1);
++  }
++  return stat.value().logicalSize;
++}
++
++int setSize(int handle, std::uint64_t newSize, bool flushAfter) {
++  auto file = lookupHandle(handle);
++  if (!file) {
++    errno = EBADF;
++    return -1;
++  }
++  auto stat = file->stat();
++  if (!stat.ok()) {
++    setErrno(stat.status());
++    return -1;
++  }
++  const std::uint64_t current = stat.value().logicalSize;
++  if (newSize > current) {
++    auto grown = file->allocate(current, newSize - current).wait().value();
++    if (!grown.ok()) {
++      setErrno(grown.status());
++      return -1;
++    }
++  } else if (newSize < current) {
++    auto shrunk = file->truncate(newSize).wait().value();
++    if (!shrunk.ok()) {
++      setErrno(shrunk.status());
++      return -1;
++    }
++  }
++  if (flushAfter) {
++    return flush(handle);
++  }
++  return 0;
++}
++
++int truncate(int handle, std::uint64_t newSize) {
++  auto file = lookupHandle(handle);
++  if (!file) {
++    errno = EBADF;
++    return -1;
++  }
++  auto result = file->truncate(newSize).wait().value();
++  if (!result.ok()) {
++    setErrno(result.status());
++    return -1;
++  }
++  return 0;
++}
++
++int punchHole(int handle, std::uint64_t offset, std::uint64_t length) {
++  (void)handle;
++  (void)offset;
++  (void)length;
++  errno = EOPNOTSUPP; /* page compression stays disabled on UUSE */
++  return -1;
++}
++
++int lock(int handle) {
++  (void)handle;
++  return 0; /* UUSE enforces single-instance exclusivity itself */
++}
++
++bool status(const char *path, bool *existsOut, int *type, std::uint64_t *sizeOut,
++            std::uint64_t *allocSizeOut, bool *rwPerm) {
++  if (!state().enabled) {
++    return false;
++  }
++  std::string namespacePath;
++  if (!toNamespacePath(path, namespacePath)) {
++    return false;
++  }
++  auto client = threadClient();
++  if (!client) {
++    return false;
++  }
++  auto stat = client->stat(namespacePath).wait().value();
++  if (!stat.ok()) {
++    if (stat.status() == uuse::Status::NotFound) {
++      if (existsOut != nullptr) {
++        *existsOut = false;
++      }
++      if (type != nullptr) {
++        *type = kTypeMissing;
++      }
++      return true;
++    }
++    if (existsOut != nullptr) {
++      *existsOut = false;
++    }
++    if (type != nullptr) {
++      *type = kTypeFailed;
++    }
++    return false;
++  }
++  if (existsOut != nullptr) {
++    *existsOut = true;
++  }
++  if (type != nullptr) {
++    *type = stat.value().directory ? kTypeDir : kTypeFile;
++  }
++  if (sizeOut != nullptr) {
++    *sizeOut = stat.value().logicalSize;
++  }
++  if (allocSizeOut != nullptr) {
++    *allocSizeOut = stat.value().logicalSize;
++  }
++  if (rwPerm != nullptr) {
++    *rwPerm = true;
++  }
++  return true;
++}
++
++bool exists(const char *path) {
++  bool present = false;
++  if (!status(path, &present, nullptr, nullptr, nullptr, nullptr)) {
++    return false;
++  }
++  return present;
++}
++
++int deleteFile(const char *path, bool *existed) {
++  std::string namespacePath;
++  if (!toNamespacePath(path, namespacePath)) {
++    errno = ENOENT;
++    return -1;
++  }
++  auto client = threadClient();
++  if (!client) {
++    errno = EIO;
++    return -1;
++  }
++  auto result = client->remove(namespacePath).wait().value();
++  if (!result.ok()) {
++    if (result.status() == uuse::Status::NotFound) {
++      if (existed != nullptr) {
++        *existed = false;
++      }
++      return 0;
++    }
++    setErrno(result.status());
++    return -1;
++  }
++  if (existed != nullptr) {
++    *existed = true;
++  }
++  return 0;
++}
++
++int renameFile(const char *from, const char *to) {
++  std::string fromPath;
++  std::string toPath;
++  if (!toNamespacePath(from, fromPath) || !toNamespacePath(to, toPath)) {
++    errno = ENOENT;
++    return -1;
++  }
++  auto client = threadClient();
++  if (!client) {
++    errno = EIO;
++    return -1;
++  }
++  auto result = client->rename(fromPath, toPath).wait().value();
++  if (!result.ok()) {
++    setErrno(result.status());
++    return -1;
++  }
++  return 0;
++}
++
++int createDirectory(const char *path, bool failIfExists) {
++  std::string namespacePath;
++  if (!toNamespacePath(path, namespacePath)) {
++    errno = ENOENT;
++    return -1;
++  }
++  auto client = threadClient();
++  if (!client) {
++    errno = EIO;
++    return -1;
++  }
++  if (failIfExists) {
++    auto stat = client->stat(namespacePath).wait().value();
++    if (stat.ok()) {
++      errno = EEXIST;
++      return -1;
++    }
++  }
++  auto result = client->createDirectories(namespacePath).wait().value();
++  if (!result.ok()) {
++    setErrno(result.status());
++    return -1;
++  }
++  return 0;
++}
++
++int deleteDirectory(const char *path) {
++  std::string namespacePath;
++  if (!toNamespacePath(path, namespacePath)) {
++    errno = ENOENT;
++    return -1;
++  }
++  auto client = threadClient();
++  if (!client) {
++    errno = EIO;
++    return -1;
++  }
++  auto result = client->remove(namespacePath).wait().value();
++  if (!result.ok()) {
++    setErrno(result.status());
++    return -1;
++  }
++  return 0;
++}
++
++int scanDirectory(const char *path,
++                  const std::function<void(const char *, const char *)> &cb) {
++  std::string namespacePath;
++  if (!toNamespacePath(path, namespacePath)) {
++    errno = ENOENT;
++    return -1;
++  }
++  auto client = threadClient();
++  if (!client) {
++    errno = EIO;
++    return -1;
++  }
++  std::string cursor;
++  for (;;) {
++    auto page = client->getChildren(namespacePath, cursor, 256).wait().value();
++    if (!page.ok()) {
++      setErrno(page.status());
++      return -1;
++    }
++    for (const uuse::DirectoryEntry &entry : page.value().entries) {
++      std::string full = state().prefix;
++      if (namespacePath != "/") {
++        full += namespacePath;
++      }
++      if (full.empty() || full.back() != '/') {
++        full += '/';
++      }
++      full += entry.name;
++      cb(full.c_str(), entry.name.c_str());
++    }
++    if (page.value().nextCursor.empty()) {
++      break;
++    }
++    cursor = page.value().nextCursor;
++  }
++  return 0;
++}
++
++std::uint64_t freeSpace() {
++  BridgeState &bridge = state();
++  if (!bridge.enabled || bridge.engine == nullptr) {
++    return 0;
++  }
++  return bridge.engine->freeDataBytes();
++}
++
++} // namespace uuse_vfs
+diff --git a/storage/innobase/os/uuse_vfs.h b/storage/innobase/os/uuse_vfs.h
+new file mode 100644
+index 00000000..f133758b
+--- /dev/null
++++ b/storage/innobase/os/uuse_vfs.h
+@@ -0,0 +1,59 @@
++/* UUSE-backed InnoDB os_file seam (Phase 7, Shard-101).
++ *
++ * Standalone bridge between MySQL's os_file layer and the UUSE C++ core. The
++ * module owns the engine lifecycle, the path routing and an integer handle
++ * table; os0file.cc only dispatches into it. Host POSIX paths are untouched. */
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++#include <functional>
++
++namespace uuse_vfs {
++
++/* Handles are indices encoded above any real fd so both can coexist. */
++constexpr int kHandleBase = 0x40000000;
++
++bool isUuseHandle(int handle);
++
++/* Mounts the UUSE volume from UUSE_MYSQL_CONFIG when the path is routed.
++ * Returns true when the bridge is enabled. */
++bool init();
++void shutdown();
++
++/* True when the bridge is enabled and the host path is below UUSE_MYSQL_PREFIX
++ * (default "/uuse"); the UUSE namespace path is the prefix-stripped remainder. */
++bool pathIsUuse(const char *path);
++
++/* File lifecycle. create_mode is os_file_create_t; returns 0 on success and
++ * stores the handle. */
++int createFile(const char *path, unsigned long create_mode, bool read_only,
++               int *handle);
++int close(int handle);
++
++/* Positioned I/O; returns 0 on success and stores the transferred bytes. */
++int read(int handle, void *buf, std::size_t n, std::uint64_t offset,
++         std::size_t *out);
++int write(int handle, const void *buf, std::size_t n, std::uint64_t offset,
++          std::size_t *out);
++int flush(int handle);
++std::uint64_t size(int handle);
++int setSize(int handle, std::uint64_t size, bool flush);
++int truncate(int handle, std::uint64_t size);
++int punchHole(int handle, std::uint64_t offset, std::uint64_t length);
++int lock(int handle);
++
++/* Path operations; status returns false when the path cannot be resolved and
++ * writes the os_file_type_t-compatible value otherwise. */
++bool status(const char *path, bool *exists, int *type, std::uint64_t *size,
++            std::uint64_t *allocSize, bool *rwPerm);
++bool exists(const char *path);
++int deleteFile(const char *path, bool *existed);
++int renameFile(const char *from, const char *to);
++int createDirectory(const char *path, bool failIfExists);
++int deleteDirectory(const char *path);
++int scanDirectory(const char *path,
++                  const std::function<void(const char *, const char *)> &cb);
++std::uint64_t freeSpace();
++
++} // namespace uuse_vfs
+diff --git a/storage/innobase/os/os0file.cc b/storage/innobase/os/os0file.cc
+index 1983c72d..cc7662fe 100644
+--- a/storage/innobase/os/os0file.cc
++++ b/storage/innobase/os/os0file.cc
+@@ -40,6 +40,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
+  *******************************************************/
+ 
+ #include "os0file.h"
++#include "os/uuse_vfs.h"
+ #include "fil0fil.h"
+ #include "ha_prototypes.h"
+ #include "log0write.h"
+@@ -1500,6 +1501,9 @@ static bool os_aio_validate_skip() {
+ @param[in]      name            file name
+ @return 0 on success */
+ static int os_file_lock(int fd, const char *name) {
++  if (uuse_vfs::isUuseHandle(fd)) {
++    return (0); /* UUSE enforces single-instance exclusivity itself */
++  }
+   struct flock lk;
+ 
+   lk.l_type = F_WRLCK;
+@@ -2043,6 +2047,13 @@ static file::Block *os_file_encrypt_log(const IORequest &type, void *&buf,
+ @param[in]      request The IO context and type
+ @return the number of bytes read/written or negative value on error */
+ ssize_t SyncFileIO::execute(const IORequest &request) {
++  if (uuse_vfs::isUuseHandle(m_fh)) {
++    std::size_t uuseDone = 0;
++    const int uuseRc = request.is_read()
++                          ? uuse_vfs::read(m_fh, m_buf, m_n, m_offset, &uuseDone)
++                          : uuse_vfs::write(m_fh, m_buf, m_n, m_offset, &uuseDone);
++    return (uuseRc == 0 ? static_cast<ssize_t>(uuseDone) : -1);
++  }
+   ssize_t n_bytes;
+ 
+   if (request.is_read()) {
+@@ -2820,6 +2831,10 @@ determines whether fsync or fdatasync will be used. (true -> fdatasync)
+ @param[in]      file            open file handle
+ @return 0 if success, -1 otherwise */
+ static int os_file_fsync_posix(os_file_t file) {
++  if (uuse_vfs::isUuseHandle(file)) {
++    ++os_n_fsyncs;
++    return (uuse_vfs::flush(file) == 0 ? 0 : -1);
++  }
+   ulint failures = 0;
+ #ifdef UNIV_HOTBACKUP
+   static meb::Mutex meb_mutex;
+@@ -2924,6 +2939,25 @@ static void os_parent_dir_fsync_posix(const char *path) {
+ @return true if call succeeded */
+ static bool os_file_status_posix(const char *path, bool *exists,
+                                  os_file_type_t *type) {
++  if (uuse_vfs::pathIsUuse(path)) {
++    int uuseType = 0;
++    std::uint64_t uuseSize = 0;
++    std::uint64_t uuseAlloc = 0;
++    bool uuseRw = false;
++    if (!uuse_vfs::status(path, exists, &uuseType, &uuseSize, &uuseAlloc, &uuseRw)) {
++      if (exists != nullptr) {
++        *exists = false;
++      }
++      if (type != nullptr) {
++        *type = OS_FILE_TYPE_FAILED;
++      }
++      return (false);
++    }
++    if (type != nullptr) {
++      *type = static_cast<os_file_type_t>(uuseType);
++    }
++    return (true);
++  }
+   struct stat statinfo;
+ 
+   int ret = stat(path, &statinfo);
+@@ -2984,6 +3018,9 @@ static bool os_file_status_posix(const char *path, bool *exists,
+ @retval false if the path does not exist or if the path is
+ unusable to get to a possibly existing file or directory. */
+ static bool os_file_exists_posix(const char *path) {
++  if (uuse_vfs::pathIsUuse(path)) {
++    return (uuse_vfs::exists(path));
++  }
+   struct stat statinfo;
+ 
+   int ret = stat(path, &statinfo);
+@@ -3006,6 +3043,9 @@ Flushes the write buffers of a given file to the disk.
+ @param[in]      file            handle to a file
+ @return true if success */
+ bool os_file_flush_func(os_file_t file) {
++  if (uuse_vfs::isUuseHandle(file)) {
++    return (uuse_vfs::flush(file) == 0);
++  }
+   int ret;
+ 
+   ret = os_file_fsync_posix(file);
+@@ -3043,6 +3083,9 @@ but reports the error and returns false.
+                                 an error.
+ @return true if call succeeds, false on error */
+ bool os_file_create_directory(const char *pathname, bool fail_if_exists) {
++  if (uuse_vfs::pathIsUuse(pathname)) {
++    return (uuse_vfs::createDirectory(pathname, fail_if_exists) == 0);
++  }
+   int rcode = mkdir(pathname, 0770);
+ 
+   if (!(rcode == 0 || (errno == EEXIST && !fail_if_exists))) {
+@@ -3067,6 +3110,13 @@ for each entry.
+ @return true if call succeeds, false on error */
+ bool os_file_scan_directory(const char *path, os_dir_cbk_t scan_cbk,
+                             bool is_drop) {
++  if (uuse_vfs::pathIsUuse(path)) {
++    const int uuseRc = uuse_vfs::scanDirectory(path, scan_cbk);
++    if (uuseRc == 0 && is_drop) {
++      uuse_vfs::deleteDirectory(path);
++    }
++    return (uuseRc == 0);
++  }
+   DIR *directory;
+   dirent *entry;
+ 
+@@ -3102,6 +3152,24 @@ bool os_file_scan_directory(const char *path, os_dir_cbk_t scan_cbk,
+ pfs_os_file_t os_file_create_func(const char *name, ulint create_mode,
+                                   ulint purpose, bool read_only,
+                                   bool *success) {
++  if (uuse_vfs::pathIsUuse(name)) {
++    pfs_os_file_t uuseFile;
++#ifdef UNIV_PFS_IO
++    uuseFile.m_psi = nullptr;
++#endif
++    uuseFile.m_file = OS_FILE_CLOSED;
++    int uuseHandle = -1;
++    if (uuse_vfs::createFile(name,
++                            create_mode & ~(OS_FILE_ON_ERROR_NO_EXIT |
++                                            OS_FILE_ON_ERROR_SILENT),
++                            read_only, &uuseHandle) == 0) {
++      uuseFile.m_file = uuseHandle;
++      *success = true;
++    } else {
++      *success = false;
++    }
++    return (uuseFile);
++  }
+   bool on_error_no_exit;
+   bool on_error_silent;
+   pfs_os_file_t file;
+@@ -3270,6 +3338,30 @@ pfs_os_file_t os_file_create_func(const char *name, ulint create_mode,
+ pfs_os_file_t os_file_create_simple_no_error_handling_func(
+     const char *name, ulint create_mode, ulint access_type, bool read_only,
+     mode_t umask, bool *success) {
++  if (uuse_vfs::pathIsUuse(name)) {
++    pfs_os_file_t uuseFile;
++#ifdef UNIV_PFS_IO
++    uuseFile.m_psi = nullptr;
++#endif
++    uuseFile.m_file = OS_FILE_CLOSED;
++    int uuseHandle = -1;
++    const ulint uuseMode = create_mode & ~(OS_FILE_ON_ERROR_NO_EXIT |
++                                          OS_FILE_ON_ERROR_SILENT);
++    /* Simple create has no O_EXCL: map CREATE to create-if-missing. */
++    const ulint uuseEffective = uuseMode == OS_FILE_CREATE ? 0 : uuseMode;
++    if (uuseEffective == OS_FILE_OPEN || uuseEffective == 0) {
++      if (uuse_vfs::createFile(name, uuseEffective, read_only, &uuseHandle) == 0) {
++        uuseFile.m_file = uuseHandle;
++        *success = true;
++      } else {
++        *success = false;
++      }
++    } else {
++      *success = false;
++      errno = EINVAL;
++    }
++    return (uuseFile);
++  }
+   pfs_os_file_t file;
+   int create_flag;
+ 
+@@ -3334,6 +3426,16 @@ pfs_os_file_t os_file_create_simple_no_error_handling_func(
+ @param[out]     exist           indicate if file pre-exist
+ @return true if success */
+ bool os_file_delete_if_exists_func(const char *name, bool *exist) {
++  if (uuse_vfs::pathIsUuse(name)) {
++    bool uuseExisted = false;
++    if (uuse_vfs::deleteFile(name, &uuseExisted) != 0) {
++      return (false);
++    }
++    if (exist != nullptr) {
++      *exist = uuseExisted;
++    }
++    return (true);
++  }
+   if (Fil_path::get_file_type(name) == OS_FILE_TYPE_MISSING) {
+     if (exist != nullptr) {
+       *exist = false;
+@@ -3370,6 +3472,10 @@ bool os_file_delete_if_exists_func(const char *name, bool *exist) {
+ @param[in]      name            file path as a null-terminated string
+ @return true if success */
+ bool os_file_delete_func(const char *name) {
++  if (uuse_vfs::pathIsUuse(name)) {
++    bool uuseExisted = false;
++    return (uuse_vfs::deleteFile(name, &uuseExisted) == 0 && uuseExisted);
++  }
+   int ret = unlink(name);
+ 
+   if (ret != 0) {
+@@ -3391,6 +3497,9 @@ file is closed before calling this function.
+ @param[in]      newpath         new file path
+ @return true if success */
+ bool os_file_rename_func(const char *oldpath, const char *newpath) {
++  if (uuse_vfs::pathIsUuse(oldpath) || uuse_vfs::pathIsUuse(newpath)) {
++    return (uuse_vfs::renameFile(oldpath, newpath) == 0);
++  }
+ #ifdef UNIV_DEBUG
+   /* New path must be valid but not exist. */
+   os_file_type_t type;
+@@ -3422,6 +3531,9 @@ os_file_get_last_error.
+ @param[in]      file            Handle to a file
+ @return true if success */
+ bool os_file_close_func(os_file_t file) {
++  if (uuse_vfs::isUuseHandle(file)) {
++    return (uuse_vfs::close(file) == 0);
++  }
+   int ret = close(file);
+ 
+   if (ret == -1) {
+@@ -3437,6 +3549,9 @@ bool os_file_close_func(os_file_t file) {
+ @param[in]      file            Handle to a file
+ @return file size, or (os_offset_t) -1 on failure */
+ os_offset_t os_file_get_size(pfs_os_file_t file) {
++  if (uuse_vfs::isUuseHandle(file.m_file)) {
++    return (uuse_vfs::size(file.m_file));
++  }
+   /* Store current position */
+   os_offset_t pos = lseek(file.m_file, 0, SEEK_CUR);
+   os_offset_t file_size = lseek(file.m_file, 0, SEEK_END);
+@@ -3446,6 +3561,22 @@ os_offset_t os_file_get_size(pfs_os_file_t file) {
+ }
+ 
+ os_file_size_t os_file_get_size(const char *filename) {
++  if (uuse_vfs::pathIsUuse(filename)) {
++    os_file_size_t uuseSize;
++    bool uuseExists = false;
++    std::uint64_t uuseBytes = 0;
++    std::uint64_t uuseAlloc = 0;
++    if (!uuse_vfs::status(filename, &uuseExists, nullptr, &uuseBytes, &uuseAlloc,
++                         nullptr) ||
++        !uuseExists) {
++      uuseSize.m_total_size = ~0ULL;
++      uuseSize.m_alloc_size = (os_offset_t)ENOENT;
++      return (uuseSize);
++    }
++    uuseSize.m_total_size = uuseBytes;
++    uuseSize.m_alloc_size = uuseAlloc;
++    return (uuseSize);
++  }
+   struct stat s;
+   os_file_size_t file_size;
+ 
+@@ -3560,6 +3691,9 @@ size of the file.
+ @return true if success */
+ static bool os_file_truncate_posix(const char *pathname, pfs_os_file_t file,
+                                    os_offset_t size) {
++  if (uuse_vfs::isUuseHandle(file.m_file)) {
++    return (uuse_vfs::truncate(file.m_file, size) == 0);
++  }
+   int res = ftruncate(file.m_file, size);
+   if (res == -1) {
+     bool retry;
+@@ -3602,6 +3736,37 @@ void os_aio_simulated_put_read_threads_to_sleep() { /* No op on non Windows */
+ @param[in]  recursive  `true` if scan should be recursive
+ @param[in]  f           Function to call for each entry */
+ void Dir_Walker::walk_posix(const Path &basedir, bool recursive, Function &&f) {
++  if (uuse_vfs::pathIsUuse(basedir.c_str())) {
++    struct UuseFrame {
++      std::string path;
++      size_t depth;
++    };
++    std::vector<UuseFrame> uuseStack;
++    uuseStack.push_back({basedir, 0});
++    while (!uuseStack.empty()) {
++      UuseFrame uuseCurrent = uuseStack.back();
++      uuseStack.pop_back();
++      uuse_vfs::scanDirectory(
++          uuseCurrent.path.c_str(),
++          [&](const char *full, const char *name) {
++            if (name[0] == '.') {
++              return;
++            }
++            bool uuseExists = false;
++            int uuseType = 0;
++            uuse_vfs::status(full, &uuseExists, &uuseType, nullptr, nullptr,
++                            nullptr);
++            if (uuseType == 6) {
++              if (recursive) {
++                uuseStack.push_back({full, uuseCurrent.depth + 1});
++              }
++            } else if (uuseType == 5) {
++              f(Path(full), uuseCurrent.depth);
++            }
++          });
++    }
++    return;
++  }
+   using Stack = std::stack<Entry>;
+ 
+   Stack directories;
+@@ -5297,6 +5462,9 @@ void os_file_set_nocache(int fd [[maybe_unused]],
+                          const char *file_name [[maybe_unused]],
+                          const char *operation_name [[maybe_unused]],
+                          bool on_error_silent [[maybe_unused]]) {
++  if (uuse_vfs::isUuseHandle(fd)) {
++    return; /* UUSE data files are always unbuffered */
++  }
+ /* some versions of Solaris may not have DIRECTIO_ON */
+ #if defined(UNIV_SOLARIS) && defined(DIRECTIO_ON)
+   if (directio(fd, DIRECTIO_ON) == -1 && !on_error_silent) {
+@@ -5342,6 +5510,9 @@ void os_file_set_nocache(int fd [[maybe_unused]],
+ 
+ bool os_file_set_size_fast(const char *name, pfs_os_file_t pfs_file,
+                            os_offset_t offset, os_offset_t size, bool flush) {
++  if (uuse_vfs::isUuseHandle(pfs_file.m_file)) {
++    return (uuse_vfs::setSize(pfs_file.m_file, size, flush) == 0);
++  }
+ #if !defined(NO_FALLOCATE) && defined(UNIV_LINUX) && \
+     defined(HAVE_FALLOC_FL_ZERO_RANGE)
+   ut_a(size >= offset);
+@@ -5374,6 +5545,9 @@ bool os_file_set_size_fast(const char *name, pfs_os_file_t pfs_file,
+ 
+ bool os_file_set_size(const char *name, pfs_os_file_t file, os_offset_t offset,
+                       os_offset_t size, bool flush) {
++  if (uuse_vfs::isUuseHandle(file.m_file)) {
++    return (uuse_vfs::setSize(file.m_file, size, flush) == 0);
++  }
+   /* Write up to FSP_EXTENT_SIZE bytes at a time. */
+   ulint buf_size = 0;
+ 
+@@ -5748,6 +5922,9 @@ bool os_file_exists(const char *path) {
+ @param[in]      len             Size of the hole
+ @return DB_SUCCESS or error code */
+ dberr_t os_file_punch_hole(os_file_t fh, os_offset_t off, os_offset_t len) {
++  if (uuse_vfs::isUuseHandle(fh)) {
++    return (uuse_vfs::punchHole(fh, off, len) == 0 ? DB_SUCCESS : DB_IO_ERROR);
++  }
+   /* In this debugging mode, we act as if punch hole is supported,
+   and then skip any calls to actually punch a hole here.
+   In this way, Transparent Page Compression is still being tested. */
+@@ -5776,6 +5953,10 @@ bool os_is_sparse_file_supported(pfs_os_file_t fh) {
+ }
+ 
+ dberr_t os_get_free_space(const char *path, uint64_t &free_space) {
++  if (uuse_vfs::pathIsUuse(path)) {
++    free_space = uuse_vfs::freeSpace();
++    return (DB_SUCCESS);
++  }
+ #ifdef _WIN32
+   uint32_t block_size;
+   auto err = os_get_free_space_win32(path, block_size, free_space);
+@@ -5796,6 +5977,31 @@ dberr_t os_get_free_space(const char *path, uint64_t &free_space) {
+ @return DB_SUCCESS if all OK */
+ dberr_t os_file_get_status(const char *path, os_file_stat_t *stat_info,
+                            bool check_rw_perm, bool read_only) {
++  if (uuse_vfs::pathIsUuse(path)) {
++    bool uuseExists = false;
++    int uuseType = 0;
++    std::uint64_t uuseSize = 0;
++    std::uint64_t uuseAlloc = 0;
++    bool uuseRw = false;
++    if (!uuse_vfs::status(path, &uuseExists, &uuseType, &uuseSize, &uuseAlloc,
++                         &uuseRw)) {
++      return (DB_IO_ERROR);
++    }
++    if (uuseType == OS_FILE_TYPE_MISSING) {
++      stat_info->type = OS_FILE_TYPE_MISSING;
++      return (DB_NOT_FOUND);
++    }
++    stat_info->type = static_cast<os_file_type_t>(uuseType);
++    stat_info->size = uuseSize;
++    stat_info->alloc_size = uuseAlloc;
++    stat_info->rw_perm = uuseRw;
++    stat_info->block_size = 4096;
++    stat_info->ctime = 0;
++    stat_info->mtime = 0;
++    stat_info->atime = 0;
++    std::snprintf(stat_info->name, sizeof(stat_info->name), "%s", path);
++    return (DB_SUCCESS);
++  }
+   dberr_t ret;
+ 
+ #ifdef _WIN32
+@@ -5824,6 +6030,24 @@ dberr_t os_file_get_status(const char *path, os_file_stat_t *stat_info,
+ 
+ dberr_t os_file_write_zeros(pfs_os_file_t file, const char *name,
+                             ulint page_size, os_offset_t start, ulint len) {
++  if (uuse_vfs::isUuseHandle(file.m_file)) {
++    static thread_local std::vector<byte> uuseZeros(1024 * 1024, byte{0});
++    os_offset_t uuseOffset = start;
++    ulint uuseRemaining = len;
++    while (uuseRemaining > 0) {
++      const ulint uuseChunk =
++          std::min<ulint>(uuseRemaining, (ulint)uuseZeros.size());
++      std::size_t uuseDone = 0;
++      if (uuse_vfs::write(file.m_file, uuseZeros.data(), uuseChunk, uuseOffset,
++                         &uuseDone) != 0 ||
++          uuseDone != uuseChunk) {
++        return (DB_IO_ERROR);
++      }
++      uuseOffset += uuseChunk;
++      uuseRemaining -= uuseChunk;
++    }
++    return (DB_SUCCESS);
++  }
+   ut_a(len > 0);
+ 
+   /* Extend at most 1M at a time */

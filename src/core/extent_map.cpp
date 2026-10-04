@@ -2,7 +2,7 @@
 
 #include <algorithm>
 
-namespace hfs {
+namespace uuse {
 
 void SyntheticExtentMap::add(std::uint64_t logicalOffset, std::uint64_t length,
                              std::uint64_t physicalByte, std::uint32_t deviceId) {
@@ -44,4 +44,4 @@ std::size_t SyntheticExtentMap::size() const noexcept { return extents_.size(); 
 
 void SyntheticExtentMap::clear() noexcept { extents_.clear(); }
 
-} // namespace hfs
+} // namespace uuse

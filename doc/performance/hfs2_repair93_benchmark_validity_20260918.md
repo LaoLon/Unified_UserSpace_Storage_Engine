@@ -1,5 +1,7 @@
 # Repair-93：性能构建有效性边界
 
+> 注：项目已于 2026-10-04 由 HFS 更名为 UUSE；本文为历史记录，正文与证据路径保留 HFS 时期名称。
+
 日期：2026-09-18  
 范围：HFS 2.0 `fio-hfs` external engine 与 raw SPDK 对照
 

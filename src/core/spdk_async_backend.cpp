@@ -5,7 +5,7 @@
 #include <limits>
 #include <new>
 
-namespace hfs {
+namespace uuse {
 
 struct SpdkAsyncDataBackend::Geometry {
     std::uint64_t capacityBytes = 0;
@@ -359,4 +359,4 @@ void SpdkAsyncDataBackend::wake() noexcept {
     (void)runtime_.wakeDataReactor(reactorIndex_);
 }
 
-} // namespace hfs
+} // namespace uuse

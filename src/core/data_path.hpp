@@ -8,9 +8,9 @@
 #include "core/dma_arena.hpp"
 #include "core/extent_map.hpp"
 #include "core/io_planner.hpp"
-#include "hfs/types.hpp"
+#include "uuse/types.hpp"
 
-namespace hfs {
+namespace uuse {
 
 class SpdkRuntime;
 
@@ -68,4 +68,4 @@ private:
     std::vector<std::uint32_t> deviceBlockBytes_;   /* per-device sector size */
 };
 
-} // namespace hfs
+} // namespace uuse

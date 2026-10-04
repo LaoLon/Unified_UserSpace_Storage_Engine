@@ -5,7 +5,7 @@
 
 #include "core/operation.hpp"
 
-namespace hfs {
+namespace uuse {
 
 class ShardRing;
 
@@ -32,4 +32,4 @@ private:
     std::size_t processed_ = 0;
 };
 
-} // namespace hfs
+} // namespace uuse

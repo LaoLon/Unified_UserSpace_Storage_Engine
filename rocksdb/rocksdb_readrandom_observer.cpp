@@ -1,4 +1,4 @@
-/* Same-process RocksDB readrandom observer for HFS root-cause experiments. */
+/* Same-process RocksDB readrandom observer for UUSE root-cause experiments. */
 
 #include <algorithm>
 #include <atomic>
@@ -23,10 +23,10 @@
 #include <utility>
 #include <vector>
 
-#include "hfs/diagnostics.hpp"
+#include "uuse/diagnostics.hpp"
 #include "rocksdb/cache.h"
 #include "rocksdb/db.h"
-#include "rocksdb/hfs_filesystem.hpp"
+#include "rocksdb/uuse_filesystem.hpp"
 #include "rocksdb/options.h"
 #include "rocksdb/statistics.h"
 #include "rocksdb/table.h"
@@ -35,7 +35,7 @@
 namespace {
 
 struct Options {
-    std::string mode = "hfs";
+    std::string mode = "uuse";
     std::string dbPath;
     std::string configPath;
     std::uint64_t keys = 160000;
@@ -75,7 +75,7 @@ struct RoundResult {
     std::uint64_t blockDataMissCount = 0;
     std::uint64_t nvmeReadIos = 0;
     std::uint64_t nvmeReadBytes = 0;
-    hfs::diagnostics::Snapshot hfs;
+    uuse::diagnostics::Snapshot uuse;
 };
 
 struct WorkerStat {
@@ -85,7 +85,7 @@ struct WorkerStat {
     std::uint64_t involuntarySwitches = 0;
 };
 
-/* Builds the same binary key representation as hfs_db_bench. */
+/* Builds the same binary key representation as uuse_db_bench. */
 std::string makeKey(std::uint64_t index, std::uint32_t keySize) {
     std::string key(keySize, '\0');
     const std::uint32_t bytes = std::min<std::uint32_t>(8, keySize);
@@ -95,7 +95,7 @@ std::string makeKey(std::uint64_t index, std::uint32_t keySize) {
     return key;
 }
 
-/* Builds the same deterministic value representation as hfs_db_bench. */
+/* Builds the same deterministic value representation as uuse_db_bench. */
 std::string makeValue(std::uint64_t index, std::uint32_t valueSize) {
     std::string value(valueSize, 'v');
     const std::uint32_t bytes = std::min<std::uint32_t>(8, valueSize);
@@ -160,7 +160,7 @@ bool parseArguments(int argc, char **argv, Options *options) {
         try {
             if (name == "--mode") options->mode = arg;
             else if (name == "--db") options->dbPath = arg;
-            else if (name == "--hfs-config") options->configPath = arg;
+            else if (name == "--uuse-config") options->configPath = arg;
             else if (name == "--keys") options->keys = std::stoull(arg);
             else if (name == "--threads") options->threads = std::stoul(arg);
             else if (name == "--key-size") options->keySize = std::stoul(arg);
@@ -181,7 +181,7 @@ bool parseArguments(int argc, char **argv, Options *options) {
         }
     }
     return !options->dbPath.empty() && options->threads != 0 && options->keys != 0 &&
-           (options->mode == "hfs" || options->mode == "ext4-buffered" ||
+           (options->mode == "uuse" || options->mode == "ext4-buffered" ||
                                     options->mode == "ext4-direct");
 }
 
@@ -211,8 +211,8 @@ std::uint64_t percentile(std::vector<std::uint64_t> *values, double fraction) {
     return (*values)[position];
 }
 
-void printSnapshot(const hfs::diagnostics::Snapshot &value) {
-    std::cout << "  HFS frontend_read_ops=" << value.frontendReadOps
+void printSnapshot(const uuse::diagnostics::Snapshot &value) {
+    std::cout << "  UUSE frontend_read_ops=" << value.frontendReadOps
               << " frontend_read_bytes=" << value.frontendReadBytes
               << " request_4k=" << value.frontendRequest4k
               << " request_8k=" << value.frontendRequest8k
@@ -224,7 +224,7 @@ void printSnapshot(const hfs::diagnostics::Snapshot &value) {
               << " direct_worker_read_bytes=" << value.directWorkerReadBytes
               << " direct_worker_completion_ops=" << value.directWorkerCompletionOps
               << '\n';
-    std::cout << "  HFS planner_read_requests=" << value.plannerReadRequests
+    std::cout << "  UUSE planner_read_requests=" << value.plannerReadRequests
               << " planner_request_bytes=" << value.plannerReadRequestBytes
               << " planner_child_bytes=" << value.plannerReadChildBytes
               << " planner_span_bytes=" << value.plannerReadSpanBytes
@@ -236,23 +236,23 @@ void printSnapshot(const hfs::diagnostics::Snapshot &value) {
               << " span_4k=" << value.plannerSpan4k
               << " span_8k=" << value.plannerSpan8k
               << " span_other=" << value.plannerSpanOther << '\n';
-    std::cout << "  HFS data_read_submit=" << value.dataReactorReadSubmit
+    std::cout << "  UUSE data_read_submit=" << value.dataReactorReadSubmit
               << " data_read_complete=" << value.dataReactorReadComplete
               << " queue_depth_sum=" << value.dataReactorQueueDepthSum
               << " queue_depth_max=" << value.dataReactorQueueDepthMax << '\n';
-    std::cout << "  HFS bdev_data_read_ops=" << value.bdevDataReadOps
+    std::cout << "  UUSE bdev_data_read_ops=" << value.bdevDataReadOps
               << " bdev_data_read_bytes=" << value.bdevDataReadBytes
               << " bdev_block_bytes=" << value.bdevDataBlockBytes
               << " completion_count=" << value.completionCount
               << " completion_wait_count=" << value.completionWaitCount
               << " completion_wait_ns=" << value.completionWaitNs << '\n';
-    std::cout << "  HFS frontend_queue_wait_ns=" << value.frontendQueueWaitNs
+    std::cout << "  UUSE frontend_queue_wait_ns=" << value.frontendQueueWaitNs
               << " frontend_io_ns=" << value.frontendIoNs
               << " read_bounce_children=" << value.readBounceChildren
               << " read_bounce_bytes=" << value.readBounceBytes
               << " read_direct_user_children=" << value.readDirectUserChildren
               << " read_direct_user_bytes=" << value.readDirectUserBytes << '\n'
-              << "  HFS read_copy_out_ops=" << value.readCopyOutOps
+              << "  UUSE read_copy_out_ops=" << value.readCopyOutOps
               << " read_copy_out_bytes=" << value.readCopyOutBytes
               << " read_copy_out_ns=" << value.readCopyOutNs << '\n';
 }
@@ -263,7 +263,7 @@ rocksdb::Status configureDatabase(const Options &options, rocksdb::Options *dbOp
     dbOptions->max_background_jobs = static_cast<int>(options.threads);
     dbOptions->write_buffer_size = 64ULL * 1024ULL * 1024ULL;
     dbOptions->allow_mmap_reads = false;
-    dbOptions->use_direct_reads = options.directReads || options.mode == "hfs";
+    dbOptions->use_direct_reads = options.directReads || options.mode == "uuse";
     dbOptions->use_direct_io_for_flush_and_compaction = true;
     dbOptions->compression = options.compression ? rocksdb::kSnappyCompression
                                                   : rocksdb::kNoCompression;
@@ -273,9 +273,9 @@ rocksdb::Status configureDatabase(const Options &options, rocksdb::Options *dbOp
     tableOptions.block_cache = rocksdb::NewLRUCache(options.cacheSize);
     dbOptions->table_factory = std::shared_ptr<rocksdb::TableFactory>(
         rocksdb::NewBlockBasedTableFactory(tableOptions));
-    if (options.mode == "hfs") {
-        *ownedEnv = hfs::rocksdb_adapter::createCompositeEnv(options.configPath);
-        if (!*ownedEnv) return rocksdb::Status::IOError("cannot create HFS Env");
+    if (options.mode == "uuse") {
+        *ownedEnv = uuse::rocksdb_adapter::createCompositeEnv(options.configPath);
+        if (!*ownedEnv) return rocksdb::Status::IOError("cannot create UUSE Env");
         dbOptions->env = ownedEnv->get();
     }
     return rocksdb::Status::OK();
@@ -342,7 +342,7 @@ void printDbShape(const Options &options, rocksdb::DB *db) {
 
 /* Drops Linux page cache after population so the first buffered round is cold-ish. */
 bool dropOsCacheBeforeRead(const Options &options) {
-    if (!options.dropOsCacheBeforeRead || options.mode == "hfs") return true;
+    if (!options.dropOsCacheBeforeRead || options.mode == "uuse") return true;
     std::system("sync");
     std::ofstream output("/proc/sys/vm/drop_caches");
     if (!output) {
@@ -364,7 +364,7 @@ RoundResult runRound(const Options &options, rocksdb::DB *db, std::uint32_t roun
     const std::uint64_t beforeMiss = statistics->getTickerCount(rocksdb::BLOCK_CACHE_MISS);
     const std::uint64_t beforeDataHit = statistics->getTickerCount(rocksdb::BLOCK_CACHE_DATA_HIT);
     const std::uint64_t beforeDataMiss = statistics->getTickerCount(rocksdb::BLOCK_CACHE_DATA_MISS);
-    hfs::diagnostics::reset();
+    uuse::diagnostics::reset();
     std::vector<std::vector<std::uint64_t>> latencies(options.threads);
     std::vector<std::uint64_t> hits(options.threads, 0);
     std::vector<WorkerStat> workerStats(options.threads);
@@ -424,7 +424,7 @@ RoundResult runRound(const Options &options, rocksdb::DB *db, std::uint32_t roun
     const auto afterDisk = readDiskStats(options.diskName);
     result.nvmeReadIos = afterDisk.readIos - beforeDisk.readIos;
     result.nvmeReadBytes = (afterDisk.readSectors - beforeDisk.readSectors) * 512;
-    result.hfs = hfs::diagnostics::snapshot();
+    result.uuse = uuse::diagnostics::snapshot();
     std::cout << "=== readrandom round " << round << " ===\n"
               << "  operations=" << result.operations << " hits=" << result.hits
               << " misses=" << result.misses << " ops_per_sec="
@@ -439,7 +439,7 @@ RoundResult runRound(const Options &options, rocksdb::DB *db, std::uint32_t roun
               << " data_miss=" << result.blockDataMissCount << '\n'
               << "  Linux " << options.diskName << " read_ios=" << result.nvmeReadIos
               << " read_bytes=" << result.nvmeReadBytes << '\n';
-    if (options.mode == "hfs") printSnapshot(result.hfs);
+    if (options.mode == "uuse") printSnapshot(result.uuse);
     for (const auto &worker : workerStats) {
         std::cout << "  worker tid=" << worker.tid << " cpu_ms="
                   << std::setprecision(3) << (worker.cpuNs / 1000000.0)
@@ -454,14 +454,14 @@ RoundResult runRound(const Options &options, rocksdb::DB *db, std::uint32_t roun
 int main(int argc, char **argv) {
     Options options;
     if (!parseArguments(argc, argv, &options)) {
-        std::cerr << "usage: --mode=hfs|ext4-buffered|ext4-direct --db=PATH "
-                     "[--hfs-config=PATH] [--keys=160000] [--threads=8] "
+        std::cerr << "usage: --mode=uuse|ext4-buffered|ext4-direct --db=PATH "
+                     "[--uuse-config=PATH] [--keys=160000] [--threads=8] "
                      "[--direct-reads=0|1] [--drop-os-cache-before-read=0|1] "
                      "[--skip-fill=0|1] [--skip-compaction=0|1] [--rounds=3]\n";
         return 1;
     }
     if (options.diskName.empty()) {
-        options.diskName = options.mode == "hfs" ? "nvme0n1" : "sdb1";
+        options.diskName = options.mode == "uuse" ? "nvme0n1" : "sdb1";
     }
     rocksdb::Options dbOptions;
     std::unique_ptr<rocksdb::Env> ownedEnv;

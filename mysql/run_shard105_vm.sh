@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Compare the same MySQL binary in alternating HFS and native sessions.
+# Compare the same MySQL binary in alternating UUSE and native sessions.
 set -euo pipefail
 
-BUILD="${BUILD:-/home/hfs/mysql-build}"
-HFS_CONFIG="${HFS_CONFIG:-/root/code/config/hfs_mysql.conf}"
-HFS_DATA="${HFS_DATA:-/home/hfs/mysql-shard104-datadir}"
-NATIVE_DATA="${NATIVE_DATA:-/home/hfs/mysql-native-datadir}"
-RESULT="${RESULT:-/home/hfs/mysql-shard105-results}"
+BUILD="${BUILD:-/home/uuse/mysql-build}"
+UUSE_CONFIG="${UUSE_CONFIG:-/root/code/config/uuse_mysql.conf}"
+UUSE_DATA="${UUSE_DATA:-/home/uuse/mysql-shard104-datadir}"
+NATIVE_DATA="${NATIVE_DATA:-/home/uuse/mysql-native-datadir}"
+RESULT="${RESULT:-/home/uuse/mysql-shard105-results}"
 BIN="$BUILD/runtime_output_directory"
 MYSQLD="$BIN/mysqld"
 MYSQL="$BIN/mysql"
@@ -23,7 +23,7 @@ export LD_LIBRARY_PATH="/root/code/build-verify:${LD_LIBRARY_PATH:-}"
 
 # Initialize the native comparator only once so repeated sessions reuse data.
 if [[ ! -f "$NATIVE_DATA/auto.cnf" ]]; then
-  env -u HFS_MYSQL_CONFIG -u HFS_MYSQL_PREFIX \
+  env -u UUSE_MYSQL_CONFIG -u UUSE_MYSQL_PREFIX \
     "$MYSQLD" --no-defaults --user=root --basedir="$BUILD" \
     --datadir="$NATIVE_DATA" --initialize-insecure \
     --log-error="$RESULT/native-initialize.log" \
@@ -46,12 +46,12 @@ trap 'stop_server || true' EXIT
 
 start_server() {
   local mode="$1" run="$2" data
-  if [[ "$mode" == hfs ]]; then
-    data="$HFS_DATA"
-    export HFS_MYSQL_CONFIG="$HFS_CONFIG" HFS_MYSQL_PREFIX="$HFS_DATA"
+  if [[ "$mode" == uuse ]]; then
+    data="$UUSE_DATA"
+    export UUSE_MYSQL_CONFIG="$UUSE_CONFIG" UUSE_MYSQL_PREFIX="$UUSE_DATA"
   else
     data="$NATIVE_DATA"
-    unset HFS_MYSQL_CONFIG HFS_MYSQL_PREFIX
+    unset UUSE_MYSQL_CONFIG UUSE_MYSQL_PREFIX
   fi
   "$MYSQLD" --no-defaults --user=root --basedir="$BUILD" --datadir="$data" \
     --socket="$SOCKET" --pid-file="$RESULT/mysqld.pid" \
@@ -74,15 +74,15 @@ start_server() {
 
 sysbench_mysql() {
   sysbench --db-driver=mysql --mysql-user=root --mysql-socket="$SOCKET" \
-    --mysql-db=hfs_perf --tables=1 --table-size=10000 "$@"
+    --mysql-db=uuse_perf --tables=1 --table-size=10000 "$@"
 }
 
 # Alternate modes to expose session drift while keeping both datasets stable.
-for run in hfs-1 native-1 hfs-2 native-2; do
+for run in uuse-1 native-1 uuse-2 native-2; do
   mode="${run%-*}"
   start_server "$mode" "$run"
-  sql -e 'CREATE DATABASE IF NOT EXISTS hfs_perf'
-  if ! sql -e "SHOW TABLES FROM hfs_perf LIKE 'sbtest1'" | grep -q sbtest1; then
+  sql -e 'CREATE DATABASE IF NOT EXISTS uuse_perf'
+  if ! sql -e "SHOW TABLES FROM uuse_perf LIKE 'sbtest1'" | grep -q sbtest1; then
     sysbench_mysql oltp_read_write prepare > "$RESULT/${run}-prepare.log" 2>&1
   fi
   sql -e "SHOW VARIABLES LIKE 'innodb_flush_log_at_trx_commit';
@@ -91,11 +91,11 @@ for run in hfs-1 native-1 hfs-2 native-2; do
   ps -L -p "$SERVER_PID" -o tid,psr,pcpu,comm \
     > "$RESULT/${run}-cpu-map.tsv"
   "$MYSQLSLAP" --no-defaults --protocol=socket --socket="$SOCKET" -uroot \
-    --create-schema=hfs_perf --query='SELECT k FROM sbtest1 WHERE id=1' \
+    --create-schema=uuse_perf --query='SELECT k FROM sbtest1 WHERE id=1' \
     --concurrency=8 --number-of-queries=10000 --iterations=3 \
     > "$RESULT/${run}-mysqlslap-read.log" 2>&1
   "$MYSQLSLAP" --no-defaults --protocol=socket --socket="$SOCKET" -uroot \
-    --create-schema=hfs_perf \
+    --create-schema=uuse_perf \
     --query='UPDATE sbtest1 SET k=k+1 WHERE id=FLOOR(RAND()*10000)+1' \
     --concurrency=8 --number-of-queries=3000 --iterations=3 \
     > "$RESULT/${run}-mysqlslap-write.log" 2>&1

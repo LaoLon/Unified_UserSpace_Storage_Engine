@@ -17,12 +17,12 @@
 #include "core/dma_arena.hpp"
 #include "core/extent_map.hpp"
 #include "core/io_planner.hpp"
-#include "hfs/config.hpp"
-#include "hfs/core.hpp"
+#include "uuse/config.hpp"
+#include "uuse/core.hpp"
 #include "runtime/spdk_runtime.hpp"
 #include "test_support.hpp"
 
-using namespace hfs;
+using namespace uuse;
 
 namespace {
 
@@ -57,20 +57,20 @@ void fillPattern(std::span<std::byte> bytes, std::uint8_t seed) {
 
 int main() {
     const std::string lockPath =
-        "/tmp/hfs2-datapath-" + std::to_string(::getpid()) + ".lock";
+        "/tmp/uuse-datapath-" + std::to_string(::getpid()) + ".lock";
     auto parsed = parseConfig(validConfigText(lockPath), "data_path_device_test");
-    HFS_TEST_CHECK(parsed.ok());
+    UUSE_TEST_CHECK(parsed.ok());
 
     {
         auto created = Engine::create(parsed.value());
-        HFS_TEST_CHECK(created.ok());
+        UUSE_TEST_CHECK(created.ok());
         auto engine = std::move(created).value();
-        HFS_TEST_CHECK(engine->format({true}).wait().value().ok());
-        HFS_TEST_CHECK(engine->mount().wait().value().ok());
+        UUSE_TEST_CHECK(engine->format({true}).wait().value().ok());
+        UUSE_TEST_CHECK(engine->mount().wait().value().ok());
 
         const auto geometry = engine->deviceGeometries()[0];
         const std::uint32_t metaBlock = engine->config().metadataBlockSize;
-        HFS_TEST_CHECK(metaBlock == kBlockSize);
+        UUSE_TEST_CHECK(metaBlock == kBlockSize);
         /* 2 MiB into the data region, 4 MiB synthetic extent. */
         const std::uint64_t physicalByte = (geometry.dataStart + 512) * metaBlock;
 
@@ -81,8 +81,8 @@ int main() {
         arena.configure(16ULL << 20, dmaAlloc, dmaFree, nullptr);
 
         SpdkRuntime &runtime = SpdkRuntime::instance();
-        HFS_TEST_CHECK(runtime.active());
-        HFS_TEST_CHECK(runtime.dataReactorCount() > 0);
+        UUSE_TEST_CHECK(runtime.active());
+        UUSE_TEST_CHECK(runtime.dataReactorCount() > 0);
 
         IoPlanner::Config plannerConfig;
         plannerConfig.blockSize = metaBlock;
@@ -95,16 +95,16 @@ int main() {
 
         /* 1. zero-fill the extent so RMW reads see defined content */
         std::vector<std::byte> zeros(2ULL << 20, std::byte{0});
-        HFS_TEST_CHECK(path.write(map, zeros, 0, zeros.size(), ~0ULL).ok());
-        HFS_TEST_CHECK(path.write(map, zeros, zeros.size(), zeros.size(), ~0ULL).ok());
+        UUSE_TEST_CHECK(path.write(map, zeros, 0, zeros.size(), ~0ULL).ok());
+        UUSE_TEST_CHECK(path.write(map, zeros, zeros.size(), zeros.size(), ~0ULL).ok());
 
         /* 2. aligned write/read round-trip through bounce buffers */
         std::vector<std::byte> pattern(3 * metaBlock);
         fillPattern(pattern, 0x11);
-        HFS_TEST_CHECK(path.write(map, pattern, 0, pattern.size(), ~0ULL).ok());
+        UUSE_TEST_CHECK(path.write(map, pattern, 0, pattern.size(), ~0ULL).ok());
         std::vector<std::byte> readBack(pattern.size(), std::byte{0xFF});
-        HFS_TEST_CHECK(path.read(map, readBack, 0, readBack.size()).ok());
-        HFS_TEST_CHECK(readBack == pattern);
+        UUSE_TEST_CHECK(path.read(map, readBack, 0, readBack.size()).ok());
+        UUSE_TEST_CHECK(readBack == pattern);
 
         /* 3. unaligned write/read exercises head/tail RMW children */
         std::vector<std::byte> unaligned(5000);
@@ -117,22 +117,22 @@ int main() {
         const auto delayedWriteElapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - delayedWriteStart);
         test_hooks::setDataIoDelay(test_hooks::DataIoDelayKind::Write, 0);
-        HFS_TEST_CHECK(delayedWrite.ok());
+        UUSE_TEST_CHECK(delayedWrite.ok());
         /* The second RMW phase must be fully reaped before DataPath returns. */
-        HFS_TEST_CHECK(delayedWriteElapsed.count() >= 20);
+        UUSE_TEST_CHECK(delayedWriteElapsed.count() >= 20);
         std::vector<std::byte> unalignedRead(unaligned.size(), std::byte{0});
-        HFS_TEST_CHECK(
+        UUSE_TEST_CHECK(
             path.read(map, unalignedRead, unalignedOffset, unalignedRead.size()).ok());
-        HFS_TEST_CHECK(unalignedRead == unaligned);
+        UUSE_TEST_CHECK(unalignedRead == unaligned);
 
         std::vector<std::byte> window(3 * metaBlock, std::byte{0});
-        HFS_TEST_CHECK(path.read(map, window, 2 * metaBlock, window.size()).ok());
+        UUSE_TEST_CHECK(path.read(map, window, 2 * metaBlock, window.size()).ok());
         /* step 2 pattern still covers block 2; the unaligned write overlays it */
         std::vector<std::byte> expected(window.size(), std::byte{0});
         std::memcpy(expected.data(), pattern.data() + 2 * metaBlock, metaBlock);
         std::memcpy(expected.data() + (unalignedOffset - 2 * metaBlock), unaligned.data(),
                     unaligned.size());
-        HFS_TEST_CHECK(window == expected);
+        UUSE_TEST_CHECK(window == expected);
 
         /* 3b. sparse read: unmapped ranges read as zeros */
         {
@@ -144,20 +144,20 @@ int main() {
             std::vector<std::byte> secondBlock(metaBlock);
             fillPattern(firstBlock, 0x55);
             fillPattern(secondBlock, 0x66);
-            HFS_TEST_CHECK(path.write(sparse, firstBlock, 0, firstBlock.size(), ~0ULL).ok());
-            HFS_TEST_CHECK(path.write(sparse, secondBlock, 2 * metaBlock,
+            UUSE_TEST_CHECK(path.write(sparse, firstBlock, 0, firstBlock.size(), ~0ULL).ok());
+            UUSE_TEST_CHECK(path.write(sparse, secondBlock, 2 * metaBlock,
                                       secondBlock.size(), ~0ULL).ok());
             std::vector<std::byte> sparseRead(3 * metaBlock, std::byte{0xFF});
             const auto beforeSparse = path.stats();
-            HFS_TEST_CHECK(path.read(sparse, sparseRead, 0, sparseRead.size()).ok());
+            UUSE_TEST_CHECK(path.read(sparse, sparseRead, 0, sparseRead.size()).ok());
             const auto afterSparse = path.stats();
-            HFS_TEST_CHECK(afterSparse.zeroChildren > beforeSparse.zeroChildren);
-            HFS_TEST_CHECK(afterSparse.zeroBytes - beforeSparse.zeroBytes == metaBlock);
-            HFS_TEST_CHECK(std::memcmp(sparseRead.data(), firstBlock.data(), metaBlock) == 0);
+            UUSE_TEST_CHECK(afterSparse.zeroChildren > beforeSparse.zeroChildren);
+            UUSE_TEST_CHECK(afterSparse.zeroBytes - beforeSparse.zeroBytes == metaBlock);
+            UUSE_TEST_CHECK(std::memcmp(sparseRead.data(), firstBlock.data(), metaBlock) == 0);
             for (std::size_t i = metaBlock; i < 2 * metaBlock; ++i) {
-                HFS_TEST_CHECK(sparseRead[i] == std::byte{0});
+                UUSE_TEST_CHECK(sparseRead[i] == std::byte{0});
             }
-            HFS_TEST_CHECK(
+            UUSE_TEST_CHECK(
                 std::memcmp(sparseRead.data() + 2 * metaBlock, secondBlock.data(),
                             metaBlock) == 0);
         }
@@ -171,30 +171,30 @@ int main() {
             std::vector<std::byte> appendBytes(metaBlock + 100);
             fillPattern(appendBytes, 0x77);
             const auto beforeAppend = path.stats();
-            HFS_TEST_CHECK(
+            UUSE_TEST_CHECK(
                 path.write(appendMap, appendBytes, 0, appendBytes.size(), 0).ok());
             const auto afterAppend = path.stats();
-            HFS_TEST_CHECK(afterAppend.submits - beforeAppend.submits == 2);
-            HFS_TEST_CHECK(afterAppend.completes - beforeAppend.completes == 2);
+            UUSE_TEST_CHECK(afterAppend.submits - beforeAppend.submits == 2);
+            UUSE_TEST_CHECK(afterAppend.completes - beforeAppend.completes == 2);
             std::vector<std::byte> appendRead(appendBytes.size(), std::byte{0});
-            HFS_TEST_CHECK(path.read(appendMap, appendRead, 0, appendRead.size()).ok());
-            HFS_TEST_CHECK(appendRead == appendBytes);
+            UUSE_TEST_CHECK(path.read(appendMap, appendRead, 0, appendRead.size()).ok());
+            UUSE_TEST_CHECK(appendRead == appendBytes);
         }
 
         /* 4. DMA-capable caller buffer takes the direct path without copies */
         auto lease = BufferLease::fromArena(arena, 1U << 20, 1000);
-        HFS_TEST_CHECK(lease.ok());
+        UUSE_TEST_CHECK(lease.ok());
         auto leaseSpan = lease.value().span().first(1U << 20);
-        HFS_TEST_CHECK(runtime.isDmaCapable(leaseSpan.data(), leaseSpan.size()));
+        UUSE_TEST_CHECK(runtime.isDmaCapable(leaseSpan.data(), leaseSpan.size()));
         fillPattern(leaseSpan, 0x33);
         const auto beforeDirect = path.stats();
-        HFS_TEST_CHECK(path.write(map, std::span<const std::byte>(leaseSpan.data(),
+        UUSE_TEST_CHECK(path.write(map, std::span<const std::byte>(leaseSpan.data(),
                                                                   leaseSpan.size()),
                                   0, leaseSpan.size(), ~0ULL).ok());
-        HFS_TEST_CHECK(path.read(map, leaseSpan, 0, leaseSpan.size()).ok());
+        UUSE_TEST_CHECK(path.read(map, leaseSpan, 0, leaseSpan.size()).ok());
         const auto afterDirect = path.stats();
-        HFS_TEST_CHECK(afterDirect.directChildren > beforeDirect.directChildren);
-        HFS_TEST_CHECK(afterDirect.copyBytes == beforeDirect.copyBytes);
+        UUSE_TEST_CHECK(afterDirect.directChildren > beforeDirect.directChildren);
+        UUSE_TEST_CHECK(afterDirect.copyBytes == beforeDirect.copyBytes);
         lease.value().reset();
 
         /* 4b. capability probe: can plain (non-hugepage) heap memory be
@@ -215,18 +215,18 @@ int main() {
                     std::vector<std::byte> probePattern(metaBlock);
                     fillPattern(probePattern, 0x9B);
                     std::span<std::byte> heapSpan(static_cast<std::byte *>(heap), metaBlock);
-                    HFS_TEST_CHECK(path.write(map, std::span<const std::byte>(probePattern),
+                    UUSE_TEST_CHECK(path.write(map, std::span<const std::byte>(probePattern),
                                               probeOffset, metaBlock, ~0ULL)
                                        .ok());
                     const auto beforeHeap = path.stats();
-                    HFS_TEST_CHECK(path.read(map, heapSpan, probeOffset, metaBlock).ok());
+                    UUSE_TEST_CHECK(path.read(map, heapSpan, probeOffset, metaBlock).ok());
                     const auto afterHeap = path.stats();
                     std::printf("dma-register probe: direct_delta=%llu copy_delta=%llu\n",
                                 static_cast<unsigned long long>(afterHeap.directChildren -
                                                                 beforeHeap.directChildren),
                                 static_cast<unsigned long long>(afterHeap.copyBytes -
                                                                 beforeHeap.copyBytes));
-                    HFS_TEST_CHECK(std::memcmp(heap, probePattern.data(), metaBlock) == 0);
+                    UUSE_TEST_CHECK(std::memcmp(heap, probePattern.data(), metaBlock) == 0);
                 }
                 if (registerRc == 0) {
                     spdk_mem_unregister(heap, metaBlock);
@@ -242,13 +242,13 @@ int main() {
         std::vector<std::byte> large(3U << 20);
         fillPattern(large, 0x44);
         const auto beforeLarge = path.stats();
-        HFS_TEST_CHECK(path.write(map, large, 0, large.size(), ~0ULL).ok());
+        UUSE_TEST_CHECK(path.write(map, large, 0, large.size(), ~0ULL).ok());
         const auto afterLarge = path.stats();
-        HFS_TEST_CHECK(afterLarge.submits - beforeLarge.submits == 3);
-        HFS_TEST_CHECK(afterLarge.completes - beforeLarge.completes == 3);
+        UUSE_TEST_CHECK(afterLarge.submits - beforeLarge.submits == 3);
+        UUSE_TEST_CHECK(afterLarge.completes - beforeLarge.completes == 3);
         std::vector<std::byte> largeBack(large.size(), std::byte{0});
-        HFS_TEST_CHECK(path.read(map, largeBack, 0, largeBack.size()).ok());
-        HFS_TEST_CHECK(checksum(largeBack) == checksum(large));
+        UUSE_TEST_CHECK(path.read(map, largeBack, 0, largeBack.size()).ok());
+        UUSE_TEST_CHECK(checksum(largeBack) == checksum(large));
 
         /* A late child completion must become TimedOut at the parent boundary
          * while still draining before the buffers are released. */
@@ -259,34 +259,34 @@ int main() {
         test_hooks::setDataIoDelay(test_hooks::DataIoDelayKind::Generic, 25);
         auto timeoutResult = timeoutPath.read(map, timeoutRead, 0, timeoutRead.size());
         test_hooks::setDataIoDelay(test_hooks::DataIoDelayKind::Generic, 0);
-        HFS_TEST_CHECK(!timeoutResult.ok() && timeoutResult.status() == Status::TimedOut);
-        HFS_TEST_CHECK(timeoutPath.stats().submits == timeoutPath.stats().completes);
+        UUSE_TEST_CHECK(!timeoutResult.ok() && timeoutResult.status() == Status::TimedOut);
+        UUSE_TEST_CHECK(timeoutPath.stats().submits == timeoutPath.stats().completes);
 
         /* 6. child accounting and error-free completion */
         const auto stats = path.stats();
-        HFS_TEST_CHECK(stats.submits == stats.completes);
-        HFS_TEST_CHECK(stats.bounceChildren > 0);
-        HFS_TEST_CHECK(stats.copyBytes > 0);
-        HFS_TEST_CHECK(stats.parentWaits > 0);
-        HFS_TEST_CHECK(stats.errors == 0);
+        UUSE_TEST_CHECK(stats.submits == stats.completes);
+        UUSE_TEST_CHECK(stats.bounceChildren > 0);
+        UUSE_TEST_CHECK(stats.copyBytes > 0);
+        UUSE_TEST_CHECK(stats.parentWaits > 0);
+        UUSE_TEST_CHECK(stats.errors == 0);
         const auto arenaStats = arena.stats();
-        HFS_TEST_CHECK(arenaStats.acquires == arenaStats.releases);
+        UUSE_TEST_CHECK(arenaStats.acquires == arenaStats.releases);
         std::printf("datapath stats: submits=%llu direct=%llu bounce=%llu copy=%llu\n",
                     static_cast<unsigned long long>(stats.submits),
                     static_cast<unsigned long long>(stats.directChildren),
                     static_cast<unsigned long long>(stats.bounceChildren),
                     static_cast<unsigned long long>(stats.copyBytes));
 
-        HFS_TEST_CHECK(engine->stop().wait().value().ok());
+        UUSE_TEST_CHECK(engine->stop().wait().value().ok());
     }
 
     /* restore a clean formatted image for the other device tests */
     {
         auto created = Engine::create(parsed.value());
-        HFS_TEST_CHECK(created.ok());
+        UUSE_TEST_CHECK(created.ok());
         auto engine = std::move(created).value();
-        HFS_TEST_CHECK(engine->format({true}).wait().value().ok());
-        HFS_TEST_CHECK(engine->stop().wait().value().ok());
+        UUSE_TEST_CHECK(engine->format({true}).wait().value().ok());
+        UUSE_TEST_CHECK(engine->stop().wait().value().ok());
     }
 
     ::unlink(lockPath.c_str());

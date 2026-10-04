@@ -15,7 +15,7 @@
 
 #include "common/trace.hpp"
 
-namespace hfs {
+namespace uuse {
 
 namespace {
 
@@ -629,4 +629,4 @@ CompletionNotifier &AsyncCompletionQueue::notifier() noexcept { return notifier_
 
 const CompletionNotifier &AsyncCompletionQueue::notifier() const noexcept { return notifier_; }
 
-} // namespace hfs
+} // namespace uuse

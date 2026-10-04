@@ -13,22 +13,22 @@
 #include "core/frame_pool.hpp"
 #include "core/operation.hpp"
 #include "core/shard_ring.hpp"
-#include "hfs/task.hpp"
+#include "uuse/task.hpp"
 #include "test_support.hpp"
 
 namespace {
 
 /* noinline + runtime value keeps the coroutine frame real (no elision). */
-__attribute__((noinline)) hfs::Task<int> answer(int value) { co_return value; }
+__attribute__((noinline)) uuse::Task<int> answer(int value) { co_return value; }
 
 int gCompletions = 0;
-void onOpComplete(hfs::Operation *operation) {
+void onOpComplete(uuse::Operation *operation) {
     (void)operation;
     ++gCompletions;
 }
 
 /* Counts value completions without retaining an Operation or frontend object. */
-void onCompletionPublished(void *raw, const hfs::CompletionEvent &event) {
+void onCompletionPublished(void *raw, const uuse::CompletionEvent &event) {
     auto *count = static_cast<int *>(raw);
     ++(*count);
     if (event.requestId == 0) {
@@ -53,23 +53,23 @@ void testDmaFree(void *ptr, void *) noexcept { ::operator delete(ptr); }
 int main() {
     /* 0. large contiguous allocations use the bounded arena path. */
     {
-        hfs::DmaArena arena;
+        uuse::DmaArena arena;
         arena.configure(3 * 1024 * 1024, testDmaAlloc, testDmaFree, nullptr);
         auto large = arena.acquire(2 * 1024 * 1024, 0);
-        HFS_TEST_CHECK(large.ok());
-        HFS_TEST_CHECK(arena.owns(large.value().data()));
+        UUSE_TEST_CHECK(large.ok());
+        UUSE_TEST_CHECK(arena.owns(large.value().data()));
         auto over = arena.acquire(2 * 1024 * 1024, 0);
-        HFS_TEST_CHECK(!over.ok() && over.status() == hfs::Status::Busy);
+        UUSE_TEST_CHECK(!over.ok() && over.status() == uuse::Status::Busy);
         arena.release(large.value());
-        HFS_TEST_CHECK(arena.stats().bytes == 0);
+        UUSE_TEST_CHECK(arena.stats().bytes == 0);
     }
 
     /* 0b. bounded arena wait wakes on release and times out otherwise. */
     {
-        hfs::DmaArena arena;
+        uuse::DmaArena arena;
         arena.configure(4096, testDmaAlloc, testDmaFree, nullptr);
         auto held = arena.acquire(4096, 0);
-        HFS_TEST_CHECK(held.ok());
+        UUSE_TEST_CHECK(held.ok());
         std::atomic<bool> waiterOk = false;
         std::thread waiter([&] {
             auto acquired = arena.acquire(4096, 200);
@@ -79,144 +79,144 @@ int main() {
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
         arena.release(held.value());
         waiter.join();
-        HFS_TEST_CHECK(waiterOk.load());
+        UUSE_TEST_CHECK(waiterOk.load());
 
         auto heldAgain = arena.acquire(4096, 0);
-        HFS_TEST_CHECK(heldAgain.ok());
+        UUSE_TEST_CHECK(heldAgain.ok());
         auto timedOut = arena.acquire(4096, 10);
-        HFS_TEST_CHECK(!timedOut.ok() && timedOut.status() == hfs::Status::Busy);
+        UUSE_TEST_CHECK(!timedOut.ok() && timedOut.status() == uuse::Status::Busy);
         arena.release(heldAgain.value());
     }
 
     /* 1. frame pool: bounded classes, reuse, overflow accounting */
     {
-        auto &pool = hfs::FramePool::instance();
+        auto &pool = uuse::FramePool::instance();
         pool.setCapacity(64 * 1024);
         std::vector<void *> blocks;
         for (int i = 0; i < 1000; ++i) {
             void *block = pool.allocate(200);
-            HFS_TEST_CHECK(block != nullptr);
+            UUSE_TEST_CHECK(block != nullptr);
             blocks.push_back(block);
         }
         const auto stats = pool.stats();
-        HFS_TEST_CHECK(stats.overflowAllocations > 0);
-        HFS_TEST_CHECK(stats.poolBytes <= stats.capacityBytes);
+        UUSE_TEST_CHECK(stats.overflowAllocations > 0);
+        UUSE_TEST_CHECK(stats.poolBytes <= stats.capacityBytes);
         for (void *block : blocks) {
             pool.deallocate(block, 200);
         }
-        HFS_TEST_CHECK(pool.stats().freeBlocks[1] > 0);
+        UUSE_TEST_CHECK(pool.stats().freeBlocks[1] > 0);
         void *reused = pool.allocate(200);
-        HFS_TEST_CHECK(reused != nullptr);
+        UUSE_TEST_CHECK(reused != nullptr);
         pool.deallocate(reused, 200);
-        HFS_TEST_CHECK(pool.hasBudget(256));
+        UUSE_TEST_CHECK(pool.hasBudget(256));
     }
 
     /* 2. Task frames come from the pool and are returned */
     {
-        auto &pool = hfs::FramePool::instance();
+        auto &pool = uuse::FramePool::instance();
         const auto before = pool.stats();
         {
             auto task = answer(42);
             auto result = task.wait();
-            HFS_TEST_CHECK(result.ok() && result.value() == 42);
+            UUSE_TEST_CHECK(result.ok() && result.value() == 42);
         }
         const auto after = pool.stats();
-        HFS_TEST_CHECK((after.allocations + after.overflowAllocations) >
+        UUSE_TEST_CHECK((after.allocations + after.overflowAllocations) >
                        (before.allocations + before.overflowAllocations));
-        HFS_TEST_CHECK((after.deallocations + after.overflowAllocations) >
+        UUSE_TEST_CHECK((after.deallocations + after.overflowAllocations) >
                        (before.deallocations + before.overflowAllocations));
     }
 
     /* 3. operation lifecycle and single terminal transition */
     {
-        hfs::Operation::setPoolCapacity(4);
+        uuse::Operation::setPoolCapacity(4);
         gCompletions = 0;
-        auto *operation = hfs::Operation::create(11);
-        HFS_TEST_CHECK(operation != nullptr);
-        HFS_TEST_CHECK(operation->requestId == 11);
+        auto *operation = uuse::Operation::create(11);
+        UUSE_TEST_CHECK(operation != nullptr);
+        UUSE_TEST_CHECK(operation->requestId == 11);
         operation->onComplete = onOpComplete;
         operation->addRef();
         operation->release();
-        HFS_TEST_CHECK(operation->complete(0));
-        HFS_TEST_CHECK(!operation->complete(0));
-        HFS_TEST_CHECK(gCompletions == 1);
+        UUSE_TEST_CHECK(operation->complete(0));
+        UUSE_TEST_CHECK(!operation->complete(0));
+        UUSE_TEST_CHECK(gCompletions == 1);
         operation->release();
-        HFS_TEST_CHECK(hfs::Operation::liveCount() == 0);
+        UUSE_TEST_CHECK(uuse::Operation::liveCount() == 0);
 
         /* Role references close independently while sharing one underlying count. */
-        auto *roleOperation = hfs::Operation::create(12);
-        HFS_TEST_CHECK(roleOperation != nullptr);
-        HFS_TEST_CHECK(roleOperation->refCount() == 1);
-        HFS_TEST_CHECK(roleOperation->refCount(hfs::OperationRefRole::Legacy) == 1);
-        HFS_TEST_CHECK(roleOperation->tryAcquireRef(hfs::OperationRefRole::Actor));
-        roleOperation->acquireRef(hfs::OperationRefRole::Scheduler);
-        roleOperation->acquireRef(hfs::OperationRefRole::Backend);
-        roleOperation->acquireRef(hfs::OperationRefRole::Parent);
-        HFS_TEST_CHECK(roleOperation->refCount() == 5);
-        HFS_TEST_CHECK(roleOperation->refCount(hfs::OperationRefRole::Actor) == 1);
-        HFS_TEST_CHECK(roleOperation->releaseRef(hfs::OperationRefRole::Parent));
-        HFS_TEST_CHECK(roleOperation->releaseRef(hfs::OperationRefRole::Backend));
-        HFS_TEST_CHECK(roleOperation->releaseRef(hfs::OperationRefRole::Scheduler));
-        HFS_TEST_CHECK(roleOperation->releaseRef(hfs::OperationRefRole::Actor));
-        HFS_TEST_CHECK(!roleOperation->releaseRef(hfs::OperationRefRole::Actor));
-        HFS_TEST_CHECK(roleOperation->refCount() == 1);
+        auto *roleOperation = uuse::Operation::create(12);
+        UUSE_TEST_CHECK(roleOperation != nullptr);
+        UUSE_TEST_CHECK(roleOperation->refCount() == 1);
+        UUSE_TEST_CHECK(roleOperation->refCount(uuse::OperationRefRole::Legacy) == 1);
+        UUSE_TEST_CHECK(roleOperation->tryAcquireRef(uuse::OperationRefRole::Actor));
+        roleOperation->acquireRef(uuse::OperationRefRole::Scheduler);
+        roleOperation->acquireRef(uuse::OperationRefRole::Backend);
+        roleOperation->acquireRef(uuse::OperationRefRole::Parent);
+        UUSE_TEST_CHECK(roleOperation->refCount() == 5);
+        UUSE_TEST_CHECK(roleOperation->refCount(uuse::OperationRefRole::Actor) == 1);
+        UUSE_TEST_CHECK(roleOperation->releaseRef(uuse::OperationRefRole::Parent));
+        UUSE_TEST_CHECK(roleOperation->releaseRef(uuse::OperationRefRole::Backend));
+        UUSE_TEST_CHECK(roleOperation->releaseRef(uuse::OperationRefRole::Scheduler));
+        UUSE_TEST_CHECK(roleOperation->releaseRef(uuse::OperationRefRole::Actor));
+        UUSE_TEST_CHECK(!roleOperation->releaseRef(uuse::OperationRefRole::Actor));
+        UUSE_TEST_CHECK(roleOperation->refCount() == 1);
         roleOperation->release();
-        HFS_TEST_CHECK(hfs::Operation::liveCount() == 0);
+        UUSE_TEST_CHECK(uuse::Operation::liveCount() == 0);
 
         /* A frontend handle keeps a fast-completed operation alive until return. */
         int published = 0;
-        auto *fast = hfs::Operation::create(13);
-        HFS_TEST_CHECK(fast != nullptr);
+        auto *fast = uuse::Operation::create(13);
+        UUSE_TEST_CHECK(fast != nullptr);
         fast->setCompletionSink({&published, onCompletionPublished});
         auto handle = fast->acquireFrontendHandle({7, 1});
-        HFS_TEST_CHECK(handle.valid());
-        HFS_TEST_CHECK(handle.requestId() == 13);
-        HFS_TEST_CHECK(handle.token().slot == 7);
-        HFS_TEST_CHECK(fast->refCount(hfs::OperationRefRole::FrontendHandle) == 1);
+        UUSE_TEST_CHECK(handle.valid());
+        UUSE_TEST_CHECK(handle.requestId() == 13);
+        UUSE_TEST_CHECK(handle.token().slot == 7);
+        UUSE_TEST_CHECK(fast->refCount(uuse::OperationRefRole::FrontendHandle) == 1);
         fast->release(); /* Drop the creator reference before the frontend returns. */
-        HFS_TEST_CHECK(fast->completeTerminal(0));
-        HFS_TEST_CHECK(fast->isTerminal());
-        HFS_TEST_CHECK(!fast->isCompletionPublished());
-        HFS_TEST_CHECK(fast->publishCompletion());
-        HFS_TEST_CHECK(fast->state.load() == hfs::OperationState::CompletionPublished);
-        HFS_TEST_CHECK(published == 1);
-        HFS_TEST_CHECK(!fast->publishCompletion());
-        HFS_TEST_CHECK(handle.valid());
+        UUSE_TEST_CHECK(fast->completeTerminal(0));
+        UUSE_TEST_CHECK(fast->isTerminal());
+        UUSE_TEST_CHECK(!fast->isCompletionPublished());
+        UUSE_TEST_CHECK(fast->publishCompletion());
+        UUSE_TEST_CHECK(fast->state.load() == uuse::OperationState::CompletionPublished);
+        UUSE_TEST_CHECK(published == 1);
+        UUSE_TEST_CHECK(!fast->publishCompletion());
+        UUSE_TEST_CHECK(handle.valid());
         handle.reset();
-        HFS_TEST_CHECK(hfs::Operation::liveCount() == 0);
+        UUSE_TEST_CHECK(uuse::Operation::liveCount() == 0);
 
         /* New preparation and drain states remain on the existing lifecycle object. */
-        auto *lifecycle = hfs::Operation::create(14);
-        HFS_TEST_CHECK(lifecycle != nullptr);
-        HFS_TEST_CHECK(lifecycle->transition(hfs::OperationState::Created,
-                                             hfs::OperationState::Enqueued));
-        HFS_TEST_CHECK(lifecycle->beginPreparing());
-        HFS_TEST_CHECK(lifecycle->state.load() == hfs::OperationState::Preparing);
-        HFS_TEST_CHECK(lifecycle->beginDraining());
-        HFS_TEST_CHECK(lifecycle->state.load() == hfs::OperationState::Draining);
-        HFS_TEST_CHECK(lifecycle->completeTerminal(0));
-        HFS_TEST_CHECK(lifecycle->state.load() == hfs::OperationState::Completed);
-        HFS_TEST_CHECK(lifecycle->publishCompletion());
+        auto *lifecycle = uuse::Operation::create(14);
+        UUSE_TEST_CHECK(lifecycle != nullptr);
+        UUSE_TEST_CHECK(lifecycle->transition(uuse::OperationState::Created,
+                                             uuse::OperationState::Enqueued));
+        UUSE_TEST_CHECK(lifecycle->beginPreparing());
+        UUSE_TEST_CHECK(lifecycle->state.load() == uuse::OperationState::Preparing);
+        UUSE_TEST_CHECK(lifecycle->beginDraining());
+        UUSE_TEST_CHECK(lifecycle->state.load() == uuse::OperationState::Draining);
+        UUSE_TEST_CHECK(lifecycle->completeTerminal(0));
+        UUSE_TEST_CHECK(lifecycle->state.load() == uuse::OperationState::Completed);
+        UUSE_TEST_CHECK(lifecycle->publishCompletion());
         lifecycle->release();
-        HFS_TEST_CHECK(hfs::Operation::liveCount() == 0);
+        UUSE_TEST_CHECK(uuse::Operation::liveCount() == 0);
 
         /* Terminal transition and publication each reject a second caller. */
-        auto *split = hfs::Operation::create(15);
-        HFS_TEST_CHECK(split != nullptr);
-        HFS_TEST_CHECK(split->completeTerminal(hfs::Status::TimedOut, -110, 128));
-        HFS_TEST_CHECK(!split->completeTerminal(hfs::Status::Ok));
-        HFS_TEST_CHECK(!split->isCompletionPublished());
-        HFS_TEST_CHECK(split->publishCompletion());
-        HFS_TEST_CHECK(!split->publishCompletion());
+        auto *split = uuse::Operation::create(15);
+        UUSE_TEST_CHECK(split != nullptr);
+        UUSE_TEST_CHECK(split->completeTerminal(uuse::Status::TimedOut, -110, 128));
+        UUSE_TEST_CHECK(!split->completeTerminal(uuse::Status::Ok));
+        UUSE_TEST_CHECK(!split->isCompletionPublished());
+        UUSE_TEST_CHECK(split->publishCompletion());
+        UUSE_TEST_CHECK(!split->publishCompletion());
         split->release();
-        HFS_TEST_CHECK(hfs::Operation::liveCount() == 0);
+        UUSE_TEST_CHECK(uuse::Operation::liveCount() == 0);
 
         /* Pool reuse clears public state, sidecar state, hooks and role counters. */
         std::uint32_t sidecarProbe = 99;
-        auto *dirty = hfs::Operation::create(16);
-        HFS_TEST_CHECK(dirty != nullptr);
-        dirty->kind = hfs::OperationKind::Write;
-        dirty->state.store(hfs::OperationState::Draining);
+        auto *dirty = uuse::Operation::create(16);
+        UUSE_TEST_CHECK(dirty != nullptr);
+        dirty->kind = uuse::OperationKind::Write;
+        dirty->state.store(uuse::OperationState::Draining);
         dirty->fileId = 44;
         dirty->offset = 55;
         dirty->length = 66;
@@ -224,7 +224,7 @@ int main() {
         dirty->userCtx = &sidecarProbe;
         dirty->onComplete = onOpComplete;
         dirty->status = -5;
-        dirty->resultStatus = hfs::Status::IoError;
+        dirty->resultStatus = uuse::Status::IoError;
         dirty->backendErrno = -5;
         dirty->completedBytes = 77;
         dirty->retryCount = 8;
@@ -236,90 +236,90 @@ int main() {
         dirty->asyncState().schedulerNode = &sidecarProbe;
         dirty->asyncState().parent = &sidecarProbe;
         dirty->asyncState().backendState = &sidecarProbe;
-        dirty->asyncState().status = hfs::Status::IoError;
+        dirty->asyncState().status = uuse::Status::IoError;
         dirty->asyncState().backendErrno = -6;
         dirty->asyncState().childCount = 2;
         dirty->asyncState().submittedChildren = 2;
         dirty->asyncState().drainedChildren = 1;
         dirty->asyncState().completionPublished = true;
-        HFS_TEST_CHECK(dirty->attachAsyncStorage(&sidecarProbe, sizeof(sidecarProbe),
+        UUSE_TEST_CHECK(dirty->attachAsyncStorage(&sidecarProbe, sizeof(sidecarProbe),
                                                   resetSidecarProbe));
         dirty->release();
-        HFS_TEST_CHECK(sidecarProbe == 0);
+        UUSE_TEST_CHECK(sidecarProbe == 0);
 
-        auto *reused = hfs::Operation::create(17);
-        HFS_TEST_CHECK(reused != nullptr);
-        HFS_TEST_CHECK(reused->requestId == 17);
-        HFS_TEST_CHECK(reused->kind == hfs::OperationKind::Other);
-        HFS_TEST_CHECK(reused->state.load() == hfs::OperationState::Created);
-        HFS_TEST_CHECK(!reused->isTerminal());
-        HFS_TEST_CHECK(!reused->isCompletionPublished());
-        HFS_TEST_CHECK(reused->fileId == 0 && reused->offset == 0 && reused->length == 0);
-        HFS_TEST_CHECK(reused->shard == 0 && reused->userCtx == nullptr);
-        HFS_TEST_CHECK(reused->onComplete == nullptr);
-        HFS_TEST_CHECK(reused->status == 0 && reused->resultStatus == hfs::Status::Ok);
-        HFS_TEST_CHECK(reused->backendErrno == 0 && reused->completedBytes == 0);
-        HFS_TEST_CHECK(reused->retryCount == 0 && reused->schedulerNode == nullptr);
-        HFS_TEST_CHECK(reused->dmaLease == nullptr && reused->parent == nullptr);
-        HFS_TEST_CHECK(!reused->completionToken().valid());
-        HFS_TEST_CHECK(reused->completionSink().context == nullptr);
-        HFS_TEST_CHECK(reused->completionSink().publish == nullptr);
-        HFS_TEST_CHECK(reused->asyncStorage().storage == nullptr);
-        HFS_TEST_CHECK(reused->asyncState().schedulerNode == nullptr);
-        HFS_TEST_CHECK(reused->asyncState().parent == nullptr);
-        HFS_TEST_CHECK(reused->asyncState().backendState == nullptr);
-        HFS_TEST_CHECK(reused->asyncState().childCount == 0);
-        HFS_TEST_CHECK(reused->asyncState().submittedChildren == 0);
-        HFS_TEST_CHECK(reused->asyncState().drainedChildren == 0);
-        HFS_TEST_CHECK(!reused->asyncState().completionPublished);
-        HFS_TEST_CHECK(reused->refCount() == 1);
-        HFS_TEST_CHECK(reused->refCount(hfs::OperationRefRole::Legacy) == 1);
-        HFS_TEST_CHECK(reused->refCount(hfs::OperationRefRole::Actor) == 0);
+        auto *reused = uuse::Operation::create(17);
+        UUSE_TEST_CHECK(reused != nullptr);
+        UUSE_TEST_CHECK(reused->requestId == 17);
+        UUSE_TEST_CHECK(reused->kind == uuse::OperationKind::Other);
+        UUSE_TEST_CHECK(reused->state.load() == uuse::OperationState::Created);
+        UUSE_TEST_CHECK(!reused->isTerminal());
+        UUSE_TEST_CHECK(!reused->isCompletionPublished());
+        UUSE_TEST_CHECK(reused->fileId == 0 && reused->offset == 0 && reused->length == 0);
+        UUSE_TEST_CHECK(reused->shard == 0 && reused->userCtx == nullptr);
+        UUSE_TEST_CHECK(reused->onComplete == nullptr);
+        UUSE_TEST_CHECK(reused->status == 0 && reused->resultStatus == uuse::Status::Ok);
+        UUSE_TEST_CHECK(reused->backendErrno == 0 && reused->completedBytes == 0);
+        UUSE_TEST_CHECK(reused->retryCount == 0 && reused->schedulerNode == nullptr);
+        UUSE_TEST_CHECK(reused->dmaLease == nullptr && reused->parent == nullptr);
+        UUSE_TEST_CHECK(!reused->completionToken().valid());
+        UUSE_TEST_CHECK(reused->completionSink().context == nullptr);
+        UUSE_TEST_CHECK(reused->completionSink().publish == nullptr);
+        UUSE_TEST_CHECK(reused->asyncStorage().storage == nullptr);
+        UUSE_TEST_CHECK(reused->asyncState().schedulerNode == nullptr);
+        UUSE_TEST_CHECK(reused->asyncState().parent == nullptr);
+        UUSE_TEST_CHECK(reused->asyncState().backendState == nullptr);
+        UUSE_TEST_CHECK(reused->asyncState().childCount == 0);
+        UUSE_TEST_CHECK(reused->asyncState().submittedChildren == 0);
+        UUSE_TEST_CHECK(reused->asyncState().drainedChildren == 0);
+        UUSE_TEST_CHECK(!reused->asyncState().completionPublished);
+        UUSE_TEST_CHECK(reused->refCount() == 1);
+        UUSE_TEST_CHECK(reused->refCount(uuse::OperationRefRole::Legacy) == 1);
+        UUSE_TEST_CHECK(reused->refCount(uuse::OperationRefRole::Actor) == 0);
         reused->release();
-        HFS_TEST_CHECK(hfs::Operation::liveCount() == 0);
+        UUSE_TEST_CHECK(uuse::Operation::liveCount() == 0);
 
-        const std::size_t overflowBefore = hfs::Operation::poolOverflow();
-        std::vector<hfs::Operation *> held;
+        const std::size_t overflowBefore = uuse::Operation::poolOverflow();
+        std::vector<uuse::Operation *> held;
         for (int i = 0; i < 8; ++i) {
-            auto *created = hfs::Operation::create(100 + i);
+            auto *created = uuse::Operation::create(100 + i);
             if (created != nullptr) {
                 held.push_back(created);
             }
         }
-        HFS_TEST_CHECK(held.size() == 4);
-        HFS_TEST_CHECK(hfs::Operation::poolOverflow() > overflowBefore);
+        UUSE_TEST_CHECK(held.size() == 4);
+        UUSE_TEST_CHECK(uuse::Operation::poolOverflow() > overflowBefore);
         for (auto *item : held) {
             item->release();
         }
-        HFS_TEST_CHECK(hfs::Operation::liveCount() == 0);
+        UUSE_TEST_CHECK(uuse::Operation::liveCount() == 0);
     }
 
     /* 4. ring order, full/busy and doorbell dedup */
     {
-        hfs::Operation::setPoolCapacity(32);
-        hfs::ShardRing ring(8);
-        std::vector<hfs::Operation *> ops;
+        uuse::Operation::setPoolCapacity(32);
+        uuse::ShardRing ring(8);
+        std::vector<uuse::Operation *> ops;
         for (int i = 0; i < 8; ++i) {
-            auto *operation = hfs::Operation::create(static_cast<std::uint64_t>(i));
-            HFS_TEST_CHECK(operation != nullptr);
+            auto *operation = uuse::Operation::create(static_cast<std::uint64_t>(i));
+            UUSE_TEST_CHECK(operation != nullptr);
             ops.push_back(operation);
             auto reservation = ring.reserve();
-            HFS_TEST_CHECK(reservation.valid());
+            UUSE_TEST_CHECK(reservation.valid());
             ring.publish(reservation, operation);
         }
         auto full = ring.reserve();
-        HFS_TEST_CHECK(!full.valid());
-        HFS_TEST_CHECK(ring.stats().busy == 1);
-        HFS_TEST_CHECK(ring.stats().doorbells == 1); /* armed once for the burst */
-        HFS_TEST_CHECK(ring.doorbellArmed());
-        std::vector<hfs::Operation *> out(8);
-        HFS_TEST_CHECK(ring.drain(out.data(), out.size()) == 8);
+        UUSE_TEST_CHECK(!full.valid());
+        UUSE_TEST_CHECK(ring.stats().busy == 1);
+        UUSE_TEST_CHECK(ring.stats().doorbells == 1); /* armed once for the burst */
+        UUSE_TEST_CHECK(ring.doorbellArmed());
+        std::vector<uuse::Operation *> out(8);
+        UUSE_TEST_CHECK(ring.drain(out.data(), out.size()) == 8);
         for (int i = 0; i < 8; ++i) {
-            HFS_TEST_CHECK(out[i] == ops[i]);
+            UUSE_TEST_CHECK(out[i] == ops[i]);
         }
-        HFS_TEST_CHECK(ring.empty());
+        UUSE_TEST_CHECK(ring.empty());
         ring.clearDoorbell();
-        HFS_TEST_CHECK(!ring.doorbellArmed());
+        UUSE_TEST_CHECK(!ring.doorbellArmed());
         for (auto *operation : ops) {
             operation->release();
         }
@@ -330,20 +330,20 @@ int main() {
         constexpr int kProducers = 4;
         constexpr int kPerProducer = 500;
         constexpr int kTotal = kProducers * kPerProducer;
-        hfs::Operation::setPoolCapacity(4096);
-        hfs::ShardRing ring(1024);
-        hfs::CompletionQueue completions(2048);
-        const std::size_t overflowBefore = hfs::Operation::poolOverflow();
+        uuse::Operation::setPoolCapacity(4096);
+        uuse::ShardRing ring(1024);
+        uuse::CompletionQueue completions(2048);
+        const std::size_t overflowBefore = uuse::Operation::poolOverflow();
 
         struct StepCtx {
-            hfs::CompletionQueue *completions = nullptr;
+            uuse::CompletionQueue *completions = nullptr;
         };
         StepCtx stepCtx{&completions};
-        hfs::ShardActor actor(
+        uuse::ShardActor actor(
             ring,
-            [](void *raw, hfs::Operation *operation) {
+            [](void *raw, uuse::Operation *operation) {
                 auto *ctx = static_cast<StepCtx *>(raw);
-                hfs::CompletionQueue::Event event;
+                uuse::CompletionQueue::Event event;
                 event.requestId = operation->requestId;
                 event.userCtx = operation->userCtx;
                 event.status = 0;
@@ -353,8 +353,8 @@ int main() {
             },
             &stepCtx, 64);
 
-        hfs::trace::setEnabled(true);
-        const std::uint64_t traceBefore = hfs::trace::recorded();
+        uuse::trace::setEnabled(true);
+        const std::uint64_t traceBefore = uuse::trace::recorded();
         std::atomic<bool> failure{false};
         std::vector<std::thread> producers;
         producers.reserve(kProducers);
@@ -363,7 +363,7 @@ int main() {
                 for (int i = 0; i < kPerProducer; ++i) {
                     const std::uint64_t id =
                         static_cast<std::uint64_t>(producer * kPerProducer + i);
-                    auto *operation = hfs::Operation::create(id);
+                    auto *operation = uuse::Operation::create(id);
                     if (operation == nullptr) {
                         failure.store(true);
                         return;
@@ -382,7 +382,7 @@ int main() {
             });
         }
 
-        std::vector<hfs::CompletionQueue::Event> events(64);
+        std::vector<uuse::CompletionQueue::Event> events(64);
         std::vector<bool> seen(kTotal, false);
         std::size_t reaped = 0;
         while (reaped < static_cast<std::size_t>(kTotal) && !failure.load()) {
@@ -413,51 +413,51 @@ int main() {
             }
         }
 
-        HFS_TEST_CHECK(!failure.load());
-        HFS_TEST_CHECK(reaped == static_cast<std::size_t>(kTotal));
+        UUSE_TEST_CHECK(!failure.load());
+        UUSE_TEST_CHECK(reaped == static_cast<std::size_t>(kTotal));
         for (bool value : seen) {
-            HFS_TEST_CHECK(value);
+            UUSE_TEST_CHECK(value);
         }
-        HFS_TEST_CHECK(ring.empty());
-        HFS_TEST_CHECK(completions.empty());
-        HFS_TEST_CHECK(completions.dropped() == 0);
-        HFS_TEST_CHECK(hfs::Operation::liveCount() == 0);
-        HFS_TEST_CHECK(hfs::Operation::poolOverflow() == overflowBefore);
-        HFS_TEST_CHECK(hfs::trace::recorded() > traceBefore);
-        hfs::trace::setEnabled(false);
+        UUSE_TEST_CHECK(ring.empty());
+        UUSE_TEST_CHECK(completions.empty());
+        UUSE_TEST_CHECK(completions.dropped() == 0);
+        UUSE_TEST_CHECK(uuse::Operation::liveCount() == 0);
+        UUSE_TEST_CHECK(uuse::Operation::poolOverflow() == overflowBefore);
+        UUSE_TEST_CHECK(uuse::trace::recorded() > traceBefore);
+        uuse::trace::setEnabled(false);
     }
 
     /* 6. lost-wake window: publish after the actor cleared the doorbell */
     {
-        hfs::Operation::setPoolCapacity(8);
-        hfs::ShardRing ring(4);
+        uuse::Operation::setPoolCapacity(8);
+        uuse::ShardRing ring(4);
         int processed = 0;
-        hfs::ShardActor actor(
+        uuse::ShardActor actor(
             ring,
-            [](void *raw, hfs::Operation *operation) {
+            [](void *raw, uuse::Operation *operation) {
                 ++(*static_cast<int *>(raw));
                 operation->complete(0);
                 operation->release();
             },
             &processed, 4);
 
-        auto *first = hfs::Operation::create(1);
-        HFS_TEST_CHECK(first != nullptr);
+        auto *first = uuse::Operation::create(1);
+        UUSE_TEST_CHECK(first != nullptr);
         auto reservation = ring.reserve();
-        HFS_TEST_CHECK(reservation.valid());
+        UUSE_TEST_CHECK(reservation.valid());
         ring.publish(reservation, first);
-        HFS_TEST_CHECK(actor.runOnce() == 1);
-        HFS_TEST_CHECK(!ring.doorbellArmed());
+        UUSE_TEST_CHECK(actor.runOnce() == 1);
+        UUSE_TEST_CHECK(!ring.doorbellArmed());
 
-        auto *second = hfs::Operation::create(2);
-        HFS_TEST_CHECK(second != nullptr);
+        auto *second = uuse::Operation::create(2);
+        UUSE_TEST_CHECK(second != nullptr);
         reservation = ring.reserve();
-        HFS_TEST_CHECK(reservation.valid());
+        UUSE_TEST_CHECK(reservation.valid());
         ring.publish(reservation, second);
-        HFS_TEST_CHECK(ring.doorbellArmed());
-        HFS_TEST_CHECK(actor.runOnce() == 1);
-        HFS_TEST_CHECK(processed == 2);
-        HFS_TEST_CHECK(hfs::Operation::liveCount() == 0);
+        UUSE_TEST_CHECK(ring.doorbellArmed());
+        UUSE_TEST_CHECK(actor.runOnce() == 1);
+        UUSE_TEST_CHECK(processed == 2);
+        UUSE_TEST_CHECK(uuse::Operation::liveCount() == 0);
     }
 
     /* 7. concurrent pool churn: the lock-free free list must never hand one
@@ -465,14 +465,14 @@ int main() {
     {
         constexpr int kThreads = 4;
         constexpr int kIterations = 20000;
-        hfs::Operation::setPoolCapacity(64);
+        uuse::Operation::setPoolCapacity(64);
         std::atomic<bool> failure{false};
         std::vector<std::thread> threads;
         threads.reserve(kThreads);
         for (int thread = 0; thread < kThreads; ++thread) {
             threads.emplace_back([&failure]() {
                 for (int i = 0; i < kIterations; ++i) {
-                    auto *operation = hfs::Operation::create(1);
+                    auto *operation = uuse::Operation::create(1);
                     if (operation == nullptr) {
                         failure.store(true);
                         continue;
@@ -491,8 +491,8 @@ int main() {
         for (auto &thread : threads) {
             thread.join();
         }
-        HFS_TEST_CHECK(!failure.load());
-        HFS_TEST_CHECK(hfs::Operation::liveCount() == 0);
+        UUSE_TEST_CHECK(!failure.load());
+        UUSE_TEST_CHECK(uuse::Operation::liveCount() == 0);
     }
 
     std::printf("data_plane_test: ok\n");

@@ -4,15 +4,15 @@
 #include <deque>
 #include <vector>
 
-#include "hfs/journal.hpp"
-#include "hfs/export.hpp"
-#include "hfs/types.hpp"
+#include "uuse/journal.hpp"
+#include "uuse/export.hpp"
+#include "uuse/types.hpp"
 
-namespace hfs::metadata {
+namespace uuse::metadata {
 
 /* Batches ordered metadata requests into one journal transaction and one
  * device flush. The metadata actor is the single caller in production. */
-class HFS_API GroupCommitCoordinator {
+class UUSE_API GroupCommitCoordinator {
 public:
     struct Stats {
         std::uint64_t requests = 0;
@@ -47,4 +47,4 @@ private:
     Stats stats_;
 };
 
-} // namespace hfs::metadata
+} // namespace uuse::metadata

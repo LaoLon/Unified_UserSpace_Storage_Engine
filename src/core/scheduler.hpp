@@ -6,7 +6,7 @@
 
 #include "core/operation.hpp"
 
-namespace hfs {
+namespace uuse {
 
 /* Caller-owned intrusive scheduling node; must stay alive until complete().
  * The scheduler links it into an interval tree plus a FIFO pending list. */
@@ -32,7 +32,7 @@ struct SchedulerNode {
     SchedulerNode *fifoNext = nullptr;
 };
 
-/* Single actor-owned inode dependency scheduler (hfs2.0.md §7.2). */
+/* Single actor-owned inode dependency scheduler (uuse.md §7.2). */
 class InodeDependencyScheduler {
 public:
     using AdmitCallback = void (*)(void *ctx, SchedulerNode &node);
@@ -94,4 +94,4 @@ private:
 /* Files are pinned to one data shard: hash(file_id) % reactorCount. */
 std::uint32_t shardForFile(std::uint64_t fileId, std::uint32_t reactorCount) noexcept;
 
-} // namespace hfs
+} // namespace uuse

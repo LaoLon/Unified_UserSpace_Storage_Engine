@@ -7,11 +7,11 @@
 #include <span>
 #include <string>
 
-#include "hfs/config.hpp"
-#include "hfs/export.hpp"
-#include "hfs/types.hpp"
+#include "uuse/config.hpp"
+#include "uuse/export.hpp"
+#include "uuse/types.hpp"
 
-namespace hfs {
+namespace uuse {
 
 using DataIoCompletion = void (*)(void *, int);
 using DataReactorPoller = int (*)(void *) noexcept;
@@ -40,7 +40,7 @@ struct DataIoRequest {
  * io channels). Engine mount/stop switch it between Active and EnvReady
  * without re-initializing DPDK; the env lives until process exit.
  * Shard-69 owns this layer; Shard-70+ add the real superblock mount. */
-class HFS_API SpdkRuntime {
+class UUSE_API SpdkRuntime {
 public:
     static SpdkRuntime &instance() noexcept;
 
@@ -99,7 +99,7 @@ public:
     Result<void> controlFlush(std::size_t index);
 
     /* True when a completed data write is not yet covered by a device flush
-     * (hfs2.0.md 20.3). A successful controlFlush publishes coverage for every
+     * (uuse.md 20.3). A successful controlFlush publishes coverage for every
      * write that completed before it was submitted. */
     bool dataFlushPending() const noexcept;
 
@@ -144,4 +144,4 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-} // namespace hfs
+} // namespace uuse

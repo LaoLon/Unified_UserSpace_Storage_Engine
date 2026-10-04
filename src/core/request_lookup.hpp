@@ -7,7 +7,7 @@
 #include <new>
 #include <utility>
 
-namespace hfs {
+namespace uuse {
 
 /* Fixed-capacity requestId lookup with backward-shift deletion. */
 class RequestLookupTable final {
@@ -152,4 +152,4 @@ private:
     std::size_t capacity_ = 0;
 };
 
-} // namespace hfs
+} // namespace uuse

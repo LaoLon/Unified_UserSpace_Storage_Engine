@@ -1,5 +1,7 @@
 # HFS 2.0 P0-9 剩余小项实施与验收（2026-09-29）
 
+> 注：项目已于 2026-10-04 由 HFS 更名为 UUSE；本文为历史记录，正文与证据路径保留 HFS 时期名称。
+
 > 台账：`doc/review/hfs2_architecture_optimization_review_20260928.md` §3 P0-9、
 > §14.2。本轮完成 ②（`File::read/write` 每次重建 `extentMapFor`）与
 > ③（direct 路径 `isBufferDmaCapable` 双调用）；①（sink/handle intrusive ref）

@@ -3,7 +3,7 @@
 #include <algorithm>
 #include <limits>
 
-namespace hfs::metadata {
+namespace uuse::metadata {
 
 void InodeExtentMap::configure(std::uint64_t extentBytes) noexcept {
     if (extentBytes != 0) {
@@ -176,4 +176,4 @@ Result<std::size_t> InodeExtentMap::lookup(std::uint64_t offset, std::uint64_t l
     return count;
 }
 
-} // namespace hfs::metadata
+} // namespace uuse::metadata

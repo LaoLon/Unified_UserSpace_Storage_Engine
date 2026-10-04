@@ -6,11 +6,11 @@
 #include <span>
 #include <vector>
 
-#include "hfs/types.hpp"
+#include "uuse/types.hpp"
 
-namespace hfs::metadata {
+namespace uuse::metadata {
 
-/* Extent lifecycle: FREE -> RESERVED -> INITIALIZED -> COMMITTED (hfs2.0.md §9.4). */
+/* Extent lifecycle: FREE -> RESERVED -> INITIALIZED -> COMMITTED (uuse.md §9.4). */
 enum class ExtentState : std::uint8_t {
     Free = 0,
     Reserved = 1,
@@ -32,7 +32,7 @@ struct AllocatorConfig {
     std::uint64_t maxReserveExtents = 64;
 };
 
-/* Multi-device placement policy (hfs2.0.md §9.5). */
+/* Multi-device placement policy (uuse.md §9.5). */
 enum class PlacementPolicy : std::uint8_t {
     CapacityWeighted = 0,
     RoundRobin = 1,
@@ -52,7 +52,7 @@ private:
 
 /* Bounded per-device extent allocator: two-level bitmap plus a free-run index
  * with next-fit search and neighbour merging. Bitmap state is only made
- * durable through checkpoint snapshots (hfs2.0.md §9.4). */
+ * durable through checkpoint snapshots (uuse.md §9.4). */
 class Allocator {
 public:
     /* Snapshot framing used by checkpoint snapshots and tests. */
@@ -125,4 +125,4 @@ private:
     std::map<std::uint64_t, std::uint64_t> freeRuns_; /* start -> count */
 };
 
-} // namespace hfs::metadata
+} // namespace uuse::metadata

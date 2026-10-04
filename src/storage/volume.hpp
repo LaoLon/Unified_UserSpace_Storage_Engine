@@ -4,11 +4,11 @@
 #include <cstdint>
 #include <vector>
 
-#include "hfs/config.hpp"
-#include "hfs/superblock.hpp"
-#include "hfs/types.hpp"
+#include "uuse/config.hpp"
+#include "uuse/superblock.hpp"
+#include "uuse/types.hpp"
 
-namespace hfs {
+namespace uuse {
 
 class SpdkRuntime;
 
@@ -31,4 +31,4 @@ Result<VolumeInfo> mountVolume(SpdkRuntime &runtime, const Config &config);
 /* Publish the clean-shutdown state to every configured device. */
 Result<void> updateCleanShutdown(SpdkRuntime &runtime, const Config &config, bool clean);
 
-} // namespace hfs
+} // namespace uuse

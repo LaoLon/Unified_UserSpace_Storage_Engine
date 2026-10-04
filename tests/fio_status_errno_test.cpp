@@ -8,23 +8,23 @@
  * and silently drops a job when open_file returns an error without errno. */
 int main() {
     errno = 0;
-    HFS_TEST_CHECK(hfs::fio::setErrnoFromStatus(hfs::Status::Busy) == EAGAIN);
-    HFS_TEST_CHECK(errno == EAGAIN);
+    UUSE_TEST_CHECK(uuse::fio::setErrnoFromStatus(uuse::Status::Busy) == EAGAIN);
+    UUSE_TEST_CHECK(errno == EAGAIN);
 
     errno = 0;
-    HFS_TEST_CHECK(hfs::fio::setErrnoFromStatus(hfs::Status::NoMemory) == ENOMEM);
-    HFS_TEST_CHECK(errno == ENOMEM);
+    UUSE_TEST_CHECK(uuse::fio::setErrnoFromStatus(uuse::Status::NoMemory) == ENOMEM);
+    UUSE_TEST_CHECK(errno == ENOMEM);
 
-    HFS_TEST_CHECK(hfs::fio::mapStatusToErrno(hfs::Status::TryAgain) == EAGAIN);
-    HFS_TEST_CHECK(hfs::fio::mapStatusToErrno(hfs::Status::NoSpace) == ENOSPC);
-    HFS_TEST_CHECK(hfs::fio::mapStatusToErrno(hfs::Status::NotFound) == ENOENT);
-    HFS_TEST_CHECK(hfs::fio::mapStatusToErrno(hfs::Status::AlreadyExists) == EEXIST);
-    HFS_TEST_CHECK(hfs::fio::mapStatusToErrno(hfs::Status::InvalidArgument) == EINVAL);
-    HFS_TEST_CHECK(hfs::fio::mapStatusToErrno(hfs::Status::NotSupported) == ENOTSUP);
-    HFS_TEST_CHECK(hfs::fio::mapStatusToErrno(hfs::Status::Cancelled) == ECANCELED);
-    HFS_TEST_CHECK(hfs::fio::mapStatusToErrno(hfs::Status::TimedOut) == ETIMEDOUT);
-    HFS_TEST_CHECK(hfs::fio::mapStatusToErrno(hfs::Status::IoError) == EIO);
-    HFS_TEST_CHECK(hfs::fio::mapStatusToErrno(hfs::Status::Corrupt) == EIO);
+    UUSE_TEST_CHECK(uuse::fio::mapStatusToErrno(uuse::Status::TryAgain) == EAGAIN);
+    UUSE_TEST_CHECK(uuse::fio::mapStatusToErrno(uuse::Status::NoSpace) == ENOSPC);
+    UUSE_TEST_CHECK(uuse::fio::mapStatusToErrno(uuse::Status::NotFound) == ENOENT);
+    UUSE_TEST_CHECK(uuse::fio::mapStatusToErrno(uuse::Status::AlreadyExists) == EEXIST);
+    UUSE_TEST_CHECK(uuse::fio::mapStatusToErrno(uuse::Status::InvalidArgument) == EINVAL);
+    UUSE_TEST_CHECK(uuse::fio::mapStatusToErrno(uuse::Status::NotSupported) == ENOTSUP);
+    UUSE_TEST_CHECK(uuse::fio::mapStatusToErrno(uuse::Status::Cancelled) == ECANCELED);
+    UUSE_TEST_CHECK(uuse::fio::mapStatusToErrno(uuse::Status::TimedOut) == ETIMEDOUT);
+    UUSE_TEST_CHECK(uuse::fio::mapStatusToErrno(uuse::Status::IoError) == EIO);
+    UUSE_TEST_CHECK(uuse::fio::mapStatusToErrno(uuse::Status::Corrupt) == EIO);
 
     std::printf("fio_status_errno_test: ok\n");
     return 0;

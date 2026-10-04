@@ -1,4 +1,4 @@
-#include "hfs/journal.hpp"
+#include "uuse/journal.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -14,12 +14,12 @@
 #include "common/stats.hpp"
 #include "common/test_hooks.hpp"
 #include "common/trace.hpp"
-#include "hfs/core.hpp"
-#include "hfs/crc.hpp"
-#include "hfs/superblock.hpp"
+#include "uuse/core.hpp"
+#include "uuse/crc.hpp"
+#include "uuse/superblock.hpp"
 #include "runtime/spdk_runtime.hpp"
 
-namespace hfs {
+namespace uuse {
 
 namespace {
 
@@ -31,9 +31,9 @@ std::uint64_t elapsedNs(std::chrono::steady_clock::time_point start) noexcept {
             .count());
 }
 
-constexpr std::uint64_t kJournalSlotMagic = 0x484653324a524e4cULL; /* "HFS2JRNL" */
+constexpr std::uint64_t kJournalSlotMagic = 0x555553454a524e4cULL; /* "UUSEJRNL" */
 constexpr std::uint32_t kJournalFormatVersion = 1;
-constexpr std::uint64_t kCheckpointMagic = 0x4846533243505431ULL; /* "HFS2CPT1" */
+constexpr std::uint64_t kCheckpointMagic = 0x5555534543505431ULL; /* "UUSECPT1" */
 constexpr std::uint32_t kCheckpointFormatVersion = 2;
 /* v1 checkpoint slots have no kind field and are always full snapshots. */
 constexpr std::uint32_t kCheckpointVersionFullOnly = 1;
@@ -99,7 +99,7 @@ std::uint64_t bytesToBlocks(std::uint64_t bytes, std::uint64_t blockSize) {
 /* Test-only checkpoint barrier fault; production behavior is unchanged unless
  * the caller explicitly requests this environment-variable injection. */
 bool testCheckpointFlushFailureRequested() {
-    const char *value = std::getenv("HFS_TEST_FAIL_CHECKPOINT_FLUSH");
+    const char *value = std::getenv("UUSE_TEST_FAIL_CHECKPOINT_FLUSH");
     return value != nullptr && std::string(value) == "1";
 }
 
@@ -148,7 +148,7 @@ struct Journal::Impl {
     std::uint32_t forcePercent = 80;
     std::uint32_t blockSize = 0;
 
-    Hfs2Superblock superblock{};
+    UuseSuperblock superblock{};
     std::uint32_t sbSlot = 0; /* slot holding the newest superblock */
     bool sbValid = false;
 
@@ -293,8 +293,8 @@ struct Journal::Impl {
 
     Result<void> readSuperblocks() {
         std::vector<std::byte> record(kSuperblockRecordSize);
-        Hfs2Superblock slotA{};
-        Hfs2Superblock slotB{};
+        UuseSuperblock slotA{};
+        UuseSuperblock slotB{};
         auto readA = readBlock(0, record);
         if (!readA.ok()) {
             return readA;
@@ -310,7 +310,7 @@ struct Journal::Impl {
         const bool validA = superblockValid(slotA);
         const bool validB = superblockValid(slotB);
         if (!validA && !validB) {
-            return makeError(Status::NotFound, "no valid HFS 2.0 superblock on device");
+            return makeError(Status::NotFound, "no valid UUSE 2.0 superblock on device");
         }
         if (validA && validB && slotB.generation > slotA.generation) {
             superblock = slotB;
@@ -615,7 +615,7 @@ Result<std::unique_ptr<Journal>> Journal::create(std::unique_ptr<JournalDevice> 
 
     /* Newest valid checkpoint wins; its sequence resumes the ring scan. A
      * delta record resolves to the full base it points at, and the journal
-     * replay then starts from the base txid (hfs2.0.md §10.4 b). */
+     * replay then starts from the base txid (uuse.md §10.4 b). */
     std::vector<std::byte> payloadA;
     std::vector<std::byte> payloadB;
     std::uint64_t sequenceA = 0;
@@ -852,8 +852,8 @@ public:
                        std::span<const std::byte> buffer) override {
         for (auto &entry : devices_) {
             std::vector<std::byte> replica(buffer.begin(), buffer.end());
-            if (isSuperblock(offsetBlocks) && replica.size() >= sizeof(Hfs2Superblock)) {
-                Hfs2Superblock superblock{};
+            if (isSuperblock(offsetBlocks) && replica.size() >= sizeof(UuseSuperblock)) {
+                UuseSuperblock superblock{};
                 std::memcpy(&superblock, replica.data(), sizeof(superblock));
                 const DeviceGeometry &geometry = geometries_[entry.first];
                 superblock.deviceId = static_cast<std::uint32_t>(entry.first);
@@ -887,8 +887,8 @@ public:
                 replicas.emplace_back(range.buffer.begin(), range.buffer.end());
                 std::vector<std::byte> &replica = replicas.back();
                 if (isSuperblock(range.offsetBlocks) &&
-                    replica.size() >= sizeof(Hfs2Superblock)) {
-                    Hfs2Superblock superblock{};
+                    replica.size() >= sizeof(UuseSuperblock)) {
+                    UuseSuperblock superblock{};
                     std::memcpy(&superblock, replica.data(), sizeof(superblock));
                     const DeviceGeometry &geometry = geometries_[entry.first];
                     superblock.deviceId = static_cast<std::uint32_t>(entry.first);
@@ -1289,7 +1289,7 @@ Result<void> Journal::checkpointLocked(bool deferFlush, bool forceFullBase) {
     }
     const std::uint64_t checkpointTxid = impl.lastTxid;
     trace::event(trace::EventId::ChkptBegin, checkpointTxid, impl.head - impl.tail);
-    /* Journal-backed delta (hfs2.0.md §10.4 b): a delta only points at the
+    /* Journal-backed delta (uuse.md §10.4 b): a delta only points at the
      * current full base; the journal keeps (base, head] for recovery. A full
      * base is written when none exists, when the replay window grows past
      * force_percent of the ring, or when the ring is about to fill (append
@@ -1376,7 +1376,7 @@ bool Journal::needsCheckpoint() const {
         return false;
     }
     /* Journal-backed deltas do not advance tail, so the trigger counts appends
-     * since the last checkpoint instead of tail occupancy (hfs2.0.md §10.4).
+     * since the last checkpoint instead of tail occupancy (uuse.md §10.4).
      * Deltas are O(1) records, so the cadence is half the configured trigger:
      * a full base is still bounded by force_percent of the ring. */
     const std::uint64_t appended = impl.head - impl.lastCheckpointSequence;
@@ -1408,4 +1408,4 @@ Journal::Stats Journal::stats() const {
     return impl_->statsCache;
 }
 
-} // namespace hfs
+} // namespace uuse

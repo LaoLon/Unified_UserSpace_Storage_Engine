@@ -3,7 +3,7 @@
 #include <cstdio>
 #include <string>
 
-#define HFS_TEST_CHECK(condition)                                                        \
+#define UUSE_TEST_CHECK(condition)                                                        \
     do {                                                                                 \
         if (!(condition)) {                                                              \
             std::fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #condition);    \
@@ -12,15 +12,15 @@
     } while (0)
 
 /* Device tests use the configured BDF; structure tests do not access a device. */
-#ifndef HFS_TEST_PCI_BDF
-#define HFS_TEST_PCI_BDF ""
+#ifndef UUSE_TEST_PCI_BDF
+#define UUSE_TEST_PCI_BDF ""
 #endif
 
 /* A schema-complete single-device config; lockPath keeps tests isolated. */
 inline std::string validConfigText(const std::string &lockPath,
-                                   const std::string &instance = "hfs2-test",
+                                   const std::string &instance = "uuse-test",
                                    unsigned int dmaArenaMb = 32) {
-    return "[hfs]\n"
+    return "[uuse]\n"
            "schema_version = 1\n"
            "instance_name = " + instance + "\n"
            "volume_uuid = auto\n"
@@ -46,7 +46,7 @@ inline std::string validConfigText(const std::string &lockPath,
            "\n"
            "[device.nvme0]\n"
            "bdev_name = Nvme0n1\n"
-           "pci_bdf = " HFS_TEST_PCI_BDF "\n"
+           "pci_bdf = " UUSE_TEST_PCI_BDF "\n"
            "role = metadata,data\n"
            "weight = 1\n"
            "required = true\n"
@@ -76,7 +76,7 @@ inline std::string validConfigText(const std::string &lockPath,
            "[observability]\n"
            "trace = false\n"
            "trace_sample = 1\n"
-           "trace_dir = /mnt/hfs-data\n"
+           "trace_dir = /mnt/uuse-data\n"
            "stats = false\n";
 }
 

@@ -1,0 +1,29 @@
+diff --git a/storage/innobase/os/uuse_vfs.cc b/storage/innobase/os/uuse_vfs.cc
+--- a/storage/innobase/os/uuse_vfs.cc
++++ b/storage/innobase/os/uuse_vfs.cc
+@@ -18,6 +18,7 @@
+ 
+ #include "uuse/config.hpp"
+ #include "uuse/core.hpp"
++#include "uuse/diagnostics.hpp"
+ #include "uuse/file.hpp"
+ #include "my_thread.h"
+ 
+@@ -493,6 +494,17 @@
+     bridge.handles.clear();
+     bridge.freeHandles.clear();
+   }
++  /* Report SPDK data I/O before the engine releases its counters. */
++  if (uuse::diagnostics::profilingEnabled()) {
++    const auto io = uuse::diagnostics::snapshot();
++    std::fprintf(stderr,
++                 "uuse_vfs: device_io read_ops=%llu read_bytes=%llu "
++                 "write_ops=%llu write_bytes=%llu\n",
++                 static_cast<unsigned long long>(io.bdevDataReadOps),
++                 static_cast<unsigned long long>(io.bdevDataReadBytes),
++                 static_cast<unsigned long long>(io.bdevDataWriteOps),
++                 static_cast<unsigned long long>(io.bdevDataWriteBytes));
++  }
+   auto stopped = bridge.engine->stop().wait().value();
+   if (!stopped.ok()) {
+     std::fprintf(stderr, "uuse_vfs: engine stop failed: %s\n",

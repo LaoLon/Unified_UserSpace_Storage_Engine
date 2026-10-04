@@ -12,7 +12,7 @@
 #include <unistd.h>
 #endif
 
-namespace hfs::fio {
+namespace uuse::fio {
 
 void FioCompletionHub::Endpoint::reset() noexcept {
     std::atomic_ref<std::uint32_t>(epoch_).store(0, std::memory_order_relaxed);
@@ -156,4 +156,4 @@ void FioCompletionHub::wakeCallback(void *context) noexcept {
     }
 }
 
-} // namespace hfs::fio
+} // namespace uuse::fio

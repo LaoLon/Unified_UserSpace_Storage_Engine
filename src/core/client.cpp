@@ -1,4 +1,4 @@
-#include "hfs/core.hpp"
+#include "uuse/core.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -16,15 +16,15 @@
 #include "core/async_data_service.hpp"
 #include "core/data_plane.hpp"
 #include "core/request_lookup.hpp"
-#include "hfs/diagnostics.hpp"
+#include "uuse/diagnostics.hpp"
 #include "metadata/inode_map.hpp"
 #include "metadata/namespace.hpp"
 
-namespace hfs {
+namespace uuse {
 
 /* Counts as a metadata user for as long as a client (or any of its open
  * files) is alive, so Engine::stop() cannot tear down the namespace below
- * live handles (hfs2.0.md §14.3). */
+ * live handles (uuse.md §14.3). */
 struct MetadataLease {
     Engine *engine = nullptr;
 
@@ -1119,7 +1119,7 @@ Task<Result<WriteResult>> File::write(std::span<const IoVec> buffers, std::uint6
     }
 
     /* Allocate missing extents, zero-initialize them, then commit. Extents are
-     * invisible until COMMITTED (hfs2.0.md §9.4). */
+     * invisible until COMMITTED (uuse.md §9.4). */
     auto reservations = state.namespaceState->reserveExtents(impl_->handle, offset, total);
     if (!reservations.ok()) {
         co_return makeError<WriteResult>(reservations.status(), reservations.message());
@@ -1294,4 +1294,4 @@ Task<Result<void>> File::sync() {
         impl_->state->namespaceState->logicalEpoch());
 }
 
-} // namespace hfs
+} // namespace uuse

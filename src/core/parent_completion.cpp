@@ -2,7 +2,7 @@
 
 #include "common/trace.hpp"
 
-namespace hfs {
+namespace uuse {
 
 void ParentCompletion::init(std::uint32_t childCount, DoneCallback callback,
                             void *ctx) noexcept {
@@ -47,4 +47,4 @@ std::uint32_t ParentCompletion::pending() const noexcept {
     return pending_.load(std::memory_order_acquire);
 }
 
-} // namespace hfs
+} // namespace uuse

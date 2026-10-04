@@ -3,9 +3,9 @@
 #include <cstdint>
 #include <cstddef>
 
-namespace hfs::trace {
+namespace uuse::trace {
 
-/* Tracepoint ids; ids are stable and only appended, per hfs2.0.md §16.5. */
+/* Tracepoint ids; ids are stable and only appended, per uuse.md §16.5. */
 enum class EventId : std::uint16_t {
     FeSubmit = 1,
     FeReap,
@@ -109,4 +109,4 @@ void event(EventId id, std::uint64_t a0 = 0, std::uint64_t a1 = 0,
 std::uint64_t recorded() noexcept;
 std::uint64_t dropped() noexcept;
 
-} // namespace hfs::trace
+} // namespace uuse::trace

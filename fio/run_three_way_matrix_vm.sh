@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# Benchmark ext4/libaio, raw SPDK, and HFS on one verified NVMe controller.
+# Benchmark ext4/libaio, raw SPDK, and UUSE on one verified NVMe controller.
 set -euo pipefail
 
-FIO="${FIO:-/home/hfs/fio/fio}"
-CONFIG="${CONFIG:-/root/code/config/hfs_nvme.conf}"
-HFSCTL="${HFSCTL:-/root/code/build-verify/hfsctl}"
-HFS_PLUGIN="${HFS_PLUGIN:-/root/code/build-verify/fio-hfs.so}"
-HFS_LIB_DIR="${HFS_LIB_DIR:-/root/code/build-verify}"
+FIO="${FIO:-/home/uuse/fio/fio}"
+CONFIG="${CONFIG:-/root/code/config/uuse_nvme.conf}"
+UUSECTL="${UUSECTL:-/root/code/build-verify/uusectl}"
+UUSE_PLUGIN="${UUSE_PLUGIN:-/root/code/build-verify/fio-uuse.so}"
+UUSE_LIB_DIR="${UUSE_LIB_DIR:-/root/code/build-verify}"
 RAW_PLUGIN="${RAW_PLUGIN:-/root/code/spdk/build/fio/spdk_bdev}"
-RESULT="${RESULT:-/home/hfs/fio-three-way-20260925}"
-MOUNT="${MOUNT:-/mnt/hfs-fio-ext4}"
+RESULT="${RESULT:-/home/uuse/fio-three-way-20260925}"
+MOUNT="${MOUNT:-/mnt/uuse-fio-ext4}"
 EXPECTED_SERIAL="${EXPECTED_SERIAL:-VMware NVME_0002}"
 RUNS="${RUNS:-3}"
 RUNTIME_SECONDS="${RUNTIME_SECONDS:-10}"
@@ -19,8 +19,8 @@ DEVICE=""
 STAGE="preflight"
 
 test -n "$BDF" && test -d "/sys/bus/pci/devices/$BDF"
-test -x "$FIO" && test -x "$HFSCTL"
-test -f "$HFS_PLUGIN" && test -f "$RAW_PLUGIN"
+test -x "$FIO" && test -x "$UUSECTL"
+test -f "$UUSE_PLUGIN" && test -f "$RAW_PLUGIN"
 test "$(awk '/^HugePages_Total:/ {print $2}' /proc/meminfo)" -ge 1024
 test "$(nproc)" -ge 6
 test "$RUNS" -ge 1 && test "$RUNTIME_SECONDS" -ge 1
@@ -89,7 +89,7 @@ test "${ALLOW_FORMAT:-0}" == 1 || {
   printf 'set ALLOW_FORMAT=1 to overwrite the verified test NVMe\n' >&2
   exit 2
 }
-if [[ "${RESUME_SPDK_HFS:-0}" == 1 || "${RECHECK_EXT4:-0}" == 1 ]]; then
+if [[ "${RESUME_SPDK_UUSE:-0}" == 1 || "${RECHECK_EXT4:-0}" == 1 ]]; then
   test -d "$RESULT"
   for bs in 4k 16k 64k; do
     for qd in 32 64; do
@@ -113,8 +113,8 @@ mkdir -p "$RESULT" "$MOUNT"
     "$(awk '/^HugePages_Total:/ {print $2}' /proc/meminfo)"
   "$FIO" --version
   git -C /root/code/spdk rev-parse HEAD
-  sha256sum "$CONFIG" "$HFS_PLUGIN" "$RAW_PLUGIN"
-  df -h /home/hfs
+  sha256sum "$CONFIG" "$UUSE_PLUGIN" "$RAW_PLUGIN"
+  df -h /home/uuse
 } > "$RESULT/environment.txt"
 
 # Fail immediately if fio reports an engine error or no mixed I/O.
@@ -161,7 +161,7 @@ if [[ "${RECHECK_EXT4:-0}" == 1 ]]; then
   exit 0
 fi
 
-if [[ "${RESUME_SPDK_HFS:-0}" != 1 ]]; then
+if [[ "${RESUME_SPDK_UUSE:-0}" != 1 ]]; then
   STAGE="ext4"
   mkfs.ext4 -F "$DEVICE" > "$RESULT/ext4-format.log" 2>&1
   mount -t ext4 -o noatime "$DEVICE" "$MOUNT"
@@ -186,9 +186,9 @@ bind_driver uio_pci_generic
 /root/code/spdk/scripts/gen_nvme.sh --json-with-subsystems > "$RESULT/spdk-nvme.json"
 grep -q "$BDF" "$RESULT/spdk-nvme.json"
 
-# Pair raw and HFS measurements at the same total outstanding request count.
-# HFS uses one 32-deep queue and adds a second queue only above QD32.
-STAGE="spdk-hfs"
+# Pair raw and UUSE measurements at the same total outstanding request count.
+# UUSE uses one 32-deep queue and adds a second queue only above QD32.
+STAGE="spdk-uuse"
 for bs in 4k 16k 64k; do
   for qd in 32 64; do
     if (( qd <= 32 )); then
@@ -222,12 +222,12 @@ PY
         > "$prefix.json" 2> "$prefix.stderr"
       check_result "$prefix.json"
 
-      prefix="$RESULT/hfs-${bs}-q${qd}-r${rep}"
-      "$HFSCTL" --config="$CONFIG" format --yes \
+      prefix="$RESULT/uuse-${bs}-q${qd}-r${rep}"
+      "$UUSECTL" --config="$CONFIG" format --yes \
         > "$prefix.format.log" 2>&1
-      LD_LIBRARY_PATH="$HFS_LIB_DIR" taskset -c 0-5 "$FIO" \
-        --name=hfs-prep --ioengine="external:$HFS_PLUGIN" --thread=1 \
-        --hfs_config="$CONFIG" --hfs_async=1 --hfs_client_depth=32 \
+      LD_LIBRARY_PATH="$UUSE_LIB_DIR" taskset -c 0-5 "$FIO" \
+        --name=uuse-prep --ioengine="external:$UUSE_PLUGIN" --thread=1 \
+        --uuse_config="$CONFIG" --uuse_async=1 --uuse_client_depth=32 \
         --filename=/fio-matrix --rw=write --bs=64k --size="$SIZE" \
         --direct=1 --iodepth=4 --numjobs=1 --output-format=json \
         > "$prefix.prep.json" 2> "$prefix.prep.stderr"
@@ -237,16 +237,16 @@ import sys
 with open(sys.argv[1], encoding="utf-8") as handle:
     assert all(job["error"] == 0 for job in json.load(handle)["jobs"])
 PY
-      LD_LIBRARY_PATH="$HFS_LIB_DIR" taskset -c 0-5 "$FIO" \
-        --name=hfs --ioengine="external:$HFS_PLUGIN" --thread=1 \
-        --hfs_config="$CONFIG" --hfs_async=1 --hfs_client_depth=32 \
+      LD_LIBRARY_PATH="$UUSE_LIB_DIR" taskset -c 0-5 "$FIO" \
+        --name=uuse --ioengine="external:$UUSE_PLUGIN" --thread=1 \
+        --uuse_config="$CONFIG" --uuse_async=1 --uuse_client_depth=32 \
         --filename=/fio-matrix --bs="$bs" --size="$SIZE" \
         --rw=randrw --rwmixread=50 --direct=1 --iodepth="$per_job" \
         --numjobs="$num_jobs" --group_reporting=1 --time_based=1 --runtime="$RUNTIME_SECONDS" \
         --output-format=json > "$prefix.json" 2> "$prefix.stderr"
       check_result "$prefix.json"
-      grep -q 'fio-hfs closure:' "$prefix.stderr"
-      printf 'raw+hfs %s q%s rep%s complete\n' "$bs" "$qd" "$rep"
+      grep -q 'fio-uuse closure:' "$prefix.stderr"
+      printf 'raw+uuse %s q%s rep%s complete\n' "$bs" "$qd" "$rep"
     done
   done
 done

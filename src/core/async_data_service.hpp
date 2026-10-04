@@ -7,9 +7,9 @@
 
 #include "core/io_planner.hpp"
 #include "core/operation.hpp"
-#include "hfs/types.hpp"
+#include "uuse/types.hpp"
 
-namespace hfs {
+namespace uuse {
 
 class DmaArena;
 class ExtentMap;
@@ -182,4 +182,4 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-} // namespace hfs
+} // namespace uuse

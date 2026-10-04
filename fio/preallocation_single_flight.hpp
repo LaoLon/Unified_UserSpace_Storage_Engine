@@ -4,11 +4,11 @@
 #include <cstdint>
 #include <memory>
 
-#include "hfs/file.hpp"
+#include "uuse/file.hpp"
 
-namespace hfs::fio {
+namespace uuse::fio {
 
-using FileHandle = ::hfs::FileHandle;
+using FileHandle = ::uuse::FileHandle;
 
 /* The bounded identity of one shared-file preallocation request. */
 struct PreallocationKey {
@@ -119,4 +119,4 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-} // namespace hfs::fio
+} // namespace uuse::fio

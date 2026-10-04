@@ -4,9 +4,9 @@
 #include <string>
 #include <vector>
 
-#include "hfs/config.hpp"
+#include "uuse/config.hpp"
 
-namespace hfs {
+namespace uuse {
 
 /* NUMA placement observed for one configured PCI device. */
 struct NumaDevicePlacement {
@@ -40,4 +40,4 @@ Result<std::vector<std::uint32_t>> parseNumaIdList(const std::string &text);
 NumaTopologySnapshot snapshotNumaTopology(const Config &config,
                                           const std::string &sysfsRoot = "/sys");
 
-} // namespace hfs
+} // namespace uuse

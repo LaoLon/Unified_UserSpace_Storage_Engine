@@ -3,7 +3,7 @@
 #include <atomic>
 #include <cstdint>
 
-namespace hfs::stats {
+namespace uuse::stats {
 
 /* Accumulates one barrier phase duration for durability diagnostics. */
 struct PhaseTimer {
@@ -76,7 +76,7 @@ struct Counters {
     std::atomic<std::uint64_t> snapshotHits{0};
     std::atomic<std::uint64_t> snapshotBuilds{0};
     /* Durability-path diagnostics; used to verify that fsync covers in-place
-     * data writes (hfs2.0.md 20.3). Relaxed counters, safe to leave enabled. */
+     * data writes (uuse.md 20.3). Relaxed counters, safe to leave enabled. */
     std::atomic<std::uint64_t> syncCalls{0};
     std::atomic<std::uint64_t> syncEarlyReturns{0};
     std::atomic<std::uint64_t> syncJoiners{0};
@@ -99,4 +99,4 @@ Counters &counters() noexcept;
 bool enabled() noexcept;
 void setEnabled(bool value) noexcept;
 
-} // namespace hfs::stats
+} // namespace uuse::stats

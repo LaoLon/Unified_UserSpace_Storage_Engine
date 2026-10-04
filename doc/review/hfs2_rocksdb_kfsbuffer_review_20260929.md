@@ -1,5 +1,7 @@
 # HFS 2.0 RocksDB kFSBuffer 读路径设计评审（Shard-111，2026-09-29）
 
+> 注：项目已于 2026-10-04 由 HFS 更名为 UUSE；本文为历史记录，正文与证据路径保留 HFS 时期名称。
+
 > 前置：`doc/review/hfs2_zero_copy_frontend_review_20260929.md` §3.3（P2-1 RocksDB
 > 结论：`memory_allocator` 不覆盖 direct 读，唯一路径是 kFSBuffer）。
 > 结论：**采纳 kFSBuffer + 非 direct 读 + arena `fs_scratch`**；adapter 内实现，

@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# Compare the same MySQL binary on one NVMe: HFS volume vs native ext4 datadir.
+# Compare the same MySQL binary on one NVMe: UUSE volume vs native ext4 datadir.
 # Each phase rebuilds its datadir on the verified target device; per-run logs
 # capture sysbench read/read-write, mysqlslap, durability counters and CPU maps.
 set -euo pipefail
 
-BUILD="${BUILD:-/home/hfs/mysql-build}"
-CONFIG="${CONFIG:-/root/code/config/hfs_mysql.conf}"
-HFSCTL="${HFSCTL:-/root/code/build-verify/hfsctl}"
-RESULT="${RESULT:-/home/hfs/mysql-samedisk-20260926}"
+BUILD="${BUILD:-/home/uuse/mysql-build}"
+CONFIG="${CONFIG:-/root/code/config/uuse_mysql.conf}"
+UUSECTL="${UUSECTL:-/root/code/build-verify/uusectl}"
+RESULT="${RESULT:-/home/uuse/mysql-samedisk-20260926}"
 MOUNT="${MOUNT:-/mnt/mysql-samedisk-ext4}"
-HFS_DATA="${HFS_DATA:-/home/hfs/mysql-samedisk-hfs-datadir}"
+UUSE_DATA="${UUSE_DATA:-/home/uuse/mysql-samedisk-uuse-datadir}"
 EXPECTED_SERIAL="${EXPECTED_SERIAL:-VMware NVME_0002}"
 BIN="$BUILD/runtime_output_directory"
 MYSQLD="$BIN/mysqld"
@@ -23,15 +23,15 @@ BDF="$(awk -F= '/^[[:space:]]*pci_bdf[[:space:]]*=/ {gsub(/[[:space:]]/, "", $2)
 STAGE=preflight
 
 test -n "$BDF" && test -d "/sys/bus/pci/devices/$BDF"
-for executable in "$MYSQLD" "$MYSQL" "$MYSQLADMIN" "$MYSQLSLAP" "$HFSCTL"; do
+for executable in "$MYSQLD" "$MYSQL" "$MYSQLADMIN" "$MYSQLSLAP" "$UUSECTL"; do
   test -x "$executable" || { printf 'missing: %s\n' "$executable" >&2; exit 2; }
 done
 command -v sysbench > /dev/null
 test "$(awk '/^HugePages_Total:/ {print $2}' /proc/meminfo)" -ge 1024
 test "$(nproc)" -ge 6
-test "$(df -PB1 /home/hfs | awk 'NR==2 {print $4}')" -ge 4294967296
+test "$(df -PB1 /home/uuse | awk 'NR==2 {print $4}')" -ge 4294967296
 ! pgrep -x mysqld > /dev/null
-! pgrep -x hfs_db_bench > /dev/null
+! pgrep -x uuse_db_bench > /dev/null
 mkdir -p "$RESULT" "$MOUNT"
 if [[ "${PREFLIGHT_ONLY:-0}" == 1 ]]; then
   printf 'preflight ok: BDF=%s\n' "$BDF"
@@ -40,7 +40,7 @@ fi
 
 export LD_LIBRARY_PATH="/root/code/build-verify:${LD_LIBRARY_PATH:-}"
 
-# Bind only the controller named in the HFS MySQL configuration.
+# Bind only the controller named in the UUSE MySQL configuration.
 bind_driver() {
   local wanted="$1" current override="/sys/bus/pci/devices/$BDF/driver_override"
   current="$(basename "$(readlink -f "/sys/bus/pci/devices/$BDF/driver")")"
@@ -107,9 +107,9 @@ trap cleanup EXIT
 
 start_server() {
   local mode="$1" run="$2" data="$3"
-  if [[ "$mode" == hfs ]]; then
-    data="$HFS_DATA"
-    HFS_MYSQL_CONFIG="$CONFIG" HFS_MYSQL_PREFIX="$HFS_DATA" \
+  if [[ "$mode" == uuse ]]; then
+    data="$UUSE_DATA"
+    UUSE_MYSQL_CONFIG="$CONFIG" UUSE_MYSQL_PREFIX="$UUSE_DATA" \
       "$MYSQLD" --no-defaults --user=root --basedir="$BUILD" --datadir="$data" \
       --socket="$SOCKET" --pid-file="$RESULT/mysqld.pid" \
       --log-error="$RESULT/${run}-mysqld.log" --skip-networking \
@@ -117,7 +117,7 @@ start_server() {
       --innodb-use-native-aio=OFF --disabled-storage-engines=MyISAM \
       > "$RESULT/${run}-mysqld.stdout" 2>&1 &
   else
-    env -u HFS_MYSQL_CONFIG -u HFS_MYSQL_PREFIX \
+    env -u UUSE_MYSQL_CONFIG -u UUSE_MYSQL_PREFIX \
       "$MYSQLD" --no-defaults --user=root --basedir="$BUILD" --datadir="$data" \
       --socket="$SOCKET" --pid-file="$RESULT/mysqld.pid" \
       --log-error="$RESULT/${run}-mysqld.log" --skip-networking \
@@ -140,24 +140,24 @@ start_server() {
 
 sysbench_mysql() {
   sysbench --db-driver=mysql --mysql-user=root --mysql-socket="$SOCKET" \
-    --mysql-db=hfs_perf --tables=1 --table-size=10000 "$@"
+    --mysql-db=uuse_perf --tables=1 --table-size=10000 "$@"
 }
 
 # Run the identical measurement set on the live server of one phase.
 measure() {
   local run="$1"
-  sql -e 'CREATE DATABASE IF NOT EXISTS hfs_perf'
+  sql -e 'CREATE DATABASE IF NOT EXISTS uuse_perf'
   sysbench_mysql oltp_read_write prepare > "$RESULT/${run}-prepare.log" 2>&1
   sql -e "SHOW VARIABLES LIKE 'innodb_flush_log_at_trx_commit';
     SHOW GLOBAL STATUS LIKE 'Innodb_os_log_fsyncs'" \
     > "$RESULT/${run}-durability-before.tsv"
   ps -L -p "$SERVER_PID" -o tid,psr,pcpu,comm > "$RESULT/${run}-cpu-map.tsv"
   "$MYSQLSLAP" --no-defaults --protocol=socket --socket="$SOCKET" -uroot \
-    --create-schema=hfs_perf --query='SELECT k FROM sbtest1 WHERE id=1' \
+    --create-schema=uuse_perf --query='SELECT k FROM sbtest1 WHERE id=1' \
     --concurrency=8 --number-of-queries=10000 --iterations=3 \
     > "$RESULT/${run}-mysqlslap-read.log" 2>&1
   "$MYSQLSLAP" --no-defaults --protocol=socket --socket="$SOCKET" -uroot \
-    --create-schema=hfs_perf \
+    --create-schema=uuse_perf \
     --query='UPDATE sbtest1 SET k=k+1 WHERE id=FLOOR(RAND()*10000)+1' \
     --concurrency=8 --number-of-queries=3000 --iterations=3 \
     > "$RESULT/${run}-mysqlslap-write.log" 2>&1
@@ -172,18 +172,18 @@ measure() {
 {
   date -Is
   printf 'config=%s\n' "$CONFIG"
-  printf 'mount=%s hfs_data=%s\n' "$MOUNT" "$HFS_DATA"
+  printf 'mount=%s uuse_data=%s\n' "$MOUNT" "$UUSE_DATA"
   printf 'cpus=%s hugepages=%s\n' "$(nproc)" \
     "$(awk '/^HugePages_Total:/ {print $2}' /proc/meminfo)"
   free -h
-  df -h /home/hfs
-  sha256sum "$CONFIG" "$MYSQLD" "$HFSCTL"
+  df -h /home/uuse
+  sha256sum "$CONFIG" "$MYSQLD" "$UUSECTL"
   "$MYSQLD" --version
   sysbench --version
 } > "$RESULT/environment.txt"
 
 # Interleave modes so session drift is visible; each phase rebuilds its datadir.
-for run in hfs-1 native-1 hfs-2 native-2; do
+for run in uuse-1 native-1 uuse-2 native-2; do
   mode="${run%-*}"
   if [[ "$mode" == native ]]; then
     STAGE="native-setup-$run"
@@ -193,7 +193,7 @@ for run in hfs-1 native-1 hfs-2 native-2; do
     mount -t ext4 -o noatime "$DEVICE" "$MOUNT"
     native_data="$MOUNT/datadir"
     STAGE="native-init-$run"
-    env -u HFS_MYSQL_CONFIG -u HFS_MYSQL_PREFIX \
+    env -u UUSE_MYSQL_CONFIG -u UUSE_MYSQL_PREFIX \
       "$MYSQLD" --no-defaults --user=root --basedir="$BUILD" \
       --datadir="$native_data" --initialize-insecure \
       --innodb-use-native-aio=OFF --disabled-storage-engines=MyISAM \
@@ -207,25 +207,25 @@ for run in hfs-1 native-1 hfs-2 native-2; do
     du -sh "$native_data" > "$RESULT/${run}-datadir-size.txt"
     umount "$MOUNT"
   else
-    STAGE="hfs-setup-$run"
+    STAGE="uuse-setup-$run"
     bind_driver uio_pci_generic
-    "$HFSCTL" --config="$CONFIG" format --yes > "$RESULT/${run}-hfs-format.log" 2>&1
-    rm -rf "$HFS_DATA"
-    mkdir -p "$HFS_DATA"
-    STAGE="hfs-init-$run"
-    HFS_MYSQL_CONFIG="$CONFIG" HFS_MYSQL_PREFIX="$HFS_DATA" \
-      "$MYSQLD" --no-defaults --user=root --basedir="$BUILD" --datadir="$HFS_DATA" \
+    "$UUSECTL" --config="$CONFIG" format --yes > "$RESULT/${run}-uuse-format.log" 2>&1
+    rm -rf "$UUSE_DATA"
+    mkdir -p "$UUSE_DATA"
+    STAGE="uuse-init-$run"
+    UUSE_MYSQL_CONFIG="$CONFIG" UUSE_MYSQL_PREFIX="$UUSE_DATA" \
+      "$MYSQLD" --no-defaults --user=root --basedir="$BUILD" --datadir="$UUSE_DATA" \
       --initialize-insecure --innodb-use-native-aio=OFF \
       --disabled-storage-engines=MyISAM \
       --log-error="$RESULT/${run}-initialize.log" \
       > "$RESULT/${run}-initialize.stdout" 2>&1
-    STAGE="hfs-run-$run"
-    start_server hfs "$run" "$HFS_DATA"
+    STAGE="uuse-run-$run"
+    start_server uuse "$run" "$UUSE_DATA"
     measure "$run"
     stop_server
-    STAGE="hfs-check-$run"
-    "$HFSCTL" --config="$CONFIG" check > "$RESULT/${run}-hfs-check.log" 2>&1
-    grep -q 'corruption=none' "$RESULT/${run}-hfs-check.log"
+    STAGE="uuse-check-$run"
+    "$UUSECTL" --config="$CONFIG" check > "$RESULT/${run}-uuse-check.log" 2>&1
+    grep -q 'corruption=none' "$RESULT/${run}-uuse-check.log"
   fi
   printf '%s complete\n' "$run"
 done

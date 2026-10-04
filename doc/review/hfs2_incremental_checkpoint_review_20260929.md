@@ -1,5 +1,7 @@
 # HFS 2.0 增量 checkpoint 设计评审（P2-2，2026-09-29）
 
+> 注：项目已于 2026-10-04 由 HFS 更名为 UUSE；本文为历史记录，正文与证据路径保留 HFS 时期名称。
+
 > 台账：`doc/review/hfs2_architecture_optimization_review_20260928.md` §5 P2-2。
 > 结论：分两步实施——**(a) 冻结视图 + 锁外编码**（不改磁盘格式，本轮实施）；
 > **(b) dirty-object 增量 checkpoint**（格式版本 +1，后续 shard）。同时记录

@@ -6,7 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace hfs::fio {
+namespace uuse::fio {
 
 /* Process-wide endpoint registry used by FIO workers without sharing Client slots. */
 class FioCompletionHub final {
@@ -66,4 +66,4 @@ private:
     std::atomic<bool> active_{false};
 };
 
-} // namespace hfs::fio
+} // namespace uuse::fio

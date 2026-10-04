@@ -14,10 +14,10 @@
 #include "common/trace.hpp"
 #include "common/test_hooks.hpp"
 #include "core/parent_completion.hpp"
-#include "hfs/diagnostics.hpp"
+#include "uuse/diagnostics.hpp"
 #include "runtime/spdk_runtime.hpp"
 
-namespace hfs {
+namespace uuse {
 
 namespace {
 
@@ -445,4 +445,4 @@ Result<void> DataPath::execute(const ExtentMap &map, std::span<std::byte> readBu
 
 DataPath::Stats DataPath::stats() const noexcept { return stats_; }
 
-} // namespace hfs
+} // namespace uuse

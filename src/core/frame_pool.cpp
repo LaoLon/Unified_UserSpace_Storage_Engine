@@ -2,9 +2,9 @@
 
 #include <limits>
 
-#include "hfs/task.hpp"
+#include "uuse/task.hpp"
 
-namespace hfs {
+namespace uuse {
 
 namespace {
 
@@ -127,4 +127,4 @@ void deallocateTaskFrame(void *ptr, std::size_t size) noexcept {
 
 } // namespace detail
 
-} // namespace hfs
+} // namespace uuse

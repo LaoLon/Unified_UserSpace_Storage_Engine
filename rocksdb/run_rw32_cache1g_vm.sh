@@ -1,29 +1,29 @@
 #!/usr/bin/env bash
 # Compare 32-worker RocksDB writes and random reads on one verified NVMe,
-# then value-verify every key through the same read path. Includes HFS
-# adapter call-pattern counters (HFS_ROCKSDB_IO_STATS=1) for cross-checks.
+# then value-verify every key through the same read path. Includes UUSE
+# adapter call-pattern counters (UUSE_ROCKSDB_IO_STATS=1) for cross-checks.
 set -euo pipefail
 
-CONFIG="${CONFIG:-/root/code/config/hfs_nvme.conf}"
-BENCH="${BENCH:-/root/code/build-verify/hfs_db_bench}"
-HFSCTL="${HFSCTL:-/root/code/build-verify/hfsctl}"
-RESULT="${RESULT:-/home/hfs/rocksdb-rw32-cache1g-20260925}"
-MOUNT="${MOUNT:-/mnt/hfs-rocksdb-ext4}"
+CONFIG="${CONFIG:-/root/code/config/uuse_nvme.conf}"
+BENCH="${BENCH:-/root/code/build-verify/uuse_db_bench}"
+UUSECTL="${UUSECTL:-/root/code/build-verify/uusectl}"
+RESULT="${RESULT:-/home/uuse/rocksdb-rw32-cache1g-20260925}"
+MOUNT="${MOUNT:-/mnt/uuse-rocksdb-ext4}"
 EXPECTED_SERIAL="${EXPECTED_SERIAL:-VMware NVME_0002}"
 BDF="$(awk -F= '/^[[:space:]]*pci_bdf[[:space:]]*=/ {gsub(/[[:space:]]/, "", $2); print $2; exit}' "$CONFIG")"
 DEVICE=""
 STAGE=preflight
 
 test -n "$BDF" && test -d "/sys/bus/pci/devices/$BDF"
-test -x "$BENCH" && test -x "$HFSCTL"
+test -x "$BENCH" && test -x "$UUSECTL"
 test "$(awk '/^HugePages_Total:/ {print $2}' /proc/meminfo)" -ge 1024
 test "$(nproc)" -ge 6
-test "$(df -PB1 /home/hfs | awk 'NR==2 {print $4}')" -ge 4294967296
-! pgrep -x hfs_db_bench >/dev/null
+test "$(df -PB1 /home/uuse | awk 'NR==2 {print $4}')" -ge 4294967296
+! pgrep -x uuse_db_bench >/dev/null
 ! pgrep -x mysqld >/dev/null
 test ! -e "$RESULT"
 
-# Bind only the controller named in the HFS configuration.
+# Bind only the controller named in the UUSE configuration.
 bind_driver() {
   local wanted="$1" current override="/sys/bus/pci/devices/$BDF/driver_override"
   current="$(basename "$(readlink -f "/sys/bus/pci/devices/$BDF/driver")")"
@@ -91,7 +91,7 @@ mkdir -p "$RESULT" "$MOUNT"
   printf 'cpus=%s hugepages=%s\n' "$(nproc)" "$(awk '/^HugePages_Total:/ {print $2}' /proc/meminfo)"
   grep -m1 'model name' /proc/cpuinfo
   free -h
-  df -h /home/hfs
+  df -h /home/uuse
   git -C /root/code/spdk rev-parse HEAD
   sha256sum "$CONFIG" "$BENCH"
   ldd "$BENCH" | grep rocksdb || true
@@ -105,9 +105,9 @@ run_bench() {
     --worker_cpus=0,1,2,3,4,5 --cache_size=1073741824
     --block_size=4096 --compression=none --use_direct_reads=1
     --use_direct_io_for_flush_and_compaction=1)
-  if [[ "$mode" == hfs ]]; then
-    args+=(--hfs-config="$CONFIG")
-    HFS_ROCKSDB_IO_STATS=1 LD_LIBRARY_PATH=/root/code/build-verify taskset -c 0-5 "$BENCH" "${args[@]}" \
+  if [[ "$mode" == uuse ]]; then
+    args+=(--uuse-config="$CONFIG")
+    UUSE_ROCKSDB_IO_STATS=1 LD_LIBRARY_PATH=/root/code/build-verify taskset -c 0-5 "$BENCH" "${args[@]}" \
       > "$RESULT/$mode.stdout" 2> "$RESULT/$mode.stderr"
   else
     LD_LIBRARY_PATH=/root/code/build-verify taskset -c 0-5 "$BENCH" "${args[@]}" \
@@ -116,8 +116,8 @@ run_bench() {
   grep -q '^fillseq ' "$RESULT/$mode.stdout"
   grep -q '^readrandom r1 ' "$RESULT/$mode.stdout"
   ! grep -Eiq '(^|[[:space:]])(error|failed|corruption)(:|[[:space:]])' "$RESULT/$mode.stderr"
-  if [[ "$mode" == hfs ]]; then
-    grep -q 'hfs-rocksdb io stats:' "$RESULT/$mode.stderr"
+  if [[ "$mode" == uuse ]]; then
+    grep -q 'uuse-rocksdb io stats:' "$RESULT/$mode.stderr"
   fi
   printf '%s complete\n' "$mode"
 }
@@ -131,9 +131,9 @@ verify_bench() {
     --block_size=4096 --compression=none --use_direct_reads=1
     --use_direct_io_for_flush_and_compaction=1)
   local status=0
-  if [[ "$mode" == hfs ]]; then
-    args+=(--hfs-config="$CONFIG")
-    HFS_ROCKSDB_IO_STATS=1 LD_LIBRARY_PATH=/root/code/build-verify taskset -c 0-5 "$BENCH" "${args[@]}" \
+  if [[ "$mode" == uuse ]]; then
+    args+=(--uuse-config="$CONFIG")
+    UUSE_ROCKSDB_IO_STATS=1 LD_LIBRARY_PATH=/root/code/build-verify taskset -c 0-5 "$BENCH" "${args[@]}" \
       > "$RESULT/$mode-verify.stdout" 2> "$RESULT/$mode-verify.stderr" || status=$?
   else
     LD_LIBRARY_PATH=/root/code/build-verify taskset -c 0-5 "$BENCH" "${args[@]}" \
@@ -142,8 +142,8 @@ verify_bench() {
   test "$status" -eq 0
   grep -q '^overwrite ' "$RESULT/$mode-verify.stdout"
   ! grep -Eiq 'verification failed|Put failed|Get failed' "$RESULT/$mode-verify.stderr"
-  if [[ "$mode" == hfs ]]; then
-    grep -q 'hfs-rocksdb io stats:' "$RESULT/$mode-verify.stderr"
+  if [[ "$mode" == uuse ]]; then
+    grep -q 'uuse-rocksdb io stats:' "$RESULT/$mode-verify.stderr"
   fi
   printf '%s overwrite verification complete\n' "$mode"
 }
@@ -157,10 +157,10 @@ du -sh "$MOUNT/db" > "$RESULT/native-size.txt"
 verify_bench native "$MOUNT/db"
 umount "$MOUNT"
 
-STAGE=hfs
+STAGE=uuse
 bind_driver uio_pci_generic
-"$HFSCTL" --config="$CONFIG" format --yes > "$RESULT/hfs-format.log" 2>&1
-run_bench hfs /rocksdb-rw32-cache1g
-verify_bench hfs /rocksdb-rw32-cache1g
-"$HFSCTL" --config="$CONFIG" check > "$RESULT/hfs-check.log" 2>&1
+"$UUSECTL" --config="$CONFIG" format --yes > "$RESULT/uuse-format.log" 2>&1
+run_bench uuse /rocksdb-rw32-cache1g
+verify_bench uuse /rocksdb-rw32-cache1g
+"$UUSECTL" --config="$CONFIG" check > "$RESULT/uuse-check.log" 2>&1
 STAGE=complete

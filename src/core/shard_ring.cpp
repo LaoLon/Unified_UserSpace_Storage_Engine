@@ -6,7 +6,7 @@
 #include "common/trace.hpp"
 #include "core/operation.hpp"
 
-namespace hfs {
+namespace uuse {
 
 std::size_t ShardRing::roundUpPowerOfTwo(std::size_t value) {
     std::size_t result = 1;
@@ -129,4 +129,4 @@ ShardRing::Stats ShardRing::stats() const noexcept {
     return stats;
 }
 
-} // namespace hfs
+} // namespace uuse

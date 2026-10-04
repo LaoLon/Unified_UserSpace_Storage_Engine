@@ -11,7 +11,7 @@
 
 #include "metadata/inode_map.hpp"
 
-namespace hfs::metadata {
+namespace uuse::metadata {
 
 /* Reserved root directory inode id; slot 0 stays unused. */
 constexpr std::uint64_t kRootInodeId = 1;
@@ -28,13 +28,13 @@ struct StringHash {
     }
 };
 
-/* Per-directory name index: hash lookup plus ordered cursor (hfs2.0.md §13.2). */
+/* Per-directory name index: hash lookup plus ordered cursor (uuse.md §13.2). */
 struct DirectoryIndex {
     std::unordered_map<std::string, std::uint64_t, StringHash, std::equal_to<>> byName;
     std::map<std::string, std::uint64_t, std::less<>> ordered;
 };
 
-/* In-memory inode (hfs2.0.md §13.3). */
+/* In-memory inode (uuse.md §13.3). */
 struct Inode {
     std::uint64_t id = 0;
     std::uint32_t generation = 1;
@@ -56,4 +56,4 @@ struct Inode {
     bool orphan() const noexcept { return linkCount == 0 && openCount > 0; }
 };
 
-} // namespace hfs::metadata
+} // namespace uuse::metadata

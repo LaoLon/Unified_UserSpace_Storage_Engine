@@ -1,5 +1,7 @@
 # HFS 2.0 性能 gate 形状修订评审（2026-09-29）
 
+> 注：项目已于 2026-10-04 由 HFS 更名为 UUSE；本文为历史记录，正文与证据路径保留 HFS 时期名称。
+
 > 评审对象：`doc/design/hfs2.0.md` §16.2 的 FIO 主 gate 定义。
 > 触发证据：`doc/performance/hfs2_8j4_shape_attribution_20260929.md`、
 > `doc/performance/hfs2_stage_abcd_regression_20260929.md`。

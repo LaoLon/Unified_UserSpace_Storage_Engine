@@ -1,5 +1,7 @@
 # HFS 2.0 MySQL 前端 zero-copy（Shard-110）实施与验收（2026-09-29）
 
+> 注：项目已于 2026-10-04 由 HFS 更名为 UUSE；本文为历史记录，正文与证据路径保留 HFS 时期名称。
+
 > 设计依据：`doc/design/hfs2.0.md` §20.8、`doc/review/hfs2_zero_copy_frontend_review_20260929.md`。
 > 实现：`mysql/patches/hfs_seam_shard110_zero_copy.patch`（seam `allocDmaBuffer/
 > freeDmaBuffer` + `buf_pool_t::allocate_chunk/deallocate_chunk` 钩子 + `buf_chunk_t`

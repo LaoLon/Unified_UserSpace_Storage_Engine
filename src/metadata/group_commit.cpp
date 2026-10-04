@@ -4,7 +4,7 @@
 
 #include "common/trace.hpp"
 
-namespace hfs::metadata {
+namespace uuse::metadata {
 
 Result<std::uint64_t> GroupCommitCoordinator::enqueue(std::vector<JournalRecord> records,
                                                       std::uint64_t epoch) {
@@ -78,4 +78,4 @@ Result<std::uint64_t> GroupCommitCoordinator::sync(std::uint64_t targetEpoch) {
     return stats_.durableEpoch;
 }
 
-} // namespace hfs::metadata
+} // namespace uuse::metadata

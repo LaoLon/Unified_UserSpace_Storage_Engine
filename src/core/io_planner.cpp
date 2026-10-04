@@ -5,7 +5,7 @@
 
 #include "common/trace.hpp"
 
-namespace hfs {
+namespace uuse {
 
 IoPlanner::IoPlanner(Config config) : config_(config) {}
 
@@ -186,4 +186,4 @@ Result<IoPlanner::Plan> IoPlanner::plan(const ExtentMap &map, std::uint64_t offs
     return plan;
 }
 
-} // namespace hfs
+} // namespace uuse

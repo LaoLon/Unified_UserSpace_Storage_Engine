@@ -5,7 +5,7 @@
 
 #include "common/trace.hpp"
 
-namespace hfs {
+namespace uuse {
 
 namespace {
 
@@ -350,4 +350,4 @@ void BufferLease::reset() noexcept {
     bytes_ = {};
 }
 
-} // namespace hfs
+} // namespace uuse

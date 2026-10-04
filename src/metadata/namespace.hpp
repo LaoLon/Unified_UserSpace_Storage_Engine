@@ -10,20 +10,20 @@
 #include <string_view>
 #include <vector>
 
-#include "hfs/file.hpp"
-#include "hfs/journal.hpp"
-#include "hfs/types.hpp"
+#include "uuse/file.hpp"
+#include "uuse/journal.hpp"
+#include "uuse/types.hpp"
 #include "metadata/allocator.hpp"
 #include "metadata/inode.hpp"
 #include "metadata/inode_map.hpp"
 
-namespace hfs::metadata {
+namespace uuse::metadata {
 
 /* Limits and memory-budget accounting for the in-memory namespace. */
 struct NamespaceConfig {
     std::uint64_t maxInodes = 1'000'000;
     std::uint64_t maxNamespaceBytes = 1ULL << 30;
-    /* Memory charged per inode (hfs2.0.md §13.3 target is <=1 KiB per inode). */
+    /* Memory charged per inode (uuse.md §13.3 target is <=1 KiB per inode). */
     std::uint64_t bytesPerInode = 1024;
     /* Memory charged per visible directory entry (name bytes are extra). */
     std::uint64_t bytesPerDirectoryEntry = 64;
@@ -43,7 +43,7 @@ struct ExtentAllocation {
 };
 
 /* Resident in-memory namespace: inode table, directory indexes and the
- * create/open/remove/rename state machine (hfs2.0.md §13.2/§13.3). Durability
+ * create/open/remove/rename state machine (uuse.md §13.2/§13.3). Durability
  * (journal/checkpoint wiring) lands with the metadata transaction path. */
 class Namespace {
 public:
@@ -133,7 +133,7 @@ public:
     /* Restores durable sizes when the checkpoint transaction fails. */
     void rollbackPreparedDurableEpoch() noexcept;
 
-    /* Metadata journaling (hfs2.0.md §9.3): mutations stage compact records
+    /* Metadata journaling (uuse.md §9.3): mutations stage compact records
      * that the background journal writer appends and the next durable barrier
      * flushes; mutation types without a record force a full checkpoint
      * instead. The barrier and writer run on other threads, so these accessors
@@ -318,4 +318,4 @@ private:
     PlacementPicker picker_;
 };
 
-} // namespace hfs::metadata
+} // namespace uuse::metadata

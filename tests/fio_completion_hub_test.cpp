@@ -8,12 +8,12 @@
 #include "test_support.hpp"
 
 int main() {
-    hfs::fio::FioCompletionHub hub;
-    HFS_TEST_CHECK(hub.initialize());
+    uuse::fio::FioCompletionHub hub;
+    UUSE_TEST_CHECK(hub.initialize());
     auto *endpoint = hub.acquire();
-    HFS_TEST_CHECK(endpoint != nullptr);
+    UUSE_TEST_CHECK(endpoint != nullptr);
     auto *other = hub.acquire();
-    HFS_TEST_CHECK(other != nullptr);
+    UUSE_TEST_CHECK(other != nullptr);
 
     const std::uint32_t first = endpoint->epoch();
     endpoint->prepareWait();
@@ -22,27 +22,27 @@ int main() {
         endpoint->notify();
         endpoint->notify();
     });
-    HFS_TEST_CHECK(endpoint->waitSince(first, std::chrono::milliseconds(250)));
+    UUSE_TEST_CHECK(endpoint->waitSince(first, std::chrono::milliseconds(250)));
     producer.join();
-    HFS_TEST_CHECK(endpoint->epoch() != first);
+    UUSE_TEST_CHECK(endpoint->epoch() != first);
     const std::uint32_t otherFirst = other->epoch();
     other->notify();
-    HFS_TEST_CHECK(other->epoch() != otherFirst);
-    HFS_TEST_CHECK(endpoint->epoch() != first);
+    UUSE_TEST_CHECK(other->epoch() != otherFirst);
+    UUSE_TEST_CHECK(endpoint->epoch() != first);
 
     const std::uint32_t second = endpoint->epoch();
     endpoint->prepareWait();
-    HFS_TEST_CHECK(!endpoint->waitSince(second, std::chrono::milliseconds(5)));
+    UUSE_TEST_CHECK(!endpoint->waitSince(second, std::chrono::milliseconds(5)));
 
     endpoint->prepareWait();
-    hfs::fio::FioCompletionHub::wakeCallback(endpoint);
-    HFS_TEST_CHECK(endpoint->epoch() != second);
-    HFS_TEST_CHECK(endpoint->waitSince(second, std::chrono::microseconds(0)));
+    uuse::fio::FioCompletionHub::wakeCallback(endpoint);
+    UUSE_TEST_CHECK(endpoint->epoch() != second);
+    UUSE_TEST_CHECK(endpoint->waitSince(second, std::chrono::microseconds(0)));
 
     /* release() wakes and waits for an active waiter before reuse. */
     {
         auto *busy = hub.acquire();
-        HFS_TEST_CHECK(busy != nullptr);
+        UUSE_TEST_CHECK(busy != nullptr);
         const std::uint32_t observed = busy->epoch();
         busy->prepareWait();
         std::atomic<bool> waiterDone{false};
@@ -53,9 +53,9 @@ int main() {
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
         hub.release(busy);
         waiter.join();
-        HFS_TEST_CHECK(waiterDone.load(std::memory_order_acquire));
+        UUSE_TEST_CHECK(waiterDone.load(std::memory_order_acquire));
         auto *reused = hub.acquire();
-        HFS_TEST_CHECK(reused != nullptr);
+        UUSE_TEST_CHECK(reused != nullptr);
         hub.release(reused);
     }
 

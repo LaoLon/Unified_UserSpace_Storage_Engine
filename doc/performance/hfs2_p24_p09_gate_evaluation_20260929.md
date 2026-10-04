@@ -1,5 +1,7 @@
 # HFS 2.0 P2-4 / P0-9① 门禁评估（2026-09-29）
 
+> 注：项目已于 2026-10-04 由 HFS 更名为 UUSE；本文为历史记录，正文与证据路径保留 HFS 时期名称。
+
 ## 1. P2-4 per-shard / per-class arena：门禁未满足
 
 - 门禁定义（台账 §5 P2-4）："profile 证明 central arena 仍是瓶颈才启动"；

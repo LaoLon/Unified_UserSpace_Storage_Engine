@@ -1,5 +1,7 @@
 # HFS 2.0 MySQL/InnoDB 侵入式适配审计（os_file seam）
 
+> 注：项目已于 2026-10-04 由 HFS 更名为 UUSE；本文为历史记录，正文与证据路径保留 HFS 时期名称。
+
 时间：2026-09-24  
 状态：审计完成（未实施；实施前必须先更新 `doc/design/hfs2.0.md` §3.2/§11，见 AGENTS.md）  
 审计对象：MySQL 8.0.46（`mysql-server` 最新 8.0 tag）`storage/innobase`  

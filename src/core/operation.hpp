@@ -5,10 +5,10 @@
 #include <cstddef>
 #include <cstdint>
 
-#include "hfs/async.hpp"
-#include "hfs/types.hpp"
+#include "uuse/async.hpp"
+#include "uuse/types.hpp"
 
-namespace hfs {
+namespace uuse {
 
 class OperationPool;
 
@@ -34,7 +34,7 @@ struct CompletionSink {
 /* Bounded async bookkeeping storage; it does not own frontend or file objects.
  * Per-child state lives in the async data service's RequestState sidecar; only
  * aggregate counters are kept here so the operation remains small and the
- * per-request reset cost stays bounded (hfs2.0.md §5.2). */
+ * per-request reset cost stays bounded (uuse.md §5.2). */
 struct AsyncIoState {
     void *schedulerNode = nullptr;
     void *parent = nullptr;
@@ -196,4 +196,4 @@ private:
     AsyncStorageHook asyncStorage_{};
 };
 
-} // namespace hfs
+} // namespace uuse

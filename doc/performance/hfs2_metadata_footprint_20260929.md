@@ -1,5 +1,7 @@
 # HFS 2.0 metadata footprint 证据（P1-5 子项闭合，2026-09-29）
 
+> 注：项目已于 2026-10-04 由 HFS 更名为 UUSE；本文为历史记录，正文与证据路径保留 HFS 时期名称。
+
 > 设计依据：`hfs2.0.md` §17.1（metadata memory ≤1 KiB/active inode，不含实际
 > name bytes 与 DMA arena）。目的：判断 P1-5 的两个子项（hot/cold split、
 > `kMaxChildren` 4+ 有界溢出块）是否有实现价值。

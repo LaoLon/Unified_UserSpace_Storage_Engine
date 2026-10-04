@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 # Four-engine 4K randrw comparison on one verified NVMe at 64 total
-# outstanding I/Os: ext4+libaio, ext4+io_uring, SPDK raw bdev and HFS.
-# Shape A keeps the previous matrix convention: 1 job x QD64 (HFS 2 x 32).
+# outstanding I/Os: ext4+libaio, ext4+io_uring, SPDK raw bdev and UUSE.
+# Shape A keeps the previous matrix convention: 1 job x QD64 (UUSE 2 x 32).
 # Shape B uses the literal 64 threads x QD1. Three 10 s reps per cell.
 set -uo pipefail
 
-FIO="${FIO:-/home/hfs/fio/fio}"
-CONFIG="${CONFIG:-/root/code/config/hfs_nvme.conf}"
-HFSCTL="${HFSCTL:-/root/code/build-verify/hfsctl}"
-HFS_PLUGIN="${HFS_PLUGIN:-/root/code/build-verify/fio-hfs.so}"
+FIO="${FIO:-/home/uuse/fio/fio}"
+CONFIG="${CONFIG:-/root/code/config/uuse_nvme.conf}"
+UUSECTL="${UUSECTL:-/root/code/build-verify/uusectl}"
+UUSE_PLUGIN="${UUSE_PLUGIN:-/root/code/build-verify/fio-uuse.so}"
 LIB_DIR="${LIB_DIR:-/root/code/build-verify}"
 RAW_PLUGIN="${RAW_PLUGIN:-/root/code/spdk/build/fio/spdk_bdev}"
-RESULT="${RESULT:-/home/hfs/fio-four-engine-20260928}"
+RESULT="${RESULT:-/home/uuse/fio-four-engine-20260928}"
 MOUNT="${MOUNT:-/mnt/fio-four-engine}"
 EXPECTED_SERIAL="${EXPECTED_SERIAL:-VMware NVME_0002}"
 RUNS="${RUNS:-3}"
@@ -24,8 +24,8 @@ STAGE=preflight
 FAILED=0
 
 test -n "$BDF" && test -d "/sys/bus/pci/devices/$BDF"
-test -x "$FIO" && test -x "$HFSCTL"
-test -f "$HFS_PLUGIN" && test -f "$RAW_PLUGIN"
+test -x "$FIO" && test -x "$UUSECTL"
+test -f "$UUSE_PLUGIN" && test -f "$RAW_PLUGIN"
 test "$(awk '/^HugePages_Total:/ {print $2}' /proc/meminfo)" -ge 1024
 test "$(nproc)" -ge 6
 test "$SIZE" == 256m
@@ -94,8 +94,8 @@ mkdir -p "$RESULT" "$MOUNT"
     "$(awk '/^HugePages_Total:/ {print $2}' /proc/meminfo)"
   "$FIO" --version
   git -C /root/code/spdk rev-parse HEAD
-  sha256sum "$CONFIG" "$HFS_PLUGIN" "$RAW_PLUGIN"
-  df -h /home/hfs
+  sha256sum "$CONFIG" "$UUSE_PLUGIN" "$RAW_PLUGIN"
+  df -h /home/uuse
 } > "$RESULT/environment.txt"
 printf 'label\tengine\tshape\trep\trc\n' > "$RESULT/cells.tsv"
 
@@ -122,8 +122,8 @@ run_cell() {
   if [[ "$rc" == 0 ]]; then
     check_result "$prefix.json" || rc=$?
   fi
-  if [[ "$rc" == 0 && "$engine" == hfs ]]; then
-    grep -q 'fio-hfs closure:' "$prefix.stderr" || rc=$?
+  if [[ "$rc" == 0 && "$engine" == uuse ]]; then
+    grep -q 'fio-uuse closure:' "$prefix.stderr" || rc=$?
   fi
   printf '%s\t%s\t%s\t%s\t%s\n' "$label" "$engine" "$shape" "$rep" "$rc" >> "$RESULT/cells.tsv"
   if [[ "$rc" != 0 ]]; then
@@ -203,35 +203,35 @@ for rep in $(seq 1 "$RUNS"); do
     --runtime="$RUNTIME" --output-format=json
 done
 
-# --- HFS external engine ---
-STAGE=hfs
+# --- UUSE external engine ---
+STAGE=uuse
 for rep in $(seq 1 "$RUNS"); do
-  "$HFSCTL" --config="$CONFIG" format --yes > "$RESULT/hfs-r$rep-format.log" 2>&1
-  prefix="$RESULT/hfs-a-r$rep"
+  "$UUSECTL" --config="$CONFIG" format --yes > "$RESULT/uuse-r$rep-format.log" 2>&1
+  prefix="$RESULT/uuse-a-r$rep"
   LD_LIBRARY_PATH="$LIB_DIR" taskset -c 0-5 "$FIO" \
-    --name=hfs-prep --ioengine="external:$HFS_PLUGIN" --thread=1 \
-    --hfs_config="$CONFIG" --hfs_async=1 --hfs_client_depth=32 \
+    --name=uuse-prep --ioengine="external:$UUSE_PLUGIN" --thread=1 \
+    --uuse_config="$CONFIG" --uuse_async=1 --uuse_client_depth=32 \
     --filename=/fio-four-engine --rw=write --bs=64k --size="$SIZE" \
     --direct=1 --iodepth=4 --numjobs=1 --output-format=json \
     > "$prefix.prep.json" 2> "$prefix.prep.stderr"
-  run_cell "hfs-a-r$rep" hfs A "$rep" "$prefix" \
-    env LD_LIBRARY_PATH="$LIB_DIR" "$FIO" --name=hfs-a \
-    --ioengine="external:$HFS_PLUGIN" --thread=1 \
-    --hfs_config="$CONFIG" --hfs_async=1 --hfs_client_depth=32 \
+  run_cell "uuse-a-r$rep" uuse A "$rep" "$prefix" \
+    env LD_LIBRARY_PATH="$LIB_DIR" "$FIO" --name=uuse-a \
+    --ioengine="external:$UUSE_PLUGIN" --thread=1 \
+    --uuse_config="$CONFIG" --uuse_async=1 --uuse_client_depth=32 \
     --filename=/fio-four-engine --bs="$BS" --size="$SIZE" \
     --rw=randrw --rwmixread=50 --direct=1 --iodepth=32 --numjobs=2 \
     --group_reporting=1 --time_based=1 --runtime="$RUNTIME" --output-format=json
-  prefix="$RESULT/hfs-b-r$rep"
-  run_cell "hfs-b-r$rep" hfs B "$rep" "$prefix" \
-    env LD_LIBRARY_PATH="$LIB_DIR" "$FIO" --name=hfs-b \
-    --ioengine="external:$HFS_PLUGIN" --thread=1 \
-    --hfs_config="$CONFIG" --hfs_async=1 --hfs_client_depth=32 \
+  prefix="$RESULT/uuse-b-r$rep"
+  run_cell "uuse-b-r$rep" uuse B "$rep" "$prefix" \
+    env LD_LIBRARY_PATH="$LIB_DIR" "$FIO" --name=uuse-b \
+    --ioengine="external:$UUSE_PLUGIN" --thread=1 \
+    --uuse_config="$CONFIG" --uuse_async=1 --uuse_client_depth=32 \
     --filename=/fio-four-engine --bs="$BS" --size="$SIZE" \
     --rw=randrw --rwmixread=50 --direct=1 --iodepth=1 --numjobs=64 \
     --group_reporting=1 --time_based=1 --runtime="$RUNTIME" --output-format=json
 done
-"$HFSCTL" --config="$CONFIG" check > "$RESULT/hfs-check.log" 2>&1
-grep -q 'corruption=none' "$RESULT/hfs-check.log" || FAILED=1
+"$UUSECTL" --config="$CONFIG" check > "$RESULT/uuse-check.log" 2>&1
+grep -q 'corruption=none' "$RESULT/uuse-check.log" || FAILED=1
 
 STAGE=complete
 exit "$FAILED"

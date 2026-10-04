@@ -1,5 +1,7 @@
 # HFS 2.0 RocksDB db_bench 对照测试（2026-09-19）
 
+> 注：项目已于 2026-10-04 由 HFS 更名为 UUSE；本文为历史记录，正文与证据路径保留 HFS 时期名称。
+
 日期：2026-09-19  
 设备：真实 NVMe BDF `0000:0b:00.0`（30 GiB），同一物理盘两侧分别建 ext4 与 HFS  
 软件：RocksDB 8.9.1（`/usr`），stock `/usr/bin/db_bench` vs `build-repair98/hfs_db_bench`  

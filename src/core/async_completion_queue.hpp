@@ -7,9 +7,9 @@
 #include <memory>
 #include <span>
 
-#include "hfs/async.hpp"
+#include "uuse/async.hpp"
 
-namespace hfs {
+namespace uuse {
 
 /* Nonblocking producer notification used only as a wake hint. */
 class CompletionNotifier {
@@ -195,4 +195,4 @@ private:
 
 using ShardCompletionRing = AsyncCompletionRing;
 
-} // namespace hfs
+} // namespace uuse

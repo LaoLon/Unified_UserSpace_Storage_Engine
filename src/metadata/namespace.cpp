@@ -6,12 +6,12 @@
 #include <limits>
 #include <unordered_set>
 
-namespace hfs::metadata {
+namespace uuse::metadata {
 
 namespace {
 
-constexpr std::uint64_t kNamespaceSnapshotMagic = 0x484653324e535031ULL; /* HFS2NSP1 */
-constexpr std::uint32_t kNamespaceSnapshotVersion = 1;
+constexpr std::uint64_t kNamespaceSnapshotMagic = 0x555553454e535031ULL; /* UUSENSP1 */
+constexpr std::uint32_t kNamespaceSnapshotVersion = 2;
 
 /* Appends fixed-width fields so checkpoint encoding stays architecture-neutral. */
 template <typename T>
@@ -1699,4 +1699,4 @@ Namespace::ExtentPoolStats Namespace::extentPoolStats() const {
     return result;
 }
 
-} // namespace hfs::metadata
+} // namespace uuse::metadata

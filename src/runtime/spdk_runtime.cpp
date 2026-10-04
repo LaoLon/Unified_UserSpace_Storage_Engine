@@ -30,7 +30,7 @@
 #include "common/trace.hpp"
 #include "runtime/numa_topology.hpp"
 
-#ifdef HFS_WITH_SPDK
+#ifdef UUSE_WITH_SPDK
 #include <poll.h>
 #include <spdk/bdev.h>
 #include <spdk/env.h>
@@ -42,11 +42,11 @@
 #include <sys/syscall.h>
 #endif
 
-namespace hfs {
+namespace uuse {
 
 namespace {
 
-/* Automatic data reactor count from hfs2.0.md §6.2. */
+/* Automatic data reactor count from uuse.md §6.2. */
 std::uint32_t reactorCountFor(const Config &config, std::uint32_t cpuCount) {
     std::uint32_t reactors = config.dataReactors;
     if (reactors == 0) {
@@ -66,7 +66,7 @@ std::uint32_t reactorCountFor(const Config &config, std::uint32_t cpuCount) {
 
 } // namespace
 
-#ifdef HFS_WITH_SPDK
+#ifdef UUSE_WITH_SPDK
 
 namespace {
 
@@ -257,9 +257,9 @@ struct ControlIo {
 };
 
 /* Returns whether an explicitly requested test flush fault targets this device.
- * The hook is inert unless the caller sets HFS_TEST_FAIL_FLUSH_DEVICE. */
+ * The hook is inert unless the caller sets UUSE_TEST_FAIL_FLUSH_DEVICE. */
 bool testFlushFailureRequested(std::size_t deviceIndex) {
-    const char *value = std::getenv("HFS_TEST_FAIL_FLUSH_DEVICE");
+    const char *value = std::getenv("UUSE_TEST_FAIL_FLUSH_DEVICE");
     if (value == nullptr || *value == '\0') {
         return false;
     }
@@ -368,7 +368,7 @@ struct SpdkRuntime::Impl {
     std::condition_variable stateChanged;
     Config config;
     std::vector<DeviceState> devices;
-    /* Per-device data durability sequences (hfs2.0.md 10.2/20.3): a write
+    /* Per-device data durability sequences (uuse.md 10.2/20.3): a write
      * completion advances writtenSeq, a device flush publishes coverage. */
     std::vector<std::atomic<std::uint64_t>> dataWrittenSeq;
     std::vector<std::atomic<std::uint64_t>> dataFlushedSeq;
@@ -632,7 +632,7 @@ struct SpdkRuntime::Impl {
     int initEnv() {
         struct spdk_env_opts opts;
         spdk_env_opts_init(&opts);
-        opts.name = "hfs2";
+        opts.name = "uuse";
         opts.opts_size = sizeof(opts);
         /* Keep DPDK's EAL main lcore on the configured metadata CPU. */
         opts.main_core = static_cast<int>(config.metadataCpu);
@@ -814,7 +814,7 @@ struct SpdkRuntime::Impl {
                      static_cast<unsigned long long>(metadata->osTid.load(
                          std::memory_order_relaxed)),
                      config.metadataCpu, sched_getcpu());
-        metadata->spdk = spdk_thread_create("hfs2-meta", nullptr);
+        metadata->spdk = spdk_thread_create("uuse-meta", nullptr);
         if (metadata->spdk == nullptr) {
             publishStartDone(-ENOMEM);
             return;
@@ -1004,7 +1004,7 @@ struct SpdkRuntime::Impl {
                                        : reactor->cpu,
                      sched_getcpu());
 
-        const std::string name = "hfs2-data" + std::to_string(dataIndex - 1);
+        const std::string name = "uuse-data" + std::to_string(dataIndex - 1);
         reactor->spdk = spdk_thread_create(name.c_str(), nullptr);
         if (reactor->spdk == nullptr) {
             reactor->result.store(-ENOMEM, std::memory_order_release);
@@ -1504,7 +1504,7 @@ struct SpdkRuntime::Impl {
         bool terminal = false;
     };
 
-    static constexpr std::uint64_t kDataIoStateMagic = 0x4832465344415441ULL;
+    static constexpr std::uint64_t kDataIoStateMagic = 0x5532465344415441ULL;
     static constexpr unsigned kImmediateRetryLimit = 8;
     static_assert(sizeof(DataIoState) <= DataIoRequest::kStorageBytes,
                   "DataIoRequest storage is too small for the SPDK state");
@@ -2453,7 +2453,7 @@ bool SpdkRuntime::isDmaCapable(const void *buffer, std::size_t bytes) const noex
     return physical != SPDK_VTOPHYS_ERROR && size >= bytes;
 }
 
-#else /* !HFS_WITH_SPDK */
+#else /* !UUSE_WITH_SPDK */
 
 struct SpdkRuntime::Impl {};
 
@@ -2620,6 +2620,6 @@ bool SpdkRuntime::isDmaCapable(const void *buffer, std::size_t bytes) const noex
     return false;
 }
 
-#endif /* HFS_WITH_SPDK */
+#endif /* UUSE_WITH_SPDK */
 
-} // namespace hfs
+} // namespace uuse

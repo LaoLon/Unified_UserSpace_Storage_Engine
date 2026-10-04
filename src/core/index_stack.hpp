@@ -8,7 +8,7 @@
 #include <memory>
 #include <new>
 
-namespace hfs {
+namespace uuse {
 
 /* LIFO stack of pool indices shared by multiple producers and consumers.
  * Indices are never returned to the OS, so links can be stored in a parallel
@@ -91,4 +91,4 @@ private:
     std::uint32_t capacity_ = 0;
 };
 
-} // namespace hfs
+} // namespace uuse

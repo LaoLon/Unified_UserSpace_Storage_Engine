@@ -9,11 +9,11 @@
 
 namespace {
 
-using hfs::fio::PreallocationKey;
-using hfs::fio::PreallocationResult;
-using hfs::fio::PreallocationResultStatus;
-using hfs::fio::PreallocationSingleFlight;
-using hfs::fio::PreallocationState;
+using uuse::fio::PreallocationKey;
+using uuse::fio::PreallocationResult;
+using uuse::fio::PreallocationResultStatus;
+using uuse::fio::PreallocationSingleFlight;
+using uuse::fio::PreallocationState;
 
 /* Keep callback state outside the helper to model a real File::allocate call. */
 struct CallbackContext {
@@ -39,7 +39,7 @@ PreallocationKey makeKey(std::uint64_t engineGeneration, std::uint64_t inodeId,
                          std::uint32_t fileGeneration, std::uint64_t offset,
                          std::uint64_t length) {
     return PreallocationKey{engineGeneration,
-                            hfs::fio::FileHandle{inodeId, fileGeneration}, offset,
+                            uuse::fio::FileHandle{inodeId, fileGeneration}, offset,
                             length};
 }
 
@@ -87,13 +87,13 @@ int main() {
             waiter.join();
         }
 
-        HFS_TEST_CHECK(context.calls.load(std::memory_order_relaxed) == 1);
-        HFS_TEST_CHECK(ownerResult == success);
+        UUSE_TEST_CHECK(context.calls.load(std::memory_order_relaxed) == 1);
+        UUSE_TEST_CHECK(ownerResult == success);
         for (const auto &result : waiterResults) {
-            HFS_TEST_CHECK(result == success);
+            UUSE_TEST_CHECK(result == success);
         }
-        HFS_TEST_CHECK(helper.stateFor(key) == PreallocationState::Ready);
-        HFS_TEST_CHECK(helper.size() == 1);
+        UUSE_TEST_CHECK(helper.stateFor(key) == PreallocationState::Ready);
+        UUSE_TEST_CHECK(helper.size() == 1);
     }
 
     /* A successful callback with incomplete evidence is retained as one failure. */
@@ -104,14 +104,14 @@ int main() {
 
         const PreallocationResult first =
             helper.getOrAllocate(key, ownerCallback, &context);
-        HFS_TEST_CHECK(first.status == PreallocationResultStatus::InvalidOwnerResult);
-        HFS_TEST_CHECK(helper.stateFor(key) == PreallocationState::Failed);
+        UUSE_TEST_CHECK(first.status == PreallocationResultStatus::InvalidOwnerResult);
+        UUSE_TEST_CHECK(helper.stateFor(key) == PreallocationState::Failed);
 
         context.result = success;
         const PreallocationResult second =
             helper.getOrAllocate(key, ownerCallback, &context);
-        HFS_TEST_CHECK(second == first);
-        HFS_TEST_CHECK(context.calls.load(std::memory_order_relaxed) == 1);
+        UUSE_TEST_CHECK(second == first);
+        UUSE_TEST_CHECK(context.calls.load(std::memory_order_relaxed) == 1);
     }
 
     /* Owner failure is broadcast unchanged, including the backend errno. */
@@ -137,11 +137,11 @@ int main() {
         owner.join();
         waiter.join();
 
-        HFS_TEST_CHECK(context.calls.load(std::memory_order_relaxed) == 1);
-        HFS_TEST_CHECK(ownerResult.status == PreallocationResultStatus::OwnerFailed);
-        HFS_TEST_CHECK(ownerResult.backendErrno == ENOSPC);
-        HFS_TEST_CHECK(waiterResult == ownerResult);
-        HFS_TEST_CHECK(helper.stateFor(key) == PreallocationState::Failed);
+        UUSE_TEST_CHECK(context.calls.load(std::memory_order_relaxed) == 1);
+        UUSE_TEST_CHECK(ownerResult.status == PreallocationResultStatus::OwnerFailed);
+        UUSE_TEST_CHECK(ownerResult.backendErrno == ENOSPC);
+        UUSE_TEST_CHECK(waiterResult == ownerResult);
+        UUSE_TEST_CHECK(helper.stateFor(key) == PreallocationState::Failed);
     }
 
     /* Capacity is bounded, and explicit clear permits a later lifecycle owner. */
@@ -151,14 +151,14 @@ int main() {
         context.result = success;
         const PreallocationKey secondKey = makeKey(1, 10, 4, 0, 4096);
 
-        HFS_TEST_CHECK(helper.getOrAllocate(key, ownerCallback, &context).ok());
+        UUSE_TEST_CHECK(helper.getOrAllocate(key, ownerCallback, &context).ok());
         const PreallocationResult full =
             helper.getOrAllocate(secondKey, ownerCallback, &context);
-        HFS_TEST_CHECK(full.status == PreallocationResultStatus::CapacityExhausted);
-        HFS_TEST_CHECK(context.calls.load(std::memory_order_relaxed) == 1);
-        HFS_TEST_CHECK(helper.clear(key));
-        HFS_TEST_CHECK(helper.getOrAllocate(secondKey, ownerCallback, &context).ok());
-        HFS_TEST_CHECK(context.calls.load(std::memory_order_relaxed) == 2);
+        UUSE_TEST_CHECK(full.status == PreallocationResultStatus::CapacityExhausted);
+        UUSE_TEST_CHECK(context.calls.load(std::memory_order_relaxed) == 1);
+        UUSE_TEST_CHECK(helper.clear(key));
+        UUSE_TEST_CHECK(helper.getOrAllocate(secondKey, ownerCallback, &context).ok());
+        UUSE_TEST_CHECK(context.calls.load(std::memory_order_relaxed) == 2);
     }
 
     /* Generation reset removes only stale generations and reset removes all state. */
@@ -168,16 +168,16 @@ int main() {
         context.result = success;
         const PreallocationKey newer = makeKey(2, 9, 3, 4096, 8192);
 
-        HFS_TEST_CHECK(helper.getOrAllocate(key, ownerCallback, &context).ok());
-        HFS_TEST_CHECK(helper.getOrAllocate(newer, ownerCallback, &context).ok());
-        HFS_TEST_CHECK(helper.resetForGeneration(2) == 1);
-        HFS_TEST_CHECK(helper.stateFor(key) == PreallocationState::Absent);
-        HFS_TEST_CHECK(helper.stateFor(newer) == PreallocationState::Ready);
-        HFS_TEST_CHECK(helper.size() == 1);
+        UUSE_TEST_CHECK(helper.getOrAllocate(key, ownerCallback, &context).ok());
+        UUSE_TEST_CHECK(helper.getOrAllocate(newer, ownerCallback, &context).ok());
+        UUSE_TEST_CHECK(helper.resetForGeneration(2) == 1);
+        UUSE_TEST_CHECK(helper.stateFor(key) == PreallocationState::Absent);
+        UUSE_TEST_CHECK(helper.stateFor(newer) == PreallocationState::Ready);
+        UUSE_TEST_CHECK(helper.size() == 1);
 
         helper.reset();
-        HFS_TEST_CHECK(helper.size() == 0);
-        HFS_TEST_CHECK(helper.stateFor(newer) == PreallocationState::Absent);
+        UUSE_TEST_CHECK(helper.size() == 0);
+        UUSE_TEST_CHECK(helper.stateFor(newer) == PreallocationState::Absent);
     }
 
     /* Invalid keys never invoke an owner and never consume a bounded slot. */
@@ -185,12 +185,12 @@ int main() {
         PreallocationSingleFlight helper(1);
         CallbackContext context;
         context.result = success;
-        const PreallocationKey invalid{0, hfs::fio::FileHandle{}, 0, 4096};
+        const PreallocationKey invalid{0, uuse::fio::FileHandle{}, 0, 4096};
         const PreallocationResult result =
             helper.getOrAllocate(invalid, ownerCallback, &context);
-        HFS_TEST_CHECK(result.status == PreallocationResultStatus::InvalidKey);
-        HFS_TEST_CHECK(context.calls.load(std::memory_order_relaxed) == 0);
-        HFS_TEST_CHECK(helper.size() == 0);
+        UUSE_TEST_CHECK(result.status == PreallocationResultStatus::InvalidKey);
+        UUSE_TEST_CHECK(context.calls.load(std::memory_order_relaxed) == 0);
+        UUSE_TEST_CHECK(helper.size() == 0);
     }
 
     std::printf("preallocation_single_flight_test: ok\n");

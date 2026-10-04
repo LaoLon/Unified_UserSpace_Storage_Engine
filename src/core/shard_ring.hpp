@@ -5,7 +5,7 @@
 #include <cstdint>
 #include <memory>
 
-namespace hfs {
+namespace uuse {
 
 class Operation;
 
@@ -71,4 +71,4 @@ private:
     std::atomic<std::size_t> highWatermark_{0};
 };
 
-} // namespace hfs
+} // namespace uuse

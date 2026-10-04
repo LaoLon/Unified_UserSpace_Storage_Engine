@@ -1,5 +1,7 @@
 # HFS 2.0 P2-3 metadata actor 收敛评估与迁移计划（2026-09-29）
 
+> 注：项目已于 2026-10-04 由 HFS 更名为 UUSE；本文为历史记录，正文与证据路径保留 HFS 时期名称。
+
 > 设计依据：`hfs2.0.md` §4.2 模块布局、§6.4/§7.2 的 actor ownership 表
 > （"namespace/journal/checkpoint → metadata actor"、"extent map 由 metadata actor
 > 维护，data shard 持有 immutable/versioned snapshot"、"路径 API 只进 metadata

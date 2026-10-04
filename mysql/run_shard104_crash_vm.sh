@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
-# Recover HFS-backed InnoDB after writes and an online DDL interrupted by SIGKILL.
+# Recover UUSE-backed InnoDB after writes and an online DDL interrupted by SIGKILL.
 set -euo pipefail
 
-BUILD="${BUILD:-/home/hfs/mysql-build}"
-CONFIG="${CONFIG:-/root/code/config/hfs_mysql.conf}"
-DATA="${DATA:-/home/hfs/mysql-shard104-datadir}"
-RESULT="${RESULT:-/home/hfs/mysql-shard104-crash}"
-HFSCTL="${HFSCTL:-/root/code/build-verify/hfsctl}"
+BUILD="${BUILD:-/home/uuse/mysql-build}"
+CONFIG="${CONFIG:-/root/code/config/uuse_mysql.conf}"
+DATA="${DATA:-/home/uuse/mysql-shard104-datadir}"
+RESULT="${RESULT:-/home/uuse/mysql-shard104-crash}"
+UUSECTL="${UUSECTL:-/root/code/build-verify/uusectl}"
 BIN="$BUILD/runtime_output_directory"
 SOCKET="$RESULT/mysql.sock"
 SERVER_PID=""
 mkdir -p "$RESULT"
-export HFS_MYSQL_CONFIG="$CONFIG" HFS_MYSQL_PREFIX="$DATA"
+export UUSE_MYSQL_CONFIG="$CONFIG" UUSE_MYSQL_PREFIX="$DATA"
 export LD_LIBRARY_PATH="/root/code/build-verify:${LD_LIBRARY_PATH:-}"
 
 sql() {
@@ -51,30 +51,30 @@ trap 'stop_server || true' EXIT
 
 # A larger table keeps index creation active long enough to interrupt it.
 start_server prepare
-sql -e "CREATE DATABASE IF NOT EXISTS hfs_matrix"
-sql -e "CREATE TABLE IF NOT EXISTS hfs_matrix.crash_data(
+sql -e "CREATE DATABASE IF NOT EXISTS uuse_matrix"
+sql -e "CREATE TABLE IF NOT EXISTS uuse_matrix.crash_data(
   id INT AUTO_INCREMENT PRIMARY KEY, payload VARCHAR(120) NOT NULL)
   ENGINE=InnoDB"
-if [[ "$(sql -e 'SELECT COUNT(*) FROM hfs_matrix.crash_data')" == 0 ]]; then
-  sql -e "INSERT INTO hfs_matrix.crash_data(payload)
+if [[ "$(sql -e 'SELECT COUNT(*) FROM uuse_matrix.crash_data')" == 0 ]]; then
+  sql -e "INSERT INTO uuse_matrix.crash_data(payload)
     VALUES(REPEAT('x',100))"
   for _ in $(seq 1 17); do
-    sql -e "INSERT INTO hfs_matrix.crash_data(payload)
-      SELECT payload FROM hfs_matrix.crash_data" > /dev/null
+    sql -e "INSERT INTO uuse_matrix.crash_data(payload)
+      SELECT payload FROM uuse_matrix.crash_data" > /dev/null
   done
 fi
-EXPECTED="$(sql -e 'SELECT COUNT(*) FROM hfs_matrix.crash_data')"
+EXPECTED="$(sql -e 'SELECT COUNT(*) FROM uuse_matrix.crash_data')"
 test "$EXPECTED" -ge 131072
 stop_server
 
 # Interrupt an online index build while another client changes rows.
 start_server online-ddl
-sql -e "ALTER TABLE hfs_matrix.crash_data ADD INDEX idx_payload(payload),
+sql -e "ALTER TABLE uuse_matrix.crash_data ADD INDEX idx_payload(payload),
   ALGORITHM=INPLACE, LOCK=NONE" > "$RESULT/ddl-client.log" 2>&1 &
 DDL_PID=$!
 (
   for i in $(seq 1 200); do
-    sql -e "UPDATE hfs_matrix.crash_data SET payload=CONCAT('u', $i)
+    sql -e "UPDATE uuse_matrix.crash_data SET payload=CONCAT('u', $i)
       WHERE id BETWEEN 1 AND 100" > /dev/null 2>&1 || break
   done
 ) &
@@ -93,19 +93,19 @@ printf 'online DDL was active at SIGKILL\n' > "$RESULT/ddl-crash-point.log"
 
 # InnoDB must recover the committed rows and permit further writes.
 start_server ddl-recovery
-test "$(sql -e 'SELECT COUNT(*) FROM hfs_matrix.crash_data')" == "$EXPECTED"
-sql -e 'CHECK TABLE hfs_matrix.crash_data' > "$RESULT/ddl-check-table.tsv"
+test "$(sql -e 'SELECT COUNT(*) FROM uuse_matrix.crash_data')" == "$EXPECTED"
+sql -e 'CHECK TABLE uuse_matrix.crash_data' > "$RESULT/ddl-check-table.tsv"
 grep -q $'\tOK$' "$RESULT/ddl-check-table.tsv"
-sql -e "UPDATE hfs_matrix.crash_data SET payload='recovered' WHERE id=1"
+sql -e "UPDATE uuse_matrix.crash_data SET payload='recovered' WHERE id=1"
 stop_server
-"$HFSCTL" --config="$CONFIG" check > "$RESULT/ddl-hfs-check.log" 2>&1
-grep -q 'corruption=none' "$RESULT/ddl-hfs-check.log"
+"$UUSECTL" --config="$CONFIG" check > "$RESULT/ddl-uuse-check.log" 2>&1
+grep -q 'corruption=none' "$RESULT/ddl-uuse-check.log"
 
 # Interrupt repeated data-page updates to exercise doublewrite recovery.
 start_server torn-page
 (
   for i in $(seq 1 400); do
-    sql -e "UPDATE hfs_matrix.crash_data
+    sql -e "UPDATE uuse_matrix.crash_data
       SET payload=CONCAT('page', $i, REPEAT('x',80))
       WHERE id BETWEEN 1000 AND 3000" > /dev/null 2>&1 || break
   done
@@ -122,10 +122,10 @@ SERVER_PID=""
 wait "$WRITER_PID" 2>/dev/null || true
 printf 'page writer was active at SIGKILL\n' > "$RESULT/page-crash-point.log"
 start_server page-recovery
-test "$(sql -e 'SELECT COUNT(*) FROM hfs_matrix.crash_data')" == "$EXPECTED"
-sql -e 'CHECK TABLE hfs_matrix.crash_data' > "$RESULT/page-check-table.tsv"
+test "$(sql -e 'SELECT COUNT(*) FROM uuse_matrix.crash_data')" == "$EXPECTED"
+sql -e 'CHECK TABLE uuse_matrix.crash_data' > "$RESULT/page-check-table.tsv"
 grep -q $'\tOK$' "$RESULT/page-check-table.tsv"
 stop_server
-"$HFSCTL" --config="$CONFIG" check > "$RESULT/page-hfs-check.log" 2>&1
-grep -q 'corruption=none' "$RESULT/page-hfs-check.log"
+"$UUSECTL" --config="$CONFIG" check > "$RESULT/page-uuse-check.log" 2>&1
+grep -q 'corruption=none' "$RESULT/page-uuse-check.log"
 printf 'Shard-104 crash matrix passed, rows=%s\n' "$EXPECTED"

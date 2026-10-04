@@ -20,9 +20,9 @@ constexpr std::uint64_t kIterations = 200000;
 } // namespace
 
 int main() {
-    hfs::BoundedIndexStack stack;
-    HFS_TEST_CHECK(stack.initialize(kCapacity));
-    HFS_TEST_CHECK(stack.capacity() == kCapacity);
+    uuse::BoundedIndexStack stack;
+    UUSE_TEST_CHECK(stack.initialize(kCapacity));
+    UUSE_TEST_CHECK(stack.capacity() == kCapacity);
 
     /* Per-index claim marker detects any duplicate delivery. */
     auto owner = std::make_unique<std::atomic<int>[]>(kCapacity);
@@ -60,8 +60,8 @@ int main() {
     for (auto &thread : threads) {
         thread.join();
     }
-    HFS_TEST_CHECK(!failure.load());
-    HFS_TEST_CHECK(delivered.load() > 0);
+    UUSE_TEST_CHECK(!failure.load());
+    UUSE_TEST_CHECK(delivered.load() > 0);
 
     /* Every index must be back on the stack exactly once. */
     std::size_t drained = 0;
@@ -69,8 +69,8 @@ int main() {
     while (stack.pop(index)) {
         ++drained;
     }
-    HFS_TEST_CHECK(drained == kCapacity);
-    HFS_TEST_CHECK(!stack.pop(index));
+    UUSE_TEST_CHECK(drained == kCapacity);
+    UUSE_TEST_CHECK(!stack.pop(index));
 
     std::printf("index_stack_test: delivered=%llu empty=%llu ok\n",
                 static_cast<unsigned long long>(delivered.load()),

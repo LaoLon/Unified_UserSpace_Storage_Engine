@@ -14,13 +14,13 @@
 #include "common/test_hooks.hpp"
 #include "runtime/spdk_runtime.hpp"
 
-namespace hfs {
+namespace uuse {
 
 namespace {
 
 /* Test-only boundary before publishing a clean or dirty superblock flag. */
 bool testCleanFlagFailureRequested() {
-    const char *value = std::getenv("HFS_TEST_FAIL_CLEAN_FLAG");
+    const char *value = std::getenv("UUSE_TEST_FAIL_CLEAN_FLAG");
     return value != nullptr && std::string(value) == "1";
 }
 
@@ -80,7 +80,7 @@ Result<std::array<std::uint8_t, 16>> resolveUuid(const std::string &text) {
     return uuid;
 }
 
-std::vector<std::byte> buildSuperblockRecord(const Hfs2Superblock &superblock,
+std::vector<std::byte> buildSuperblockRecord(const UuseSuperblock &superblock,
                                              std::uint32_t metadataBlockSize) {
     std::vector<std::byte> record(metadataBlockSize, std::byte{0});
     std::memcpy(record.data(), &superblock, sizeof(superblock));
@@ -89,14 +89,14 @@ std::vector<std::byte> buildSuperblockRecord(const Hfs2Superblock &superblock,
 
 Result<bool> readSuperblock(SpdkRuntime &runtime, std::size_t deviceIndex,
                             std::uint64_t byteOffset, std::uint32_t metadataBlockSize,
-                            std::uint32_t sectorSize, Hfs2Superblock *out) {
+                            std::uint32_t sectorSize, UuseSuperblock *out) {
     std::vector<std::byte> record(metadataBlockSize);
     const std::uint64_t offsetBlocks = byteOffset / sectorSize;
     auto read = runtime.controlRead(deviceIndex, offsetBlocks, record);
     if (!read.ok()) {
         return makeError<bool>(read.status(), read.message());
     }
-    Hfs2Superblock candidate{};
+    UuseSuperblock candidate{};
     std::memcpy(&candidate, record.data(), sizeof(candidate));
     if (!superblockValid(candidate)) {
         return false;
@@ -105,7 +105,7 @@ Result<bool> readSuperblock(SpdkRuntime &runtime, std::size_t deviceIndex,
     return true;
 }
 
-DeviceGeometry geometryFromSuperblock(const Hfs2Superblock &superblock) {
+DeviceGeometry geometryFromSuperblock(const UuseSuperblock &superblock) {
     DeviceGeometry geometry;
     geometry.deviceId = superblock.deviceId;
     geometry.replicaId = superblock.replicaId;
@@ -171,7 +171,7 @@ Result<VolumeInfo> formatVolume(SpdkRuntime &runtime, const Config &config, bool
         layout.deviceId = static_cast<std::uint32_t>(i);
         layout.replicaId = config.devices[i].metadata ? nextReplicaId++ : 0;
 
-        Hfs2Superblock superblock{};
+        UuseSuperblock superblock{};
         superblock.magic = kSuperblockMagic;
         superblock.formatVersion = kSuperblockFormatVersion;
         superblock.featureFlags =
@@ -250,7 +250,7 @@ Result<VolumeInfo> mountVolume(SpdkRuntime &runtime, const Config &config) {
      * fail closed before any journal or namespace state is opened. */
     std::vector<bool> metadataReplicasSeen(config.metadataReplication, false);
     std::size_t metadataReplicaCount = 0;
-    Hfs2Superblock metadataReference{};
+    UuseSuperblock metadataReference{};
     bool haveMetadataReference = false;
 
     for (std::size_t i = 0; i < config.devices.size(); ++i) {
@@ -260,8 +260,8 @@ Result<VolumeInfo> mountVolume(SpdkRuntime &runtime, const Config &config) {
             return makeError<VolumeInfo>(Status::IoError, "device geometry is not available");
         }
 
-        Hfs2Superblock slotA{};
-        Hfs2Superblock slotB{};
+        UuseSuperblock slotA{};
+        UuseSuperblock slotB{};
         auto readA = readSuperblock(runtime, i, 0, config.metadataBlockSize, sectorSize, &slotA);
         if (!readA.ok()) {
             return makeError<VolumeInfo>(readA.status(), readA.message());
@@ -277,9 +277,9 @@ Result<VolumeInfo> mountVolume(SpdkRuntime &runtime, const Config &config) {
         if (!hasA && !hasB) {
             return makeError<VolumeInfo>(
                 Status::NotFound, "device '" + config.devices[i].bdevName +
-                                      "' is not formatted as HFS 2.0 (or was erased)");
+                                      "' is not formatted as UUSE 2.0 (or was erased)");
         }
-        const Hfs2Superblock &chosen =
+        const UuseSuperblock &chosen =
             (hasA && hasB) ? (slotB.generation > slotA.generation ? slotB : slotA)
                            : (hasA ? slotA : slotB);
 
@@ -381,7 +381,7 @@ Result<VolumeInfo> mountVolume(SpdkRuntime &runtime, const Config &config) {
 }
 
 Result<void> updateCleanShutdown(SpdkRuntime &runtime, const Config &config, bool clean) {
-    std::vector<Hfs2Superblock> current(config.devices.size());
+    std::vector<UuseSuperblock> current(config.devices.size());
     std::vector<std::uint32_t> sectorSizes(config.devices.size(), 0);
     std::vector<std::uint64_t> targetOffsets(config.devices.size(), 0);
     /* Read every replica before publishing one shared lifecycle version. */
@@ -390,8 +390,8 @@ Result<void> updateCleanShutdown(SpdkRuntime &runtime, const Config &config, boo
         if (sectorSize == 0 || config.metadataBlockSize == 0) {
             return makeError(Status::IoError, "device geometry is not available");
         }
-        Hfs2Superblock slotA{};
-        Hfs2Superblock slotB{};
+        UuseSuperblock slotA{};
+        UuseSuperblock slotB{};
         auto readA = readSuperblock(runtime, deviceIndex, 0, config.metadataBlockSize,
                                     sectorSize, &slotA);
         if (!readA.ok()) return makeError(readA.status(), readA.message());
@@ -406,7 +406,7 @@ Result<void> updateCleanShutdown(SpdkRuntime &runtime, const Config &config, boo
         sectorSizes[deviceIndex] = sectorSize;
         targetOffsets[deviceIndex] = useB ? 0 : kSuperblockSlotOffsetBytes;
     }
-    const Hfs2Superblock &reference = current.front();
+    const UuseSuperblock &reference = current.front();
     if (reference.generation == std::numeric_limits<std::uint64_t>::max() ||
         reference.mountEpoch == std::numeric_limits<std::uint64_t>::max()) {
         return makeError(Status::Corrupt, "superblock lifecycle counter overflow");
@@ -420,7 +420,7 @@ Result<void> updateCleanShutdown(SpdkRuntime &runtime, const Config &config, boo
     }
     /* Publish identical generation and epoch values to all configured devices. */
     for (std::size_t deviceIndex = 0; deviceIndex < config.devices.size(); ++deviceIndex) {
-        Hfs2Superblock updated = current[deviceIndex];
+        UuseSuperblock updated = current[deviceIndex];
         updated.generation = nextGeneration;
         updated.mountEpoch = nextMountEpoch;
         updated.cleanShutdown = clean ? 1 : 0;
@@ -435,4 +435,4 @@ Result<void> updateCleanShutdown(SpdkRuntime &runtime, const Config &config, boo
     return Result<void>(Status::Ok);
 }
 
-} // namespace hfs
+} // namespace uuse

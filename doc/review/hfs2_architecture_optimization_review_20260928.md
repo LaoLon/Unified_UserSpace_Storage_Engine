@@ -1,5 +1,7 @@
 # HFS 2.0 架构与性能优化点 Review
 
+> 注：项目已于 2026-10-04 由 HFS 更名为 UUSE；本文为历史记录，正文与证据路径保留 HFS 时期名称。
+
 > 日期：2026-09-28
 > 评审对象：当前工作区 `src/`、`rocksdb/`、`fio/`、`src/runtime/`、`src/metadata/`（HEAD `d84fb0f`）
 > 事实源：`doc/design/hfs2.0.md`（本文不替代其接口/边界/验收约束；涉及设计变更的条目必须先更新该文档）

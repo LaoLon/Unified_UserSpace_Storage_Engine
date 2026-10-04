@@ -1,5 +1,7 @@
 # HFS 2.0 metadata microbenchmark（§17.1）与 checkpoint/replay 修复（2026-09-29）
 
+> 注：项目已于 2026-10-04 由 HFS 更名为 UUSE；本文为历史记录，正文与证据路径保留 HFS 时期名称。
+
 > 设计依据：`doc/design/hfs2.0.md` §17.1（metadata ≥20,000 ops/s、1M active inode
 > mount ≤10 s、replay ≤2 s）。工具：`tools/hfs_meta_bench.cpp`（CMake target
 > `hfs_meta_bench`，仅用 public Engine/Client/File API）。

@@ -1,5 +1,7 @@
 # HFS 2.0 设计文档评审
 
+> 注：项目已于 2026-10-04 由 HFS 更名为 UUSE；本文为历史记录，正文与证据路径保留 HFS 时期名称。
+
 > 评审对象：第一轮为旧版 `doc/design/hfs2.0.md`（2900 行）；第二轮为 2026-09-16
 > clean-break 重写版（C++20 coroutine-first、`.conf`、multi-NVMe，见 §9）。
 >

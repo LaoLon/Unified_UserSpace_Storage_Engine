@@ -1,5 +1,7 @@
 # HFS 2.0 MySQL 追加写异步化（Shard-112）实施与验收（2026-09-29）
 
+> 注：项目已于 2026-10-04 由 HFS 更名为 UUSE；本文为历史记录，正文与证据路径保留 HFS 时期名称。
+
 > 前置：`doc/performance/hfs2_mysql_write_p99_attribution_20260929.md`（归因：
 > 约 20% 的 InnoDB 追加写被异步固定覆盖契约拒绝 → 同步消息环 → 写 p99）。
 > 实现：`mysql/patches/hfs_seam_shard112_async_append.patch`（seam `write`）。

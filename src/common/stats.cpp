@@ -1,7 +1,7 @@
 #include "common/stats.hpp"
-#include "hfs/diagnostics.hpp"
+#include "uuse/diagnostics.hpp"
 
-namespace hfs::stats {
+namespace uuse::stats {
 
 namespace {
 
@@ -16,9 +16,9 @@ bool enabled() noexcept { return g_enabled; }
 
 void setEnabled(bool value) noexcept { g_enabled = value; }
 
-} // namespace hfs::stats
+} // namespace uuse::stats
 
-namespace hfs::diagnostics {
+namespace uuse::diagnostics {
 
 Snapshot snapshot() noexcept {
     const auto &c = stats::counters();
@@ -241,4 +241,4 @@ void recordSnapshotBuild() noexcept {
     stats::counters().snapshotBuilds.fetch_add(1, std::memory_order_relaxed);
 }
 
-} // namespace hfs::diagnostics
+} // namespace uuse::diagnostics

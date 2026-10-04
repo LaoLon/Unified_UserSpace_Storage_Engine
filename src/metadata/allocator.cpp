@@ -3,14 +3,14 @@
 #include <algorithm>
 #include <cstring>
 
-#include "hfs/crc.hpp"
+#include "uuse/crc.hpp"
 
-namespace hfs::metadata {
+namespace uuse::metadata {
 
 namespace {
 
-constexpr std::uint32_t kSnapshotMagic = 0x4c413248; /* "H2AL" */
-constexpr std::uint32_t kSnapshotVersion = 1;
+constexpr std::uint32_t kSnapshotMagic = 0x4c413255; /* "H2AL" */
+constexpr std::uint32_t kSnapshotVersion = 2;
 constexpr std::size_t kSnapshotHeaderBytes = Allocator::kSnapshotHeaderBytes;
 
 template <typename T>
@@ -474,4 +474,4 @@ Result<void> Allocator::deserialize(std::span<const std::byte> data) {
     return Result<void>(Status::Ok);
 }
 
-} // namespace hfs::metadata
+} // namespace uuse::metadata

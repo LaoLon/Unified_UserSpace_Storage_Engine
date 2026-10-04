@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
-project(hfs VERSION 2.0.0 LANGUAGES CXX)
+project(uuse VERSION 2.0.0 LANGUAGES CXX)
 
-# HFS 2.0 build: C++20 core. SPDK is required for the runtime layer; without
+# UUSE 2.0 build: C++20 core. SPDK is required for the runtime layer; without
 # it the core still builds and the runtime returns NotSupported.
 # src_legacy_frozen/ is never part of this build.
 set(CMAKE_CXX_STANDARD 20)
@@ -17,15 +17,15 @@ endif()
 add_compile_options(-Wall -Wextra -Wno-unused-parameter)
 find_package(Threads REQUIRED)
 
-set(HFS_SPDK_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/spdk CACHE PATH "SPDK source and build root")
-if(EXISTS ${HFS_SPDK_ROOT}/include/spdk/init.h AND EXISTS ${HFS_SPDK_ROOT}/build/lib)
-  set(HFS_WITH_SPDK ON)
+set(UUSE_SPDK_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/spdk CACHE PATH "SPDK source and build root")
+if(EXISTS ${UUSE_SPDK_ROOT}/include/spdk/init.h AND EXISTS ${UUSE_SPDK_ROOT}/build/lib)
+  set(UUSE_WITH_SPDK ON)
 else()
-  set(HFS_WITH_SPDK OFF)
-  message(WARNING "SPDK not found at ${HFS_SPDK_ROOT}; building without SPDK runtime support")
+  set(UUSE_WITH_SPDK OFF)
+  message(WARNING "SPDK not found at ${UUSE_SPDK_ROOT}; building without SPDK runtime support")
 endif()
 
-set(HFS_CORE_SRC
+set(UUSE_CORE_SRC
   src/common/crc.cpp
   src/common/log.cpp
   src/common/stats.cpp
@@ -59,46 +59,46 @@ set(HFS_CORE_SRC
   src/storage/volume.cpp
 )
 
-add_library(hfs_core SHARED ${HFS_CORE_SRC})
-add_library(hfs::core ALIAS hfs_core)
-set_target_properties(hfs_core PROPERTIES
-  OUTPUT_NAME hfs_core
+add_library(uuse_core SHARED ${UUSE_CORE_SRC})
+add_library(uuse::core ALIAS uuse_core)
+set_target_properties(uuse_core PROPERTIES
+  OUTPUT_NAME uuse_core
   VERSION ${PROJECT_VERSION}
   SOVERSION 2
   CXX_VISIBILITY_PRESET hidden
   VISIBILITY_INLINES_HIDDEN ON
 )
-target_compile_definitions(hfs_core PRIVATE HFS_CORE_ABI_MAJOR=2)
-target_compile_options(hfs_core PRIVATE -fno-exceptions -fno-rtti)
-target_include_directories(hfs_core
+target_compile_definitions(uuse_core PRIVATE UUSE_CORE_ABI_MAJOR=3)
+target_compile_options(uuse_core PRIVATE -fno-exceptions -fno-rtti)
+target_include_directories(uuse_core
   PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
-target_link_libraries(hfs_core PRIVATE Threads::Threads)
+target_link_libraries(uuse_core PRIVATE Threads::Threads)
 
-set(FIO_SOURCE_DIR "" CACHE PATH "fio source tree for the optional HFS external engine")
-option(HFS_FIO_DEBUG "Build fio-hfs without optimization and with debug symbols" OFF)
+set(FIO_SOURCE_DIR "" CACHE PATH "fio source tree for the optional UUSE external engine")
+option(UUSE_FIO_DEBUG "Build fio-uuse without optimization and with debug symbols" OFF)
 if(EXISTS ${FIO_SOURCE_DIR}/fio.h)
-  add_library(fio-hfs MODULE
-    fio/fio_hfs.cpp
+  add_library(fio-uuse MODULE
+    fio/fio_uuse.cpp
     fio/fio_completion_hub.cpp
     fio/preallocation_single_flight.cpp
   )
-  target_include_directories(fio-hfs PRIVATE
+  target_include_directories(fio-uuse PRIVATE
     ${FIO_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/include
   )
-  target_compile_options(fio-hfs PRIVATE -include ${FIO_SOURCE_DIR}/config-host.h)
-  if(HFS_FIO_DEBUG)
-    target_compile_options(fio-hfs PRIVATE -O0 -g)
+  target_compile_options(fio-uuse PRIVATE -include ${FIO_SOURCE_DIR}/config-host.h)
+  if(UUSE_FIO_DEBUG)
+    target_compile_options(fio-uuse PRIVATE -O0 -g)
   endif()
-  target_link_libraries(fio-hfs PRIVATE hfs_core)
-  if(HFS_WITH_SPDK)
-    target_compile_definitions(fio-hfs PRIVATE HFS_WITH_SPDK=1)
-    target_include_directories(fio-hfs PRIVATE ${HFS_SPDK_ROOT}/include)
+  target_link_libraries(fio-uuse PRIVATE uuse_core)
+  if(UUSE_WITH_SPDK)
+    target_compile_definitions(fio-uuse PRIVATE UUSE_WITH_SPDK=1)
+    target_include_directories(fio-uuse PRIVATE ${UUSE_SPDK_ROOT}/include)
   endif()
-  set_target_properties(fio-hfs PROPERTIES PREFIX "" OUTPUT_NAME "fio-hfs")
+  set_target_properties(fio-uuse PROPERTIES PREFIX "" OUTPUT_NAME "fio-uuse")
 endif()
 
 set(ROCKSDB_ROOT "" CACHE PATH "RocksDB 8.9.1 installation root for the optional adapter")
@@ -109,39 +109,39 @@ if(EXISTS ${ROCKSDB_ROOT}/include/rocksdb/file_system.h)
   if(NOT ROCKSDB_LIBRARY)
     message(FATAL_ERROR "RocksDB library not found below ${ROCKSDB_ROOT}")
   endif()
-  add_library(hfs_rocksdb SHARED rocksdb/hfs_filesystem.cpp)
-  target_include_directories(hfs_rocksdb PRIVATE
+  add_library(uuse_rocksdb SHARED rocksdb/uuse_filesystem.cpp)
+  target_include_directories(uuse_rocksdb PRIVATE
     ${ROCKSDB_ROOT}/include ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR})
-  target_link_libraries(hfs_rocksdb PRIVATE hfs_core
+  target_link_libraries(uuse_rocksdb PRIVATE uuse_core
     ${ROCKSDB_LIBRARY})
-  set_target_properties(hfs_rocksdb PROPERTIES OUTPUT_NAME hfs_rocksdb)
-  add_executable(hfs_rocksdb_smoke rocksdb/hfs_filesystem_smoke.cpp)
-  target_include_directories(hfs_rocksdb_smoke PRIVATE
+  set_target_properties(uuse_rocksdb PROPERTIES OUTPUT_NAME uuse_rocksdb)
+  add_executable(uuse_rocksdb_smoke rocksdb/uuse_filesystem_smoke.cpp)
+  target_include_directories(uuse_rocksdb_smoke PRIVATE
     ${ROCKSDB_ROOT}/include ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/include)
-  target_link_libraries(hfs_rocksdb_smoke PRIVATE hfs_rocksdb ${ROCKSDB_LIBRARY})
-  add_executable(hfs_db_bench rocksdb/hfs_db_bench.cpp)
-  target_include_directories(hfs_db_bench PRIVATE
+  target_link_libraries(uuse_rocksdb_smoke PRIVATE uuse_rocksdb ${ROCKSDB_LIBRARY})
+  add_executable(uuse_db_bench rocksdb/uuse_db_bench.cpp)
+  target_include_directories(uuse_db_bench PRIVATE
     ${ROCKSDB_ROOT}/include ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/include
   )
-  target_link_libraries(hfs_db_bench PRIVATE hfs_rocksdb ${ROCKSDB_LIBRARY})
+  target_link_libraries(uuse_db_bench PRIVATE uuse_rocksdb ${ROCKSDB_LIBRARY})
   add_executable(rocksdb_readrandom_observer rocksdb/rocksdb_readrandom_observer.cpp)
   target_include_directories(rocksdb_readrandom_observer PRIVATE
     ${ROCKSDB_ROOT}/include ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/include
   )
-  target_link_libraries(rocksdb_readrandom_observer PRIVATE hfs_rocksdb hfs_core ${ROCKSDB_LIBRARY})
-  add_executable(hfs_ldb rocksdb/hfs_ldb.cpp)
-  target_include_directories(hfs_ldb PRIVATE
+  target_link_libraries(rocksdb_readrandom_observer PRIVATE uuse_rocksdb uuse_core ${ROCKSDB_LIBRARY})
+  add_executable(uuse_ldb rocksdb/uuse_ldb.cpp)
+  target_include_directories(uuse_ldb PRIVATE
     ${ROCKSDB_ROOT}/include ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/include
   )
-  target_link_libraries(hfs_ldb PRIVATE hfs_rocksdb ${ROCKSDB_LIBRARY})
+  target_link_libraries(uuse_ldb PRIVATE uuse_rocksdb ${ROCKSDB_LIBRARY})
 endif()
 
-if(HFS_WITH_SPDK)
+if(UUSE_WITH_SPDK)
   # Mirror of the legacy SPDK static link set; bdev/nvme/env/thread/init are
   # the modules the runtime uses, the rest keep subsystem registration intact.
   set(SPDK_LIB_LIST
@@ -158,26 +158,26 @@ if(HFS_WITH_SPDK)
   )
   set(SPDK_STATIC_LIBS "")
   foreach(lib IN LISTS SPDK_LIB_LIST)
-    list(APPEND SPDK_STATIC_LIBS ${HFS_SPDK_ROOT}/build/lib/libspdk_${lib}.a)
+    list(APPEND SPDK_STATIC_LIBS ${UUSE_SPDK_ROOT}/build/lib/libspdk_${lib}.a)
   endforeach()
-  file(GLOB DPDK_STATIC_LIBS ${HFS_SPDK_ROOT}/dpdk/build/lib/librte_*.a)
+  file(GLOB DPDK_STATIC_LIBS ${UUSE_SPDK_ROOT}/dpdk/build/lib/librte_*.a)
   list(SORT DPDK_STATIC_LIBS)
   if(NOT DPDK_STATIC_LIBS)
     message(FATAL_ERROR
-      "no DPDK static libraries under ${HFS_SPDK_ROOT}/dpdk/build/lib; "
+      "no DPDK static libraries under ${UUSE_SPDK_ROOT}/dpdk/build/lib; "
       "build DPDK inside the VM before configuring with SPDK")
   endif()
   set(ISAL_LIBS
-    ${HFS_SPDK_ROOT}/isa-l/.libs/libisal.a
-    ${HFS_SPDK_ROOT}/isa-l-crypto/.libs/libisal_crypto.a
+    ${UUSE_SPDK_ROOT}/isa-l/.libs/libisal.a
+    ${UUSE_SPDK_ROOT}/isa-l-crypto/.libs/libisal_crypto.a
   )
-  set(HFS_SYS_LIBS numa dl rt uuid ssl crypto m lz4 fuse3 keyutils aio)
+  set(UUSE_SYS_LIBS numa dl rt uuid ssl crypto m lz4 fuse3 keyutils aio)
 
   # Attach the SPDK runtime closure to a target (core library and the device
   # data-path test both need it).
-  function(hfs_link_spdk target)
-    target_compile_definitions(${target} PRIVATE HFS_WITH_SPDK=1)
-    target_include_directories(${target} PRIVATE ${HFS_SPDK_ROOT}/include)
+  function(uuse_link_spdk target)
+    target_compile_definitions(${target} PRIVATE UUSE_WITH_SPDK=1)
+    target_include_directories(${target} PRIVATE ${UUSE_SPDK_ROOT}/include)
     target_link_libraries(${target} PRIVATE
       -Wl,--whole-archive -Wl,--no-as-needed
       ${SPDK_STATIC_LIBS}
@@ -186,60 +186,60 @@ if(HFS_WITH_SPDK)
       ${DPDK_STATIC_LIBS}
       -Wl,--no-whole-archive
       ${ISAL_LIBS}
-      ${HFS_SYS_LIBS}
+      ${UUSE_SYS_LIBS}
     )
   endfunction()
 
-  hfs_link_spdk(hfs_core)
+  uuse_link_spdk(uuse_core)
 endif()
 
-add_executable(hfsctl tools/hfsctl.cpp)
-target_link_libraries(hfsctl PRIVATE hfs_core)
-target_compile_options(hfsctl PRIVATE -fno-exceptions -fno-rtti)
+add_executable(uusectl tools/uusectl.cpp)
+target_link_libraries(uusectl PRIVATE uuse_core)
+target_compile_options(uusectl PRIVATE -fno-exceptions -fno-rtti)
 
-add_executable(hfs_lock_probe tools/hfs_lock_probe.cpp)
-target_link_libraries(hfs_lock_probe PRIVATE hfs_core)
-target_compile_options(hfs_lock_probe PRIVATE -fno-exceptions -fno-rtti)
+add_executable(uuse_lock_probe tools/uuse_lock_probe.cpp)
+target_link_libraries(uuse_lock_probe PRIVATE uuse_core)
+target_compile_options(uuse_lock_probe PRIVATE -fno-exceptions -fno-rtti)
 
 # Metadata microbenchmark for the design §17.1 budgets (1M inode / mount).
-add_executable(hfs_meta_bench tools/hfs_meta_bench.cpp)
-target_link_libraries(hfs_meta_bench PRIVATE hfs_core)
-target_compile_options(hfs_meta_bench PRIVATE -fno-exceptions -fno-rtti)
+add_executable(uuse_meta_bench tools/uuse_meta_bench.cpp)
+target_link_libraries(uuse_meta_bench PRIVATE uuse_core)
+target_compile_options(uuse_meta_bench PRIVATE -fno-exceptions -fno-rtti)
 
-add_executable(hfs_trace_dump tools/hfs_trace_dump.cpp)
-target_include_directories(hfs_trace_dump PRIVATE
+add_executable(uuse_trace_dump tools/uuse_trace_dump.cpp)
+target_include_directories(uuse_trace_dump PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/include
   ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
-target_compile_options(hfs_trace_dump PRIVATE -fno-exceptions -fno-rtti)
+target_compile_options(uuse_trace_dump PRIVATE -fno-exceptions -fno-rtti)
 
 enable_testing()
 # Keep device tests aligned with the checked-in single-device configuration.
-file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/config/hfs_nvme.conf" HFS_TEST_BDF_LINES
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/config/uuse_nvme.conf" UUSE_TEST_BDF_LINES
   REGEX "^[ \t]*pci_bdf[ \t]*=")
-list(LENGTH HFS_TEST_BDF_LINES HFS_TEST_BDF_COUNT)
-if(NOT HFS_TEST_BDF_COUNT EQUAL 1)
-  message(FATAL_ERROR "config/hfs_nvme.conf must declare exactly one pci_bdf for device tests")
+list(LENGTH UUSE_TEST_BDF_LINES UUSE_TEST_BDF_COUNT)
+if(NOT UUSE_TEST_BDF_COUNT EQUAL 1)
+  message(FATAL_ERROR "config/uuse_nvme.conf must declare exactly one pci_bdf for device tests")
 endif()
-list(GET HFS_TEST_BDF_LINES 0 HFS_TEST_BDF_LINE)
+list(GET UUSE_TEST_BDF_LINES 0 UUSE_TEST_BDF_LINE)
 string(REGEX REPLACE "^[ \t]*pci_bdf[ \t]*=[ \t]*([^ \t#]+).*" "\\1"
-  HFS_TEST_PCI_BDF "${HFS_TEST_BDF_LINE}")
-set(HFS_TESTS config_parser_test task_test crc_test geometry_test journal_test)
-if(HFS_WITH_SPDK)
-  list(APPEND HFS_TESTS engine_lifecycle_test spdk_runtime_test format_mount_test
+  UUSE_TEST_PCI_BDF "${UUSE_TEST_BDF_LINE}")
+set(UUSE_TESTS config_parser_test task_test crc_test geometry_test journal_test)
+if(UUSE_WITH_SPDK)
+  list(APPEND UUSE_TESTS engine_lifecycle_test spdk_runtime_test format_mount_test
        journal_device_test file_api_test file_data_test)
 endif()
-foreach(test_name IN LISTS HFS_TESTS)
+foreach(test_name IN LISTS UUSE_TESTS)
   add_executable(${test_name} tests/${test_name}.cpp)
-  target_link_libraries(${test_name} PRIVATE hfs_core)
+  target_link_libraries(${test_name} PRIVATE uuse_core)
   target_compile_options(${test_name} PRIVATE -fno-exceptions -fno-rtti)
   target_include_directories(${test_name} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/tests
   )
   target_compile_definitions(${test_name} PRIVATE
-    HFS_DEFAULT_CONF_PATH="${CMAKE_CURRENT_SOURCE_DIR}/config/hfs_nvme.conf"
-    HFS_TEST_PCI_BDF="${HFS_TEST_PCI_BDF}")
+    UUSE_DEFAULT_CONF_PATH="${CMAKE_CURRENT_SOURCE_DIR}/config/uuse_nvme.conf"
+    UUSE_TEST_PCI_BDF="${UUSE_TEST_PCI_BDF}")
   add_test(NAME ${test_name} COMMAND ${test_name})
 endforeach()
 
@@ -248,7 +248,7 @@ add_executable(spdk_async_backend_test
   tests/spdk_async_backend_test.cpp
   src/core/spdk_async_backend.cpp
 )
-target_link_libraries(spdk_async_backend_test PRIVATE hfs_core Threads::Threads)
+target_link_libraries(spdk_async_backend_test PRIVATE uuse_core Threads::Threads)
 target_compile_options(spdk_async_backend_test PRIVATE -fno-exceptions -fno-rtti)
 target_include_directories(spdk_async_backend_test PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -447,8 +447,8 @@ add_test(NAME index_stack_test COMMAND index_stack_test)
 
 # Device-backed data-path test: real NVMe read/write through the async data
 # reactor path (compiles the core sources directly and links SPDK).
-if(HFS_WITH_SPDK)
-  add_executable(data_path_device_test tests/data_path_device_test.cpp ${HFS_CORE_SRC})
+if(UUSE_WITH_SPDK)
+  add_executable(data_path_device_test tests/data_path_device_test.cpp ${UUSE_CORE_SRC})
   target_include_directories(data_path_device_test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -456,13 +456,13 @@ if(HFS_WITH_SPDK)
   )
   target_compile_options(data_path_device_test PRIVATE -fno-exceptions -fno-rtti)
   target_compile_definitions(data_path_device_test PRIVATE
-    HFS_TEST_PCI_BDF="${HFS_TEST_PCI_BDF}")
+    UUSE_TEST_PCI_BDF="${UUSE_TEST_PCI_BDF}")
   target_link_libraries(data_path_device_test PRIVATE Threads::Threads)
-  hfs_link_spdk(data_path_device_test)
+  uuse_link_spdk(data_path_device_test)
   add_test(NAME data_path_device_test COMMAND data_path_device_test)
 
   # Device-backed per-inode snapshot-cache test (review P1-1).
-  add_executable(snapshot_cache_device_test tests/snapshot_cache_device_test.cpp ${HFS_CORE_SRC})
+  add_executable(snapshot_cache_device_test tests/snapshot_cache_device_test.cpp ${UUSE_CORE_SRC})
   target_include_directories(snapshot_cache_device_test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -470,9 +470,9 @@ if(HFS_WITH_SPDK)
   )
   target_compile_options(snapshot_cache_device_test PRIVATE -fno-exceptions -fno-rtti)
   target_compile_definitions(snapshot_cache_device_test PRIVATE
-    HFS_TEST_PCI_BDF="${HFS_TEST_PCI_BDF}")
+    UUSE_TEST_PCI_BDF="${UUSE_TEST_PCI_BDF}")
   target_link_libraries(snapshot_cache_device_test PRIVATE Threads::Threads)
-  hfs_link_spdk(snapshot_cache_device_test)
+  uuse_link_spdk(snapshot_cache_device_test)
   add_test(NAME snapshot_cache_device_test COMMAND snapshot_cache_device_test)
 endif()
 
@@ -529,6 +529,6 @@ add_custom_target(compile-commands ALL
   COMMAND ${CMAKE_COMMAND} -E copy_if_different
     ${CMAKE_BINARY_DIR}/compile_commands.json
     ${CMAKE_SOURCE_DIR}/compile_commands.json
-  DEPENDS hfs_core hfsctl
+  DEPENDS uuse_core uusectl
   VERBATIM
 )

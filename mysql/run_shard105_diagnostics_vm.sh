@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
-# Sample HFS SPDK device I/O counters during MySQL read and write workloads.
+# Sample UUSE SPDK device I/O counters during MySQL read and write workloads.
 set -euo pipefail
 
-BUILD="${BUILD:-/home/hfs/mysql-build}"
-CONFIG="${CONFIG:-/root/code/config/hfs_mysql.conf}"
-DATA="${DATA:-/home/hfs/mysql-shard104-datadir}"
-RESULT="${RESULT:-/home/hfs/mysql-shard105-diagnostics}"
+BUILD="${BUILD:-/home/uuse/mysql-build}"
+CONFIG="${CONFIG:-/root/code/config/uuse_mysql.conf}"
+DATA="${DATA:-/home/uuse/mysql-shard104-datadir}"
+RESULT="${RESULT:-/home/uuse/mysql-shard105-diagnostics}"
 BIN="$BUILD/runtime_output_directory"
 SOCKET="$RESULT/mysql.sock"
 mkdir -p "$RESULT"
-sed 's/^stats = false$/stats = true/' "$CONFIG" > "$RESULT/hfs_mysql_stats.conf"
-grep -q '^stats = true$' "$RESULT/hfs_mysql_stats.conf"
-export HFS_MYSQL_CONFIG="$RESULT/hfs_mysql_stats.conf"
-export HFS_MYSQL_PREFIX="$DATA"
+sed 's/^stats = false$/stats = true/' "$CONFIG" > "$RESULT/uuse_mysql_stats.conf"
+grep -q '^stats = true$' "$RESULT/uuse_mysql_stats.conf"
+export UUSE_MYSQL_CONFIG="$RESULT/uuse_mysql_stats.conf"
+export UUSE_MYSQL_PREFIX="$DATA"
 export LD_LIBRARY_PATH="/root/code/build-verify:${LD_LIBRARY_PATH:-}"
 
 "$BIN/mysqld" --no-defaults --user=root --basedir="$BUILD" --datadir="$DATA" \
@@ -45,11 +45,11 @@ done
 ps -L -p "$SERVER_PID" -o tid,psr,pcpu,comm > "$RESULT/cpu-map.tsv"
 for workload in oltp_read_only oltp_read_write; do
   sysbench --db-driver=mysql --mysql-user=root --mysql-socket="$SOCKET" \
-    --mysql-db=hfs_perf --tables=1 --table-size=10000 --threads=8 \
+    --mysql-db=uuse_perf --tables=1 --table-size=10000 --threads=8 \
     --time=5 --percentile=99 --histogram=on "$workload" run \
     > "$RESULT/${workload}.log" 2>&1
 done
 cleanup
 trap - EXIT
-grep -q 'hfs_vfs: device_io read_ops=' "$RESULT/mysqld.log"
-grep 'hfs_vfs: device_io read_ops=' "$RESULT/mysqld.log" | tail -n 1
+grep -q 'uuse_vfs: device_io read_ops=' "$RESULT/mysqld.log"
+grep 'uuse_vfs: device_io read_ops=' "$RESULT/mysqld.log" | tail -n 1

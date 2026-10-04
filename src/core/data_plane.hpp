@@ -6,10 +6,10 @@
 
 #include "core/data_path.hpp"
 #include "core/dma_arena.hpp"
-#include "hfs/types.hpp"
+#include "uuse/types.hpp"
 #include "metadata/inode_map.hpp"
 
-namespace hfs {
+namespace uuse {
 
 class SpdkRuntime;
 
@@ -45,4 +45,4 @@ private:
     std::vector<std::byte> zeroBuffer_;
 };
 
-} // namespace hfs
+} // namespace uuse

@@ -1,5 +1,7 @@
 # HFS 2.0 前端 zero-copy DMA 设计评审（P2-1，2026-09-29）
 
+> 注：项目已于 2026-10-04 由 HFS 更名为 UUSE；本文为历史记录，正文与证据路径保留 HFS 时期名称。
+
 > 评审对象：`doc/review/hfs2_architecture_optimization_review_20260928.md` §5 P2-1。
 > 结论：**采纳"前端池内存由 HFS arena 提供"方案**（RocksDB opt-in + MySQL 默认开启），
 > 拒绝"每请求注册用户内存"和"RocksDB kFSBuffer"；核心不新增 public ABI。

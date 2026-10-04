@@ -4,11 +4,11 @@
 #include <cstdint>
 
 #include "core/extent_map.hpp"
-#include "hfs/types.hpp"
+#include "uuse/types.hpp"
 
-namespace hfs {
+namespace uuse {
 
-/* Splits a logical I/O into device-local children (hfs2.0.md §7.3):
+/* Splits a logical I/O into device-local children (uuse.md §7.3):
  * aligned direct children (<= maxChildBytes) plus head/tail RMW children. */
 class IoPlanner {
 public:
@@ -52,4 +52,4 @@ private:
     Config config_;
 };
 
-} // namespace hfs
+} // namespace uuse

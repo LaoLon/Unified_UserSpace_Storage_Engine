@@ -1,5 +1,7 @@
 # HFS 2.0 修复后压测与原生 SPDK 对比（2026-09-18）
 
+> 注：项目已于 2026-10-04 由 HFS 更名为 UUSE；本文为历史记录，正文与证据路径保留 HFS 时期名称。
+
 日期：2026-09-18  
 设备：真实 `Nvme0n1`，PCI BDF `0000:0b:00.0`，`uio_pci_generic`，`vm.nr_hugepages=1024`  
 构建：VM `/root/code/HFS_BASE_SPDK/build-repair98`（Release）  

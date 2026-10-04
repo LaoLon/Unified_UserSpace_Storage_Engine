@@ -1,5 +1,7 @@
 # HFS 2.0 MySQL/InnoDB frontend Shard 开发计划（Shard-99 起）
 
+> 注：项目已于 2026-10-04 由 HFS 更名为 UUSE；本文为历史记录，正文与证据路径保留 HFS 时期名称。
+
 > 日期：2026-09-24
 >
 > 状态：Shard-99/100/101/101B/102/103 已完成（2026-09-24）；Shard-104/105 已完成实施与 2026-09-25 当前 VM 验证。Phase 7 总体 85% FIO 性能目标仍未达到，见 `doc/performance/hfs2_mysql_shard104_105_20260925.md`。

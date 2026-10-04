@@ -22,9 +22,9 @@
 #include "core/request_lookup.hpp"
 #include "core/scheduler.hpp"
 #include "core/shard_ring.hpp"
-#include "hfs/diagnostics.hpp"
+#include "uuse/diagnostics.hpp"
 
-namespace hfs {
+namespace uuse {
 
 class AsyncDataService::Impl {
 private:
@@ -1384,4 +1384,4 @@ std::size_t AsyncDataService::shardCount() const noexcept {
     return impl_ == nullptr ? 0 : impl_->shardCount();
 }
 
-} // namespace hfs
+} // namespace uuse

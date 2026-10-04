@@ -6,11 +6,11 @@
 #include <mutex>
 #include <new>
 
-namespace hfs::fio {
+namespace uuse::fio {
 
 namespace {
 
-/* Build a helper-generated failure without depending on the HFS Result type. */
+/* Build a helper-generated failure without depending on the UUSE Result type. */
 PreallocationResult helperFailure(PreallocationResultStatus status,
                                   int backendErrno) noexcept {
     PreallocationResult result;
@@ -353,4 +353,4 @@ std::size_t PreallocationSingleFlight::capacity() const noexcept {
     return impl_ == nullptr ? 0 : impl_->capacity;
 }
 
-} // namespace hfs::fio
+} // namespace uuse::fio

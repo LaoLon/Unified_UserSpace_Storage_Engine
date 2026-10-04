@@ -1,5 +1,7 @@
 # RocksDB/HFS CPU 隔离定位
 
+> 注：项目已于 2026-10-04 由 HFS 更名为 UUSE；本文为历史记录，正文与证据路径保留 HFS 时期名称。
+
 测试设备为同一块 `/dev/nvme0n1`，BDF `0000:0b:00.0`。统一 workload
 为 8 个 worker、每个 worker 20,000 个 key，总计 160,000 个唯一 key，
 key 16 B、value 100 B。每个 timed read 前在同一进程内完成一次 warm-up，

@@ -4,9 +4,9 @@
 #include <span>
 #include <vector>
 
-#include "hfs/types.hpp"
+#include "uuse/types.hpp"
 
-namespace hfs {
+namespace uuse {
 
 /* One logical-to-physical extent mapping (physical in device bytes). */
 struct ExtentView {
@@ -41,4 +41,4 @@ private:
     std::vector<ExtentView> extents_;
 };
 
-} // namespace hfs
+} // namespace uuse

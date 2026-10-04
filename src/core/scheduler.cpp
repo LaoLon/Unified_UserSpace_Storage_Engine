@@ -2,7 +2,7 @@
 
 #include "common/trace.hpp"
 
-namespace hfs {
+namespace uuse {
 
 namespace {
 
@@ -295,4 +295,4 @@ InodeDependencyScheduler::Stats InodeDependencyScheduler::stats() const noexcept
     return stats_;
 }
 
-} // namespace hfs
+} // namespace uuse

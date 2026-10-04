@@ -8,7 +8,7 @@
 #include "core/async_data_service.hpp"
 #include "runtime/spdk_runtime.hpp"
 
-namespace hfs {
+namespace uuse {
 
 /* Actor-local SPDK backend with construction-time geometry and request pools. */
 class SpdkAsyncDataBackend final : public AsyncDataBackend {
@@ -99,4 +99,4 @@ private:
     bool valid_ = false;
 };
 
-} // namespace hfs
+} // namespace uuse

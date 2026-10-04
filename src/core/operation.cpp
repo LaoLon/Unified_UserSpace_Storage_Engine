@@ -9,9 +9,9 @@
 
 #include "common/trace.hpp"
 #include "core/index_stack.hpp"
-#include "hfs/types.hpp"
+#include "uuse/types.hpp"
 
-namespace hfs {
+namespace uuse {
 
 /* Bounded pool for Operation objects; see operation.hpp. Storage is
  * preallocated once, so create/destroy never allocate and the free list is a
@@ -483,4 +483,4 @@ std::size_t Operation::poolOverflow() noexcept {
     return OperationPool::instance().overflow();
 }
 
-} // namespace hfs
+} // namespace uuse

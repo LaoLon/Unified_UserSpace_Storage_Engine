@@ -1,11 +1,11 @@
-# HFS_BASE_SPDK
+# UUSE_BASE_SPDK
 
-> 状态（2026-09-16）：HFS 正在按 `doc/design/hfs2.0.md` 做 clean-break 重构（C++20
-> coroutine-first、raw SPDK bdev、`.conf` 配置）。下方 README 描述的是 HFS 1.x
-> 冻结线（Blobstore/preload）的构建与使用方式，仅用于旧线复现，不代表 HFS 2.0。
+> 状态（2026-09-16）：UUSE 正在按 `doc/design/uuse.md` 做 clean-break 重构（C++20
+> coroutine-first、raw SPDK bdev、`.conf` 配置）。下方 README 描述的是 UUSE 1.x
+> 冻结线（Blobstore/preload）的构建与使用方式，仅用于旧线复现，不代表 UUSE 2.0。
 
 An experimental filesystem built on SPDK Blobstore. The initial implementation is migrated from
-the `hfs` example and uses a malloc bdev configured through JSON.
+the `uuse` example and uses a malloc bdev configured through JSON.
 
 SPDK official project: <https://github.com/spdk/spdk>
 
@@ -13,7 +13,7 @@ SPDK official project: <https://github.com/spdk/spdk>
 
 ```bash
 git clone --recurse-submodules <repository-url>
-cd HFS_BASE_SPDK
+cd UUSE_BASE_SPDK
 ```
 
 For an existing checkout:
@@ -52,8 +52,8 @@ make app
 Outputs are isolated from the source tree:
 
 ```text
-build/bin/spdk-hfs
-build/obj/hfs.o
+build/bin/spdk-uuse
+build/obj/uuse.o
 ```
 
 Run with the default configuration:
@@ -65,7 +65,7 @@ make run
 Override the configuration file at build time when needed:
 
 ```bash
-make CONFIG=/absolute/path/to/hfs.json
+make CONFIG=/absolute/path/to/uuse.json
 ```
 
 Generate a clangd compilation database with Bear after both SPDK configuration and build:
@@ -76,38 +76,38 @@ make compile-commands
 
 ## LD_PRELOAD Usage
 
-The interceptor library (`libhfs.so`) exposes an HFS namespace under a mount prefix
-(default `/hfs/`). Programs that operate on paths under the prefix are routed to the
-HFS filesystem; everything else passes through to the kernel.
+The interceptor library (`libuuse.so`) exposes an UUSE namespace under a mount prefix
+(default `/uuse/`). Programs that operate on paths under the prefix are routed to the
+UUSE filesystem; everything else passes through to the kernel.
 
 ```bash
-# Build the library (cmake-based build also produces build-cmake/libhfs.so)
+# Build the library (cmake-based build also produces build-cmake/libuuse.so)
 make lib
 
-# Format a fresh in-memory backend and route one process's file operations to HFS
-HFS_FORMAT=1 LD_PRELOAD=$PWD/build/lib/libhfs.so python3 - <<'EOF'
+# Format a fresh in-memory backend and route one process's file operations to UUSE
+UUSE_FORMAT=1 LD_PRELOAD=$PWD/build/lib/libuuse.so python3 - <<'EOF'
 import os
-os.mkdir('/hfs/d')
-fd = os.open('/hfs/d/f', os.O_CREAT | os.O_RDWR, 0o644)
+os.mkdir('/uuse/d')
+fd = os.open('/uuse/d/f', os.O_CREAT | os.O_RDWR, 0o644)
 os.write(fd, b'hello')
 os.close(fd)
-print(os.listdir('/hfs/d'))
+print(os.listdir('/uuse/d'))
 EOF
 
 # Custom mount prefix
-HFS_MOUNT_PREFIX=/data HFS_FORMAT=1 LD_PRELOAD=$PWD/build/lib/libhfs.so <program>
+UUSE_MOUNT_PREFIX=/data UUSE_FORMAT=1 LD_PRELOAD=$PWD/build/lib/libuuse.so <program>
 
-# Reuse a persistent SPDK bdev (format once, then omit HFS_FORMAT)
-HFS_CONFIG_PATH=$PWD/config/hfs_db_aio.json HFS_BDEV_NAME=Aio0 \
-	HFS_FORMAT=1 LD_PRELOAD=$PWD/build/lib/libhfs.so <formatting-program>
-HFS_CONFIG_PATH=$PWD/config/hfs_db_aio.json HFS_BDEV_NAME=Aio0 \
-	LD_PRELOAD=$PWD/build/lib/libhfs.so <program>
+# Reuse a persistent SPDK bdev (format once, then omit UUSE_FORMAT)
+UUSE_CONFIG_PATH=$PWD/config/uuse_db_aio.json UUSE_BDEV_NAME=Aio0 \
+	UUSE_FORMAT=1 LD_PRELOAD=$PWD/build/lib/libuuse.so <formatting-program>
+UUSE_CONFIG_PATH=$PWD/config/uuse_db_aio.json UUSE_BDEV_NAME=Aio0 \
+	LD_PRELOAD=$PWD/build/lib/libuuse.so <program>
 ```
 
 ## Database Validation
 
 The current stage validates a single database process on a persistent SPDK AIO/NVMe backend.
-Clients connect to the database through its normal socket or TCP interface; they do not mount HFS
+Clients connect to the database through its normal socket or TCP interface; they do not mount UUSE
 directly.
 
 | Backend | Status | Validation |
@@ -116,8 +116,8 @@ directly.
 | RocksDB | Supported for the validated POSIX path | `scripts/db/rocksdb_smoke.sh` covers cross-process reopen, normal/direct I/O, WAL recovery, concurrent read/write, and `ldb checkconsistency` |
 
 Use `scripts/db/database_benchmark.sh` to record the effective backend configuration, RocksDB
-throughput, write latency p50/p99, CPU time, RSS, HFS lock/I/O counters, and error counts. Optional
-counters are enabled only when `HFS_STATS_PATH` (or `HFS_STATS=1`) is set; the default runtime path
+throughput, write latency p50/p99, CPU time, RSS, UUSE lock/I/O counters, and error counts. Optional
+counters are enabled only when `UUSE_STATS_PATH` (or `UUSE_STATS=1`) is set; the default runtime path
 keeps them disabled.
 
 For a repeatable three-round stage result with raw logs, median aggregation, and dispersion data, use
@@ -127,16 +127,16 @@ before including a round in the summary.
 Known limitations:
 
 - External shell commands (`mkdir`, `cat`, `dd`, ...) run in fork+exec children that
-  inherit `_HFS_INIT_DONE` and fall through to the kernel. Use single-process
+  inherit `_UUSE_INIT_DONE` and fall through to the kernel. Use single-process
   workloads (python, C programs) or run everything in one shell built-in.
 - The default malloc bdev is process-private: data does not survive across processes.
-- Persistent AIO/NVMe bdevs require one explicit `HFS_FORMAT=1` formatting run; normal runs
-  load the existing blobstore and reject an unformatted backend. Only one HFS process may mount
+- Persistent AIO/NVMe bdevs require one explicit `UUSE_FORMAT=1` formatting run; normal runs
+  load the existing blobstore and reject an unformatted backend. Only one UUSE process may mount
   a backend at a time; sequential process restart/reopen is supported.
 - File `mmap` returns `ENODEV`; native `libaio` and `io_uring` completion queues are not supported.
 
 Run the interceptor smoke test (assertions run in a single python process):
 
 ```bash
-bash scripts/preload_smoke.sh build/lib/libhfs.so
+bash scripts/preload_smoke.sh build/lib/libuuse.so
 ```

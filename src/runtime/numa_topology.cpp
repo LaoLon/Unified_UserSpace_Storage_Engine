@@ -9,7 +9,7 @@
 #include <system_error>
 #include <utility>
 
-namespace hfs {
+namespace uuse {
 
 namespace {
 
@@ -240,4 +240,4 @@ NumaTopologySnapshot snapshotNumaTopology(const Config &config,
     return snapshot;
 }
 
-} // namespace hfs
+} // namespace uuse

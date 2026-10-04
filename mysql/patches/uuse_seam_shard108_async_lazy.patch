@@ -1,0 +1,16 @@
+--- a/storage/innobase/os/uuse_vfs.cc	2026-09-28 06:19:15.289312518 +0000
++++ b/storage/innobase/os/uuse_vfs.cc	2026-09-28 06:19:15.301171832 +0000
+@@ -369,6 +369,13 @@
+ bool asyncIo(const std::shared_ptr<uuse::File> &file, void *buf, std::size_t n,
+              std::uint64_t offset, bool write, std::size_t *out, int *errorOut) {
+   ThreadClientHolder *holder = t_holder.get();
++  /* Lazily create this thread's own client on first I/O. threadClient() sets
++   * t_holder only for per-thread clients; the shared overflow client cannot
++   * own an async poll loop, so those threads keep the synchronous fallback. */
++  if ((holder == nullptr || holder->client == nullptr) && file != nullptr && n != 0) {
++    (void)threadClient();
++    holder = t_holder.get();
++  }
+   if (holder == nullptr || holder->client == nullptr || file == nullptr || n == 0) {
+     state().asyncFallbacks.fetch_add(1, std::memory_order_relaxed);
+     return false;

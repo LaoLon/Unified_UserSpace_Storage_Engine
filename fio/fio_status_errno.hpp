@@ -2,33 +2,33 @@
 
 #include <cerrno>
 
-#include "hfs/types.hpp"
+#include "uuse/types.hpp"
 
-namespace hfs::fio {
+namespace uuse::fio {
 
 /* Maps one core status to the errno value used by the fio adapter. */
-inline int mapStatusToErrno(::hfs::Status status) noexcept {
+inline int mapStatusToErrno(::uuse::Status status) noexcept {
     switch (status) {
-    case ::hfs::Status::Busy:
-    case ::hfs::Status::TryAgain:
+    case ::uuse::Status::Busy:
+    case ::uuse::Status::TryAgain:
         return EAGAIN;
-    case ::hfs::Status::NoMemory:
+    case ::uuse::Status::NoMemory:
         return ENOMEM;
-    case ::hfs::Status::NoSpace:
+    case ::uuse::Status::NoSpace:
         return ENOSPC;
-    case ::hfs::Status::NotFound:
+    case ::uuse::Status::NotFound:
         return ENOENT;
-    case ::hfs::Status::AlreadyExists:
+    case ::uuse::Status::AlreadyExists:
         return EEXIST;
-    case ::hfs::Status::InvalidArgument:
+    case ::uuse::Status::InvalidArgument:
         return EINVAL;
-    case ::hfs::Status::NotSupported:
+    case ::uuse::Status::NotSupported:
         return ENOTSUP;
-    case ::hfs::Status::Cancelled:
+    case ::uuse::Status::Cancelled:
         return ECANCELED;
-    case ::hfs::Status::TimedOut:
+    case ::uuse::Status::TimedOut:
         return ETIMEDOUT;
-    case ::hfs::Status::IoError:
+    case ::uuse::Status::IoError:
         return EIO;
     default:
         return EIO;
@@ -38,10 +38,10 @@ inline int mapStatusToErrno(::hfs::Status status) noexcept {
 /* Stores errno for fio's setup error path and returns the same value. The
  * engine must not return an error code without setting errno: fio reports
  * err=0 and silently drops the job otherwise. */
-inline int setErrnoFromStatus(::hfs::Status status) noexcept {
+inline int setErrnoFromStatus(::uuse::Status status) noexcept {
     const int value = mapStatusToErrno(status);
     errno = value;
     return value;
 }
 
-} // namespace hfs::fio
+} // namespace uuse::fio

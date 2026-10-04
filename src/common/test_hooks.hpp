@@ -1,5 +1,5 @@
 /* Process-level crash injection for crash-consistency tests (design §10.2).
- * The hook is inert unless HFS_TEST_CRASH_AT matches the requested point. */
+ * The hook is inert unless UUSE_TEST_CRASH_AT matches the requested point. */
 
 #pragma once
 
@@ -14,11 +14,11 @@
 #include <unordered_map>
 #include <unistd.h>
 
-namespace hfs::test_hooks {
+namespace uuse::test_hooks {
 
 /* True when the caller requested a crash at the named durability point. */
 inline bool crashRequested(const char *point) noexcept {
-    const char *value = std::getenv("HFS_TEST_CRASH_AT");
+    const char *value = std::getenv("UUSE_TEST_CRASH_AT");
     if (value == nullptr || *value == '\0') {
         return false;
     }
@@ -26,18 +26,18 @@ inline bool crashRequested(const char *point) noexcept {
 }
 
 /* Terminates the process without cleanup, simulating a hard crash. When
- * HFS_TEST_CRASH_ARM_FILE is set, the hook stays inert until that file exists,
+ * UUSE_TEST_CRASH_ARM_FILE is set, the hook stays inert until that file exists,
  * which lets the workload arm the crash after the database is open. The first
- * HFS_TEST_CRASH_SKIP occurrences are skipped as an additional control. */
+ * UUSE_TEST_CRASH_SKIP occurrences are skipped as an additional control. */
 inline void crashIfRequested(const char *point) noexcept {
     if (!crashRequested(point)) {
         return;
     }
-    const char *armFile = std::getenv("HFS_TEST_CRASH_ARM_FILE");
+    const char *armFile = std::getenv("UUSE_TEST_CRASH_ARM_FILE");
     if (armFile != nullptr && *armFile != '\0' && ::access(armFile, F_OK) != 0) {
         return;
     }
-    const char *skipText = std::getenv("HFS_TEST_CRASH_SKIP");
+    const char *skipText = std::getenv("UUSE_TEST_CRASH_SKIP");
     const unsigned long skip = skipText != nullptr ? std::strtoul(skipText, nullptr, 10) : 0;
     static std::mutex mutex;
     static std::unordered_map<std::string, unsigned long> seen;
@@ -49,7 +49,7 @@ inline void crashIfRequested(const char *point) noexcept {
     if (count < skip) {
         return;
     }
-    std::fprintf(stderr, "hfs: test crash at %s (occurrence %lu)\n", point, count + 1);
+    std::fprintf(stderr, "uuse: test crash at %s (occurrence %lu)\n", point, count + 1);
     std::fflush(stderr);
     ::_exit(137);
 }
@@ -72,9 +72,9 @@ struct DataIoDelaySetting {
 namespace detail {
 
 inline constexpr const char *kDataIoDelayEnv[static_cast<std::size_t>(
-    DataIoDelayKind::Count)] = {"HFS_TEST_DATA_IO_DELAY_MS",
-                                "HFS_TEST_DATA_IO_READ_DELAY_MS",
-                                "HFS_TEST_DATA_IO_WRITE_DELAY_MS"};
+    DataIoDelayKind::Count)] = {"UUSE_TEST_DATA_IO_DELAY_MS",
+                                "UUSE_TEST_DATA_IO_READ_DELAY_MS",
+                                "UUSE_TEST_DATA_IO_WRITE_DELAY_MS"};
 
 /* Missing or invalid values are treated as no injection. */
 inline DataIoDelaySetting parseDataIoDelay(const char *name) noexcept {
@@ -150,4 +150,4 @@ inline void setDataIoDelay(DataIoDelayKind kind, std::uint32_t milliseconds) noe
     detail::dataIoDelayCache(kind).store(milliseconds);
 }
 
-} // namespace hfs::test_hooks
+} // namespace uuse::test_hooks

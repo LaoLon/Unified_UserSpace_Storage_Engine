@@ -9,13 +9,13 @@
 #include <span>
 #include <vector>
 
-#include "hfs/types.hpp"
+#include "uuse/types.hpp"
 
-namespace hfs {
+namespace uuse {
 
 class DmaArena;
 
-/* RAII buffer: caller-owned memory or an arena slice (hfs2.0.md §8.1). */
+/* RAII buffer: caller-owned memory or an arena slice (uuse.md §8.1). */
 class BufferLease {
 public:
     BufferLease() = default;
@@ -40,7 +40,7 @@ private:
     std::span<std::byte> bytes_;
 };
 
-/* Bounded on-demand arena shared by the data path (hfs2.0.md §8.2). */
+/* Bounded on-demand arena shared by the data path (uuse.md §8.2). */
 class DmaArena {
 public:
     using Allocator = void *(*)(std::size_t size, void *ctx);
@@ -115,4 +115,4 @@ private:
     std::uint64_t busy_ = 0;
 };
 
-} // namespace hfs
+} // namespace uuse

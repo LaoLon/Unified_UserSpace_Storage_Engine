@@ -3,7 +3,7 @@
 #include <atomic>
 #include <cstdint>
 
-namespace hfs {
+namespace uuse {
 
 /* Aggregates child completions: first error, completed bytes, single wake. */
 class ParentCompletion {
@@ -29,4 +29,4 @@ private:
     void *ctx_ = nullptr;
 };
 
-} // namespace hfs
+} // namespace uuse

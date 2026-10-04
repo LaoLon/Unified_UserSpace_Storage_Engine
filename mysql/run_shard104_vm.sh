@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Exercise the supported MySQL/InnoDB surface on the configured HFS NVMe.
+# Exercise the supported MySQL/InnoDB surface on the configured UUSE NVMe.
 set -euo pipefail
 
-BUILD="${BUILD:-/home/hfs/mysql-build}"
-CONFIG="${CONFIG:-/root/code/config/hfs_mysql.conf}"
-HFSCTL="${HFSCTL:-/root/code/build-verify/hfsctl}"
-DATA="${DATA:-/home/hfs/mysql-shard104-datadir}"
-RESULT="${RESULT:-/home/hfs/mysql-shard104-results}"
+BUILD="${BUILD:-/home/uuse/mysql-build}"
+CONFIG="${CONFIG:-/root/code/config/uuse_mysql.conf}"
+UUSECTL="${UUSECTL:-/root/code/build-verify/uusectl}"
+DATA="${DATA:-/home/uuse/mysql-shard104-datadir}"
+RESULT="${RESULT:-/home/uuse/mysql-shard104-results}"
 BIN="$BUILD/runtime_output_directory"
 MYSQLD="$BIN/mysqld"
 MYSQL="$BIN/mysql"
@@ -16,11 +16,11 @@ MYSQLCHECK="$BIN/mysqlcheck"
 SOCKET="$RESULT/mysql.sock"
 SERVER_PID=""
 
-for executable in "$MYSQLD" "$MYSQL" "$MYSQLADMIN" "$MYSQLDUMP" "$MYSQLCHECK" "$HFSCTL"; do
+for executable in "$MYSQLD" "$MYSQL" "$MYSQLADMIN" "$MYSQLDUMP" "$MYSQLCHECK" "$UUSECTL"; do
   test -x "$executable" || { printf 'missing executable: %s\n' "$executable" >&2; exit 2; }
 done
 mkdir -p "$RESULT" "$DATA"
-export HFS_MYSQL_CONFIG="$CONFIG" HFS_MYSQL_PREFIX="$DATA"
+export UUSE_MYSQL_CONFIG="$CONFIG" UUSE_MYSQL_PREFIX="$DATA"
 export LD_LIBRARY_PATH="/root/code/build-verify:${LD_LIBRARY_PATH:-}"
 
 # Check the configured controller binding and hugepage budget before I/O.
@@ -29,7 +29,7 @@ test -n "$BDF"
 test "$(basename "$(readlink -f "/sys/bus/pci/devices/$BDF/driver")")" == uio_pci_generic
 test "$(awk '/^HugePages_Total:/ {print $2}' /proc/meminfo)" -ge 1024
 
-# Keep the datadir empty on the host; routed data belongs only on HFS.
+# Keep the datadir empty on the host; routed data belongs only on UUSE.
 test -z "$(find "$DATA" -mindepth 1 -maxdepth 1 -print -quit)" || {
   printf 'host datadir is not empty: %s\n' "$DATA" >&2
   exit 2
@@ -37,7 +37,7 @@ test -z "$(find "$DATA" -mindepth 1 -maxdepth 1 -print -quit)" || {
 
 # Require an explicit flag before erasing the selected test volume.
 if [[ "${FORMAT_DEVICE:-0}" == 1 ]]; then
-  "$HFSCTL" --config="$CONFIG" format --yes > "$RESULT/format.log" 2>&1
+  "$UUSECTL" --config="$CONFIG" format --yes > "$RESULT/format.log" 2>&1
 fi
 
 sql() {
@@ -93,62 +93,62 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Bootstrap the HFS-backed datadir and exercise core SQL semantics.
+# Bootstrap the UUSE-backed datadir and exercise core SQL semantics.
 "$MYSQLD" --no-defaults --user=root --basedir="$BUILD" --datadir="$DATA" \
   --initialize-insecure --innodb-use-native-aio=OFF \
   --log-error="$RESULT/initialize.log" \
   > "$RESULT/initialize.stdout" 2>&1
 start_server
-sql -e "CREATE DATABASE hfs_matrix;
-CREATE TABLE hfs_matrix.items(id INT PRIMARY KEY, v VARCHAR(80)) ENGINE=InnoDB;
-INSERT INTO hfs_matrix.items VALUES (1,'alpha'),(2,'beta');
-START TRANSACTION; UPDATE hfs_matrix.items SET v='changed' WHERE id=1; ROLLBACK;
+sql -e "CREATE DATABASE uuse_matrix;
+CREATE TABLE uuse_matrix.items(id INT PRIMARY KEY, v VARCHAR(80)) ENGINE=InnoDB;
+INSERT INTO uuse_matrix.items VALUES (1,'alpha'),(2,'beta');
+START TRANSACTION; UPDATE uuse_matrix.items SET v='changed' WHERE id=1; ROLLBACK;
 SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
-START TRANSACTION; INSERT INTO hfs_matrix.items VALUES(3,'gamma'); COMMIT;
+START TRANSACTION; INSERT INTO uuse_matrix.items VALUES(3,'gamma'); COMMIT;
 SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
-START TRANSACTION; UPDATE hfs_matrix.items SET v='delta' WHERE id=2; COMMIT;
-ALTER TABLE hfs_matrix.items ADD INDEX idx_v(v), ALGORITHM=INPLACE, LOCK=NONE;
-ALTER TABLE hfs_matrix.items ADD COLUMN tag INT DEFAULT 7, ALGORITHM=INSTANT;
-DELETE FROM hfs_matrix.items WHERE id=3;
-CREATE TABLE hfs_matrix.child(id INT PRIMARY KEY, parent_id INT,
+START TRANSACTION; UPDATE uuse_matrix.items SET v='delta' WHERE id=2; COMMIT;
+ALTER TABLE uuse_matrix.items ADD INDEX idx_v(v), ALGORITHM=INPLACE, LOCK=NONE;
+ALTER TABLE uuse_matrix.items ADD COLUMN tag INT DEFAULT 7, ALGORITHM=INSTANT;
+DELETE FROM uuse_matrix.items WHERE id=3;
+CREATE TABLE uuse_matrix.child(id INT PRIMARY KEY, parent_id INT,
   CONSTRAINT fk_parent FOREIGN KEY(parent_id) REFERENCES items(id)) ENGINE=InnoDB;
-INSERT INTO hfs_matrix.child VALUES(1,1);
-CREATE TABLE hfs_matrix.words(id INT PRIMARY KEY, body TEXT,
+INSERT INTO uuse_matrix.child VALUES(1,1);
+CREATE TABLE uuse_matrix.words(id INT PRIMARY KEY, body TEXT,
   FULLTEXT KEY ft_body(body)) ENGINE=InnoDB;
-INSERT INTO hfs_matrix.words VALUES(1,'hfs fulltext smoke');
-CREATE TABLE hfs_matrix.places(id INT PRIMARY KEY,
+INSERT INTO uuse_matrix.words VALUES(1,'uuse fulltext smoke');
+CREATE TABLE uuse_matrix.places(id INT PRIMARY KEY,
   pos POINT NOT NULL SRID 4326, SPATIAL KEY sp_pos(pos)) ENGINE=InnoDB;
-INSERT INTO hfs_matrix.places VALUES(1,ST_GeomFromText('POINT(1 2)',4326));
-SELECT COUNT(*),MIN(tag),MAX(tag) FROM hfs_matrix.items;
-SELECT COUNT(*) FROM hfs_matrix.child;
-SELECT COUNT(*) FROM hfs_matrix.words WHERE MATCH(body) AGAINST('hfs');
-SELECT ST_AsText(pos) FROM hfs_matrix.places;
+INSERT INTO uuse_matrix.places VALUES(1,ST_GeomFromText('POINT(1 2)',4326));
+SELECT COUNT(*),MIN(tag),MAX(tag) FROM uuse_matrix.items;
+SELECT COUNT(*) FROM uuse_matrix.child;
+SELECT COUNT(*) FROM uuse_matrix.words WHERE MATCH(body) AGAINST('uuse');
+SELECT ST_AsText(pos) FROM uuse_matrix.places;
 SHOW BINARY LOGS;" > "$RESULT/sql-matrix.tsv"
-test "$(sql -e 'SELECT COUNT(*) FROM hfs_matrix.items')" == 2
-test "$(sql -e 'SELECT v FROM hfs_matrix.items WHERE id=1')" == alpha
+test "$(sql -e 'SELECT COUNT(*) FROM uuse_matrix.items')" == 2
+test "$(sql -e 'SELECT v FROM uuse_matrix.items WHERE id=1')" == alpha
 expect_rejected myisam sql -e \
-  'CREATE TABLE hfs_matrix.unsupported_myisam(id INT) ENGINE=MyISAM'
+  'CREATE TABLE uuse_matrix.unsupported_myisam(id INT) ENGINE=MyISAM'
 expect_rejected aria sql -e \
-  'CREATE TABLE hfs_matrix.unsupported_aria(id INT) ENGINE=Aria'
+  'CREATE TABLE uuse_matrix.unsupported_aria(id INT) ENGINE=Aria'
 expect_rejected compression sql -e \
-  "CREATE TABLE hfs_matrix.unsupported_compression(id INT PRIMARY KEY)
+  "CREATE TABLE uuse_matrix.unsupported_compression(id INT PRIMARY KEY)
      ENGINE=InnoDB COMPRESSION='zlib';
-   INSERT INTO hfs_matrix.unsupported_compression VALUES(1)"
+   INSERT INTO uuse_matrix.unsupported_compression VALUES(1)"
 expect_rejected clone sql -e \
   "INSTALL PLUGIN clone SONAME 'mysql_clone.so'"
 "$MYSQLCHECK" --no-defaults --protocol=socket --socket="$SOCKET" -uroot \
-  --check hfs_matrix > "$RESULT/mysqlcheck.log"
+  --check uuse_matrix > "$RESULT/mysqlcheck.log"
 "$MYSQLDUMP" --no-defaults --protocol=socket --socket="$SOCKET" -uroot \
-  --single-transaction hfs_matrix > "$RESULT/hfs_matrix.sql"
-sql -e 'CREATE DATABASE hfs_restore'
-sql hfs_restore < "$RESULT/hfs_matrix.sql"
-test "$(sql -e 'SELECT COUNT(*) FROM hfs_restore.items')" == 2
+  --single-transaction uuse_matrix > "$RESULT/uuse_matrix.sql"
+sql -e 'CREATE DATABASE uuse_restore'
+sql uuse_restore < "$RESULT/uuse_matrix.sql"
+test "$(sql -e 'SELECT COUNT(*) FROM uuse_restore.items')" == 2
 stop_server
 
-# Reopen in a new process and check the durable contents and HFS metadata.
+# Reopen in a new process and check the durable contents and UUSE metadata.
 start_server
-test "$(sql -e 'SELECT COUNT(*) FROM hfs_matrix.items')" == 2
-test "$(sql -e 'SELECT COUNT(*) FROM hfs_restore.items')" == 2
+test "$(sql -e 'SELECT COUNT(*) FROM uuse_matrix.items')" == 2
+test "$(sql -e 'SELECT COUNT(*) FROM uuse_restore.items')" == 2
 stop_server
 expect_rejected daemonize "$MYSQLD" --no-defaults --user=root \
   --basedir="$BUILD" --datadir="$DATA" --daemonize --validate-config \
@@ -162,12 +162,12 @@ expect_rejected native-aio "$MYSQLD" --no-defaults --user=root \
   --disabled-storage-engines=MyISAM
 mkdir -p "$RESULT/invalid-config-host"
 expect_rejected invalid-config env \
-  HFS_MYSQL_CONFIG="$RESULT/missing.conf" \
-  HFS_MYSQL_PREFIX="$RESULT/invalid-config-host" \
+  UUSE_MYSQL_CONFIG="$RESULT/missing.conf" \
+  UUSE_MYSQL_PREFIX="$RESULT/invalid-config-host" \
   "$MYSQLD" --no-defaults --user=root --basedir="$BUILD" \
   --datadir="$RESULT/invalid-config-host" --initialize-insecure \
   --innodb-use-native-aio=OFF
 test -z "$(find "$RESULT/invalid-config-host" -mindepth 1 -print -quit)"
-"$HFSCTL" --config="$CONFIG" check > "$RESULT/hfs-check.log" 2>&1
-grep -q 'corruption=none' "$RESULT/hfs-check.log"
+"$UUSECTL" --config="$CONFIG" check > "$RESULT/uuse-check.log" 2>&1
+grep -q 'corruption=none' "$RESULT/uuse-check.log"
 printf 'Shard-104 functional matrix passed\n'

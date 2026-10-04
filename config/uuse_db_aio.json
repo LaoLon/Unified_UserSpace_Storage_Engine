@@ -1,0 +1,17 @@
+{
+  "subsystems": [
+    {
+      "subsystem": "bdev",
+      "config": [
+        {
+          "method": "bdev_aio_create",
+          "params": {
+            "filename": "/var/tmp/uuse-db.img",
+            "name": "Aio0",
+            "block_size": 4096
+          }
+        }
+      ]
+    }
+  ]
+}

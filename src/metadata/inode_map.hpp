@@ -5,10 +5,10 @@
 #include <vector>
 
 #include "core/extent_map.hpp"
-#include "hfs/types.hpp"
+#include "uuse/types.hpp"
 #include "metadata/allocator.hpp"
 
-namespace hfs::metadata {
+namespace uuse::metadata {
 
 /* One logical extent range mapped to a device run (COMMITTED extents only). */
 struct ExtentDescriptor {
@@ -18,7 +18,7 @@ struct ExtentDescriptor {
     std::uint32_t deviceId = 0;
 };
 
-/* Per-inode logical-to-physical extent map (hfs2.0.md §9.4/§13.3): a versioned
+/* Per-inode logical-to-physical extent map (uuse.md §9.4/§13.3): a versioned
  * vector mutated by the metadata actor and read through the ExtentMap view. */
 class InodeExtentMap final : public ExtentMap {
 public:
@@ -49,4 +49,4 @@ private:
     std::vector<ExtentDescriptor> extents_; /* sorted by logicalExtent */
 };
 
-} // namespace hfs::metadata
+} // namespace uuse::metadata

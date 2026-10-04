@@ -3,7 +3,7 @@
 #include "common/trace.hpp"
 #include "core/shard_ring.hpp"
 
-namespace hfs {
+namespace uuse {
 
 ShardActor::ShardActor(ShardRing &ring, Step step, void *ctx, std::size_t batchSize)
     : ring_(ring), step_(step), ctx_(ctx), batch_(batchSize == 0 ? 1 : batchSize) {}
@@ -44,4 +44,4 @@ std::size_t ShardActor::processed() const noexcept { return processed_; }
 
 std::size_t ShardActor::batchSize() const noexcept { return batch_.size(); }
 
-} // namespace hfs
+} // namespace uuse

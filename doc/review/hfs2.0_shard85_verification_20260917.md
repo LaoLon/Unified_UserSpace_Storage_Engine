@@ -1,5 +1,7 @@
 # HFS 2.0 Shard-85 verification record
 
+> 注：项目已于 2026-10-04 由 HFS 更名为 UUSE；本文为历史记录，正文与证据路径保留 HFS 时期名称。
+
 时间：2026-09-17  
 分支：`main`  
 正式设备：`Nvme0n1`, PCI BDF `0000:0b:00.0`  

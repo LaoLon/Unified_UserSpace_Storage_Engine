@@ -7,7 +7,7 @@
 
 #include "common/trace.hpp"
 
-namespace hfs {
+namespace uuse {
 
 /* Bounded SPSC completion queue: the shard actor pushes, the frontend reaps. */
 class CompletionQueue {
@@ -86,4 +86,4 @@ private:
     std::atomic<std::uint64_t> dropped_{0};
 };
 
-} // namespace hfs
+} // namespace uuse

@@ -14,7 +14,7 @@
 
 namespace {
 
-constexpr const char *kTraceDirectory = "/tmp/hfs2-shard86-trace-test";
+constexpr const char *kTraceDirectory = "/tmp/uuse-shard86-trace-test";
 
 void cleanupTraceDirectory() noexcept {
     char path[256];
@@ -37,49 +37,49 @@ void cleanupTraceDirectory() noexcept {
 
 int main() {
     cleanupTraceDirectory();
-    hfs::trace::setSample(1);
-    HFS_TEST_CHECK(hfs::trace::start(kTraceDirectory));
-    HFS_TEST_CHECK(hfs::trace::sessionActive());
-    hfs::trace::setEnabled(true);
-    hfs::trace::event(hfs::trace::EventId::ActorBatch, 1, 2, 3, 4);
-    hfs::trace::event(hfs::trace::EventId::FeSubmit, 5, 6, 7, 8);
-    hfs::trace::event(hfs::trace::EventId::FeReap, 9, 10, 11, 12);
-    HFS_TEST_CHECK(hfs::trace::recorded() == 3);
-    hfs::trace::setEnabled(false);
-    hfs::trace::stop();
-    HFS_TEST_CHECK(!hfs::trace::sessionActive());
-    HFS_TEST_CHECK(hfs::trace::dropped() == 0);
+    uuse::trace::setSample(1);
+    UUSE_TEST_CHECK(uuse::trace::start(kTraceDirectory));
+    UUSE_TEST_CHECK(uuse::trace::sessionActive());
+    uuse::trace::setEnabled(true);
+    uuse::trace::event(uuse::trace::EventId::ActorBatch, 1, 2, 3, 4);
+    uuse::trace::event(uuse::trace::EventId::FeSubmit, 5, 6, 7, 8);
+    uuse::trace::event(uuse::trace::EventId::FeReap, 9, 10, 11, 12);
+    UUSE_TEST_CHECK(uuse::trace::recorded() == 3);
+    uuse::trace::setEnabled(false);
+    uuse::trace::stop();
+    UUSE_TEST_CHECK(!uuse::trace::sessionActive());
+    UUSE_TEST_CHECK(uuse::trace::dropped() == 0);
 
-    const int manifestFd = ::open("/tmp/hfs2-shard86-trace-test/trace-manifest.json",
+    const int manifestFd = ::open("/tmp/uuse-shard86-trace-test/trace-manifest.json",
                                   O_RDONLY | O_CLOEXEC);
-    HFS_TEST_CHECK(manifestFd >= 0);
+    UUSE_TEST_CHECK(manifestFd >= 0);
     char manifest[4096]{};
     const ssize_t manifestBytes = ::read(manifestFd, manifest, sizeof(manifest) - 1);
     ::close(manifestFd);
-    HFS_TEST_CHECK(manifestBytes > 0);
-    HFS_TEST_CHECK(std::strstr(manifest, "\"format_version\":2") != nullptr);
-    HFS_TEST_CHECK(std::strstr(manifest, "\"closed\":true") != nullptr);
-    HFS_TEST_CHECK(std::strstr(manifest, "\"source_threads\":[") != nullptr);
+    UUSE_TEST_CHECK(manifestBytes > 0);
+    UUSE_TEST_CHECK(std::strstr(manifest, "\"format_version\":2") != nullptr);
+    UUSE_TEST_CHECK(std::strstr(manifest, "\"closed\":true") != nullptr);
+    UUSE_TEST_CHECK(std::strstr(manifest, "\"source_threads\":[") != nullptr);
 
     char path[256];
     const int written = std::snprintf(path, sizeof(path), "%s/trace-0.bin",
                                       kTraceDirectory);
     struct stat fileStatus {};
-    HFS_TEST_CHECK(written > 0 && static_cast<std::size_t>(written) < sizeof(path));
-    HFS_TEST_CHECK(::stat(path, &fileStatus) == 0);
-    HFS_TEST_CHECK(fileStatus.st_size >=
-                   static_cast<off_t>(3 * sizeof(hfs::trace::TraceRecord)));
+    UUSE_TEST_CHECK(written > 0 && static_cast<std::size_t>(written) < sizeof(path));
+    UUSE_TEST_CHECK(::stat(path, &fileStatus) == 0);
+    UUSE_TEST_CHECK(fileStatus.st_size >=
+                   static_cast<off_t>(3 * sizeof(uuse::trace::TraceRecord)));
 
-    hfs::trace::setEnabled(true);
-    const std::uint64_t beforeFallback = hfs::trace::recorded();
-    hfs::trace::event(hfs::trace::EventId::SchedDone, 13);
-    HFS_TEST_CHECK(hfs::trace::recorded() == beforeFallback + 1);
-    hfs::trace::setEnabled(false);
+    uuse::trace::setEnabled(true);
+    const std::uint64_t beforeFallback = uuse::trace::recorded();
+    uuse::trace::event(uuse::trace::EventId::SchedDone, 13);
+    UUSE_TEST_CHECK(uuse::trace::recorded() == beforeFallback + 1);
+    uuse::trace::setEnabled(false);
 
     /* Concurrent producers stopped mid-flight keep recorded == on-disk. */
     {
-        HFS_TEST_CHECK(hfs::trace::start(kTraceDirectory));
-        hfs::trace::setEnabled(true);
+        UUSE_TEST_CHECK(uuse::trace::start(kTraceDirectory));
+        uuse::trace::setEnabled(true);
         std::atomic<bool> stopNow{false};
         std::atomic<std::uint64_t> emitted{0};
         std::vector<std::thread> producers;
@@ -87,17 +87,17 @@ int main() {
             producers.emplace_back([&stopNow, &emitted] {
                 while (!stopNow.load(std::memory_order_acquire) &&
                        emitted.fetch_add(1, std::memory_order_relaxed) < 16000) {
-                    hfs::trace::event(hfs::trace::EventId::ActorBatch, 1);
+                    uuse::trace::event(uuse::trace::EventId::ActorBatch, 1);
                 }
             });
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
         stopNow.store(true, std::memory_order_release);
-        hfs::trace::stop();
+        uuse::trace::stop();
         for (std::thread &thread : producers) {
             thread.join();
         }
-        HFS_TEST_CHECK(hfs::trace::dropped() == 0);
+        UUSE_TEST_CHECK(uuse::trace::dropped() == 0);
 
         std::uint64_t onDisk = 0;
         for (std::uint32_t index = 0; index < 64; ++index) {
@@ -109,10 +109,10 @@ int main() {
             struct stat fileStatus {};
             if (::stat(path, &fileStatus) == 0) {
                 onDisk += static_cast<std::uint64_t>(fileStatus.st_size) /
-                          sizeof(hfs::trace::TraceRecord);
+                          sizeof(uuse::trace::TraceRecord);
             }
         }
-        HFS_TEST_CHECK(onDisk == hfs::trace::recorded());
+        UUSE_TEST_CHECK(onDisk == uuse::trace::recorded());
     }
 
     cleanupTraceDirectory();

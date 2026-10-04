@@ -1,5 +1,7 @@
 # HFS 2.0 Shard 开发计划（Phase 0-6）
 
+> 注：项目已于 2026-10-04 由 HFS 更名为 UUSE；本文为历史记录，正文与证据路径保留 HFS 时期名称。
+
 > 状态：HFS 2.0 当前执行计划，2026-09-16 起生效
 >
 > 事实源：`doc/design/hfs2.0.md`；评审依据：`doc/review/hfs2.0_design_review_20260916.md`

@@ -2,7 +2,7 @@
 
 #include "core/extent_map.hpp"
 
-namespace hfs {
+namespace uuse {
 
 DataPlane::DataPlane(SpdkRuntime &runtime, DmaArena &arena,
                      IoPlanner::Config plannerConfig, DataPath::Config pathConfig)
@@ -68,4 +68,4 @@ Result<void> DataPlane::write(const metadata::InodeExtentMap &map,
     return path_.write(map, buffer, offset, length, knownEof);
 }
 
-} // namespace hfs
+} // namespace uuse
