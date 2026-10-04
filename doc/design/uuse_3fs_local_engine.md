@@ -131,13 +131,19 @@ UUSE `.conf` 指向该 BDF。
     同时加载 2 个 chunk_engine target + 1 个 UUSE target 并稳定运行。
   - 待做：单链 E2E（客户端写读经 UUSE target）+ 崩溃恢复；`StorageTargets::create`
     路径尚未带 UUSE 选项。
-  - M2.3 试验记录（2026-10-05）：新建单 target chain `900100003` + 单链表
-    （ChainTableId 3）后，客户端 16MB 写读与 SIGKILL 恢复均成功，但
-    `list-targets` 显示 UUSE target 的 UsedSize 保持 smoke 预建值 4784128——
-    **meta 服务仍使用原链表（ChainTableId 1）选链，未走单链表**；文件实际落在
-    chunk_engine 链上。下一步需确认 meta 的链选择口径（chain table 选择配置/
-    口径），或改用 storage client 直连 target 的测试路径；试验后环境已恢复
-    （systemd storage active、原链表 ChainTableId 4、设备归还内核）。
+  - M2.3 试验记录（2026-10-05，两轮）：
+    1) 新建单 target chain `900100003` + 新链表（ChainTableId 3）后客户端写读
+       成功但 UUSE target 用量不变——查明 **新 inode 继承父目录布局
+       `ChainTableId(1)` 并取该表最新版本**（`MetaServer` root layout +
+       `MetaClient::updateLayout`），新链表不生效。
+    2) 上传 **表 1 的新版本（v2，仅含 chain 900100003）** 后路由生效：客户端
+       16MB 写入进入 UUSE target，但 **storage 在 `AioReadWorker::run`（collect
+       的 UUSE 直读分支）崩溃**，写入中断（文件截断、I/O 错误）。
+    根因假设：UUSE `Client`/`File::read` 从 AioRead 多个 worker 线程调用主线程
+    创建的 Client，违反 UUSE 的线程模型（M1 smoke 为单线程）。
+    待做：读路径改为 per-thread Client 或专用 UUSE I/O 线程（或加锁验证）；
+    修复后重跑单链 E2E。试验后环境已恢复（systemd active、表 1 v3 恢复原两链、
+    设备归还内核）。
 - **M2.3**：接 3FS 集群（单链单副本或替换一个副本），FUSE 写读、SIGKILL 恢复、
   `hfsctl`/`list-targets` 检查。
 
