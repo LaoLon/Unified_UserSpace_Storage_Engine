@@ -197,6 +197,11 @@ add_executable(uusectl tools/uusectl.cpp)
 target_link_libraries(uusectl PRIVATE uuse_core)
 target_compile_options(uusectl PRIVATE -fno-exceptions -fno-rtti)
 
+# M1 chunk-store PoC for the 3FS local-engine adaptation (design §5).
+add_executable(uuse_chunkstore_poc tools/uuse_chunkstore_poc.cpp)
+target_link_libraries(uuse_chunkstore_poc PRIVATE uuse_core)
+target_compile_options(uuse_chunkstore_poc PRIVATE -fno-exceptions -fno-rtti)
+
 add_executable(uuse_lock_probe tools/uuse_lock_probe.cpp)
 target_link_libraries(uuse_lock_probe PRIVATE uuse_core)
 target_compile_options(uuse_lock_probe PRIVATE -fno-exceptions -fno-rtti)

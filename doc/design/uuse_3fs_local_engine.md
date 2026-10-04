@@ -80,7 +80,15 @@ rename/remove/dirs）、C++20 异步 Client（submitRead/submitWrite/poll）、C
   - 形状探针已完成（2026-10-04，.250）：见
     `doc/performance/uuse_chunk_shape_probe_20261004.md`——64k 随机读 48.2K IOPS、
     512k/4m 带宽 3.0–4.0 GiB/s，无软件错误，数据面可行性通过。
-  - 待办：固定 slot 布局 + chunk 元数据 + CRC32C + sync/恢复语义的 PoC 工具。
+  - PoC 工具已完成（2026-10-04）：`tools/uuse_chunkstore_poc.cpp`——固定 slot
+    布局（64K/512K/4M 三档 × 2 文件 × 32 slot）、append-only 元数据 journal
+    （PUT/DELETE 记录 + 记录 CRC，重挂载重放）、COW overwrite + free list、
+    数据 CRC32C、`File::sync` 持久化。验证：跨进程 CLI 全流程
+    （put/get/overwrite/delete/verify/info）与工具内 `selftest` 全部通过
+    （版本递增、空间核算 188/192、删除后 NotFound、journal 重放零错误），
+    非设备 CTest 21/21；证据在 VM `/home/uuse/uuse-chunkstore-poc-20261004`。
+  - 边界：同进程 stop→mount 后数据路径读挂起（`doc/bug.md` #47），恢复验证
+    按跨进程重启口径执行（与 3FS storage 重启语义一致）。
 - **M2 3FS fork 单机 E2E**：新增 `UuseChunkStore` 后端 + UUSE 读分支 +
   `engine_type` 开关；在 uuse 3FS 实验室单 storage 节点跑通
   create-target → 写读 → `storage_bench`/FIO → SIGKILL 恢复 → `hfsctl` 等价检查。

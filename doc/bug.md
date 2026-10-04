@@ -57,6 +57,7 @@ Bug 等级：**致命 > 严重 > 一般**。
 - 44：已修复（replay 每事务 before-image 导致 O(T×N) 重挂载）。
 - 45：已修复（engine 未 stop 时析构崩溃：析构兜底停止 runtime）。
 - 46：已修复（同进程 remount 崩溃，与 #45 同源）。
+- 47：待处理（同进程 remount 后数据路径读挂起；跨进程恢复不受影响）。
 
 ## Bug 记录
 
@@ -808,6 +809,25 @@ Bug 等级：**致命 > 严重 > 一般**。
   继续运行，remount 期间与 mount 的控制 I/O 竞争。
 - **修复**：同 #45（`Engine::~Engine` 兜底停止 runtime）。
 - **验证结果**：3/3 通过，remount 0.99–1.27 s；CTest 29/29。
+
+### 47. 同进程 remount 后数据路径读挂起
+
+- **状态**：待处理（已定位到数据路径 latch 不完成；PoC 已用跨进程重启规避）
+- **等级**：一般（影响同进程 stop→mount 的工具/测试；跨进程恢复不受影响）
+- **时间**：2026-10-04
+- **现象**：chunk-store PoC 自测在 phase 1 正常写入/读取/sync 后 `stop()`，同一
+  进程内 `Engine::create`+`mount()`（generation 递增），`ChunkStore::open` 重放
+  元数据时 `File::read` 永久等待；主线程栈停在 `DataPath::execute →
+  waitForLatch`，data reactor 线程停在 `waitDataReactorIdle`（ppoll），metadata
+  reactor 正常。
+- **排查过程**：`gdb -p` 全线程栈；对照 `format_mount_test`（同进程 remount 但
+  不做数据 I/O，通过）。挂起点是二次 mount 后首次数据读（journal 重放读），
+  latch 已创建但没有任何完成投递。
+- **根因**：待定位——疑似二次 runtime 生命周期下 data reactor 的提交/唤醒路径
+  与首次实例状态不一致（#45/#46 修的是崩溃，本次是挂起）。
+- **修复**：未修复；PoC 与恢复验证改为跨进程重启（与 3FS storage 重启语义一致）。
+- **验证结果**：跨进程 CLI 全流程（put/get/overwrite/delete/verify）与 `selftest`
+  均通过；同进程 remount + 数据读可稳定复现挂起（进程栈见 PoC 证据目录）。
 
 ## 记录模板
 
