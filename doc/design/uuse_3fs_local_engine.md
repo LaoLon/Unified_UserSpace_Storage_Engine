@@ -131,6 +131,13 @@ UUSE `.conf` 指向该 BDF。
     同时加载 2 个 chunk_engine target + 1 个 UUSE target 并稳定运行。
   - 待做：单链 E2E（客户端写读经 UUSE target）+ 崩溃恢复；`StorageTargets::create`
     路径尚未带 UUSE 选项。
+  - M2.3 试验记录（2026-10-05）：新建单 target chain `900100003` + 单链表
+    （ChainTableId 3）后，客户端 16MB 写读与 SIGKILL 恢复均成功，但
+    `list-targets` 显示 UUSE target 的 UsedSize 保持 smoke 预建值 4784128——
+    **meta 服务仍使用原链表（ChainTableId 1）选链，未走单链表**；文件实际落在
+    chunk_engine 链上。下一步需确认 meta 的链选择口径（chain table 选择配置/
+    口径），或改用 storage client 直连 target 的测试路径；试验后环境已恢复
+    （systemd storage active、原链表 ChainTableId 4、设备归还内核）。
 - **M2.3**：接 3FS 集群（单链单副本或替换一个副本），FUSE 写读、SIGKILL 恢复、
   `hfsctl`/`list-targets` 检查。
 
