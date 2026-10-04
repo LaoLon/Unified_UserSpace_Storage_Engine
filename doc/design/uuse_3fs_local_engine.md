@@ -92,6 +92,10 @@ rename/remove/dirs）、C++20 异步 Client（submitRead/submitWrite/poll）、C
 - **M2 3FS fork 单机 E2E**：新增 `UuseChunkStore` 后端 + UUSE 读分支 +
   `engine_type` 开关；在 uuse 3FS 实验室单 storage 节点跑通
   create-target → 写读 → `storage_bench`/FIO → SIGKILL 恢复 → `hfsctl` 等价检查。
+  - 前置条件已完成（2026-10-05）：.251 的 3FS 构建环境已恢复——`/build/3fs`
+    @ `22fca04`（与部署版本一致），clang-17 + gcc-12，6 个目标二进制构建通过；
+    构建流程与兼容补丁见 `integrations/3fs/README.md` 和
+    `integrations/3fs/patches/`。
 - **M3 双存储节点与对照**：.251/.250 双节点跑 CRAQ 复制、resync、节点故障；
   与 `chunk_engine` 同机 A/B 吞吐/延迟/CPU，记录正式结论。
 
