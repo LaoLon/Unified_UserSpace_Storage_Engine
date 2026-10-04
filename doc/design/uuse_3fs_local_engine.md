@@ -77,6 +77,10 @@ rename/remove/dirs）、C++20 异步 Client（submitRead/submitWrite/poll）、C
   布局在 UUSE 上实现 put/get/overwrite/delete + CRC32C + sync，并用
   64 KiB/512 KiB/4 MiB 随机读写微基准与 `chunk_engine` 的负载形状对照；
   先回答"UUSE 能不能支撑 chunk 数据面"。
+  - 形状探针已完成（2026-10-04，.250）：见
+    `doc/performance/uuse_chunk_shape_probe_20261004.md`——64k 随机读 48.2K IOPS、
+    512k/4m 带宽 3.0–4.0 GiB/s，无软件错误，数据面可行性通过。
+  - 待办：固定 slot 布局 + chunk 元数据 + CRC32C + sync/恢复语义的 PoC 工具。
 - **M2 3FS fork 单机 E2E**：新增 `UuseChunkStore` 后端 + UUSE 读分支 +
   `engine_type` 开关；在 uuse 3FS 实验室单 storage 节点跑通
   create-target → 写读 → `storage_bench`/FIO → SIGKILL 恢复 → `hfsctl` 等价检查。
