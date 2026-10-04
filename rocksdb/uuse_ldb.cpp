@@ -20,7 +20,7 @@ bool parseArguments(int argc, char **argv, std::string *config, std::string *dbP
         if (argument == "checkconsistency") {
             commandSeen = true;
         } else if (argument.rfind("--uuse-config=", 0) == 0) {
-            *config = argument.substr(13);
+            *config = argument.substr(14);
         } else if (argument.rfind("--db=", 0) == 0) {
             *dbPath = argument.substr(5);
         } else if (index == 1 && config->empty()) {

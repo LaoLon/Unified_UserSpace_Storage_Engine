@@ -92,7 +92,7 @@ bool parseArguments(int argc, char **argv, BenchOptions *options) {
     for (int i = 1; i < argc; ++i) {
         const std::string argument = argv[i];
         if (argument.rfind("--uuse-config=", 0) == 0) {
-            options->configPath = argument.substr(13);
+            options->configPath = argument.substr(14);
         } else if (argument.rfind("--db=", 0) == 0) {
             options->dbPath = argument.substr(5);
         } else if (argument.rfind("--benchmarks=", 0) == 0) {
