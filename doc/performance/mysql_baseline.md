@@ -1,6 +1,9 @@
 # HFS 2.0 MySQL 基线：原生 ext4 对比 HFS（sysbench 16/32/64 线程）
 
 > 注：项目已于 2026-10-04 由 HFS 更名为 UUSE；本文为历史记录，正文与证据路径保留 HFS 时期名称。
+>
+> 2026-10-04 改名后回归（FIO/RocksDB/MySQL 同会话对照，无系统性回退）：见
+> `doc/performance/uuse_rename_regression_20261004.md`。
 
 日期：2026-09-27 会话（UTC 17:00:10–17:08:34，本地 2026-09-28 01:00–01:09）。
 范围：同一块 NVMe 上，同一个 MySQL 8.0.46 二进制分别使用 **HFS 卷**与
