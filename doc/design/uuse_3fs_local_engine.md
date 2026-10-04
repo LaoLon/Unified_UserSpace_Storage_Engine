@@ -72,6 +72,59 @@ rename/remove/dirs）、C++20 异步 Client（submitRead/submitWrite/poll）、C
 
 ## 5. 里程碑
 
+### M2 实施方案（2026-10-05 冻结）
+
+**后端选择**：`StorageTarget` 增加第三分支 `useUuseEngine()`（由 target 的
+`PhysicalConfig.use_uuse_engine` 或 storage 配置的 `engine_type` 决定）。旧
+`ChunkStore`/`ChunkReplica` 依赖 `ChunkFileView` 的 POSIX fd 与 `ChunkMetaStore`
+的 KV 文件，无法直接复用；UUSE 后端按同一语义**新实现**。
+
+**`UuseChunkStore` 类面（对齐 `StorageTarget` 现有调用）**：
+
+| 方法 | 语义（映射到 UUSE） |
+|---|---|
+| `create/load(PhysicalConfig)` | 在 UUSE 卷内建/载入目标目录：每 chunk 尺寸档 2 个固定 slot 文件（`f<fileId>.dat`，slot = 档位大小）+ append-only 元数据 journal（`meta.log`） |
+| `get(ChunkId)` | journal 重放后的内存映射（含 `commitVer/updateVer/chainVer/size/state/checksum/innerFileId/innerOffset`） |
+| `createChunk(id, size, ChunkInfo&, executor, allowToAllocate)` | 分配空 slot，返回 `ChunkInfo`（无 fd，`view` 由 UUSE 位置描述替代） |
+| `set(id, ChunkInfo, persist)` | 追加 PUT 记录（写数据后）；COW：旧 slot 回收 |
+| `remove(id, ChunkInfo&)` | 追加 DELETE 记录 + slot 回收 |
+| `queryChunks(range)` / `getAllMetadata` | 内存映射过滤（逆序，与旧语义一致） |
+| `usedSize` / `uncommitted` / `resetUncommitted` | 由元数据聚合 |
+| `sync()` | 同步 slot 文件与 journal（`File::sync` 触发 metadata checkpoint） |
+| `update(job, executor)` | 移植 `ChunkReplica::update` 的版本/校验和/COW 语义，I/O 走 UUSE `File::write` |
+| `aioPrepareRead/aioFinishRead` | UUSE 无 fd：`readFd` 置无效，记录 `innerFileId/innerOffset`；读执行分支见下 |
+
+**读路径分期**：
+- M2.1（单机 E2E）：`StorageOperator` 对 UUSE target 走**内联同步读**（`File::read`
+  + `.wait()`），不经过 `AioReadWorker`；以文档化 stepping stone 形式验收正确性。
+- M2.2：接 `uuse::Client::submitRead/poll` 异步完成，替代 fd/io_uring 分支。
+
+**构建集成**：3FS 侧新增 `UuseChunkStore.{h,cc}` 与 smoke 目标，链接 UUSE
+`libuuse_core.so`（UUSE 头文件与 .so 从 .250 构建产物复制到 .251；SPDK/DPDK
+静态闭包已在 .so 内）。运行前提：目标 NVMe 绑定 uio、`vm.nr_hugepages=1024`、
+UUSE `.conf` 指向该 BDF。
+
+**去风险结果（2026-10-05，.251 实测）**：
+- 链接：clang-17（`--gcc-install-dir=.../12`）链接 gcc-15 构建的
+  `libuuse_core.so` 需加 `-Wl,--allow-shlib-undefined`（新 libstdc++ 符号由运行时
+  系统库解析），与 3FS 现有链接口径一致。
+- 运行：.251 真实 NVMe（`0000:13:00.0`）上 format/mount/128 KiB 写读/CRC 通过
+  （`UUSE_LINK_SMOKE_PASS`）。
+- 约束：.251 运行态下 hugepage 最多分配到 ~357 页，M2 测试配置改用
+  `dma_arena_mb = 256`（需求 221 页）。
+- 产物位置：.251 `/root/code-uuse`（UUSE 头文件 + `libuuse_core.so` + 冒烟程序）。
+
+**分阶段与验收**：
+- **M2.1**：`UuseChunkStore` 核心 + smoke（put/get/COW/remove/query/跨进程恢复）
+  在 .251 真实 NVMe 上通过 → 目标：语义正确性。
+- **M2.2**：`StorageTarget` 第三分支 + `engine_type` 开关 + 异步读；单 storage
+  节点创建 UUSE target，直连 storage client 写读通过。
+- **M2.3**：接 3FS 集群（单链单副本或替换一个副本），FUSE 写读、SIGKILL 恢复、
+  `hfsctl`/`list-targets` 检查。
+
+**停止条件**：数据校验错、崩溃恢复不守恒、版本语义与 `ChunkReplica` 不一致、
+journal 重放丢记录——出现任一即回退修复，不做性能结论。
+
 - **M0 侦察与接口冻结**（本 doc）。
 - **M1 UUSE chunk 数据面 PoC（不动 3FS）**：独立 C++ 工具/库，按固定 slot
   布局在 UUSE 上实现 put/get/overwrite/delete + CRC32C + sync，并用
