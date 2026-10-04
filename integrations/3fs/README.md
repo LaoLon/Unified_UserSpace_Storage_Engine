@@ -78,21 +78,23 @@
 - `patches/apply-uuse-chunkstore.sh`：安装 M2.1 的 `UuseChunkStore` 核心与
   smoke 目标（源码在 `uuse/`）。
 
-## M2.1 UuseChunkStore（已通过）
+## M2.1/M2.2 UuseChunkStore（核心已通过，接线已构建）
 
 - 源码：`uuse/UuseChunkStore.{h,cc}`、`uuse/UuseChunkStoreSmoke.cc`、
   `uuse/CMake.uuse-chunkstore.cmake`。
-- 构建（.251，需 `/root/code-uuse` 的 UUSE 头文件与 `libuuse_core.so`）：
+- 安装（含 M2.2 的 `StorageTarget` 第三后端接线：PhysicalConfig
+  `use_uuse_engine/uuse_conf`、create/load/update/commit/query 分支）：
 
   ```bash
   bash integrations/3fs/patches/apply-uuse-chunkstore.sh /build/3fs
-  cd /build/3fs && cmake -S . -B build && cmake --build build -j3 --target uuse_chunkstore_smoke
+  cd /build/3fs && cmake -S . -B build
+  cmake --build build -j3 --target storage_main uuse_chunkstore_smoke
   ```
 
 - 运行（目标 NVMe 绑 uio + hugepages；.251 用 `dma_arena_mb = 256` 的配置）：
 
   ```bash
-  uuse_chunkstore_smoke <uuse.conf> /uuse-store/t<targetId> 1   # 写入+COW+删除+query+sync
+  uuse_chunkstore_smoke <uuse.conf> /uuse-store/t<targetId> 1   # 写入+COW+删除+query+update/commit+sync
   uuse_chunkstore_smoke <uuse.conf> /uuse-store/t<targetId> 2   # 新进程重放 journal 校验恢复
   ```
 
@@ -100,6 +102,10 @@
   `SMOKE2_PASS live=3 free=189 used=4784128`（64K/512K/4M 写入+CRC、COW 版本递增、
   update/commit 语义（自动递增版本、陈旧版本拒绝、commit 持久化）、删除不复活、
   journal 重放守恒）。
+- 接线状态：`storage_main` 已带 UUSE 后端构建通过；UUSE target 由
+  `target.toml` 的 `use_uuse_engine = true` + `uuse_conf` 选择，数据落在 UUSE
+  卷的 `/uuse-store/t<targetId>`；**读路径尚未接线**（`aioPrepareRead` 返回明确
+  错误，待 AioStatus 分支）；单 storage 节点 E2E 待做。
 
 ## 部署说明
 

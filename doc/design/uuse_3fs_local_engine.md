@@ -124,7 +124,9 @@ UUSE `.conf` 指向该 BDF。
   节点创建 UUSE target，直连 storage client 写读通过。
   - 进展（2026-10-05）：`ChunkReplica::update` 的版本/COW/校验和/commit 语义已移植到
     `UuseChunkStore::update/commit` 并通过 smoke（自动递增版本、陈旧版本拒绝、
-    commit 持久化、跨进程恢复）；`StorageTarget` 接线与读路径为下一步。
+    commit 持久化、跨进程恢复）；`StorageTarget` 第三后端接线已完成并构建出带 UUSE
+    后端的 `storage_main`（create/load/update/commit/query 分支；UUSE target 由
+    `target.toml` 的 `use_uuse_engine/uuse_conf` 选择）。读路径与单节点 E2E 为下一步。
 - **M2.3**：接 3FS 集群（单链单副本或替换一个副本），FUSE 写读、SIGKILL 恢复、
   `hfsctl`/`list-targets` 检查。
 
