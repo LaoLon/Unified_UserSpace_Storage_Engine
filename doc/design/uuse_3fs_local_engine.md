@@ -199,6 +199,12 @@ journal 重放丢记录——出现任一即回退修复，不做性能结论。
     `'_result' has error`，需完整输出定位）；旧 target 记录与链 900100003 仍在，
     RF2 链上传继续被 `TargetId duplicated` 阻挡。下一步：用完整错误输出定位
     offline/remove 的 RPC 失败原因（或直接清 FDB 中旧链记录后重建）。
+  - RF2 阻塞根因（2026-10-05，完整错误输出）：`offline-target`/`remove-target`
+    返回 **`RPC::SendFailed(2007)`**——admin 请求发不到 node 10001 的注册端点；
+    同时 mgmtd 中 .251 的 chunk_engine target 也显示 OFFLINE，说明重建进程本次的
+    服务端点/注册不完整（数据面此前可用，但 admin RPC 路径不通）。下一步：
+    排查重建进程的 endpoint 注册（routing info 中的服务地址）或改用直接清 FDB
+    旧链记录的方式解除 RF2 阻塞。
   - M3 首个数据点（2026-10-05，客户端 FUSE 64MiB dd 写+读，同机同客户端）：
     - UUSE 后端（chain 900100003，单副本）：写 **11.15s（~5.7 MiB/s，61MiB
       截断）**、读 3.29s（~19.4 MiB/s）
