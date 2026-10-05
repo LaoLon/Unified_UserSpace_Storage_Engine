@@ -1,10 +1,14 @@
 #pragma once
 
 #include <array>
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -153,6 +157,28 @@ class UuseChunkStore {
   static SlotRef slotRefOf(const ChunkMetadata &meta);
   std::string slotPath(uint32_t fileId) const;
   std::string metaPath() const;
+
+  /* All UUSE data-plane calls (File read/write/sync) are serialized on one
+   * dedicated I/O thread: the UUSE sync API is not safe for concurrent use
+   * from multiple storage worker threads (AioReadWorker/update executors). */
+  void startIoThread();
+  void stopIoThread();
+  Result<Void> runIo(std::function<Result<Void>()> fn);
+  Result<Void> ioWriteAt(uuse::File &file, const uint8_t *data, uint32_t size, uint64_t offset);
+  Result<Void> ioReadAt(uuse::File &file, uint8_t *data, uint32_t size, uint64_t offset);
+  Result<Void> ioSyncFile(uuse::File &file, const char *what);
+
+  struct IoTask {
+    std::function<Result<Void>()> fn;
+    Result<Void> result = makeError(StatusCode::kInvalidArg, "io task not run");
+    bool done = false;
+  };
+  std::thread ioThread_;
+  std::mutex ioMutex_;
+  std::condition_variable ioCv_;
+  std::condition_variable ioDoneCv_;
+  std::deque<IoTask *> ioQueue_;
+  bool ioStop_ = false;
 
   Options options_;
   std::unique_ptr<uuse::Engine> engine_;

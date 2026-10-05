@@ -139,11 +139,15 @@ UUSE `.conf` 指向该 BDF。
     2) 上传 **表 1 的新版本（v2，仅含 chain 900100003）** 后路由生效：客户端
        16MB 写入进入 UUSE target，但 **storage 在 `AioReadWorker::run`（collect
        的 UUSE 直读分支）崩溃**，写入中断（文件截断、I/O 错误）。
-    根因假设：UUSE `Client`/`File::read` 从 AioRead 多个 worker 线程调用主线程
-    创建的 Client，违反 UUSE 的线程模型（M1 smoke 为单线程）。
-    待做：读路径改为 per-thread Client 或专用 UUSE I/O 线程（或加锁验证）；
-    修复后重跑单链 E2E。试验后环境已恢复（systemd active、表 1 v3 恢复原两链、
-    设备归还内核）。
+    根因已定位并修复：`StorageTarget::aioFinishRead` 对 UUSE target 仍调用旧
+    `ChunkReplica::aioFinishRead`，访问未加载的 legacy `ChunkStore`（空 KV）→
+    SIGSEGV；已加 UUSE 分支（版本校验走 `uuseStore_->get`）。同时把 UUSE
+    数据面 I/O 串行化到专用 I/O 线程（`UuseChunkStore::runIo`）。
+    修复后 storage 不再崩溃；**剩余问题**：客户端 16MB 写入在 13MiB 处截断、
+    读回校验不一致（storage 存活、无崩溃），需继续定位（疑点：1MiB chunk 映射到
+    4MiB class 后重复 update 触发 `kChunkSizeMismatch`、或校验和口径）。
+    待做：修复后重跑单链 E2E。试验后环境已恢复（systemd active、表 1 v5 恢复原
+    两链、设备归还内核）。
 - **M2.3**：接 3FS 集群（单链单副本或替换一个副本），FUSE 写读、SIGKILL 恢复、
   `hfsctl`/`list-targets` 检查。
 

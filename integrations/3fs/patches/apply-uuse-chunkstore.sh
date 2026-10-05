@@ -459,6 +459,33 @@ rep(p, '''    auto result = job.state().storageTarget->aioPrepareRead(job);
     }
 
     ++readyToSubmit_;''')
+
+p = root + '/src/storage/store/StorageTarget.cc'
+rep(p, '''Result<Void> StorageTarget::aioFinishRead(AioReadJob &job) {
+  if (job.state().chunkEngineJob.has_chunk()) {
+    return Void{};
+  }
+  return ChunkReplica::aioFinishRead(chunkStore_, job);
+}''',
+    '''Result<Void> StorageTarget::aioFinishRead(AioReadJob &job) {
+  if (job.state().chunkEngineJob.has_chunk()) {
+    return Void{};
+  }
+  if (useUuseEngine()) {
+    if (!uuseStore_) {
+      return makeError(StorageCode::kStorageInitFailed, "uuse store not loaded");
+    }
+    auto info = uuseStore_->get(job.readIO().key.chunkId);
+    if (!info) {
+      return makeError(std::move(info.error()));
+    }
+    if (job.result().updateVer != info.value().meta.updateVer) {
+      return makeError(StorageCode::kChunkNotCommit, "uuse chunk version outdated");
+    }
+    return Void{};
+  }
+  return ChunkReplica::aioFinishRead(chunkStore_, job);
+}''')
 print('uuse read path installed')
 PY
 echo "apply-uuse-chunkstore done"

@@ -105,6 +105,7 @@ Result<std::unique_ptr<UuseChunkStore>> UuseChunkStore::open(const Options &opti
     return makeError(StatusCode::kIOError, "uuse client: " + clientResult.message());
   }
   store->client_ = clientResult.value();
+  store->startIoThread();
 
   if (options.create) {
     auto layout = store->createLayout();
@@ -132,6 +133,7 @@ Result<std::unique_ptr<UuseChunkStore>> UuseChunkStore::open(const Options &opti
 }
 
 UuseChunkStore::~UuseChunkStore() {
+  stopIoThread();
   slotFiles_.clear();
   metaFile_.reset();
   if (client_) {
@@ -144,9 +146,77 @@ UuseChunkStore::~UuseChunkStore() {
   engine_.reset();
 }
 
-std::size_t UuseChunkStore::classOfFile(uint32_t fileId) { return fileId / kFilesPerClass; }
+void UuseChunkStore::startIoThread() {
+  ioThread_ = std::thread([this]() {
+    while (true) {
+      IoTask *task = nullptr;
+      {
+        std::unique_lock lock(ioMutex_);
+        ioCv_.wait(lock, [this] { return ioStop_ || !ioQueue_.empty(); });
+        if (ioStop_ && ioQueue_.empty()) {
+          return;
+        }
+        task = ioQueue_.front();
+        ioQueue_.pop_front();
+      }
+      task->result = task->fn();
+      {
+        std::lock_guard lock(ioMutex_);
+        task->done = true;
+      }
+      ioDoneCv_.notify_all();
+    }
+  });
+}
 
-UuseChunkStore::SlotRef UuseChunkStore::slotRefOf(const ChunkMetadata &meta) {
+void UuseChunkStore::stopIoThread() {
+  {
+    std::lock_guard lock(ioMutex_);
+    ioStop_ = true;
+  }
+  ioCv_.notify_all();
+  if (ioThread_.joinable()) {
+    ioThread_.join();
+  }
+}
+
+Result<Void> UuseChunkStore::runIo(std::function<Result<Void>()> fn) {
+  if (!ioThread_.joinable()) {
+    return fn();
+  }
+  IoTask task;
+  task.fn = std::move(fn);
+  {
+    std::lock_guard lock(ioMutex_);
+    ioQueue_.push_back(&task);
+  }
+  ioCv_.notify_one();
+  {
+    std::unique_lock lock(ioMutex_);
+    ioDoneCv_.wait(lock, [&task] { return task.done; });
+  }
+  return task.result;
+}
+
+Result<Void> UuseChunkStore::ioWriteAt(uuse::File &file, const uint8_t *data, uint32_t size, uint64_t offset) {
+  return runIo([&]() { return writeAt(file, data, size, offset); });
+}
+
+Result<Void> UuseChunkStore::ioReadAt(uuse::File &file, uint8_t *data, uint32_t size, uint64_t offset) {
+  return runIo([&]() { return readAt(file, data, size, offset); });
+}
+
+Result<Void> UuseChunkStore::ioSyncFile(uuse::File &file, const char *what) {
+  return runIo([&]() -> Result<Void> {
+    auto synced = file.sync().wait().value();
+    if (!synced.ok()) {
+      return makeError(StatusCode::kIOError, std::string(what) + synced.message());
+    }
+    return Void{};
+  });
+}
+
+std::size_t UuseChunkStore::classOfFile(uint32_t fileId) { return fileId / kFilesPerClass; }UuseChunkStore::SlotRef UuseChunkStore::slotRefOf(const ChunkMetadata &meta) {
   const auto cls = classOfFile(meta.innerFileId.chunkIdx);
   return SlotRef{meta.innerFileId.chunkIdx, static_cast<uint32_t>(meta.innerOffset / kClassSize[cls])};
 }
@@ -347,7 +417,7 @@ Result<Void> UuseChunkStore::writeChunk(ChunkInfo &chunkInfo, const uint8_t *dat
   if (fileIt == slotFiles_.end()) {
     return makeError(StatusCode::kInvalidArg, "uuse slot file missing");
   }
-  auto written = writeAt(*fileIt->second, data, size, chunkInfo.meta.innerOffset + offset);
+  auto written = ioWriteAt(*fileIt->second, data, size, chunkInfo.meta.innerOffset + offset);
   if (!written) {
     return written;
   }
@@ -361,7 +431,7 @@ Result<Void> UuseChunkStore::readChunk(const ChunkInfo &chunkInfo, uint8_t *data
   if (fileIt == slotFiles_.end()) {
     return makeError(StatusCode::kInvalidArg, "uuse slot file missing");
   }
-  return readAt(*fileIt->second, data, size, chunkInfo.meta.innerOffset + offset);
+  return ioReadAt(*fileIt->second, data, size, chunkInfo.meta.innerOffset + offset);
 }
 
 Result<Void> UuseChunkStore::set(const ChunkId &chunkId, const ChunkInfo &chunkInfo) {
@@ -518,13 +588,13 @@ Result<UuseChunkStore::UpdateOutput> UuseChunkStore::update(const UpdateInput &i
   static const std::vector<uint8_t> zeros(kClassSize[kClassCount - 1], 0);
   if (input.length != 0) {
     if (updated.size < input.offset) {
-      auto filled = writeAt(*fileIt->second, zeros.data(), input.offset - updated.size,
-                            updated.innerOffset + updated.size);
+      auto filled = ioWriteAt(*fileIt->second, zeros.data(), input.offset - updated.size,
+                              updated.innerOffset + updated.size);
       if (!filled) {
         return folly::makeUnexpected(filled.error());
       }
     }
-    auto written = writeAt(*fileIt->second, input.data, input.length, updated.innerOffset + input.offset);
+    auto written = ioWriteAt(*fileIt->second, input.data, input.length, updated.innerOffset + input.offset);
     if (!written) {
       return folly::makeUnexpected(written.error());
     }
@@ -532,7 +602,7 @@ Result<UuseChunkStore::UpdateOutput> UuseChunkStore::update(const UpdateInput &i
   }
 
   std::vector<uint8_t> chunkData(updated.size);
-  auto readBack = readAt(*fileIt->second, chunkData.data(), chunkData.size(), updated.innerOffset);
+  auto readBack = ioReadAt(*fileIt->second, chunkData.data(), chunkData.size(), updated.innerOffset);
   if (!readBack) {
     return folly::makeUnexpected(readBack.error());
   }
@@ -639,16 +709,12 @@ Result<Void> UuseChunkStore::resetUncommitted(ChainVer chainVer) {
 Result<Void> UuseChunkStore::sync() {
   std::lock_guard lock(mutex_);
   for (auto &[fileId, file] : slotFiles_) {
-    auto synced = file->sync().wait().value();
-    if (!synced.ok()) {
-      return makeError(StatusCode::kIOError, "uuse slot sync: " + synced.message());
+    auto synced = ioSyncFile(*file, "uuse slot sync: ");
+    if (!synced) {
+      return synced;
     }
   }
-  auto metaSynced = metaFile_->sync().wait().value();
-  if (!metaSynced.ok()) {
-    return makeError(StatusCode::kIOError, "uuse meta sync: " + metaSynced.message());
-  }
-  return Void{};
+  return ioSyncFile(*metaFile_, "uuse meta sync: ");
 }
 
 std::size_t UuseChunkStore::liveChunks() const {
