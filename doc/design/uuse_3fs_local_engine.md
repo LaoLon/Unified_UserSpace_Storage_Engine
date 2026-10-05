@@ -358,3 +358,13 @@ journal 重放丢记录——出现任一即回退修复，不做性能结论。
   新建一个独立 target 做 A/B，不破坏现有 `chunk_engine` target。
 - 3FS fork 的改动以 patch 集形式保存在 UUSE 仓库（拟 `integrations/3fs/patches/`），
   与 `mysql/patches/` 同一维护方式；3FS 源码本体仍在 VM 内 Git 管理，不跨机同步。
+- **克隆机恢复手册（2026-10-06）**：manager 克隆 → storage 节点标准流程与防复发
+  措施：① 确认 MAC 唯一、IP 正确；② `systemd-machine-id-setup` 重置 machine-id；
+  ③ 停用/禁用 FDB+mgmtd+meta；④ NVME_0000 格式化 XFS `data1`，fstab 条目必须带
+  `nofail,x-systemd.device-timeout=15s`（数据盘缺失/延迟时不再阻塞启动——这是
+  克隆机出现 1min30s 启动等待的根因）；⑤ 配 node_id（.251=10001/.250=10002）+
+  mgmtd 地址 + target_paths + systemd；⑥ 集群重置 + 建 target/chain；
+  ⑦ 客户端同步 token + 重挂载；⑧ **chain 创建后重启 storage 服务**刷新 routing
+  （否则客户端写读报 Remote I/O error）。
+  脚本：`uuse_clone_to_storage.sh`、`uuse_cluster_reset.sh`、
+  `uuse_targets_chains_all.sh`、`uuse_fuse_restart.sh`（均在 `temp_scripts/`）。
