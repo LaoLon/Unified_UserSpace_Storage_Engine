@@ -194,6 +194,11 @@ journal 重放丢记录——出现任一即回退修复，不做性能结论。
     `upload-chains` 继续 `TargetId duplicated`。结论：需在**同一 storage 进程
     视图**下清理（先停 systemd、由重建进程处理 remove-target，或直接清理 mgmtd
     侧旧链记录），再建 RF2 链。本次已回滚，环境恢复。
+  - RF2 建链尝试 v3（2026-10-05）：在重建进程已注册为 node 10001 的情况下重试
+    `offline-target`/`remove-target`，两者仍在 **RPC 层失败**（CLI 只回显
+    `'_result' has error`，需完整输出定位）；旧 target 记录与链 900100003 仍在，
+    RF2 链上传继续被 `TargetId duplicated` 阻挡。下一步：用完整错误输出定位
+    offline/remove 的 RPC 失败原因（或直接清 FDB 中旧链记录后重建）。
   - M3 首个数据点（2026-10-05，客户端 FUSE 64MiB dd 写+读，同机同客户端）：
     - UUSE 后端（chain 900100003，单副本）：写 **11.15s（~5.7 MiB/s，61MiB
       截断）**、读 3.29s（~19.4 MiB/s）
