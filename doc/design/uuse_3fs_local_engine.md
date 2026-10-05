@@ -331,6 +331,16 @@ journal 重放丢记录——出现任一即回退修复，不做性能结论。
       systemctl start hf3fs_fuse_main` → 继续 op 级追踪（脚本化流程已就绪：
       `uuse251_target105.sh` + `uuse254_route_t.sh` + `uuse252_trace_matrix.sh`
       + 服务端 op 计数）。
+    - op 级追踪 v4（2026-10-05，.254 重启后）：manager 恢复（FDB/mgmtd/meta
+      active），客户端挂载自动恢复；但 .254 重启清空了 /tmp，路由脚本缺少
+      `mkdir -p /tmp/gen` 而失败（表 1 未切换）；且 manager 宕机后集群处于降级态
+      （各链 UNAVAILABLE/LASTSRV），矩阵对不可用链写入报 I/O 错误，未产出有效
+      数据。已恢复：.250/.251 storage 重启重新注册、.251 清理回 systemd、原链
+      回到 SYNCING→SERVING。
+      **下一次一次性执行清单**：① 确认原链 SERVING；② `uuse251_target105.sh`
+      （UUSE target 101000100105 → chain 900100006）；③ 修正后的
+      `uuse254_route_t.sh`（已补 mkdir；路由表 1 → 900100006 并验证双副本
+      SERVING/UPTODATE）；④ `uuse252_trace_matrix.sh` + 服务端 op 计数对照。
 
 ## 6. 风险与停止条件
 
