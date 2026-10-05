@@ -182,6 +182,12 @@ journal 重放丢记录——出现任一即回退修复，不做性能结论。
     `integrations/3fs/patches/`。
 - **M3 双存储节点与对照**：.251/.250 双节点跑 CRAQ 复制、resync、节点故障；
   与 `chunk_engine` 同机 A/B 吞吐/延迟/CPU，记录正式结论。
+  - RF2 建链尝试（2026-10-05）：新建 .250 target（101000200103）成功，但
+    `upload-chains` 拒绝把 UUSE target 放进新链——**target 只能属于一条链**，
+    而 101000100103 仍关联在旧链 900100003 上（`TargetId duplicated`）。
+    结论：做 RF2 前需先释放 UUSE target 的旧链关联（`remove-target
+    --node-id 10001 --target-id 101000100103` 或清理旧链 900100003），再上传
+    RF2 链；本次已回滚（移除新建 .250 target、恢复环境）。
   - M3 首个数据点（2026-10-05，客户端 FUSE 64MiB dd 写+读，同机同客户端）：
     - UUSE 后端（chain 900100003，单副本）：写 **11.15s（~5.7 MiB/s，61MiB
       截断）**、读 3.29s（~19.4 MiB/s）
