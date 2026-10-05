@@ -320,8 +320,10 @@ Result<uint32_t> StorageTarget::updateUuseChunk(UpdateJob &job) {
   result.updateVer = updated.value().updateVer;
   result.commitChainVer = updated.value().chainVer;
   result.checksum = updated.value().checksum;
-  result.lengthInfo = updated.value().length;
-  return updated.value().length;
+  const bool sizeResult = io.isTruncate() || io.isExtend();
+  const uint32_t resultLen = sizeResult ? updated.value().length : io.length;
+  result.lengthInfo = resultLen;
+  return resultLen;
 }
 
 Result<uint32_t> StorageTarget::commitUuseChunk(UpdateJob &job) {

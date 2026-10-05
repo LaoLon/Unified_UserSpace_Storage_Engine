@@ -242,6 +242,14 @@ journal 重放丢记录——出现任一即回退修复，不做性能结论。
       交互**（close/尺寸更新时在途写丢失，或客户端重试语义与我们的版本响应），
       不是后端错误。下一步：客户端 storage op 级调试日志 + storage 侧每 op 成功
       计时（定位丢失的具体 op）；或调客户端并发/超时参数复测。
+    - op 级计数与 `lengthInfo` 修正（2026-10-05）：一次矩阵中服务端记录
+      **66 update + 66 commit**（4 文件 × 16 chunk 全部到达），文件仍短 1MiB
+      → **数据未丢，问题在客户端尺寸记账/响应语义**。同时发现 `lengthInfo`
+      语义偏差：Rust `ChunkEngine` 普通写返回 `updateIO.length`（本次写长度），
+      仅 truncate/extend 返回 chunk 长度，而 UUSE 后端曾一律返回 chunk 长度
+      （客户端 split-IO 会累加该值）——已修正为同语义。修正后复测仍非确定性
+      （dd_1m FAIL / cp OK 等），剩余因素需**客户端 op 级追踪**（FUSE 写返回
+      字节数与 split-IO 合并路径）继续定位。
 
 ## 6. 风险与停止条件
 
