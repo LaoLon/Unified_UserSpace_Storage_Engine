@@ -84,6 +84,7 @@ class UuseChunkStore {
     bool isSyncing = false; /* commit the write in this request */
     bool isRemove = false;
     bool isTruncate = false;
+    bool isExtend = false;
   };
 
   struct UpdateOutput {
@@ -95,8 +96,8 @@ class UuseChunkStore {
   };
 
   static constexpr uint32_t kClassCount = 3;
-  static constexpr uint32_t kFilesPerClass = 2;
-  static constexpr uint32_t kSlotsPerFile = 32;
+  static constexpr uint32_t kFilesPerClass = 4;
+  static constexpr uint32_t kSlotsPerFile = 128;
   static constexpr uint64_t kClassSize[kClassCount] = {64u << 10, 512u << 10, 4u << 20};
 
   static Result<std::unique_ptr<UuseChunkStore>> open(const Options &options);

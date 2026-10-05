@@ -191,8 +191,17 @@ journal 重放丢记录——出现任一即回退修复，不做性能结论。
       同步 UUSE I/O + 每次 update 全 chunk 校验和回读（1 次额外读）+ journal
       append/commit；且 **4M class 仅 64 slot 的固定布局容量上限**在 64MiB
       文件上被击穿（61MiB 截断）。
-    - 下一步优化：异步/批量 UUSE I/O、增量校验和（append 场景 CRC combine）、
-      扩大 slot 布局（files/slots per class）。
+    - 优化轮（2026-10-05，第二轮）：
+      - 定位并修复**最后一个 chunk 的 `TRUNCATE` update 未实现**（客户端用它
+        物化末 chunk）——这是 61/63MiB 截断的真正原因；修复后 64MiB **完整写入**
+        （size=67108864）。
+      - slot 布局扩大（4 文件 × 128 slot/档 = 1536 slot）；整 chunk 写走
+        **增量校验和**（从写缓冲直接计算，免回读）。
+      - 结果：写 11.07s（~5.8 MiB/s，完整 64MiB）、读 3.89s（~16.5 MiB/s）。
+        写吞吐仍 ~6× 慢于原生，瓶颈在**串行同步 I/O** 与每次 update/commit
+        的等待。
+    - 下一步优化：I/O 线程改 `Client::submitRead/submitWrite` 批量异步、
+      commit 合并、多并发客户端验证。
 
 ## 6. 风险与停止条件
 

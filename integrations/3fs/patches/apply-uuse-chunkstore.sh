@@ -306,6 +306,7 @@ Result<uint32_t> StorageTarget::updateUuseChunk(UpdateJob &job) {
   input.isSyncing = job.options().isSyncing;
   input.isRemove = io.isRemove();
   input.isTruncate = io.isTruncate();
+  input.isExtend = io.isExtend();
   auto updated = uuseStore_->update(input);
   if (!updated) {
     XLOGF(ERR,

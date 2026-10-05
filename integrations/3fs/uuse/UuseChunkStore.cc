@@ -474,10 +474,7 @@ Result<UuseChunkStore::UpdateOutput> UuseChunkStore::update(const UpdateInput &i
   if (input.chunkId.data().size() != 16) {
     return makeError(StatusCode::kInvalidArg, "uuse chunk id must be 16 bytes");
   }
-  if (input.isTruncate) {
-    return makeError(StatusCode::kNotImplemented, "uuse truncate update not implemented yet");
-  }
-  if (!input.isRemove &&
+  if (!input.isRemove && !input.isTruncate && !input.isExtend &&
       (input.offset >= input.chunkSize || input.offset + input.length > input.chunkSize)) {
     return makeError(StatusCode::kInvalidArg, "uuse write offset exceeds chunk size");
   }
@@ -588,7 +585,18 @@ Result<UuseChunkStore::UpdateOutput> UuseChunkStore::update(const UpdateInput &i
     return makeError(StatusCode::kInvalidArg, "uuse slot file missing");
   }
   static const std::vector<uint8_t> zeros(kClassSize[kClassCount - 1], 0);
-  if (input.length != 0) {
+  if (input.isTruncate || input.isExtend) {
+    /* Truncate shrinks (or keeps) the chunk; extend zero-fills the new range.
+     * The storage service uses TRUNCATE to materialize the last chunk. */
+    if (input.length > updated.size) {
+      auto filled = ioWriteAt(*fileIt->second, zeros.data(), input.length - updated.size,
+                              updated.innerOffset + updated.size);
+      if (!filled) {
+        return folly::makeUnexpected(filled.error());
+      }
+    }
+    updated.size = input.length;
+  } else if (input.length != 0) {
     if (updated.size < input.offset) {
       auto filled = ioWriteAt(*fileIt->second, zeros.data(), input.offset - updated.size,
                               updated.innerOffset + updated.size);
@@ -603,15 +611,25 @@ Result<UuseChunkStore::UpdateOutput> UuseChunkStore::update(const UpdateInput &i
     updated.size = std::max<uint32_t>(updated.size, input.offset + input.length);
   }
 
-  std::vector<uint8_t> chunkData(updated.size);
-  auto readBack = ioReadAt(*fileIt->second, chunkData.data(), chunkData.size(), updated.innerOffset);
-  if (!readBack) {
-    return folly::makeUnexpected(readBack.error());
+  /* Whole-chunk write: the checksum can be computed from the written buffer
+   * (no read-back). Partial/gap/truncate writes fall back to a recompute. */
+  if (!input.isTruncate && !input.isExtend && input.length != 0 && input.offset == 0 &&
+      input.length == updated.size) {
+    ChecksumInfo::MemoryDataIterator iter(input.data, input.length);
+    const auto fullChecksum = ChecksumInfo::create(ChecksumType::CRC32C, &iter, input.length);
+    updated.checksumType = fullChecksum.type;
+    updated.checksumValue = fullChecksum.value;
+  } else {
+    std::vector<uint8_t> chunkData(updated.size);
+    auto readBack = ioReadAt(*fileIt->second, chunkData.data(), chunkData.size(), updated.innerOffset);
+    if (!readBack) {
+      return folly::makeUnexpected(readBack.error());
+    }
+    ChecksumInfo::MemoryDataIterator fullIter(chunkData.data(), chunkData.size());
+    const auto fullChecksum = ChecksumInfo::create(ChecksumType::CRC32C, &fullIter, chunkData.size());
+    updated.checksumType = fullChecksum.type;
+    updated.checksumValue = fullChecksum.value;
   }
-  ChecksumInfo::MemoryDataIterator fullIter(chunkData.data(), chunkData.size());
-  const auto fullChecksum = ChecksumInfo::create(ChecksumType::CRC32C, &fullIter, chunkData.size());
-  updated.checksumType = fullChecksum.type;
-  updated.checksumValue = fullChecksum.value;
   updated.chunkState = ChunkState::CLEAN;
 
   auto record = makeRecord(kOpPut, input.chunkId, info);
