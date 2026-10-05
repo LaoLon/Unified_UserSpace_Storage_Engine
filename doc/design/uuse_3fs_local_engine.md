@@ -227,6 +227,15 @@ journal 重放丢记录——出现任一即回退修复，不做性能结论。
       64MiB→60），且**两端均无写错误日志**（静默尾丢失）。结论：截断与传输
       无关，是客户端写流程/尾 chunk 处理问题（下一步：抓 FUSE 写返回字节数与
       末 chunk 的 update/commit/truncate 时序）。
+    - 尾截断归因（2026-10-05）：
+      - UUSE 链 + `dd conv=fsync` 32MiB：**完全正确**（0.53s / 64MB/s、尺寸精确、
+        md5 一致）
+      - UUSE 链 + `cp` 32MiB：`cp_rc=0` 但**静默截断到 28MiB**、md5 不一致
+      - 原生链 + `cp` 32MiB：**完全正确**（尺寸精确、md5 一致）
+      结论：截断是 **UUSE 后端与 FUSE `copy_file_range`/cp 写路径的交互问题**
+      （dd 路径正常），最可疑为 copy 路径的短读/`lengthInfo` 语义；下一步抓 FUSE
+      `copy_file_range` 的读写序列与返回字节数（或让 cp 走 `--sparse=never`/普通
+      读写路径验证）。
 
 ## 6. 风险与停止条件
 
