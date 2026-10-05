@@ -188,6 +188,12 @@ journal 重放丢记录——出现任一即回退修复，不做性能结论。
     结论：做 RF2 前需先释放 UUSE target 的旧链关联（`remove-target
     --node-id 10001 --target-id 101000100103` 或清理旧链 900100003），再上传
     RF2 链；本次已回滚（移除新建 .250 target、恢复环境）。
+  - RF2 建链尝试 v2（2026-10-05）：先 `offline-target` + `remove-target`
+    101000100103 释放旧链归属，但两个请求转发到 storage 节点后均失败（节点侧
+    目标视图与 mgmtd 记录不一致：systemd 进程不认识该 target），旧记录仍在 →
+    `upload-chains` 继续 `TargetId duplicated`。结论：需在**同一 storage 进程
+    视图**下清理（先停 systemd、由重建进程处理 remove-target，或直接清理 mgmtd
+    侧旧链记录），再建 RF2 链。本次已回滚，环境恢复。
   - M3 首个数据点（2026-10-05，客户端 FUSE 64MiB dd 写+读，同机同客户端）：
     - UUSE 后端（chain 900100003，单副本）：写 **11.15s（~5.7 MiB/s，61MiB
       截断）**、读 3.29s（~19.4 MiB/s）
