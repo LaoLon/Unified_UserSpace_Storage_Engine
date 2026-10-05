@@ -205,6 +205,11 @@ journal 重放丢记录——出现任一即回退修复，不做性能结论。
     服务端点/注册不完整（数据面此前可用，但 admin RPC 路径不通）。下一步：
     排查重建进程的 endpoint 注册（routing info 中的服务地址）或改用直接清 FDB
     旧链记录的方式解除 RF2 阻塞。
+  - RF2 阻塞确认（2026-10-05，等待注册 30s 后复测）：node 10001 的 .251
+    target 仍全部 OFFLINE、`offline/remove` 仍 `RPC::SendFailed`——重建进程的
+    admin 端点在该环境下不可达（数据面此前可用）。结论：RF2 解锁应走**直接清理
+    mgmtd/FDB 侧旧链与 target 记录**（或完整集群重置）的路径，而不是依赖
+    offline/remove RPC。
   - M3 首个数据点（2026-10-05，客户端 FUSE 64MiB dd 写+读，同机同客户端）：
     - UUSE 后端（chain 900100003，单副本）：写 **11.15s（~5.7 MiB/s，61MiB
       截断）**、读 3.29s（~19.4 MiB/s）
