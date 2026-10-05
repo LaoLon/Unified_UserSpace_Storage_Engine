@@ -308,6 +308,10 @@ Result<uint32_t> StorageTarget::updateUuseChunk(UpdateJob &job) {
   input.isTruncate = io.isTruncate();
   auto updated = uuseStore_->update(input);
   if (!updated) {
+    XLOGF(ERR,
+          "uuse update failed: chunk {} chunkSize {} offset {} length {} ver {} syncing {} remove {} truncate {}: {}",
+          io.key.chunkId.toString(), io.chunkSize, io.offset, io.length, io.updateVer.toUnderType(),
+          job.options().isSyncing, io.isRemove(), io.isTruncate(), updated.error().message());
     return makeError(std::move(updated.error()));
   }
   auto &result = job.result();
@@ -326,6 +330,8 @@ Result<uint32_t> StorageTarget::commitUuseChunk(UpdateJob &job) {
   const auto &io = job.commitIO();
   auto committed = uuseStore_->commit(io.key.chunkId, io.commitVer.toUnderType(), job.commitChainVer().toUnderType());
   if (!committed) {
+    XLOGF(ERR, "uuse commit failed: chunk {} ver {} chainVer {}: {}", io.key.chunkId.toString(),
+          io.commitVer.toUnderType(), job.commitChainVer().toUnderType(), committed.error().message());
     return makeError(std::move(committed.error()));
   }
   auto &result = job.result();

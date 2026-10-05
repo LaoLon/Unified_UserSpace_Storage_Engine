@@ -109,8 +109,11 @@
   `localbuf`）。服务级验证：新 `storage_main` 同时加载 2 个 chunk_engine
   target + 1 个 UUSE target（日志 `uuse store loaded target 101000100103`，
   `Load storage target TargetId(101000100103)`），稳定运行后恢复 systemd 服务。
-- 待做：单链 E2E（客户端写读经 UUSE target）+ 崩溃恢复；`StorageTargets::create`
-  路径（admin `create-target`）尚未带 UUSE 选项。
+- M2.3 单链 E2E 已通过（2026-10-05）：客户端 4/16MiB 写读 md5 全对、UUSE 用量
+  精确吻合（25,755,648）、SIGKILL 重启后读取一致；链路由通过上传
+  ChainTableId 1 的新版本（含 UUSE chain）实现。
+- 待做：`StorageTargets::create` 路径（admin `create-target`）尚未带 UUSE 选项；
+  读路径异步化（`Client::submitRead`）。
 
 ## 部署说明
 

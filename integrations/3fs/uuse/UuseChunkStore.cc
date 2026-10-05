@@ -405,7 +405,7 @@ Result<UuseChunkStore::ChunkInfo> UuseChunkStore::createChunk(const ChunkId &chu
   info.slot = slot;
   info.meta.chunkState = ChunkState::DIRTY;
   info.meta.checksumType = ChecksumType::NONE;
-  info.meta.innerFileId.chunkSize = static_cast<uint32_t>(kClassSize[cls]);
+  info.meta.innerFileId.chunkSize = chunkSize;
   info.meta.innerFileId.chunkIdx = slot.fileId;
   info.meta.innerOffset = static_cast<uint64_t>(slot.slot) * kClassSize[cls];
   return info;
@@ -562,7 +562,9 @@ Result<UuseChunkStore::UpdateOutput> UuseChunkStore::update(const UpdateInput &i
       return folly::makeUnexpected(slotResult.error());
     }
     info.slot = slotResult.value();
-    info.meta.innerFileId.chunkSize = static_cast<uint32_t>(kClassSize[cls]);
+    /* Metadata keeps the logical chunk size; the slot class only drives the
+     * physical slot size (1 MiB chunks live in the 4 MiB class). */
+    info.meta.innerFileId.chunkSize = input.chunkSize;
     info.meta.innerFileId.chunkIdx = info.slot.fileId;
     info.meta.innerOffset = static_cast<uint64_t>(info.slot.slot) * kClassSize[cls];
   }

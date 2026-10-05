@@ -143,11 +143,13 @@ UUSE `.conf` 指向该 BDF。
     `ChunkReplica::aioFinishRead`，访问未加载的 legacy `ChunkStore`（空 KV）→
     SIGSEGV；已加 UUSE 分支（版本校验走 `uuseStore_->get`）。同时把 UUSE
     数据面 I/O 串行化到专用 I/O 线程（`UuseChunkStore::runIo`）。
-    修复后 storage 不再崩溃；**剩余问题**：客户端 16MB 写入在 13MiB 处截断、
-    读回校验不一致（storage 存活、无崩溃），需继续定位（疑点：1MiB chunk 映射到
-    4MiB class 后重复 update 触发 `kChunkSizeMismatch`、或校验和口径）。
-    待做：修复后重跑单链 E2E。试验后环境已恢复（systemd active、表 1 v5 恢复原
-    两链、设备归还内核）。
+    修复：`aioFinishRead` 加 UUSE 分支；数据面 I/O 串行化到专用 I/O 线程；元数据
+    改记**逻辑 chunk 尺寸**（slot 档位只决定物理位置，解决 1MiB chunk 映射到
+    4MiB class 后的 `kChunkSizeMismatch`）。
+    **M2.3 单链 E2E 通过（2026-10-05）**：客户端 4MiB/16MiB 写读 md5 全对、尺寸
+    精确；UUSE target 用量 25,755,648 = smoke 4,784,128 + 4MiB + 16MiB（精确
+    吻合）；SIGKILL → 重启（journal 重放）后两文件 md5 仍精确匹配。
+    试验后环境已恢复（systemd active、表 1 v7 恢复原两链、设备归还内核）。
 - **M2.3**：接 3FS 集群（单链单副本或替换一个副本），FUSE 写读、SIGKILL 恢复、
   `hfsctl`/`list-targets` 检查。
 
