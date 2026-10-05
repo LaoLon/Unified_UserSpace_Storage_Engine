@@ -182,6 +182,17 @@ journal 重放丢记录——出现任一即回退修复，不做性能结论。
     `integrations/3fs/patches/`。
 - **M3 双存储节点与对照**：.251/.250 双节点跑 CRAQ 复制、resync、节点故障；
   与 `chunk_engine` 同机 A/B 吞吐/延迟/CPU，记录正式结论。
+  - M3 首个数据点（2026-10-05，客户端 FUSE 64MiB dd 写+读，同机同客户端）：
+    - UUSE 后端（chain 900100003，单副本）：写 **11.15s（~5.7 MiB/s，61MiB
+      截断）**、读 3.29s（~19.4 MiB/s）
+    - 原生 chunk_engine（原两链）：写 **1.76s（~36.4 MiB/s，尺寸精确）**、
+      读 3.13s（~20.5 MiB/s）
+    - 结论：读路径已接近原生；写路径慢 ~6×，原因明确——单 I/O 线程串行 +
+      同步 UUSE I/O + 每次 update 全 chunk 校验和回读（1 次额外读）+ journal
+      append/commit；且 **4M class 仅 64 slot 的固定布局容量上限**在 64MiB
+      文件上被击穿（61MiB 截断）。
+    - 下一步优化：异步/批量 UUSE I/O、增量校验和（append 场景 CRC combine）、
+      扩大 slot 布局（files/slots per class）。
 
 ## 6. 风险与停止条件
 
