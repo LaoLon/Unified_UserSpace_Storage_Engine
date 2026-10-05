@@ -321,6 +321,16 @@ journal 重放丢记录——出现任一即回退修复，不做性能结论。
       结论：op 级追踪需**脚本化、无 shell 引号**的建链/切换流程（target id、
       chain id、表格上传全部写入脚本文件），并先验证双副本 SERVING/UPTODATE
       后再路由新文件。
+    - op 级追踪 v3（2026-10-05）：脚本化建链成功（.251 的 UUSE target
+      101000100105 加载到 chain 900100006），但 .254 在路由表格时 SSH 反复
+      `ECONNRESET`，随后**失联（ping 不通）**——根因是 **manager VM 宕机/不可达**
+      （FDB+mgmtd+meta），导致 FUSE 客户端挂载失败、admin 操作全部失败。其余 VM
+      正常（.250/.251 storage active）。
+      **恢复步骤**：启动 .254 并确认 FDB/mgmtd/meta active → 确认表 1 仍为原两链
+      （v31）→ .252/.253 `systemctl reset-failed hf3fs_fuse_main &&
+      systemctl start hf3fs_fuse_main` → 继续 op 级追踪（脚本化流程已就绪：
+      `uuse251_target105.sh` + `uuse254_route_t.sh` + `uuse252_trace_matrix.sh`
+      + 服务端 op 计数）。
 
 ## 6. 风险与停止条件
 
