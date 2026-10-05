@@ -207,6 +207,13 @@ journal 重放丢记录——出现任一即回退修复，不做性能结论。
       说明 UUSE store 数据面很快；客户端可见的 ~172ms/chunk 开销在**服务/客户端
       流程**（疑似客户端对未创建 chunk 的 RMW 读重试/退避、RPC 往返），下一步
       需抓客户端写流程（read-before-write 行为）与 RPC 时序。
+    - 写延迟扫描（2026-10-05，8/16/32/64MiB 新文件）：快路径 **16MiB 0.26s、
+      32MiB 0.47s、64MiB 1.12s（~57–68 MiB/s，接近原生）**；异常样本
+      （8MiB 11.4s、1MiB 截断）与客户端侧 **RDMA transport 写错误告警**
+      （Soft-RoCE）相关，**后端无 update/commit 失败**（truncate 修复后）。
+      结论：store 层 1.27ms/op，客户端快路径已接近原生；此前 5.8MiB/s 均值被
+      传输重试/超时段拉低。下一步：排查 Soft-RoCE 传输稳定性 + storage 侧细粒度
+      RPC 计时，再出正式 A/B 结论。
 
 ## 6. 风险与停止条件
 
