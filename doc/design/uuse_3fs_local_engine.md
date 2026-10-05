@@ -182,6 +182,20 @@ journal 重放丢记录——出现任一即回退修复，不做性能结论。
     `integrations/3fs/patches/`。
 - **M3 双存储节点与对照**：.251/.250 双节点跑 CRAQ 复制、resync、节点故障；
   与 `chunk_engine` 同机 A/B 吞吐/延迟/CPU，记录正式结论。
+  - **正式 A/B 收口（2026-10-05，TCP 稳定口径）**：FUSE 客户端
+    `force_use_tcp=true`（排除 Soft-RoCE 抖动），3× 64MiB `dd conv=fsync`
+    写+读，md5 与尺寸逐次校验，同机同客户端同配置。
+    | 臂 | 写（3 次） | 读（3 次） | 校验 |
+    |---|---|---|---|
+    | 原生 chunk_engine（原两链，干净态） | 1.11 / 1.15 / 0.92 s（均 1.06s ≈ **60 MiB/s**） | 3.02 / 3.04 / 2.95 s（均 3.00s ≈ **21 MiB/s**） | 3/3 md5 精确 |
+    | UUSE（此前 TCP 扫描，单 target 链） | 64MiB 1.02 s ≈ **63 MiB/s** | 3.89 s ≈ **16.5 MiB/s** | 精确 |
+    - **结论：写吞吐与原生持平（~60 MiB/s 量级）；读略低（16.5 vs 21 MiB/s），
+      均受 FUSE/设备上限约束。**
+    - 限制与遗留：UUSE 臂的 RF2 重测被链归属/表格路由问题阻塞（UUSE target
+      固定关联在 chain 900100004，新建链被 `TargetId duplicated` 拒绝；表格
+      切换脚本引号问题未完成），严格同拓扑 A/B 需下次用**全新 target id +
+      脚本化表格切换**重跑；清理后残留链 900100003/900100004 与 offline
+      target 为无害记录。
   - RF2 建链尝试（2026-10-05）：新建 .250 target（101000200103）成功，但
     `upload-chains` 拒绝把 UUSE target 放进新链——**target 只能属于一条链**，
     而 101000100103 仍关联在旧链 900100003 上（`TargetId duplicated`）。
