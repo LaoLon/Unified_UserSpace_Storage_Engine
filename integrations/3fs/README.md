@@ -76,7 +76,14 @@
 - `patches/build-fixes.sh`：构建期修复（Arrow bundled deps 的
   `cmake_minimum_required` 提升、thrift 0.16.0 tarball 下载），失败后重跑构建。
 - `patches/apply-uuse-chunkstore.sh`：安装 M2.1 的 `UuseChunkStore` 核心与
-  smoke 目标（源码在 `uuse/`）。
+  smoke 目标（源码在 `uuse/`）；含 M2.2 读路径与 M3.1 sync 路径修复。
+- `patches/apply-uuse-syncpaths.sh`：M3.1 sync/resync 路径的 UUSE 分支
+  （`getAllMetadata`/`getAllMetadataMap`/`reportUnrecycledSize`/`addChunkSize`/
+  migrate 守卫）。独立脚本，可补装到旧版本安装的源码树（幂等）。
+- `patches/apply-uuse-oplogs.sh`：UUSE 后端每 op 成功日志（`uuse update ok` /
+  `uuse commit ok` / `uuse read ok`，含 chunk/ver/len），用于 op 级追踪对账。
+- 注意：`uuse_chunkstore_smoke` 目标构建需 `CC=gcc-12 CXX=g++-12`，否则 cargo
+  指纹失配会触发 Rust 重编（用默认 c++ 编译 vendored RocksDB 失败）。
 
 ## M2.1/M2.2 UuseChunkStore（核心已通过，接线已构建）
 

@@ -341,6 +341,31 @@ journal 重放丢记录——出现任一即回退修复，不做性能结论。
       （UUSE target 101000100105 → chain 900100006）；③ 修正后的
       `uuse254_route_t.sh`（已补 mkdir；路由表 1 → 900100006 并验证双副本
       SERVING/UPTODATE）；④ `uuse252_trace_matrix.sh` + 服务端 op 计数对照。
+    - **op 级追踪执行（2026-10-06，干净环境重建后）**：环境（克隆机重建 + 集群
+      重置 + 3FS/UUSE 重建构建）完成后按清单执行：① 原链 900100001/2 SERVING；
+      ② .251 UUSE target 101000100105（链 900100003）；③ .250 侧 101000200105 +
+      链 900100003 + 表 1 路由（v2）；④ writer 矩阵 + 服务端 op 计数。
+      - **发现并修复：UUSE target 的 sync/resync 路径缺失导致 storage 崩溃**
+        （SIGSEGV）：`StorageOperator::syncStart` → `StorageTarget::getAllMetadata`
+        → 落到 `chunkStore_.getAllMetadata`（UUSE target 的 `chunkStore_` 从未
+        加载）→ 空指针。同类缺口：`getAllMetadataMap`（ResyncWorker/DumpWorker）、
+        `reportUnrecycledSize`（CheckWorker）、`addChunkSize`（chunk size 变更）、
+        `migrate` 守卫。修复：为 UUSE 增加分支（`allChunks()` → `ChunkMeta`
+        转换；size 报告/`addChunkSize` 直接返回；migrate 条件加
+        `!use_uuse_engine`）。补丁
+        `integrations/3fs/patches/apply-uuse-syncpaths.sh`（已并入一键安装器）。
+        修复后链同步完成（`sync receive done ONLINE -> UPTODATE`）且不再崩溃。
+        **意义**：旧环境出现的"storage 重启/连接关闭窗口"（客户端 Transport
+        告警）与此崩溃吻合——UUSE 副本在 sync/resync 触发时崩溃会丢在途写，
+        很可能就是"静默尾丢失"的重要成因。
+      - **op 成功日志**（`apply-uuse-oplogs.sh`）：`uuse update ok` / `uuse commit
+        ok` / `uuse read ok`（含 chunk/ver/len），用于客户端矩阵与服务端 op
+        逐项对账。
+      - **矩阵结果**：干净环境下 7 轮（1+6）writer 矩阵 **28/28 文件精确**
+        （size 16MiB + md5 一致），服务端 op 守恒（update == commit，全部到达，
+        含同步转发）；尾丢失**未复现**。对比旧环境（间歇性 15/14MiB 截断 +
+        服务端 op 全达）——支持"尾丢失由环境降级/崩溃窗口引入"的判断。
+        待续：更长批次复现（后台 20 轮）+ 若复现则用 op 日志逐 chunk 对账。
 
 ## 6. 风险与停止条件
 
@@ -368,3 +393,8 @@ journal 重放丢记录——出现任一即回退修复，不做性能结论。
   （否则客户端写读报 Remote I/O error）。
   脚本：`uuse_clone_to_storage.sh`、`uuse_cluster_reset.sh`、
   `uuse_targets_chains_all.sh`、`uuse_fuse_restart.sh`（均在 `temp_scripts/`）。
+- **重建构建备忘（2026-10-06，CMake 4.2）**：Arrow 的 bundled 依赖（xsimd/lz4/
+  zlib 等）`cmake_minimum_required` 过旧会被 CMake 4.2 拒绝——整行规范化为
+  `VERSION 3.5`，且构建时导出 `CMAKE_POLICY_VERSION_MINIMUM=3.5`（环境变量对
+  嵌套 configure 生效，已实测）；`uuse_chunkstore_smoke` 目标构建需
+  `CC=gcc-12 CXX=g++-12`（否则 cargo 指纹失配触发 Rust 重编并失败）。
