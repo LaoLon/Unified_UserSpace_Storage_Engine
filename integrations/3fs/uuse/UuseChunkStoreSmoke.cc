@@ -2,6 +2,7 @@
  * phase 1: create the store, put three chunks, verify, COW overwrite, remove,
  *          query, sync (process exits afterwards).
  * phase 2: separate process reloads the journal and verifies recovery. */
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -183,6 +184,32 @@ int main(int argc, char **argv) {
     if (!syncResult.hasValue()) return fail("sync", syncResult.error());
     std::printf("SMOKE1_PASS live=%zu free=%zu used=%llu\n", store->liveChunks(), store->freeSlotCount(),
                 static_cast<unsigned long long>(store->usedSize()));
+    return 0;
+  }
+
+  if (std::string(argv[3]) == "bench") {
+    const uint32_t count = argc > 4 ? static_cast<uint32_t>(std::atoi(argv[4])) : 64;
+    std::vector<uint8_t> data(1u << 20, 0x5A);
+    const auto start = std::chrono::steady_clock::now();
+    for (uint32_t i = 0; i < count; ++i) {
+      UuseChunkStore::UpdateInput input;
+      input.chunkId = ChunkId(chunkIdFor(1000 + i));
+      input.chunkSize = 1u << 20;
+      input.offset = 0;
+      input.length = static_cast<uint32_t>(data.size());
+      input.chainVer = 1;
+      input.data = data.data();
+      ChecksumInfo::MemoryDataIterator iter(data.data(), data.size());
+      input.checksum = ChecksumInfo::create(ChecksumType::CRC32C, &iter, data.size());
+      auto updated = store->update(input);
+      if (!updated.hasValue()) return fail("bench update", updated.error());
+      auto committed = store->commit(input.chunkId, 1, 1);
+      if (!committed.hasValue()) return fail("bench commit", committed.error());
+    }
+    const auto ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+    std::printf("BENCH_STORE count=%u ms=%lld per_op_us=%lld\n", count, static_cast<long long>(ms),
+                static_cast<long long>(ms * 1000 / count));
     return 0;
   }
 

@@ -202,6 +202,11 @@ journal 重放丢记录——出现任一即回退修复，不做性能结论。
         的等待。
     - 下一步优化：I/O 线程改 `Client::submitRead/submitWrite` 批量异步、
       commit 合并、多并发客户端验证。
+    - **瓶颈定位（2026-10-05）**：存储层微基准（smoke `bench` 模式，直接
+      `update+commit` 1MiB chunk）**64 op / 81ms = 1.27ms/op（~790 MiB/s）**，
+      说明 UUSE store 数据面很快；客户端可见的 ~172ms/chunk 开销在**服务/客户端
+      流程**（疑似客户端对未创建 chunk 的 RMW 读重试/退避、RPC 往返），下一步
+      需抓客户端写流程（read-before-write 行为）与 RPC 时序。
 
 ## 6. 风险与停止条件
 
