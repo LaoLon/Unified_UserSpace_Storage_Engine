@@ -96,7 +96,7 @@ class UuseChunkStore {
   };
 
   static constexpr uint32_t kClassCount = 3;
-  static constexpr uint32_t kFilesPerClass = 4;
+  static constexpr uint32_t kFilesPerClass = 16;
   static constexpr uint32_t kSlotsPerFile = 128;
   static constexpr uint64_t kClassSize[kClassCount] = {64u << 10, 512u << 10, 4u << 20};
 
@@ -122,6 +122,11 @@ class UuseChunkStore {
 
   /* Journal delete + slot release. */
   Result<Void> remove(const ChunkId &chunkId, ChunkInfo &chunkInfo);
+
+  /* Physically removes chunks marked REMOVAL_IN_PROGRESS and releases their
+   * slots (called by the storage PunchHoleWorker). Returns true when no
+   * removable chunk remains. */
+  Result<bool> punchHole();
 
   /* ChunkReplica::update semantics on UUSE (M2.2 step 1): version checks,
    * COW allocation for new chunks, gap zero-fill, checksum verification and
@@ -151,6 +156,9 @@ class UuseChunkStore {
   Result<Void> replay();
   void applyRecord(const UuseJournalRecord &record);
   void rebuildFreeSlots();
+  /* Deletes chunks marked for removal and releases their slots; caller must
+   * hold mutex_. Returns true when no removable chunk remains. */
+  Result<bool> recycleRemovedLocked();
   Result<Void> appendRecord(const UuseJournalRecord &record);
   Result<SlotRef> allocateSlot(std::size_t cls);
   void releaseSlot(const SlotRef &slot);

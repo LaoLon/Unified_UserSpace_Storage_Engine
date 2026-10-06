@@ -1,8 +1,8 @@
 #!/bin/bash
-# M3.1 sync paths for the UUSE backend: getAllMetadata / getAllMetadataMap /
-# reportUnrecycledSize / addChunkSize / migrate guard. Standalone so it can be
-# applied to a tree that was installed from an earlier revision of
-# apply-uuse-chunkstore.sh. Idempotent.
+# M3.1 sync/recycle paths for the UUSE backend: getAllMetadata /
+# getAllMetadataMap / reportUnrecycledSize / addChunkSize / migrate guard /
+# punchHole wiring. Standalone so it can be applied to a tree that was
+# installed from an earlier revision of apply-uuse-chunkstore.sh. Idempotent.
 #
 # Usage: bash apply-uuse-syncpaths.sh <3fs-root>
 set -eu
@@ -25,6 +25,30 @@ def rep(path, old, new):
         return
     assert old in t, ('anchor missing in %s: %s' % (path, old[:70]))
     write(path, t.replace(old, new, 1))
+
+h = root + '/src/storage/store/StorageTarget.h'
+
+rep(h, '''  // recycle a batch of chunks. return true if all holes are punched.
+  Result<bool> punchHole() {
+    if (useChunkEngine() || useUuseEngine()) {
+      return true;
+    } else {
+      return chunkStore_.punchHole();
+    }
+  }''',
+'''  // recycle a batch of chunks. return true if all holes are punched.
+  Result<bool> punchHole() {
+    if (useChunkEngine()) {
+      return true;
+    } else if (useUuseEngine()) {
+      if (!uuseStore_) {
+        return makeError(StorageCode::kStorageInitFailed, "uuse store not loaded");
+      }
+      return uuseStore_->punchHole();
+    } else {
+      return chunkStore_.punchHole();
+    }
+  }''')
 
 p = root + '/src/storage/store/StorageTarget.cc'
 

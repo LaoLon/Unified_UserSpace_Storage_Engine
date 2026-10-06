@@ -366,6 +366,26 @@ journal 重放丢记录——出现任一即回退修复，不做性能结论。
         含同步转发）；尾丢失**未复现**。对比旧环境（间歇性 15/14MiB 截断 +
         服务端 op 全达）——支持"尾丢失由环境降级/崩溃窗口引入"的判断。
         待续：更长批次复现（后台 20 轮）+ 若复现则用 op 日志逐 chunk 对账。
+      - **slot 池耗尽复现与修复（2026-10-06）**：12 轮批次（768 chunk）在第 8 轮
+        复现**经典尾丢失**：`cp` 16MiB → 15MiB（恰好少 1 chunk）+ I/O error；
+        随后 dd 报错（同批次 12 轮为对照：修复后 48/48 全过）。根因：UUSE
+        store 的固定 slot 池（4 文件 × 128 槽/类 = 512 槽）被打满——
+        `update(isRemove)` 只把 chunk 标记 `REMOVAL_IN_PROGRESS` 并保留 slot，
+        真正回收依赖 `punchHole()`，而 UUSE 的 `punchHole()` 是 no-op；同时
+        meta 的 chunk 回收流滞后数分钟，持续写入下必然打满。
+        修复（`UuseChunkStore.{h,cc}` + `apply-uuse-syncpaths.sh`）：
+        ① 实现 `punchHole()`/`recycleRemovedLocked()`（删除 REMOVAL_IN_PROGRESS
+        的 chunk、journal kOpDelete、释放 slot；`recycleState` 持久化到 journal
+        `reserved2`，重启后可继续回收）；② 分配失败时**内联回收重试**；
+        ③ slot 池 4→16 文件/类（6144 槽，4MiB 类 2048 槽）。
+        修复后：12 轮 48/48 全过；24 轮在累计 2048 chunk 边界（第 21 轮）出现
+        一次 dd 失败后**自动恢复**（22–24 轮全过）——回收路径生效，边界行为
+        可预期（单波写入 < ~2GB 时稳定）。
+      - **客户端静默行为确认**：store 打满时，`echo` 小写入返回 rc=0 但文件为
+        0 字节（**完全静默**）；`cp` 截断时有时报 I/O error（rc=1）、有时静默
+        （旧环境 cp rc=0 截断 28MiB）。即后端 update 失败时，客户端错误上抛
+        不一致——"静默尾丢失" = 后端失败 + 客户端静默路径的组合。修复 slot
+        耗尽即消除该触发源；客户端错误上抛问题属于 3FS 客户端行为，另行记录。
 
 ## 6. 风险与停止条件
 

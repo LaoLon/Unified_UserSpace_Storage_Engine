@@ -77,9 +77,11 @@
   `cmake_minimum_required` 提升、thrift 0.16.0 tarball 下载），失败后重跑构建。
 - `patches/apply-uuse-chunkstore.sh`：安装 M2.1 的 `UuseChunkStore` 核心与
   smoke 目标（源码在 `uuse/`）；含 M2.2 读路径与 M3.1 sync 路径修复。
-- `patches/apply-uuse-syncpaths.sh`：M3.1 sync/resync 路径的 UUSE 分支
+- `patches/apply-uuse-syncpaths.sh`：M3.1 sync/recycle 路径的 UUSE 分支
   （`getAllMetadata`/`getAllMetadataMap`/`reportUnrecycledSize`/`addChunkSize`/
-  migrate 守卫）。独立脚本，可补装到旧版本安装的源码树（幂等）。
+  migrate 守卫/punchHole 接线）。独立脚本，可补装到旧版本安装的源码树（幂等）。
+  注意：`UuseChunkStore` 的 slot 池为 16 文件 × 128 槽/类（6144 槽）；回收依赖
+  本补丁的 punchHole 接线 + journal `reserved2` 持久化的 recycleState。
 - `patches/apply-uuse-oplogs.sh`：UUSE 后端每 op 成功日志（`uuse update ok` /
   `uuse commit ok` / `uuse read ok`，含 chunk/ver/len），用于 op 级追踪对账。
 - 注意：`uuse_chunkstore_smoke` 目标构建需 `CC=gcc-12 CXX=g++-12`，否则 cargo

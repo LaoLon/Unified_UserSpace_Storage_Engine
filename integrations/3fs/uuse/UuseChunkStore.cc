@@ -67,6 +67,7 @@ UuseJournalRecord makeRecord(uint8_t op, const ChunkId &chunkId, const UuseChunk
   record.size = info.meta.size;
   record.chunkState = static_cast<uint8_t>(info.meta.chunkState);
   record.checksumType = static_cast<uint8_t>(info.meta.checksumType);
+  record.reserved2 = static_cast<uint16_t>(info.meta.recycleState);
   record.checksumValue = info.meta.checksumValue;
   record.fileId = info.slot.fileId;
   record.innerOffset = info.meta.innerOffset;
@@ -320,6 +321,7 @@ void UuseChunkStore::applyRecord(const UuseJournalRecord &record) {
     info.meta.chunkState = static_cast<ChunkState>(record.chunkState);
     info.meta.checksumType = static_cast<ChecksumType>(record.checksumType);
     info.meta.checksumValue = record.checksumValue;
+    info.meta.recycleState = static_cast<RecycleState>(record.reserved2);
     info.meta.innerFileId.chunkSize = static_cast<uint32_t>(kClassSize[classOfFile(record.fileId)]);
     info.meta.innerFileId.chunkIdx = record.fileId;
     info.meta.innerOffset = record.innerOffset;
@@ -398,7 +400,16 @@ Result<UuseChunkStore::ChunkInfo> UuseChunkStore::createChunk(const ChunkId &chu
   std::lock_guard lock(mutex_);
   auto slotResult = allocateSlot(cls);
   if (!slotResult) {
-    return folly::makeUnexpected(slotResult.error());
+    /* Reclaim removed chunks first (the meta may have removed them since the
+     * last recycle cycle), then retry once. */
+    auto recycled = recycleRemovedLocked();
+    if (!recycled) {
+      return folly::makeUnexpected(recycled.error());
+    }
+    slotResult = allocateSlot(cls);
+    if (!slotResult) {
+      return folly::makeUnexpected(slotResult.error());
+    }
   }
   const SlotRef slot = slotResult.value();
   ChunkInfo info;
@@ -468,6 +479,33 @@ Result<Void> UuseChunkStore::remove(const ChunkId &chunkId, ChunkInfo &chunkInfo
   releaseSlot(it->second.slot);
   chunks_.erase(it);
   return Void{};
+}
+
+Result<bool> UuseChunkStore::punchHole() {
+  std::lock_guard lock(mutex_);
+  return recycleRemovedLocked();
+}
+
+Result<bool> UuseChunkStore::recycleRemovedLocked() {
+  std::vector<std::pair<ChunkId, ChunkInfo>> pending;
+  for (const auto &[key, info] : chunks_) {
+    if (info.meta.recycleState != RecycleState::NORMAL) {
+      pending.emplace_back(ChunkId(key), info);
+    }
+  }
+  if (pending.empty()) {
+    return true;
+  }
+  for (auto &[chunkId, info] : pending) {
+    const auto record = makeRecord(kOpDelete, chunkId, info);
+    auto appended = appendRecord(record);
+    if (!appended) {
+      return folly::makeUnexpected(appended.error());
+    }
+    releaseSlot(info.slot);
+    chunks_.erase(chunkId.data());
+  }
+  return false;
 }
 
 Result<UuseChunkStore::UpdateOutput> UuseChunkStore::update(const UpdateInput &input) {
@@ -556,7 +594,15 @@ Result<UuseChunkStore::UpdateOutput> UuseChunkStore::update(const UpdateInput &i
     }
     auto slotResult = allocateSlot(cls);
     if (!slotResult) {
-      return folly::makeUnexpected(slotResult.error());
+      /* Reclaim removed chunks first, then retry once. */
+      auto recycled = recycleRemovedLocked();
+      if (!recycled) {
+        return folly::makeUnexpected(recycled.error());
+      }
+      slotResult = allocateSlot(cls);
+      if (!slotResult) {
+        return folly::makeUnexpected(slotResult.error());
+      }
     }
     info.slot = slotResult.value();
     /* Metadata keeps the logical chunk size; the slot class only drives the
