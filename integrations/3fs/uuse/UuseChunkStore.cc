@@ -1,11 +1,15 @@
 #include "storage/store/UuseChunkStore.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
 #include <cstring>
 #include <set>
 #include <span>
 #include <stop_token>
 #include <string>
+#include <thread>
 
 #include <folly/logging/xlog.h>
 
@@ -141,6 +145,11 @@ UuseChunkStore::~UuseChunkStore() {
     (void)client_->close().wait();
   }
   client_.reset();
+  {
+    /* Per-thread submission clients must drain before Engine::stop(). */
+    std::lock_guard lock(clientsMutex_);
+    submissionClients_.clear();
+  }
   if (engine_) {
     (void)engine_->stop().wait();
   }
@@ -199,12 +208,101 @@ Result<Void> UuseChunkStore::runIo(std::function<Result<Void>()> fn) {
   return task.result;
 }
 
-Result<Void> UuseChunkStore::ioWriteAt(uuse::File &file, const uint8_t *data, uint32_t size, uint64_t offset) {
+Result<Void> UuseChunkStore::syncWriteAt(uuse::File &file, const uint8_t *data, uint32_t size, uint64_t offset) {
   return runIo([&]() { return writeAt(file, data, size, offset); });
 }
 
-Result<Void> UuseChunkStore::ioReadAt(uuse::File &file, uint8_t *data, uint32_t size, uint64_t offset) {
+Result<Void> UuseChunkStore::syncReadAt(uuse::File &file, uint8_t *data, uint32_t size, uint64_t offset) {
   return runIo([&]() { return readAt(file, data, size, offset); });
+}
+
+/* Lazily creates the calling thread's submission client (uuse.md §20.4: the
+ * per-thread client owns slots, credits and completions; the open Files stay
+ * on the process-level owner client). The store registry keeps it alive so a
+ * thread exit never destroys a client past the engine lifetime. */
+std::shared_ptr<UuseChunkStore::SubmissionClient> UuseChunkStore::submissionClient() {
+  thread_local const UuseChunkStore *tlsStore = nullptr;
+  thread_local std::weak_ptr<SubmissionClient> tlsClient;
+  if (tlsStore == this) {
+    if (auto cached = tlsClient.lock()) {
+      return cached;
+    }
+  }
+  std::lock_guard lock(clientsMutex_);
+  auto &entry = submissionClients_[std::this_thread::get_id()];
+  if (!entry) {
+    auto created = uuse::Client::create(*engine_);
+    if (!created.ok()) {
+      return nullptr;
+    }
+    entry = std::make_shared<SubmissionClient>();
+    entry->client = created.value();
+  }
+  tlsStore = this;
+  tlsClient = entry;
+  return entry;
+}
+
+/* Polls this thread's completions until the submitted token lands. */
+Result<Void> UuseChunkStore::waitForCompletion(SubmissionClient &submission,
+                                               const uuse::CompletionToken &token,
+                                               uint64_t expectedBytes) {
+  std::array<uuse::CompletionEvent, 8> events{};
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (std::chrono::steady_clock::now() < deadline) {
+    auto polled = submission.client->poll(events, 1, events.size(), std::chrono::milliseconds(1));
+    if (polled.status != uuse::Status::Ok) {
+      return makeError(StatusCode::kIOError, "uuse async poll failed");
+    }
+    for (std::size_t index = 0; index < polled.count; ++index) {
+      const auto &event = events[index];
+      if (event.token.slot != token.slot || event.token.generation != token.generation) {
+        continue; /* stale completion from a previously timed-out request */
+      }
+      if (event.status != uuse::Status::Ok) {
+        return makeError(StatusCode::kIOError, "uuse async request failed");
+      }
+      if (expectedBytes != 0 && event.completedBytes != expectedBytes) {
+        return makeError(StatusCode::kIOError, "uuse async short transfer");
+      }
+      return Void{};
+    }
+  }
+  return makeError(StatusCode::kIOError, "uuse async request timed out");
+}
+
+Result<Void> UuseChunkStore::asyncWriteAt(const std::shared_ptr<uuse::File> &file, const uint8_t *data,
+                                          uint32_t size, uint64_t offset) {
+  auto submission = submissionClient();
+  if (submission) {
+    uuse::IoVec vec{reinterpret_cast<std::byte *>(const_cast<uint8_t *>(data)), size};
+    const uuse::CompletionToken token{submission->tokenSeq.fetch_add(1), 1};
+    auto submitted = submission->client->submitWrite(file, vec, offset, token);
+    if (submitted.ok()) {
+      auto handle = std::move(submitted).value();
+      auto waited = waitForCompletion(*submission, token, size);
+      handle.reset();
+      return waited;
+    }
+  }
+  return syncWriteAt(*file, data, size, offset);
+}
+
+Result<Void> UuseChunkStore::asyncReadAt(const std::shared_ptr<uuse::File> &file, uint8_t *data,
+                                         uint32_t size, uint64_t offset) {
+  auto submission = submissionClient();
+  if (submission) {
+    uuse::IoVec vec{reinterpret_cast<std::byte *>(data), size};
+    const uuse::CompletionToken token{submission->tokenSeq.fetch_add(1), 1};
+    auto submitted = submission->client->submitRead(file, vec, offset, token);
+    if (submitted.ok()) {
+      auto handle = std::move(submitted).value();
+      auto waited = waitForCompletion(*submission, token, size);
+      handle.reset();
+      return waited;
+    }
+  }
+  return syncReadAt(*file, data, size, offset);
 }
 
 Result<Void> UuseChunkStore::ioSyncFile(uuse::File &file, const char *what) {
@@ -434,12 +532,16 @@ Result<UuseChunkStore::ChunkInfo> UuseChunkStore::createChunk(const ChunkId &chu
 }
 
 Result<Void> UuseChunkStore::writeChunk(ChunkInfo &chunkInfo, const uint8_t *data, uint32_t size, uint32_t offset) {
-  std::lock_guard lock(mutex_);
-  auto fileIt = slotFiles_.find(chunkInfo.slot.fileId);
-  if (fileIt == slotFiles_.end()) {
-    return makeError(StatusCode::kInvalidArg, "uuse slot file missing");
+  std::shared_ptr<uuse::File> file;
+  {
+    std::lock_guard lock(mutex_);
+    auto fileIt = slotFiles_.find(chunkInfo.slot.fileId);
+    if (fileIt == slotFiles_.end()) {
+      return makeError(StatusCode::kInvalidArg, "uuse slot file missing");
+    }
+    file = fileIt->second;
   }
-  auto written = ioWriteAt(*fileIt->second, data, size, chunkInfo.meta.innerOffset + offset);
+  auto written = asyncWriteAt(file, data, size, chunkInfo.meta.innerOffset + offset);
   if (!written) {
     return written;
   }
@@ -448,12 +550,16 @@ Result<Void> UuseChunkStore::writeChunk(ChunkInfo &chunkInfo, const uint8_t *dat
 }
 
 Result<Void> UuseChunkStore::readChunk(const ChunkInfo &chunkInfo, uint8_t *data, uint32_t size, uint32_t offset) {
-  std::lock_guard lock(mutex_);
-  auto fileIt = slotFiles_.find(chunkInfo.slot.fileId);
-  if (fileIt == slotFiles_.end()) {
-    return makeError(StatusCode::kInvalidArg, "uuse slot file missing");
+  std::shared_ptr<uuse::File> file;
+  {
+    std::lock_guard lock(mutex_);
+    auto fileIt = slotFiles_.find(chunkInfo.slot.fileId);
+    if (fileIt == slotFiles_.end()) {
+      return makeError(StatusCode::kInvalidArg, "uuse slot file missing");
+    }
+    file = fileIt->second;
   }
-  return ioReadAt(*fileIt->second, data, size, chunkInfo.meta.innerOffset + offset);
+  return asyncReadAt(file, data, size, chunkInfo.meta.innerOffset + offset);
 }
 
 Result<Void> UuseChunkStore::set(const ChunkId &chunkId, const ChunkInfo &chunkInfo) {
@@ -528,8 +634,15 @@ Result<UuseChunkStore::UpdateOutput> UuseChunkStore::update(const UpdateInput &i
     return makeError(StatusCode::kInvalidArg, "uuse write offset exceeds chunk size");
   }
 
-  std::lock_guard lock(mutex_);
   UpdateOutput output;
+  ChunkInfo info;
+  auto &updated = info.meta;
+  std::shared_ptr<uuse::File> file;
+  bool needCreate = false;
+
+  /* Phase 1: metadata plan under the store lock (no device I/O). */
+  {
+  std::lock_guard lock(mutex_);
   auto existing = chunks_.find(input.chunkId.data());
   if (existing == chunks_.end() && input.isRemove) {
     output.commitVer = ChunkVer{static_cast<uint32_t>(input.updateVer)};
@@ -538,8 +651,6 @@ Result<UuseChunkStore::UpdateOutput> UuseChunkStore::update(const UpdateInput &i
     return output;
   }
 
-  ChunkInfo info;
-  bool needCreate = false;
   if (existing != chunks_.end()) {
     info = existing->second;
     if (input.chunkSize != 0 && info.meta.innerFileId.chunkSize != input.chunkSize) {
@@ -623,7 +734,6 @@ Result<UuseChunkStore::UpdateOutput> UuseChunkStore::update(const UpdateInput &i
     info.meta.innerOffset = static_cast<uint64_t>(info.slot.slot) * kClassSize[cls];
   }
 
-  auto &updated = info.meta;
   updated.updateVer = ChunkVer{nextUpdate};
   updated.chainVer = ChainVer{input.chainVer};
   updated.chunkState = ChunkState::DIRTY;
@@ -641,13 +751,17 @@ Result<UuseChunkStore::UpdateOutput> UuseChunkStore::update(const UpdateInput &i
   if (fileIt == slotFiles_.end()) {
     return makeError(StatusCode::kInvalidArg, "uuse slot file missing");
   }
+  file = fileIt->second;
+  }  /* end phase 1 */
+
+  /* Phase 2: device I/O outside the store lock (per-thread async clients). */
   static const std::vector<uint8_t> zeros(kClassSize[kClassCount - 1], 0);
   if (input.isTruncate || input.isExtend) {
     /* Truncate shrinks (or keeps) the chunk; extend zero-fills the new range.
      * The storage service uses TRUNCATE to materialize the last chunk. */
     if (input.length > updated.size) {
-      auto filled = ioWriteAt(*fileIt->second, zeros.data(), input.length - updated.size,
-                              updated.innerOffset + updated.size);
+      auto filled = asyncWriteAt(file, zeros.data(), input.length - updated.size,
+                                 updated.innerOffset + updated.size);
       if (!filled) {
         return folly::makeUnexpected(filled.error());
       }
@@ -655,13 +769,13 @@ Result<UuseChunkStore::UpdateOutput> UuseChunkStore::update(const UpdateInput &i
     updated.size = input.length;
   } else if (input.length != 0) {
     if (updated.size < input.offset) {
-      auto filled = ioWriteAt(*fileIt->second, zeros.data(), input.offset - updated.size,
-                              updated.innerOffset + updated.size);
+      auto filled = asyncWriteAt(file, zeros.data(), input.offset - updated.size,
+                                 updated.innerOffset + updated.size);
       if (!filled) {
         return folly::makeUnexpected(filled.error());
       }
     }
-    auto written = ioWriteAt(*fileIt->second, input.data, input.length, updated.innerOffset + input.offset);
+    auto written = asyncWriteAt(file, input.data, input.length, updated.innerOffset + input.offset);
     if (!written) {
       return folly::makeUnexpected(written.error());
     }
@@ -678,7 +792,7 @@ Result<UuseChunkStore::UpdateOutput> UuseChunkStore::update(const UpdateInput &i
     updated.checksumValue = fullChecksum.value;
   } else {
     std::vector<uint8_t> chunkData(updated.size);
-    auto readBack = ioReadAt(*fileIt->second, chunkData.data(), chunkData.size(), updated.innerOffset);
+    auto readBack = asyncReadAt(file, chunkData.data(), chunkData.size(), updated.innerOffset);
     if (!readBack) {
       return folly::makeUnexpected(readBack.error());
     }
@@ -689,12 +803,16 @@ Result<UuseChunkStore::UpdateOutput> UuseChunkStore::update(const UpdateInput &i
   }
   updated.chunkState = ChunkState::CLEAN;
 
+  /* Phase 3: journal + metadata publish under the store lock. */
+  {
+  std::lock_guard lock(mutex_);
   auto record = makeRecord(kOpPut, input.chunkId, info);
   auto appended = appendRecord(record);
   if (!appended) {
     return folly::makeUnexpected(appended.error());
   }
   chunks_[input.chunkId.data()] = info;
+  }
 
   output.commitVer = updated.commitVer;
   output.updateVer = updated.updateVer;

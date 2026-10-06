@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -21,6 +22,7 @@ namespace uuse {
 class Client;
 class Engine;
 class File;
+struct CompletionToken;
 }  // namespace uuse
 
 namespace hf3fs::storage {
@@ -170,14 +172,31 @@ class UuseChunkStore {
   std::string slotPath(uint32_t fileId) const;
   std::string metaPath() const;
 
-  /* All UUSE data-plane calls (File read/write/sync) are serialized on one
-   * dedicated I/O thread: the UUSE sync API is not safe for concurrent use
-   * from multiple storage worker threads (AioReadWorker/update executors). */
+  /* All UUSE sync-facade calls (journal append, sync, fallback read/write) are
+   * serialized on one dedicated I/O thread: the UUSE sync API is not safe for
+   * concurrent use from multiple storage worker threads. The data fast path
+   * below submits through per-thread clients instead. */
   void startIoThread();
   void stopIoThread();
   Result<Void> runIo(std::function<Result<Void>()> fn);
-  Result<Void> ioWriteAt(uuse::File &file, const uint8_t *data, uint32_t size, uint64_t offset);
-  Result<Void> ioReadAt(uuse::File &file, uint8_t *data, uint32_t size, uint64_t offset);
+
+  /* Worker-direct async fast path (uuse.md §20.4 / Shard-106): the owner
+   * client holds the open Files, each calling thread submits through its own
+   * per-thread client and polls completions on that thread. Falls back to the
+   * serialized sync facade when the async frontend is unavailable. */
+  struct SubmissionClient {
+    std::shared_ptr<uuse::Client> client;
+    std::atomic<uint32_t> tokenSeq{1};
+  };
+  std::shared_ptr<SubmissionClient> submissionClient();
+  Result<Void> asyncWriteAt(const std::shared_ptr<uuse::File> &file, const uint8_t *data, uint32_t size,
+                            uint64_t offset);
+  Result<Void> asyncReadAt(const std::shared_ptr<uuse::File> &file, uint8_t *data, uint32_t size,
+                           uint64_t offset);
+  Result<Void> waitForCompletion(SubmissionClient &submission, const uuse::CompletionToken &token,
+                                 uint64_t expectedBytes);
+  Result<Void> syncWriteAt(uuse::File &file, const uint8_t *data, uint32_t size, uint64_t offset);
+  Result<Void> syncReadAt(uuse::File &file, uint8_t *data, uint32_t size, uint64_t offset);
   Result<Void> ioSyncFile(uuse::File &file, const char *what);
 
   struct IoTask {
@@ -191,6 +210,10 @@ class UuseChunkStore {
   std::condition_variable ioDoneCv_;
   std::deque<IoTask *> ioQueue_;
   bool ioStop_ = false;
+
+  /* Per-thread submission clients (kept alive until the store is destroyed). */
+  std::mutex clientsMutex_;
+  std::unordered_map<std::thread::id, std::shared_ptr<SubmissionClient>> submissionClients_;
 
   Options options_;
   std::unique_ptr<uuse::Engine> engine_;

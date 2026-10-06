@@ -430,6 +430,20 @@ journal 重放丢记录——出现任一即回退修复，不做性能结论。
         矩阵单格差异主要来自客户端间分配波动（±40%）。注：UUSE 数据面在
         storage 内串行于单一 I/O 线程（同步 API 非线程安全），当前瓶颈在传输
         层（~45 MiB/s）未显现该上限；若换更快介质/网络需关注串行化上限。
+      - **异步优化：worker-direct 快路径（2026-10-06）**：按 uuse.md §20.4 /
+        Shard-106 落地——数据面从"单 I/O 线程 + 全局锁内 I/O"改为
+        **per-thread client 池**（owner client 持文件；调用线程懒建自己的
+        client，`submitRead/submitWrite` 后本线程 `poll`）；`update` 重构为
+        三阶段（锁内规划 → **锁外设备 I/O** → 锁内 journal+发布）；submit
+        失败/前端受限时回落同步门面。新增 `bench_mt`（多线程读扩展探针）。
+        验证：① 正确性 SMOKE1/2_PASS（含 journal 重放）；② 本地并发探针：
+        单线程 1MiB 读 4.5 GB/s（~219µs/op，设备上限），16 线程交错 2.1 GB/s；
+        ③ 3FS 级修正 A/B（新链、每配置先写新文件再交叉读，64 并发双客户端）：
+        写 44.2 vs 41.2 MiB/s、顺序读 20.7 vs 20.5、随机读 683 vs 480 IOPS
+        （注意：两链 HEAD 不同节点且客户端读路由只落到 stock 侧——UUSE 侧
+        `read_ok=0`，读差异属节点/环境；UUSE 读路径的 3FS 级验证需先将 UUSE
+        副本设为 preferred/HEAD）。结论：异步化后写与本地并发能力达标、
+        无回归；UUSE 副本作为读服务方的 3FS 级验证留待后续（受读路由控制）。
       - **高并发环境修复（2026-10-06，矩阵跑通前提）**：32/64 并发下
         Soft-RoCE 转发饱和 → 通道锁死/超时 → 写路径整体损坏（EIO/挂起）。
         修复：① 存储侧 `force_use_tcp = true`（storage_main.toml +

@@ -1,13 +1,16 @@
 /* UuseChunkStore smoke test.
  * phase 1: create the store, put three chunks, verify, COW overwrite, remove,
  *          query, sync (process exits afterwards).
- * phase 2: separate process reloads the journal and verifies recovery. */
+ * phase 2: separate process reloads the journal and verifies recovery.
+ * bench_mt: concurrent read scaling probe (worker-direct async path). */
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "common/utils/Result.h"
@@ -210,6 +213,55 @@ int main(int argc, char **argv) {
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
     std::printf("BENCH_STORE count=%u ms=%lld per_op_us=%lld\n", count, static_cast<long long>(ms),
                 static_cast<long long>(ms * 1000 / count));
+    return 0;
+  }
+
+  if (std::string(argv[3]) == "bench_mt") {
+    const uint32_t threads = argc > 4 ? static_cast<uint32_t>(std::atoi(argv[4])) : 8;
+    const uint32_t perThread = argc > 5 ? static_cast<uint32_t>(std::atoi(argv[5])) : 32;
+    const uint32_t chunkBytes = 1u << 20;
+    const uint32_t chunksPerThread = 4;
+    /* Pre-create the read set (one 1 MiB chunk per slot) with data. */
+    for (uint32_t t = 0; t < threads; ++t) {
+      for (uint32_t c = 0; c < chunksPerThread; ++c) {
+        auto put = putChunk(*store, 1000000 + t * 100 + c, chunkBytes, 100 + t + c, 1);
+        if (!put.hasValue()) {
+          return fail("bench_mt create", put.error());
+        }
+      }
+    }
+    std::atomic<uint64_t> totalOps{0};
+    std::atomic<uint64_t> totalBytes{0};
+    const auto start = std::chrono::steady_clock::now();
+    std::vector<std::thread> workers;
+    workers.reserve(threads);
+    for (uint32_t t = 0; t < threads; ++t) {
+      workers.emplace_back([&, t]() {
+        std::vector<uint8_t> buffer(chunkBytes);
+        for (uint32_t i = 0; i < perThread; ++i) {
+          const uint64_t chunkIndex = 1000000 + t * 100 + (i % chunksPerThread);
+          auto got = store->get(ChunkId(chunkIdFor(chunkIndex)));
+          if (!got.hasValue()) {
+            continue;
+          }
+          auto read = store->readChunk(got.value(), buffer.data(), buffer.size(), 0);
+          if (read.hasValue()) {
+            totalOps.fetch_add(1, std::memory_order_relaxed);
+            totalBytes.fetch_add(buffer.size(), std::memory_order_relaxed);
+          }
+        }
+      });
+    }
+    for (auto &worker : workers) {
+      worker.join();
+    }
+    const auto ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+    const double mib = static_cast<double>(totalBytes.load()) / (1024.0 * 1024.0);
+    const double seconds = ms > 0 ? static_cast<double>(ms) / 1000.0 : 1e-9;
+    std::printf("BENCH_MT threads=%u ops=%llu mib=%.1f ms=%lld iops=%.0f mibs=%.1f\n", threads,
+                static_cast<unsigned long long>(totalOps.load()), mib, static_cast<long long>(ms),
+                totalOps.load() / seconds, mib / seconds);
     return 0;
   }
 
