@@ -452,6 +452,8 @@ journal 重放丢记录——出现任一即回退修复，不做性能结论。
         写上限（~50 MiB/s/客户端）更符合**更新流水线的 in-flight 深度 × 单 op
         延迟**模型（客户端 channel 深度/引擎提交批处理），与"32≈64 并发持平、
         单流即饱和"一致。配置已恢复 true。
+        （该假设已于 2026-10-07 定位实验否证：真实上限是 FUSE 客户端被钳制为
+        **单 worker 线程**，见下条。）
       - **高并发环境修复（2026-10-06，矩阵跑通前提）**：32/64 并发下
         Soft-RoCE 转发饱和 → 通道锁死/超时 → 写路径整体损坏（EIO/挂起）。
         修复：① 存储侧 `force_use_tcp = true`（storage_main.toml +
@@ -459,6 +461,51 @@ journal 重放丢记录——出现任一即回退修复，不做性能结论。
         1→8（hf3fs_fuse_main.toml + launcher）；③ 卡死的会话/通道状态必须
         **全集群重置（清 FDB + 重建 targets/chains）+ 两台存储重启**才能清除
         （单独重启存储或 mgmtd 均无效）。修复后 32/64 全矩阵零错误跑通。
+        - **写吞吐上限定位（2026-10-07，§5 待办 1 完成）**：现象——单客户端
+          顺序写 1MiB 恒定 **~35–38 MiB/s（≈35–38 ops/s）**，1/8/32/64 并发
+          完全持平；单 op 墙钟 ~26–29ms；双客户端聚合 ~54 MiB/s（~1.5×，之后
+          受共享更新流水线约束）。定位与证据：
+          - **根因：FUSE 客户端 worker 线程数被钳制为 1**。
+            `src/fuse/FuseClients.cc`：`maxThreads = std::min(max_threads,
+            (logicalCores + 1) / 2)`；客户端 VM 为 2 vCPU → `(2+1)/2 = 1`。
+            实测（`ps -L`）：客户端进程仅有 **1 个 `fuse_worker` 线程**（32 流
+            1MiB 负载下仍为 1）。因此写回调串行：吞吐 = 1/单 op 延迟；应用层
+            并发只增加排队延迟（fio n=32 clat ~0.85–0.98s ≈ 32×单 op），不提升
+            吞吐；每多一个客户端多 1 个 worker（双客户端 ~1.5–2×）。
+          - **客户端指标（log reporter 实测，32 流 1MiB）**：
+            `storage_client.concurrent_user_calls` 与 `inflight_requests`
+            max=1；`fuse.write.latency` ~29ms = `fuse.piov.prepare` ~7ms +
+            `submit` ~27ms；`request_latency` ~26ms 中 `server_latency` ~24ms、
+            `network_latency` ~1.2ms。对照：4KiB 顺序写（写缓冲合并）可达
+            ~8.5k IOPS，但每 256 次写触发一次 1MiB flush，flush 速率仍是
+            ~33/s——串行点是 1MiB flush 的写 RPC，不是 FUSE 回调数量。
+          - **客户端 update channel 池不是上限**：`chanAllocator_ =
+            traffic_control.max_concurrent_updates() = (32×128)×3 = 12288`
+            （部署配置），且每 op 完成后释放；在途 channel 远低于该值。
+          - **chunk engine 无定时器提交批处理**：存储侧写路径是
+            `UpdateWorker`（`num_threads=4`）逐 job 执行 `update`/`commit`；
+            Rust 引擎 `commit_chunk(sync=config)` 无周期批处理；UUSE 头
+            update→commit 跨度 p50 ~11.5–17ms（含向 TAIL 转发的往返）。
+            native 与 UUSE 两条链的客户端吞吐完全一致（~37 ops/s），证明引擎与
+            store 不是上限。
+          - **传输口径修正**：客户端与存储的**生效配置来自 mgmtd**
+            （`app_detail::initConfig` → `launcher_->loadConfigTemplate()`），
+            对 `/opt/3fs/etc/hf3fs_fuse_main.toml` / `storage_main.toml` 的
+            `force_use_tcp=true`、`max_connections=8` 编辑**从未生效**；实测
+            生效值一直是 `force_use_tcp=false, max_connections=1`
+            （RDMA/Soft-RoCE）。本次用 `admin_cli get-config/set-config`
+            真正切到 TCP 后，非 inline 写全部报 `update no RDMA socket`
+            （1MiB 数据面需要 RDMA READ/WRITE）；再把
+            `max_inline_write_bytes/max_inline_read_bytes='2MB'` 走 inline-TCP
+            后吞吐仍 ~31–32 ops/s——证明传输也不是上限。Soft-RoCE 实测
+            `ib_send_bw` 平均 ~0.51 Gb/s（64KiB，峰值 0.99），与写路径同量级
+            但非主因。**此前记录的"TCP 口径"应读作 RDMA/Soft-RoCE 口径**。
+          - **结论**：写吞吐上限 = 单 worker FUSE 客户端串行处理 × 单 op
+            延迟（~26–29ms）。下一步验证/修复：提高 FUSE worker 数（改
+            `FuseClients.cc` 的钳制公式，或把客户端 VM 提到 ≥4 vCPU）；
+            预期 2 worker ≈ 2×（受 2 vCPU 与共享更新流水线 ~55–65 ops/s 约束）。
+            环境已恢复（FUSE 配置 = 原始模板、路由表 1 → 900100005、测试文件
+            清理、残留 ib 测试进程清理）。
 
 ## 6. 风险与停止条件
 

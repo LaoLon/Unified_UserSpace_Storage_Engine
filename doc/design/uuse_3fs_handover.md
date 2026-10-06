@@ -27,8 +27,14 @@ NVME_0001 = `/build`（.251 构建盘）；NVME_0002（BDF `0000:13:00.0`）= UU
 | 900100001/2/3 | .250 侧 OFFLINE | SERVING(1/2) | 遗留降级链，未使用 |
 
 - 路由表 1 当前指向 **900100005**（切换命令见 §3）。
-- 客户端/存储传输：`force_use_tcp = true`（客户端两处配置 + 存储 launcher/main），
-  客户端 `max_connections = 8`（为高并发调的）。
+- **传输口径（2026-10-07 实测修正）**：客户端与存储的**生效配置来自 mgmtd**，
+  对 `/opt/3fs/etc/*.toml` 的 `force_use_tcp`/`max_connections` 编辑不会自动
+  生效（曾长期误以为已是 TCP）。实测生效值：客户端与存储全部
+  `force_use_tcp = false, max_connections = 1`——**集群数据面一直跑
+  Soft-RoCE（RDMA）**；此前文档中的"TCP 口径"应读作 RDMA 口径。真正切 TCP
+  （`admin_cli set-config`）后 1MiB 写会报 `update no RDMA socket`（数据面需要
+  RDMA READ/WRITE 或 inline）；`max_inline_*_bytes='2MB'` 走 inline-TCP 可写，
+  但吞吐不变（见 §5 待办 1 结论）。
 - 存储 `sync_when_write = true`（已从 false 实验恢复）。
 
 ---
@@ -109,6 +115,11 @@ node vm.mjs --vm host5 exec 'bash /tmp/xxx.sh'
   3FS 级无回归。提交 `ff63002`。
 - **sync_when_write=false 对照（否证 fsync 假设）**：写吞吐无提升
   （原生 103.2 vs 102.5；UUSE 96.9 vs 102.1）。提交 `a4f1e84`。
+- **写吞吐上限定位（2026-10-07）**：根因 = **FUSE 客户端 worker 线程被钳制为
+  1**（2 vCPU → `(logicalCores+1)/2 = 1`），1MiB 写回调全串行，吞吐 =
+  1/单 op ≈ 35–38 ops/s；客户端 channel 池（12288）、引擎提交批处理（无定时
+  器，4 worker）、传输（RDMA 与 inline-TCP 同值）均非上限；并纠正"TCP 口径"
+  实为 Soft-RoCE。详见设计文档 §5 M3 同名小节。
 
 ### Git 状态
 - 最新提交：`a4f1e84`（本会话链：`54e130c`→`a672398`→`409b688`→`7c17c5a`→
@@ -121,12 +132,16 @@ node vm.mjs --vm host5 exec 'bash /tmp/xxx.sh'
 
 ## 5. 待办 / 下一步（新会话建议按此顺序）
 
-1. **写吞吐上限定位（最高优先级）**：~50 MiB/s/客户端 ≈ 50 ops/s（1MiB），
-   32≈64 并发持平、单流即饱和、关 fsync 无变化 → 指向**更新流水线的 in-flight
-   深度 × 单 op 延迟**。建议：
-   - 查客户端 `updateChannelAllocator` channel 池大小（每条链 in-flight 上限）；
-   - 查 chunk engine 提交批处理间隔（是否定时器批处理锁定单 op 延迟）；
-   - 用单 op 计时（一次 1MiB 写 RTT）验证延迟归属。
+1. ~~**写吞吐上限定位（最高优先级）**~~ **已完成（2026-10-07）**：根因是
+   **FUSE 客户端 worker 线程被钳制为 1**——`FuseClients.cc` 中
+   `maxThreads = min(max_threads, (logicalCores+1)/2)`，2 vCPU 客户端 VM 得
+   `(2+1)/2 = 1`（实测仅 1 个 `fuse_worker` 线程，32 流负载下亦然）。写回调
+   全串行 → 单客户端吞吐 = 1/单 op ≈ 35–38 ops/s（1MiB），1→64 并发持平、
+   双客户端 ~1.5–2×。客户端 channel 池（12288）、存储提交/引擎（4 worker、
+   无定时器批处理）、传输（RDMA 与 inline-TCP 同值）均不是上限。详见
+   `uuse_3fs_local_engine.md` §5 M3 "写吞吐上限定位（2026-10-07）"。
+   **下一步（可选）**：改 `FuseClients.cc` 钳制公式或把客户端 VM 提到
+   ≥4 vCPU，验证 2 worker ≈ 2×。
 2. **UUSE 读路径的 3FS 级验证**：客户端读路由只落 stock 侧（UUSE `read_ok=0`）。
    需要把 UUSE 副本设为 preferred/HEAD（`SetPreferredTargetOrder` /
    `RotateAsPreferredOrder` 等 admin 命令），再跑读矩阵并核对 `uuse read ok` 计数。
@@ -135,7 +150,9 @@ node vm.mjs --vm host5 exec 'bash /tmp/xxx.sh'
 4. **UUSE 配置调优**：`data_reactors = 1`（异步服务单分片）→ 可提到 4
    （`max_data_reactors=4`），压 UUSE 读路径时可能需要。
 5. **清理遗留**：900100001/2/3 的离线 target（.250 `/storage/data1` 已用 68%）；
-   以及本会话的测试目录 `/3fs/uuse/bm`、`bm2`（各 128 个 16MiB 文件）。
+   `/3fs/uuse/bm`、`bm2`、`bm_ceiling*` 测试文件**已于 2026-10-07 清理**（UUSE
+   1MiB 类槽池 ~3GiB，写测数据勿超；删除后 GC 约 5min 起回收，`list-targets`
+   的 UsedSize 下降即回收完成）。
 6. （可选）把性能矩阵/交接结论汇总进 `doc/performance/`。
 
 ---
@@ -150,15 +167,22 @@ node vm.mjs --vm host5 exec 'bash /tmp/xxx.sh'
 3. **集群重置后必须重启两台存储**，否则客户端报 `Remote I/O error`（routing 过期）。
 4. **.251 storage 是手动进程**：VM 重启后需 `uuse251_trace_restart.sh` 拉起；
    `systemctl` 里的 storage 单元在 .251 上是停用状态。
-5. **客户端配置有两份**：`hf3fs_fuse_main_launcher.toml` + `hf3fs_fuse_main.toml`
-   （后者覆盖），改传输/连接池要改**两处**；改完硬重启（`uuse_fuse_restart.sh`）。
+5. **客户端/存储应用配置的生效源是 mgmtd**（`hf3fs_fuse_main`/`storage_main`
+   通过 launcher 从 mgmtd 拉取 FUSE_CLIENT/STORAGE 配置模板；本地
+   `/opt/3fs/etc/*.toml` 只在显式 `--cfg`/上传时起作用）。改运行时配置用
+   `admin_cli get-config -t FUSE|STORAGE -o <file>` + `set-config -t ... -f
+   <file>`（整文件替换），改完重启对应服务。⚠ 2026-10-07 前记录的
+   `force_use_tcp=true`/`max_connections=8` 本地编辑从未生效，实际一直
+   `force_use_tcp=false, max_connections=1`（Soft-RoCE）。
 6. **UUSE store 格式化**（`uusectl format` / `uuse251_store_reset.sh`）会清空
    整个 UUSE 卷（该盘上所有 store）。
 7. **凭据**：token 在 `/opt/3fs/etc/token.txt`，**不得**打印/入库。
 8. 日志：`.251/.250` `/var/log/3fs/storage_main.log`（含 `uuse update/commit/read ok`
    op 日志，可用于对账）；客户端 `/var/log/3fs/hf3fs_fuse_main.log`。
-9. 基准口径：**TCP、双客户端并发、交叉读（读对方文件）+ drop_caches**；
+9. 基准口径：**双客户端并发、交叉读（读对方文件）+ drop_caches**；
    顺序 1MiB / 随机 4KiB；每格 20s；读缓存会污染结果（顺序读 32 并发曾出现缓存假象）。
+   注意：此前文档写"TCP"，但 2026-10-07 实测数据面一直是 Soft-RoCE（RDMA），
+   见 §1 传输口径修正；单客户端写上限 ~35–38 MiB/s（FUSE 单 worker，见 §5.1）。
 
 ---
 
@@ -166,8 +190,9 @@ node vm.mjs --vm host5 exec 'bash /tmp/xxx.sh'
 
 | 维度 | 数值 | 备注 |
 |---|---|---|
-| 顺序写 | ~100 MiB/s | 32 并发即饱和（单流也接近） |
-| 随机写 4K | ~300 IOPS | |
+| 顺序写（单客户端） | ~35–38 MiB/s | FUSE worker 被钳制为 1，串行处理；1→64 并发持平（见 §5.1） |
+| 顺序写（双客户端聚合） | ~54–65 MiB/s | 每客户端多 1 个 worker（~1.5–2×），随后受共享更新流水线约束 |
+| 随机写 4K | ~300 IOPS | 写缓冲合并，仅 1MiB flush 串行 |
 | 顺序读 1M | ~20 MiB/s | 冷读（交叉读+drop_caches） |
 | 随机读 4K | ~700-750 IOPS | |
 | UUSE 本地后端 | 单线程 1MiB 读 4.5 GB/s | 远高于 3FS 链路，不是瓶颈 |
