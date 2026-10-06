@@ -444,6 +444,14 @@ journal 重放丢记录——出现任一即回退修复，不做性能结论。
         `read_ok=0`，读差异属节点/环境；UUSE 读路径的 3FS 级验证需先将 UUSE
         副本设为 preferred/HEAD）。结论：异步化后写与本地并发能力达标、
         无回归；UUSE 副本作为读服务方的 3FS 级验证留待后续（受读路由控制）。
+      - **sync_when_write 对照（2026-10-06，假设否证）**：把两台存储的
+        `sync_when_write` 从 true 改为 false（关掉每次 chunk 元数据的 KV 同步
+        写/fsync）后复测写路径（64 并发双客户端聚合）：原生 seqW 103.2 vs
+        102.5、randW 302 vs 310；UUSE seqW 96.9 vs 102.1、randW 199 vs 310
+        （后两者在噪声/漂移内）。**结论：per-op fsync 不是写吞吐上限的来源**。
+        写上限（~50 MiB/s/客户端）更符合**更新流水线的 in-flight 深度 × 单 op
+        延迟**模型（客户端 channel 深度/引擎提交批处理），与"32≈64 并发持平、
+        单流即饱和"一致。配置已恢复 true。
       - **高并发环境修复（2026-10-06，矩阵跑通前提）**：32/64 并发下
         Soft-RoCE 转发饱和 → 通道锁死/超时 → 写路径整体损坏（EIO/挂起）。
         修复：① 存储侧 `force_use_tcp = true`（storage_main.toml +
