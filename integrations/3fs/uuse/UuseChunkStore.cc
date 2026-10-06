@@ -217,7 +217,18 @@ Result<Void> UuseChunkStore::ioSyncFile(uuse::File &file, const char *what) {
   });
 }
 
-std::size_t UuseChunkStore::classOfFile(uint32_t fileId) { return fileId / kFilesPerClass; }UuseChunkStore::SlotRef UuseChunkStore::slotRefOf(const ChunkMetadata &meta) {
+std::size_t UuseChunkStore::classOfFile(uint32_t fileId) {
+  uint32_t base = 0;
+  for (std::size_t c = 0; c < kClassCount; ++c) {
+    base += kClassFiles[c];
+    if (fileId < base) {
+      return c;
+    }
+  }
+  return kClassCount;
+}
+
+UuseChunkStore::SlotRef UuseChunkStore::slotRefOf(const ChunkMetadata &meta) {
   const auto cls = classOfFile(meta.innerFileId.chunkIdx);
   return SlotRef{meta.innerFileId.chunkIdx, static_cast<uint32_t>(meta.innerOffset / kClassSize[cls])};
 }
@@ -233,7 +244,7 @@ Result<Void> UuseChunkStore::createLayout() {
   if (!dirs.ok()) {
     return makeError(StatusCode::kIOError, "uuse mkdir: " + dirs.message());
   }
-  for (uint32_t fileId = 0; fileId < kClassCount * kFilesPerClass; ++fileId) {
+  for (uint32_t fileId = 0; fileId < kFileCount; ++fileId) {
     auto opened = client_->open(slotPath(fileId), uuse::OpenFlags::Create).wait().value();
     if (!opened.ok()) {
       return makeError(StatusCode::kIOError, "uuse open: " + opened.message());
@@ -248,7 +259,7 @@ Result<Void> UuseChunkStore::createLayout() {
 }
 
 Result<Void> UuseChunkStore::openFiles() {
-  for (uint32_t fileId = 0; fileId < kClassCount * kFilesPerClass; ++fileId) {
+  for (uint32_t fileId = 0; fileId < kFileCount; ++fileId) {
     auto opened = client_->open(slotPath(fileId), uuse::OpenFlags::Create).wait().value();
     if (!opened.ok()) {
       return makeError(StatusCode::kIOError, "uuse open: " + opened.message());
@@ -344,7 +355,7 @@ void UuseChunkStore::rebuildFreeSlots() {
   for (const auto &[key, info] : chunks_) {
     used.emplace(info.slot.fileId, info.slot.slot);
   }
-  for (uint32_t fileId = 0; fileId < kClassCount * kFilesPerClass; ++fileId) {
+  for (uint32_t fileId = 0; fileId < kFileCount; ++fileId) {
     for (uint32_t slot = 0; slot < kSlotsPerFile; ++slot) {
       if (used.find({fileId, slot}) == used.end()) {
         freeSlots_[classOfFile(fileId)].push_back(SlotRef{fileId, slot});
@@ -375,7 +386,7 @@ Result<UuseChunkStore::SlotRef> UuseChunkStore::allocateSlot(std::size_t cls) {
 }
 
 void UuseChunkStore::releaseSlot(const SlotRef &slot) {
-  if (slot.fileId < kClassCount * kFilesPerClass && slot.slot < kSlotsPerFile) {
+  if (slot.fileId < kFileCount && slot.slot < kSlotsPerFile) {
     freeSlots_[classOfFile(slot.fileId)].push_back(slot);
   }
 }

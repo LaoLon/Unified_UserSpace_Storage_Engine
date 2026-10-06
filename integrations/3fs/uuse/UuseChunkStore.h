@@ -95,10 +95,13 @@ class UuseChunkStore {
     uint32_t length = 0;
   };
 
-  static constexpr uint32_t kClassCount = 3;
-  static constexpr uint32_t kFilesPerClass = 16;
+  static constexpr uint32_t kClassCount = 4;
+  /* Slot files per chunk-size class; the 1 MiB class (3FS default chunk size)
+   * gets the largest share. */
+  static constexpr uint32_t kClassFiles[kClassCount] = {8, 8, 24, 8};
   static constexpr uint32_t kSlotsPerFile = 128;
-  static constexpr uint64_t kClassSize[kClassCount] = {64u << 10, 512u << 10, 4u << 20};
+  static constexpr uint64_t kClassSize[kClassCount] = {64u << 10, 512u << 10, 1u << 20, 4u << 20};
+  static constexpr uint32_t kFileCount = 8 + 8 + 24 + 8;
 
   static Result<std::unique_ptr<UuseChunkStore>> open(const Options &options);
   ~UuseChunkStore();
