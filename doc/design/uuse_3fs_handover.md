@@ -54,6 +54,15 @@ grep -a 'uuse store loaded' /var/log/3fs/storage_main.log | tail -1
 
 ## 3. 常用操作（脚本都在 `temp_scripts/`，上传到对应 VM 的 /tmp）
 
+**执行方式**（在 `E:\Code\HFS_BASE_SPDK\temp_scripts` 下）：
+
+```powershell
+node vm.mjs --vm host1 put <本地文件> <VM路径>   # host1=.250  host2=.251  host3=.252  host4=.253  host5=.254
+node vm.mjs --vm host5 exec 'bash /tmp/xxx.sh'
+```
+
+连接信息见 `E:\Code\workspace.yaml`；临时脚本统一放 `temp_scripts/`。
+
 | 操作 | 命令（在哪个 VM） |
 |---|---|
 | 重启 .251 手动 storage | `bash /tmp/uuse251_trace_restart.sh`（.251） |
