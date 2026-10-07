@@ -140,20 +140,30 @@ node vm.mjs --vm host5 exec 'bash /tmp/xxx.sh'
    双客户端 ~1.5–2×。客户端 channel 池（12288）、存储提交/引擎（4 worker、
    无定时器批处理）、传输（RDMA 与 inline-TCP 同值）均不是上限。详见
    `uuse_3fs_local_engine.md` §5 M3 "写吞吐上限定位（2026-10-07）"。
-   **下一步（可选）**：改 `FuseClients.cc` 钳制公式或把客户端 VM 提到
-   ≥4 vCPU，验证 2 worker ≈ 2×。
-2. **UUSE 读路径的 3FS 级验证**：客户端读路由只落 stock 侧（UUSE `read_ok=0`）。
+   **4 vCPU 复测（2026-10-07 晚些）**：worker 1→2 确认；单客户端高并发
+   42–43 MiB/s（+12~15%，当日环境偏慢，normalized 更高），单流 ~29–30；
+   **双客户端 × 2 worker 在两条链上 4 次尝试全部 EIO/卡死**（见待办 2）。
+2. **修 UUSE 删除幂等性（高优先级，2026-10-07 压测阻塞点）**：
+   `UuseChunkStore::commit` 对已被回收的 chunk 返回 `kChunkMetadataNotFound`，
+   但 `update(isRemove)` 对不存在的 chunk 返回成功 → meta GC 的 `removeChunks`
+   **无限重试**（实测单 chunk 300+ 次、1s 级风暴持续数分钟），并伴随
+   `Channel is locked`、客户端 EIO；这是双客户端 2-worker 压测无法跑通的首要
+   原因（当日 `uuse commit failed: chunk not found` 291 次）。修法：commit 对
+   remove 语义在未找到时按成功返回，或保留 tombstone 记录。另：原生链在 4 并发
+   下出现 HEAD→TAIL `forward failed`，需与 Soft-RoCE 转发稳定性一起排查。
+   修完再复测双客户端 2-worker 聚合。
+3. **UUSE 读路径的 3FS 级验证**：客户端读路由只落 stock 侧（UUSE `read_ok=0`）。
    需要把 UUSE 副本设为 preferred/HEAD（`SetPreferredTargetOrder` /
    `RotateAsPreferredOrder` 等 admin 命令），再跑读矩阵并核对 `uuse read ok` 计数。
-3. **UUSE 耐久性对齐**：UUSE journal append 无 per-op fsync（进程崩溃安全、掉电可能
+4. **UUSE 耐久性对齐**：UUSE journal append 无 per-op fsync（进程崩溃安全、掉电可能
    丢最近记录）；与 3FS `sync_when_write` 语义对齐方案待定。
-4. **UUSE 配置调优**：`data_reactors = 1`（异步服务单分片）→ 可提到 4
+5. **UUSE 配置调优**：`data_reactors = 1`（异步服务单分片）→ 可提到 4
    （`max_data_reactors=4`），压 UUSE 读路径时可能需要。
-5. **清理遗留**：900100001/2/3 的离线 target（.250 `/storage/data1` 已用 68%）；
+6. **清理遗留**：900100001/2/3 的离线 target（.250 `/storage/data1` 已用 68%）；
    `/3fs/uuse/bm`、`bm2`、`bm_ceiling*` 测试文件**已于 2026-10-07 清理**（UUSE
    1MiB 类槽池 ~3GiB，写测数据勿超；删除后 GC 约 5min 起回收，`list-targets`
    的 UsedSize 下降即回收完成）。
-6. （可选）把性能矩阵/交接结论汇总进 `doc/performance/`。
+7. （可选）把性能矩阵/交接结论汇总进 `doc/performance/`。
 
 ---
 

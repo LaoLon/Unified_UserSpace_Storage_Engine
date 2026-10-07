@@ -506,6 +506,28 @@ journal 重放丢记录——出现任一即回退修复，不做性能结论。
             预期 2 worker ≈ 2×（受 2 vCPU 与共享更新流水线 ~55–65 ops/s 约束）。
             环境已恢复（FUSE 配置 = 原始模板、路由表 1 → 900100005、测试文件
             清理、残留 ib 测试进程清理）。
+        - **4 vCPU 复测与存储侧阻塞（2026-10-07）**：两台客户端 VM 升到 4 vCPU
+          后 FUSE worker 由 1 → **2**（`(4+1)/2`，`ps -L` 实测）。单客户端
+          UUSE 链复测（1MiB，两次独立运行）：io_driver n=8/32 **42.0 MiB/s**、
+          fio n=32 **43.0 MiB/s**（2 vCPU/1 worker 时为 37.4），单流 ~29–30；
+          即 2 worker 的高并发收益为 **+12~15%**。当日环境整体偏慢 ~15–20%
+          （头侧 update→commit p50 11.5→18.2ms、dd 单 op 55→65–80ms），
+          归一化后收益应更大，但本次无法厘清。
+          双客户端 × 2 worker（每链至多 4 并发 1MiB）在 UUSE 链和原生链上
+          **4 次尝试全部失败**（客户端 EIO + `Channel is locked` 风暴）：
+          ① **UUSE 链——删除非幂等 bug**：`uuse commit failed: chunk ...:
+             uuse chunk not found` 当日 291 次，单 chunk 被 meta GC 重试 300+
+             次（持续数分钟）。路径：`UuseChunkStore::update` 对
+             `isRemove` 且 chunk 不存在时返回成功，但随后的 `commit` 对已被
+             `recycleRemovedLocked` 回收的 chunk 返回 `kChunkMetadataNotFound`
+             → GC 无限重试 → 通道锁风暴 → 客户端 EIO。修法：commit 在未找到
+             时对 remove 语义按成功返回，或保留 tombstone。
+          ② **原生链**：4 并发下 HEAD→TAIL 出现 `forward failed`（1s 级重试，
+             与同进程 UUSE 侧 GC 重试风暴/Soft-RoCE 转发抖动叠加）。
+          结论：写并发上限当前由**存储侧稳定性**决定（实测稳定 ≤2–3 并发/
+          链），FUSE worker 数不再是唯一瓶颈；先修 ①/② 再复测双客户端
+          2-worker 聚合。测试后已恢复（两存储 + 两客户端重启、链 SERVING、
+          路由表 1 → 900100005、测试文件清理）。
 
 ## 6. 风险与停止条件
 
