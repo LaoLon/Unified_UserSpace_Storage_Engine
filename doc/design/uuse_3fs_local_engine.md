@@ -548,15 +548,20 @@ journal 重放丢记录——出现任一即回退修复，不做性能结论。
           |---|---|---|
           | 2 vCPU / 1 worker，RDMA | 37.4 MiB/s | 53.6（原生链） |
           | 4 vCPU / 2 workers，RDMA | 42–43 | 未跑通（通道锁/转发失败） |
+          | 4 vCPU / 2 workers，RDMA（幂等修复后复测） | **33.9–35.2** | 未跑通（.253 卡死 + 通道锁风暴；prep 触容量边界 EIO） |
           | 4 vCPU / 2 workers，inline-TCP | **47.8–48.0**（UUSE） | **63.9（UUSE）/ 60.0（原生）** |
 
           **结论**：4 vCPU + inline-TCP 下双客户端首次稳定跑通，聚合
           ~60–64 MiB/s（≈ 链的 ~64 ops/s 流水线上限，**客户端不再是瓶颈**）；
-          UUSE 与原生持平。遗留：UUSE 链 prep 在 store 接近 3 GiB 槽池容量时
-          仍会出现 `no free slot`-类 EIO（容量边界，非传输）；单流仍受单 op
-          延迟（~37ms）限制。当前 FUSE 生效配置 = v7（inline-TCP）；原始
-          RDMA 配置备份在 .254 `/tmp/fuse_cfg_orig.toml`，恢复方式：
-          `admin_cli set-config -t FUSE -f <file>` + 重启客户端。
+          UUSE 与原生持平。Soft-RoCE 复测（幂等修复后）：单客户端
+          33.9–35.2 MiB/s（低于 inline-TCP 的 47.8–48.0），双客户端仍在
+          .253 卡死 + 通道锁——**RDMA 数据面在双客户端 2-worker 下仍不稳定**，
+          inline-TCP 是本实验环境目前唯一稳定且更快的写配置。遗留：UUSE 链
+          prep 在 store 接近 3 GiB 槽池容量时仍会出现 `no free slot`-类 EIO
+          （容量边界，非传输）；单流仍受单 op 延迟（~37ms）限制。当前 FUSE
+          生效配置 = inline-TCP；原始 RDMA 配置备份在 .254
+          `/tmp/fuse_cfg_orig.toml`，恢复方式：`admin_cli set-config -t FUSE -f`
+          `<file>` + 重启客户端。
 
 ## 6. 风险与停止条件
 

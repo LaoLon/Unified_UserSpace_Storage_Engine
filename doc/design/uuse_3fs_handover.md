@@ -30,8 +30,8 @@ NVME_0001 = `/build`（.251 构建盘）；NVME_0002（BDF `0000:13:00.0`）= UU
 - **传输口径（2026-10-07 实测，含晚场更新）**：客户端与存储的**生效配置来自
   mgmtd**，对 `/opt/3fs/etc/*.toml` 的编辑不会自动生效；此前"TCP 口径"实为
   Soft-RoCE。真正切 TCP 后非 inline 写会报 `update no RDMA socket`（1MiB 数据面
-  需要 RDMA READ/WRITE 或 inline）。**当前（2026-10-07 晚）FUSE 生效配置 =
-  v7：`force_use_tcp=true` + `max_inline_write_bytes/max_inline_read_bytes
+  需要 RDMA READ/WRITE 或 inline）。**当前（2026-10-07 晚起）FUSE 生效配置 =
+  inline-TCP：`force_use_tcp=true` + `max_inline_write_bytes/max_inline_read_bytes
   ='2MB'`**——1MiB 写全 inline、链上转发随 inline 标志传递，链路上不再有 1MiB
   的 RDMA 数据搬运；存储侧配置未动（RPC 仍 RDMA，数据 inline）。这是目前唯一能让
   双客户端 2-worker 压测稳定跑通的配置（聚合 ~60–64 MiB/s）。原始 RDMA 配置备份
@@ -128,6 +128,8 @@ node vm.mjs --vm host5 exec 'bash /tmp/xxx.sh'
   `channel locked` 归零，store 用量 2.25→0.18 GiB 正常回收）。双客户端
   2-worker 压测随后稳定跑通：单客户端 **47.8–48.0 MiB/s**（fio n=32）、
   双客户端聚合 **63.9（UUSE）/ 60.0（原生）MiB/s** ≈ 链 ~64 ops/s 流水线上限。
+  软 RoCE 复测（4 vCPU/2 workers、幂等修复后）：单客户端 33.9–35.2 MiB/s、
+  双客户端仍卡死（`.253` 卡死 + 通道锁），故当前保持 **inline-TCP（v9）**。
   详见设计文档 §5 M3 "修复与复测（2026-10-07 晚）"。
 
 ### Git 状态
@@ -150,9 +152,10 @@ node vm.mjs --vm host5 exec 'bash /tmp/xxx.sh'
    无定时器批处理）、传输（RDMA 与 inline-TCP 同值）均不是上限。详见
    `uuse_3fs_local_engine.md` §5 M3 "写吞吐上限定位（2026-10-07）"。
    **4 vCPU 复测（2026-10-07，含晚场修复后）**：worker 1→2 确认。修复删除
-   幂等性并改用 inline-TCP 数据面（v7）后：单客户端 47.8–48.0 MiB/s、双客户端
-   聚合 63.9（UUSE）/60.0（原生）MiB/s，稳定跑通，已达链 ~64 ops/s 流水线上限；
-   RDMA 数据面下双客户端 2-worker 曾 4 次全部 EIO/卡死（通道锁/转发失败）。
+   幂等性并改用 inline-TCP 数据面后：单客户端 47.8–48.0 MiB/s、双客户端聚合
+   63.9（UUSE）/60.0（原生）MiB/s，稳定跑通，已达链 ~64 ops/s 流水线上限；
+   Soft-RoCE 复测单客户端 33.9–35.2 MiB/s、双客户端仍卡死（通道锁/转发失败），
+   故当前保持 inline-TCP。
 2. ~~**修 UUSE 删除幂等性（高优先级）**~~ **已完成（2026-10-07 晚）**：
    `UuseChunkStore::commit` 对不存在的 chunk 改为告警并按成功返回（与 stock
    引擎语义一致）；源码 `integrations/3fs/uuse/UuseChunkStore.{h,cc}`，增量
@@ -193,8 +196,8 @@ node vm.mjs --vm host5 exec 'bash /tmp/xxx.sh'
    <file>`（整文件替换），改完重启对应服务。⚠ 2026-10-07 前记录的
    `force_use_tcp=true`/`max_connections=8` 本地编辑从未生效，实际一直
    `force_use_tcp=false, max_connections=1`（Soft-RoCE）。当前 FUSE 另叠加
-   v7（TCP + 2MB inline，见 §1）；恢复原始：`set-config -t FUSE -f
-   /tmp/fuse_cfg_orig.toml` + 重启客户端。
+   inline-TCP（TCP + 2MB inline，见 §1；ConfigVersion 9，内容同 v7）；恢复
+   原始：`set-config -t FUSE -f /tmp/fuse_cfg_orig.toml` + 重启客户端。
 6. **UUSE store 格式化**（`uusectl format` / `uuse251_store_reset.sh`）会清空
    整个 UUSE 卷（该盘上所有 store）。
 7. **凭据**：token 在 `/opt/3fs/etc/token.txt`，**不得**打印/入库。
@@ -202,8 +205,10 @@ node vm.mjs --vm host5 exec 'bash /tmp/xxx.sh'
    op 日志，可用于对账）；客户端 `/var/log/3fs/hf3fs_fuse_main.log`。
 9. 基准口径：**双客户端并发、交叉读（读对方文件）+ drop_caches**；
    顺序 1MiB / 随机 4KiB；每格 20s；读缓存会污染结果（顺序读 32 并发曾出现缓存假象）。
-   注意：此前文档写"TCP"，但 2026-10-07 实测数据面一直是 Soft-RoCE（RDMA），
-   见 §1 传输口径修正；单客户端写上限 ~35–38 MiB/s（FUSE 单 worker，见 §5.1）。
+   注意：此前文档写"TCP"实为 Soft-RoCE（RDMA）；2026-10-07 晚起客户端数据面
+   改为 inline-TCP，见 §1。单客户端写 47.8–48.0、双客户端聚合 60–64 MiB/s
+   （4vCPU/2worker + inline-TCP）；Soft-RoCE 复测单客户端 33.9–35.2、
+   双客户端不稳定。
 
 ---
 
@@ -211,8 +216,8 @@ node vm.mjs --vm host5 exec 'bash /tmp/xxx.sh'
 
 | 维度 | 数值 | 备注 |
 |---|---|---|
-| 顺序写（单客户端） | 37.4 → **47.8–48.0 MiB/s** | 2vCPU/1worker → 4vCPU/2workers + inline-TCP（v7） |
-| 顺序写（双客户端聚合） | 53.6 → **60–64 MiB/s** | v7 下稳定；≈ 链 ~64 ops/s 流水线上限（UUSE 63.9 / 原生 60.0） |
+| 顺序写（单客户端） | 37.4 → **47.8–48.0 MiB/s** | 2vCPU/1worker → 4vCPU/2workers + inline-TCP |
+| 顺序写（双客户端聚合） | 53.6 → **60–64 MiB/s** | inline-TCP 下稳定；≈ 链 ~64 ops/s 流水线上限（UUSE 63.9 / 原生 60.0） |
 | 随机写 4K | ~300 IOPS | 写缓冲合并，仅 1MiB flush 串行 |
 | 顺序读 1M | ~20 MiB/s | 冷读（交叉读+drop_caches） |
 | 随机读 4K | ~700-750 IOPS | |
