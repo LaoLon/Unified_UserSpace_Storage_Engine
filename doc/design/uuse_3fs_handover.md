@@ -131,6 +131,11 @@ node vm.mjs --vm host5 exec 'bash /tmp/xxx.sh'
   软 RoCE 复测（4 vCPU/2 workers、幂等修复后）：单客户端 33.9–35.2 MiB/s、
   双客户端仍卡死（`.253` 卡死 + 通道锁），故当前保持 **inline-TCP（v9）**。
   详见设计文档 §5 M3 "修复与复测（2026-10-07 晚）"。
+- **双客户端 RF2 正式 A/B（2026-10-07，4 vCPU + inline-TCP）**：两轮交错
+  （原生/UUSE）：顺序写 65.1/66.9 vs **67.6/67.9** MiB/s、4K 随机写
+  286/246 vs **317/316** IOPS、单遍交叉冷读 151.0 vs **153.6/152.3** MiB/s
+  ——**UUSE 全维度 ≥ 原生**。**读路径首次由 UUSE 实际服务**（`uuse read ok`
+  每轮 2020 次，此前为 0），冷读 ~77 MiB/s/客户端。详见设计文档 §5 M3。
 
 ### Git 状态
 - 最新提交：`a4f1e84`（本会话链：`54e130c`→`a672398`→`409b688`→`7c17c5a`→
@@ -217,9 +222,9 @@ node vm.mjs --vm host5 exec 'bash /tmp/xxx.sh'
 | 维度 | 数值 | 备注 |
 |---|---|---|
 | 顺序写（单客户端） | 37.4 → **47.8–48.0 MiB/s** | 2vCPU/1worker → 4vCPU/2workers + inline-TCP |
-| 顺序写（双客户端聚合） | 53.6 → **60–64 MiB/s** | inline-TCP 下稳定；≈ 链 ~64 ops/s 流水线上限（UUSE 63.9 / 原生 60.0） |
-| 随机写 4K | ~300 IOPS | 写缓冲合并，仅 1MiB flush 串行 |
-| 顺序读 1M | ~20 MiB/s | 冷读（交叉读+drop_caches） |
+| 顺序写（双客户端聚合） | 53.6 → **65–68 MiB/s** | inline-TCP；两轮交错 UUSE 67.6/67.9 vs 原生 65.1/66.9（≈ 链 ~64 ops/s 流水线上限） |
+| 随机写 4K | **UUSE 316–317 vs 原生 246–286 IOPS** | 双客户端聚合；写缓冲合并，仅 1MiB flush 串行 |
+| 顺序读 1M（双客户端聚合） | **151–154 MiB/s** | inline-TCP + 单遍交叉冷读；UUSE 实际服务读（read_ok>0） |
 | 随机读 4K | ~700-750 IOPS | |
 | UUSE 本地后端 | 单线程 1MiB 读 4.5 GB/s | 远高于 3FS 链路，不是瓶颈 |
 

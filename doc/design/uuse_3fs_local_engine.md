@@ -562,6 +562,23 @@ journal 重放丢记录——出现任一即回退修复，不做性能结论。
           生效配置 = inline-TCP；原始 RDMA 配置备份在 .254
           `/tmp/fuse_cfg_orig.toml`，恢复方式：`admin_cli set-config -t FUSE -f`
           `<file>` + 重启客户端。
+        - **双客户端 RF2 正式 A/B（2026-10-07，4 vCPU + inline-TCP）**：链路
+          900100004（.251 stock + .250 stock）vs 900100005（.251 UUSE + .250
+          stock），双客户端同刻 32 作业、两轮交错（N/U/N/U）；1MiB 顺序写 20s、
+          4K 随机写 15s、`drop_caches` 后**单遍 1MiB 交叉冷读**：
+
+          | 维度（双客户端聚合） | 原生 | UUSE |
+          |---|---|---|
+          | 顺序写 1M 第 1/2 轮 | 65.1 / 66.9 MiB/s | **67.6 / 67.9 MiB/s** |
+          | 4K 随机写 第 1/2 轮 | 286 / 246 IOPS | **317 / 316 IOPS** |
+          | 冷读 1M 单遍 | 151.0 MiB/s | **153.6 / 152.3 MiB/s** |
+
+          结论：UUSE 全维度 ≥ 原生（差异在噪声内；随机写 UUSE 略高，需更长
+          采样确认）；聚合顺序写 ~65–68 MiB/s ≈ 链 ~64 ops/s 流水线上限。
+          **读路径首次由 UUSE 实际服务**：`uuse read ok` 每轮 2020 次（此前为
+          0）——UUSE 作为 HEAD + inline-TCP 时读落到 UUSE store，冷读
+          ~77 MiB/s/客户端。注意读口径必须用 drop_caches + **单遍**冷读：
+          io_driver 的循环读第二遍起被客户端页缓存放大（曾出现 6.5 GB/s 假象）。
 
 ## 6. 风险与停止条件
 
