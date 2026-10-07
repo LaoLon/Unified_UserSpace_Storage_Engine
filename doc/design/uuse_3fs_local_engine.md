@@ -528,6 +528,35 @@ journal 重放丢记录——出现任一即回退修复，不做性能结论。
           链），FUSE worker 数不再是唯一瓶颈；先修 ①/② 再复测双客户端
           2-worker 聚合。测试后已恢复（两存储 + 两客户端重启、链 SERVING、
           路由表 1 → 900100005、测试文件清理）。
+        - **修复与复测（2026-10-07 晚，§5 待办 2 完成）**：
+          ① **已修复 UUSE 删除幂等性**：`UuseChunkStore::commit` 对不存在的
+          chunk 改为告警并按成功返回（与 stock 引擎语义一致；源码
+          `integrations/3fs/uuse/UuseChunkStore.{h,cc}`，增量重建
+          `storage_main` 部署到 .251）。实测：GC 删除触发
+          `uuse commit: chunk ... already gone, treat as success` WARN，
+          `uuse commit failed` / `Channel is locked` 归零，store 用量正常
+          回收（2.25 → 1.24 → 0.18 GiB）。
+          ② 剩余的通道锁问题（RDMA 传输错误后 HEAD 转发重试撞 TAIL 通道锁，
+          持锁协程不释放；gdb 显示 update worker/UUSE 反应堆/IO 线程均空闲）
+          以**客户端 inline-TCP 数据面**绕开：FUSE 生效配置
+          `force_use_tcp=true` + `max_inline_write_bytes/max_inline_read_bytes
+          ='2MB'`（mgmtd ConfigVersion 7）。1MiB 写全部 inline，链上转发随
+          inline 标志传递，链路上不再有 1MiB 的 RDMA READ 数据搬运。
+          **复测结果**（1MiB 顺序写，双客户端 32 作业同刻启动）：
+
+          | 配置 | 单客户端 | 双客户端聚合 |
+          |---|---|---|
+          | 2 vCPU / 1 worker，RDMA | 37.4 MiB/s | 53.6（原生链） |
+          | 4 vCPU / 2 workers，RDMA | 42–43 | 未跑通（通道锁/转发失败） |
+          | 4 vCPU / 2 workers，inline-TCP | **47.8–48.0**（UUSE） | **63.9（UUSE）/ 60.0（原生）** |
+
+          **结论**：4 vCPU + inline-TCP 下双客户端首次稳定跑通，聚合
+          ~60–64 MiB/s（≈ 链的 ~64 ops/s 流水线上限，**客户端不再是瓶颈**）；
+          UUSE 与原生持平。遗留：UUSE 链 prep 在 store 接近 3 GiB 槽池容量时
+          仍会出现 `no free slot`-类 EIO（容量边界，非传输）；单流仍受单 op
+          延迟（~37ms）限制。当前 FUSE 生效配置 = v7（inline-TCP）；原始
+          RDMA 配置备份在 .254 `/tmp/fuse_cfg_orig.toml`，恢复方式：
+          `admin_cli set-config -t FUSE -f <file>` + 重启客户端。
 
 ## 6. 风险与停止条件
 

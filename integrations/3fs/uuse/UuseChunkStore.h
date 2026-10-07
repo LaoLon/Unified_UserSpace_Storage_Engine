@@ -138,7 +138,9 @@ class UuseChunkStore {
    * full-chunk CRC32C recompute, optional commit in the same request. */
   Result<UpdateOutput> update(const UpdateInput &input);
 
-  /* Commit an update version (commitVer/chainVer) and persist it. */
+  /* Commit an update version (commitVer/chainVer) and persist it.
+   * Idempotent: a missing chunk is treated as already removed (returns success),
+   * matching the stock engines and avoiding GC remove-retry loops. */
   Result<Void> commit(const ChunkId &chunkId, uint64_t commitVer, uint32_t chainVer);
 
   /* Chunks inside [range.begin, range.end], reverse lexicographic order. */

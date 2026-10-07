@@ -826,7 +826,17 @@ Result<Void> UuseChunkStore::commit(const ChunkId &chunkId, uint64_t commitVer, 
   std::lock_guard lock(mutex_);
   auto it = chunks_.find(chunkId.data());
   if (it == chunks_.end()) {
-    return makeError(StorageCode::kChunkMetadataNotFound, "uuse chunk not found");
+    /* Idempotent commit: a chunk that is already gone (e.g. a remove retried
+     * after its recycle, or a chunk the punch-hole worker removed first) is a
+     * no-op, not an error. The stock engines behave the same way; returning
+     * kChunkMetadataNotFound here made the meta GC retry the same remove
+     * forever and left channels locked. */
+    XLOGF(WARN,
+          "uuse commit: chunk {} already gone, treat as success, ver {} chainVer {}",
+          chunkId.toString(),
+          commitVer,
+          chainVer);
+    return Void{};
   }
   it->second.meta.commitVer = ChunkVer{static_cast<uint32_t>(commitVer)};
   it->second.meta.chainVer = ChainVer{chainVer};
