@@ -104,6 +104,8 @@ class UuseChunkStore {
   static constexpr uint32_t kSlotsPerFile = 128;
   static constexpr uint64_t kClassSize[kClassCount] = {64u << 10, 512u << 10, 1u << 20, 4u << 20};
   static constexpr uint32_t kFileCount = 8 + 8 + 24 + 8;
+  /* Upper bound for dynamically grown slot files (fileId must stay < this). */
+  static constexpr uint32_t kMaxFileCount = 4096;
 
   static Result<std::unique_ptr<UuseChunkStore>> open(const Options &options);
   ~UuseChunkStore();
@@ -168,9 +170,15 @@ class UuseChunkStore {
   Result<bool> recycleRemovedLocked();
   Result<Void> appendRecord(const UuseJournalRecord &record);
   Result<SlotRef> allocateSlot(std::size_t cls);
+  /* allocateSlot, then recycle removed chunks, then grow a new slot file.
+   * Caller must hold mutex_. Returns kNoSpace when the pool cannot grow. */
+  Result<SlotRef> allocateSlotWithRecycle(std::size_t cls);
+  /* Creates one more slot file for the class and registers its free slots.
+   * Caller must hold mutex_. */
+  Result<Void> growClass(std::size_t cls);
   void releaseSlot(const SlotRef &slot);
-  static std::size_t classOfFile(uint32_t fileId);
-  static SlotRef slotRefOf(const ChunkMetadata &meta);
+  std::size_t classOfFile(uint32_t fileId) const;
+  SlotRef slotRefOf(const ChunkMetadata &meta) const;
   std::string slotPath(uint32_t fileId) const;
   std::string metaPath() const;
 
@@ -224,6 +232,10 @@ class UuseChunkStore {
   std::unordered_map<uint32_t, std::shared_ptr<uuse::File>> slotFiles_;
   std::unordered_map<std::string, ChunkInfo> chunks_;
   std::array<std::vector<SlotRef>, kClassCount> freeSlots_;
+  /* fileId -> class for all slot files (static + dynamically grown). */
+  std::unordered_map<uint32_t, std::size_t> fileClass_;
+  /* Next fileId to use when growing the slot pool. */
+  uint32_t nextFileId_ = kFileCount;
   mutable std::mutex mutex_;
 };
 

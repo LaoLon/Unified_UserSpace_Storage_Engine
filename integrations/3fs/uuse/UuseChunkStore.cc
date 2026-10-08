@@ -9,6 +9,7 @@
 #include <span>
 #include <stop_token>
 #include <string>
+#include <string_view>
 #include <thread>
 
 #include <folly/logging/xlog.h>
@@ -33,6 +34,38 @@ std::size_t classForSize(uint32_t size) {
     }
   }
   return UuseChunkStore::kClassCount;
+}
+
+/* Static layout mapping for the compile-time slot files. */
+std::size_t staticClassOfFile(uint32_t fileId) {
+  uint32_t base = 0;
+  for (std::size_t c = 0; c < UuseChunkStore::kClassCount; ++c) {
+    base += UuseChunkStore::kClassFiles[c];
+    if (fileId < base) {
+      return c;
+    }
+  }
+  return UuseChunkStore::kClassCount;
+}
+
+/* Parses "f<id>.dat" slot file names; returns false for anything else. */
+bool parseSlotFileName(std::string_view name, uint32_t &fileId) {
+  if (name.size() < 6 || name.front() != 'f' || name.substr(name.size() - 4) != ".dat") {
+    return false;
+  }
+  uint32_t value = 0;
+  for (std::size_t i = 1; i + 4 < name.size(); ++i) {
+    const char ch = name[i];
+    if (ch < '0' || ch > '9') {
+      return false;
+    }
+    value = value * 10 + static_cast<uint32_t>(ch - '0');
+    if (value >= UuseChunkStore::kMaxFileCount) {
+      return false;
+    }
+  }
+  fileId = value;
+  return true;
 }
 
 Result<Void> writeAt(uuse::File &file, const uint8_t *data, uint32_t size, uint64_t offset) {
@@ -315,18 +348,16 @@ Result<Void> UuseChunkStore::ioSyncFile(uuse::File &file, const char *what) {
   });
 }
 
-std::size_t UuseChunkStore::classOfFile(uint32_t fileId) {
-  uint32_t base = 0;
-  for (std::size_t c = 0; c < kClassCount; ++c) {
-    base += kClassFiles[c];
-    if (fileId < base) {
-      return c;
-    }
+std::size_t UuseChunkStore::classOfFile(uint32_t fileId) const {
+  const auto it = fileClass_.find(fileId);
+  if (it != fileClass_.end()) {
+    return it->second;
   }
-  return kClassCount;
+  /* Fallback for static ids before registration (createLayout). */
+  return fileId < kFileCount ? staticClassOfFile(fileId) : kClassCount;
 }
 
-UuseChunkStore::SlotRef UuseChunkStore::slotRefOf(const ChunkMetadata &meta) {
+UuseChunkStore::SlotRef UuseChunkStore::slotRefOf(const ChunkMetadata &meta) const {
   const auto cls = classOfFile(meta.innerFileId.chunkIdx);
   return SlotRef{meta.innerFileId.chunkIdx, static_cast<uint32_t>(meta.innerOffset / kClassSize[cls])};
 }
@@ -363,7 +394,46 @@ Result<Void> UuseChunkStore::openFiles() {
       return makeError(StatusCode::kIOError, "uuse open: " + opened.message());
     }
     slotFiles_[fileId] = opened.value();
+    fileClass_[fileId] = staticClassOfFile(fileId);
   }
+  /* Discover slot files created by dynamic growth; the class is derived from
+   * the fixed file size (classSize * slotsPerFile). */
+  std::string cursor;
+  do {
+    auto page = client_->getChildren(options_.targetDir, cursor, 256).wait().value();
+    if (!page.ok()) {
+      return makeError(StatusCode::kIOError, "uuse list dir: " + page.message());
+    }
+    for (const auto &entry : page.value().entries) {
+      uint32_t fileId = 0;
+      if (!parseSlotFileName(entry.name, fileId) || fileId < kFileCount || slotFiles_.count(fileId) > 0) {
+        continue;
+      }
+      auto opened = client_->open(slotPath(fileId)).wait().value();
+      if (!opened.ok()) {
+        return makeError(StatusCode::kIOError, "uuse open grown: " + opened.message());
+      }
+      auto stat = opened.value()->stat();
+      if (!stat.ok()) {
+        return makeError(StatusCode::kIOError, "uuse stat grown: " + stat.message());
+      }
+      std::size_t cls = kClassCount;
+      for (std::size_t c = 0; c < kClassCount; ++c) {
+        if (stat.value().logicalSize == kClassSize[c] * kSlotsPerFile) {
+          cls = c;
+          break;
+        }
+      }
+      if (cls >= kClassCount) {
+        XLOGF(ERR, "uuse slot file {} has unexpected size {}", fileId, stat.value().logicalSize);
+        continue;
+      }
+      slotFiles_[fileId] = opened.value();
+      fileClass_[fileId] = cls;
+      nextFileId_ = std::max(nextFileId_, fileId + 1);
+    }
+    cursor = page.value().nextCursor;
+  } while (!cursor.empty());
   auto meta = client_->open(metaPath(), uuse::OpenFlags::Create).wait().value();
   if (!meta.ok()) {
     return makeError(StatusCode::kIOError, "uuse open meta: " + meta.message());
@@ -422,6 +492,11 @@ void UuseChunkStore::applyRecord(const UuseJournalRecord &record) {
     if (existing != chunks_.end()) {
       releaseSlot(existing->second.slot);
     }
+    const std::size_t cls = classOfFile(record.fileId);
+    if (cls >= kClassCount) {
+      XLOGF(ERR, "uuse journal references unknown slot file {}; skip chunk", record.fileId);
+      return;
+    }
     ChunkInfo info;
     info.meta.commitVer = ChunkVer{record.commitVer};
     info.meta.updateVer = ChunkVer{record.updateVer};
@@ -431,7 +506,7 @@ void UuseChunkStore::applyRecord(const UuseJournalRecord &record) {
     info.meta.checksumType = static_cast<ChecksumType>(record.checksumType);
     info.meta.checksumValue = record.checksumValue;
     info.meta.recycleState = static_cast<RecycleState>(record.reserved2);
-    info.meta.innerFileId.chunkSize = static_cast<uint32_t>(kClassSize[classOfFile(record.fileId)]);
+    info.meta.innerFileId.chunkSize = static_cast<uint32_t>(kClassSize[cls]);
     info.meta.innerFileId.chunkIdx = record.fileId;
     info.meta.innerOffset = record.innerOffset;
     info.slot = slotRefOf(info.meta);
@@ -453,10 +528,10 @@ void UuseChunkStore::rebuildFreeSlots() {
   for (const auto &[key, info] : chunks_) {
     used.emplace(info.slot.fileId, info.slot.slot);
   }
-  for (uint32_t fileId = 0; fileId < kFileCount; ++fileId) {
+  for (const auto &[fileId, cls] : fileClass_) {
     for (uint32_t slot = 0; slot < kSlotsPerFile; ++slot) {
       if (used.find({fileId, slot}) == used.end()) {
-        freeSlots_[classOfFile(fileId)].push_back(SlotRef{fileId, slot});
+        freeSlots_[cls].push_back(SlotRef{fileId, slot});
       }
     }
   }
@@ -476,15 +551,66 @@ Result<Void> UuseChunkStore::appendRecord(const UuseJournalRecord &record) {
 
 Result<UuseChunkStore::SlotRef> UuseChunkStore::allocateSlot(std::size_t cls) {
   if (freeSlots_[cls].empty()) {
-    return makeError(StatusCode::kInvalidArg, "uuse chunk class has no free slot");
+    return makeError(StorageClientCode::kNoSpace, "uuse chunk class has no free slot");
   }
   const SlotRef ref = freeSlots_[cls].back();
   freeSlots_[cls].pop_back();
   return ref;
 }
 
+Result<UuseChunkStore::SlotRef> UuseChunkStore::allocateSlotWithRecycle(std::size_t cls) {
+  auto slot = allocateSlot(cls);
+  if (slot) {
+    return slot;
+  }
+  /* Reclaim removed chunks first (the meta may have removed them since the
+   * last recycle cycle), then retry once. */
+  auto recycled = recycleRemovedLocked();
+  if (!recycled) {
+    return folly::makeUnexpected(recycled.error());
+  }
+  slot = allocateSlot(cls);
+  if (slot) {
+    return slot;
+  }
+  /* Grow the pool (dynamic slot file) and retry once more. */
+  auto grown = growClass(cls);
+  if (!grown) {
+    return folly::makeUnexpected(grown.error());
+  }
+  return allocateSlot(cls);
+}
+
+Result<Void> UuseChunkStore::growClass(std::size_t cls) {
+  if (cls >= kClassCount || nextFileId_ >= kMaxFileCount) {
+    return makeError(StorageClientCode::kNoSpace, "uuse slot file limit reached");
+  }
+  const uint32_t fileId = nextFileId_++;
+  auto opened = client_->open(slotPath(fileId), uuse::OpenFlags::Create).wait().value();
+  if (!opened.ok()) {
+    return makeError(StatusCode::kIOError, "uuse grow open: " + opened.message());
+  }
+  const uint64_t fileSize = kClassSize[cls] * kSlotsPerFile;
+  auto allocated = opened.value()->allocate(0, fileSize).wait().value();
+  if (!allocated.ok()) {
+    return makeError(StorageClientCode::kNoSpace, "uuse grow allocate: " + allocated.message());
+  }
+  /* Persist the new file's metadata before any chunk journals into it. */
+  auto synced = ioSyncFile(*opened.value(), "uuse grow sync: ");
+  if (!synced) {
+    return synced;
+  }
+  slotFiles_[fileId] = opened.value();
+  fileClass_[fileId] = cls;
+  for (uint32_t slot = 0; slot < kSlotsPerFile; ++slot) {
+    freeSlots_[cls].push_back(SlotRef{fileId, slot});
+  }
+  XLOGF(INFO, "uuse slot pool grown: class {} file {} size {} (next file {})", cls, fileId, fileSize, nextFileId_);
+  return Void{};
+}
+
 void UuseChunkStore::releaseSlot(const SlotRef &slot) {
-  if (slot.fileId < kFileCount && slot.slot < kSlotsPerFile) {
+  if (slot.slot < kSlotsPerFile && fileClass_.count(slot.fileId) > 0) {
     freeSlots_[classOfFile(slot.fileId)].push_back(slot);
   }
 }
@@ -507,18 +633,9 @@ Result<UuseChunkStore::ChunkInfo> UuseChunkStore::createChunk(const ChunkId &chu
     return makeError(StatusCode::kInvalidArg, "uuse chunk size above max class");
   }
   std::lock_guard lock(mutex_);
-  auto slotResult = allocateSlot(cls);
+  auto slotResult = allocateSlotWithRecycle(cls);
   if (!slotResult) {
-    /* Reclaim removed chunks first (the meta may have removed them since the
-     * last recycle cycle), then retry once. */
-    auto recycled = recycleRemovedLocked();
-    if (!recycled) {
-      return folly::makeUnexpected(recycled.error());
-    }
-    slotResult = allocateSlot(cls);
-    if (!slotResult) {
-      return folly::makeUnexpected(slotResult.error());
-    }
+    return folly::makeUnexpected(slotResult.error());
   }
   const SlotRef slot = slotResult.value();
   ChunkInfo info;
@@ -656,6 +773,12 @@ Result<UuseChunkStore::UpdateOutput> UuseChunkStore::update(const UpdateInput &i
     if (input.chunkSize != 0 && info.meta.innerFileId.chunkSize != input.chunkSize) {
       return makeError(StorageCode::kChunkSizeMismatch, "uuse chunk size mismatch");
     }
+    /* A write to a chunk that was pending removal cancels the removal; mark it
+     * NORMAL in the live map immediately so the punch-hole worker cannot
+     * recycle the slot while phase 2 I/O runs outside the lock. */
+    if (!input.isRemove && existing->second.meta.recycleState != RecycleState::NORMAL) {
+      existing->second.meta.recycleState = RecycleState::NORMAL;
+    }
   } else {
     needCreate = true;
     info.meta.chainVer = ChainVer{input.chainVer};
@@ -714,17 +837,9 @@ Result<UuseChunkStore::UpdateOutput> UuseChunkStore::update(const UpdateInput &i
     if (cls >= kClassCount) {
       return makeError(StatusCode::kInvalidArg, "uuse chunk size above max class");
     }
-    auto slotResult = allocateSlot(cls);
+    auto slotResult = allocateSlotWithRecycle(cls);
     if (!slotResult) {
-      /* Reclaim removed chunks first, then retry once. */
-      auto recycled = recycleRemovedLocked();
-      if (!recycled) {
-        return folly::makeUnexpected(recycled.error());
-      }
-      slotResult = allocateSlot(cls);
-      if (!slotResult) {
-        return folly::makeUnexpected(slotResult.error());
-      }
+      return folly::makeUnexpected(slotResult.error());
     }
     info.slot = slotResult.value();
     /* Metadata keeps the logical chunk size; the slot class only drives the
