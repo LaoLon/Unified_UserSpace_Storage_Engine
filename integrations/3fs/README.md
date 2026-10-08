@@ -81,8 +81,11 @@
   （`getAllMetadata`/`getAllMetadataMap`/`reportUnrecycledSize`/`addChunkSize`/
   migrate 守卫/punchHole 接线）。独立脚本，可补装到旧版本安装的源码树（幂等）。
   注意：`UuseChunkStore` 的 slot 池为按类布局 `kClassFiles = {8,8,24,8}`
-  （64K/512K/1M/4M，共 6144 槽，1MiB 类 3072 槽）；回收依赖本补丁的 punchHole
-  接线 + journal `reserved2` 持久化的 recycleState。
+  （64K/512K/1M/4M，静态共 6144 槽，1MiB 类 3072 槽）；**槽池按需动态扩容**
+  （`growClass` 新建 `f<id>.dat`，fileId 上限 4096；重启时扫描目录、按文件大小
+  推断类别），分配失败返回 `StorageClientCode::kNoSpace`（非 EIO）；回收依赖
+  本补丁的 punchHole 接线 + journal `reserved2` 持久化的 recycleState；update
+  phase-1 对 pending-removal chunk 立即标记 NORMAL（防 punch-hole 竞态）。
 - `patches/apply-uuse-oplogs.sh`：UUSE 后端每 op 成功日志（`uuse update ok` /
   `uuse commit ok` / `uuse read ok`，含 chunk/ver/len），用于 op 级追踪对账。
 - 注意：`uuse_chunkstore_smoke` 目标构建需 `CC=gcc-12 CXX=g++-12`，否则 cargo

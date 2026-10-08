@@ -579,6 +579,24 @@ journal 重放丢记录——出现任一即回退修复，不做性能结论。
           0）——UUSE 作为 HEAD + inline-TCP 时读落到 UUSE store，冷读
           ~77 MiB/s/客户端。注意读口径必须用 drop_caches + **单遍**冷读：
           io_driver 的循环读第二遍起被客户端页缓存放大（曾出现 6.5 GB/s 假象）。
+        - **环境重建 + UUSE 侧收尾项验证（2026-10-08）**：VM 重启后 .250/.251
+          数据盘（NVME_0000/0001）被清空 → 按恢复手册重建：重格式化 data1/build、
+          .251 重新克隆 3FS@22fca04 + 补丁 + 构建（含本日改动）、FDB 清库重建、
+          cluster reset + 重建 targets/chains、客户端同步 token。借此验证
+          "不改 3FS 源码"的收尾项：
+          ① **槽池动态扩容**（`allocateSlotWithRecycle` + `growClass`）：写
+          3.5GiB（3584×1MiB）触发自动新建 5 个 class-2 槽文件（file 48–52，各
+          128MiB），无 `no free slot`/EIO（61 MiB/s）；重启 .251 storage 后
+          目录扫描恢复动态文件（0 个 unknown slot file），UsedSize
+          3,758,096,387 前后一致。
+          ② **UUSE 读路径复验**：preferred order 指向 UUSE 后 112MiB 文件
+          md5 精确（1521 次 `uuse read ok`）。
+          ③ `no free slot` → `StorageClientCode::kNoSpace`（客户端可见
+          no-space 语义而非 EIO）。
+          ④ update/recycle 竞态加固：phase-1 对 pending-removal chunk 立即
+          标记 NORMAL，避免 phase-2 期间 punch-hole 回收其 slot。
+          剩余仅 3FS 核心改动项（RDMA 通道锁根因、FUSE worker 公式、纯 TCP
+          数据面等，见 handover §5.7）。
 
 ## 6. 风险与停止条件
 

@@ -27,16 +27,20 @@ NVME_0001 = `/build`（.251 构建盘）；NVME_0002（BDF `0000:13:00.0`）= UU
 | 900100001/2/3 | .250 侧 OFFLINE | SERVING(1/2) | 遗留降级链，未使用 |
 
 - 路由表 1 当前指向 **900100005**（切换命令见 §3）。
-- **传输口径（2026-10-07 实测，含晚场更新）**：客户端与存储的**生效配置来自
-  mgmtd**，对 `/opt/3fs/etc/*.toml` 的编辑不会自动生效；此前"TCP 口径"实为
+- **2026-10-08 环境重建**：VM 重启后 .250/.251 的 NVME_0000/0001（data1/build）
+  变为空白盘，集群 UNAVAILABLE；已按恢复手册重建——重格式化 data1(XFS)/
+  build(ext4)，.251 重新克隆 3FS@22fca04 + 打补丁 + 构建（含 2026-10-08 的
+  UUSE 侧新改动），FDB 清库重建，cluster reset + 重建 targets/chains
+  （900100004/900100005），客户端同步新 token + 重挂载。构建要点见 §6.10。
+- **传输口径（2026-10-07 实测 + 2026-10-08 重建后）**：客户端与存储的**生效配置
+  来自 mgmtd**，对 `/opt/3fs/etc/*.toml` 的编辑不会自动生效；此前"TCP 口径"实为
   Soft-RoCE。真正切 TCP 后非 inline 写会报 `update no RDMA socket`（1MiB 数据面
-  需要 RDMA READ/WRITE 或 inline）。**当前（2026-10-07 晚起）FUSE 生效配置 =
-  inline-TCP：`force_use_tcp=true` + `max_inline_write_bytes/max_inline_read_bytes
-  ='2MB'`**——1MiB 写全 inline、链上转发随 inline 标志传递，链路上不再有 1MiB
-  的 RDMA 数据搬运；存储侧配置未动（RPC 仍 RDMA，数据 inline）。这是目前唯一能让
-  双客户端 2-worker 压测稳定跑通的配置（聚合 ~60–64 MiB/s）。原始 RDMA 配置备份
-  在 .254 `/tmp/fuse_cfg_orig.toml`；恢复：`admin_cli set-config -t FUSE -f
-  <file>` + 重启客户端。
+  需要 RDMA READ/WRITE 或 inline）。**当前 FUSE 生效配置 = inline-TCP：
+  `force_use_tcp=true` + `max_inline_write_bytes/max_inline_read_bytes='2MB'`**
+  （重建后由 `uuse254_publish_inline.sh` 重新发布）——1MiB 写全 inline、链上转发
+  随 inline 标志传递，链路上不再有 1MiB 的 RDMA 数据搬运；存储侧配置未动（RPC
+  仍 RDMA，数据 inline）。这是目前唯一能让双客户端 2-worker 压测稳定跑通的配置
+  （聚合 ~60–64 MiB/s）。恢复/重建该配置：`bash /tmp/uuse254_publish_inline.sh`。
 - 存储 `sync_when_write = true`（已从 false 实验恢复）。
 
 ---
@@ -136,6 +140,15 @@ node vm.mjs --vm host5 exec 'bash /tmp/xxx.sh'
   286/246 vs **317/316** IOPS、单遍交叉冷读 151.0 vs **153.6/152.3** MiB/s
   ——**UUSE 全维度 ≥ 原生**。**读路径首次由 UUSE 实际服务**（`uuse read ok`
   每轮 2020 次，此前为 0），冷读 ~77 MiB/s/客户端。详见设计文档 §5 M3。
+- **环境重建 + UUSE 侧收尾项验证（2026-10-08）**：VM 重启后数据盘被清空，按
+  恢复手册完整重建（详见 §1/§6.10）。借此部署并验证了不修改 3FS 源码即可完成
+  的收尾项：① **槽池动态扩容**——写 3.5GiB（3584×1MiB）触发自动新建 5 个槽文件
+  （class 2，file 48–52，各 128MiB），全程无 `no free slot`、无 EIO（61 MiB/s）；
+  重启 .251 storage 后动态文件被目录扫描正确恢复（0 个 unknown slot file），
+  用量 3,758,096,387 前后一致；② **UUSE 读路径复验**——设 preferred order 后
+  读落到 UUSE（1521 次 `uuse read ok`），112MiB 文件 md5 精确；③ `no free slot`
+  语义改为 `StorageClientCode::kNoSpace`；④ update/recycle 竞态加固（phase-1
+  立即标记 NORMAL）。剩余仅 3FS 核心改动项（见 §5）。
 
 ### Git 状态
 - 最新提交：`a4f1e84`（本会话链：`54e130c`→`a672398`→`409b688`→`7c17c5a`→
@@ -167,8 +180,8 @@ node vm.mjs --vm host5 exec 'bash /tmp/xxx.sh'
    重建 `storage_main` 部署 .251。实测 GC 删除不再重试（`uuse commit failed`/
    `Channel is locked` 归零；store 用量 2.25 → 0.18 GiB 正常回收），双客户端
    压测随之跑通。**未做（遗留）**：RDMA 数据面下 HEAD→TAIL 转发重试撞 TAIL
-   通道锁（持锁协程不释放，gdb 显示 worker/IO 线程均空闲）的根因修复；
-   UUSE store 接近 3GiB 槽池容量时 prep 的 `no free slot` EIO 的上层提示。
+   通道锁（持锁协程不释放，gdb 显示 worker/IO 线程均空闲）的根因修复。
+   （槽池容量问题已于 2026-10-08 用动态扩容 + `kNoSpace` 语义解决，见 §4。）
 3. ~~**UUSE 读路径的 3FS 级验证**~~ **已完成（2026-10-07 晚）**：UUSE 作为
    链 HEAD + inline-TCP 时，读请求实际落到 UUSE store（`uuse read ok` 每轮
    2020 次，此前为 0）；双客户端 RF2 A/B 冷读 **153.6/152.3 vs 原生 151.0
@@ -177,11 +190,17 @@ node vm.mjs --vm host5 exec 'bash /tmp/xxx.sh'
    丢最近记录）；与 3FS `sync_when_write` 语义对齐方案待定。
 5. **UUSE 配置调优**：`data_reactors = 1`（异步服务单分片）→ 可提到 4
    （`max_data_reactors=4`），压 UUSE 读路径时可能需要。
-6. **清理遗留**：900100001/2/3 的离线 target（.250 `/storage/data1` 已用 68%）；
-   `/3fs/uuse/bm`、`bm2`、`bm_ab`、`bm_ceiling*` 测试文件**已于 2026-10-07 清理**
-   （UUSE 1MiB 类槽池 ~3GiB，写测数据勿超；删除后 GC 约 5min 起回收，
-   `list-targets` 的 UsedSize 下降即回收完成）。
-7. （可选）把性能矩阵/交接结论汇总进 `doc/performance/`。
+6. **清理遗留**：`/3fs/uuse/bm_grow`（3.5GiB，扩容验证数据）**已于 2026-10-08
+   清理**；UUSE store 现支持动态扩容（1MiB 类不再受 3GiB 静态槽限制，按需新建
+   `f<id>.dat`，上限 fileId<4096）；删除后 GC 约 5min 起回收，`list-targets`
+   的 UsedSize 下降即回收完成。旧 900100001/2/3 链已随 2026-10-08 集群重建消失。
+7. **仅剩需要改 3FS 核心代码的项**（2026-10-08 梳理）：① RDMA 数据面 HEAD→TAIL
+   转发重试撞通道锁的根因（当前用 inline-TCP 规避）；② `FuseClients.cc` 的
+   worker 钳制公式（`(logicalCores+1)/2`，小 VM 上想免加核得到 ≥2 worker）；
+   ③ 纯 TCP 大块数据面（免 `max_inline_*` 配置）；④ `StorageTargets::create`
+   带 UUSE 选项（admin create-target 直建 UUSE target，属我们 patch 面）；
+   ⑤ `sync_when_write` 传递到 UUSE commit（同属 patch 面，改动小）。
+8. （可选）把性能矩阵/交接结论汇总进 `doc/performance/`。
 
 ---
 
@@ -201,9 +220,9 @@ node vm.mjs --vm host5 exec 'bash /tmp/xxx.sh'
    `admin_cli get-config -t FUSE|STORAGE -o <file>` + `set-config -t ... -f
    <file>`（整文件替换），改完重启对应服务。⚠ 2026-10-07 前记录的
    `force_use_tcp=true`/`max_connections=8` 本地编辑从未生效，实际一直
-   `force_use_tcp=false, max_connections=1`（Soft-RoCE）。当前 FUSE 另叠加
-   inline-TCP（TCP + 2MB inline，见 §1；ConfigVersion 9，内容同 v7）；恢复
-   原始：`set-config -t FUSE -f /tmp/fuse_cfg_orig.toml` + 重启客户端。
+   `force_use_tcp=false, max_connections=1`（Soft-RoCE）。当前 FUSE 叠加
+   inline-TCP（见 §1）；重建/恢复该配置用 `bash /tmp/uuse254_publish_inline.sh`
+   （get-config → sed → set-config），然后重启客户端。
 6. **UUSE store 格式化**（`uusectl format` / `uuse251_store_reset.sh`）会清空
    整个 UUSE 卷（该盘上所有 store）。
 7. **凭据**：token 在 `/opt/3fs/etc/token.txt`，**不得**打印/入库。
@@ -215,6 +234,26 @@ node vm.mjs --vm host5 exec 'bash /tmp/xxx.sh'
    改为 inline-TCP，见 §1。单客户端写 47.8–48.0、双客户端聚合 60–64 MiB/s
    （4vCPU/2worker + inline-TCP）；Soft-RoCE 复测单客户端 33.9–35.2、
    双客户端不稳定。
+10. **3FS 重建（2026-10-08 实操）**：① 代理用 `192.168.1.102:12450`（git 系统
+    配置 `/etc/gitconfig`；旧 `.105` 已失效）；② Arrow 的 thrift-0.16.0 在
+    Apache 官方镜像被代理 TLS 阻断，**可用镜像
+    `https://mirrors.huaweicloud.com/apache/thrift/0.16.0/thrift-0.16.0.tar.gz`**
+    （sha256 `f460b5c1…`），放到 `build/src/apache-arrow-cpp/cpp/thrift_ep-prefix/
+    src/` 后重跑 `cmake --build build -j3 --target storage_main
+    uuse_chunkstore_smoke`；③ 全流程脚本：`uuse251_clone_stage1.sh` →
+    `uuse251_rebuild_all.sh` →（失败时）`uuse251_fix_thrift.sh` +
+    `uuse251_resume_build.sh`。
+11. **.254 根盘空间**：FDB 在根盘（`/var/lib/foundationdb/data/4500`）；根盘
+    ~96% 满时 FDB 会不可用（`fdbcli` 长延迟、clearrange 卡死）——先清
+    `/var/log/3fs/*.log` 等释放空间，必要时 `systemctl stop foundationdb` +
+    清 data 目录 + `configure new single ssd` 重建。
+12. **集群重置后 storage 必须重启**：运行自旧集群的 storage 携带更高的 routing
+    version，会持续 `RefreshRoutingInfo failed: InvalidRoutingInfoVersion`，
+    导致看不到新链、不触发 resync（链卡 SYNCING）。重建后先重启 .250（systemd）
+    与 .251（手动脚本）。
+13. **客户端写报 EIO 时先查链路由表**：集群重建后需 `uuse254_route_chain.sh
+    <chain>` 上传表 1，否则新文件无链可路由 → EIO；客户端 token 也要从 .254
+    同步（`/opt/3fs/etc/token.txt`，不得打印）。
 
 ---
 
