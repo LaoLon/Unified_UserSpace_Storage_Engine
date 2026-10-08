@@ -169,17 +169,18 @@ node vm.mjs --vm host5 exec 'bash /tmp/xxx.sh'
    压测随之跑通。**未做（遗留）**：RDMA 数据面下 HEAD→TAIL 转发重试撞 TAIL
    通道锁（持锁协程不释放，gdb 显示 worker/IO 线程均空闲）的根因修复；
    UUSE store 接近 3GiB 槽池容量时 prep 的 `no free slot` EIO 的上层提示。
-3. **UUSE 读路径的 3FS 级验证**：客户端读路由只落 stock 侧（UUSE `read_ok=0`）。
-   需要把 UUSE 副本设为 preferred/HEAD（`SetPreferredTargetOrder` /
-   `RotateAsPreferredOrder` 等 admin 命令），再跑读矩阵并核对 `uuse read ok` 计数。
+3. ~~**UUSE 读路径的 3FS 级验证**~~ **已完成（2026-10-07 晚）**：UUSE 作为
+   链 HEAD + inline-TCP 时，读请求实际落到 UUSE store（`uuse read ok` 每轮
+   2020 次，此前为 0）；双客户端 RF2 A/B 冷读 **153.6/152.3 vs 原生 151.0
+   MiB/s**（持平）。无需再手动设 preferred order。
 4. **UUSE 耐久性对齐**：UUSE journal append 无 per-op fsync（进程崩溃安全、掉电可能
    丢最近记录）；与 3FS `sync_when_write` 语义对齐方案待定。
 5. **UUSE 配置调优**：`data_reactors = 1`（异步服务单分片）→ 可提到 4
    （`max_data_reactors=4`），压 UUSE 读路径时可能需要。
 6. **清理遗留**：900100001/2/3 的离线 target（.250 `/storage/data1` 已用 68%）；
-   `/3fs/uuse/bm`、`bm2`、`bm_ceiling*` 测试文件**已于 2026-10-07 清理**（UUSE
-   1MiB 类槽池 ~3GiB，写测数据勿超；删除后 GC 约 5min 起回收，`list-targets`
-   的 UsedSize 下降即回收完成）。
+   `/3fs/uuse/bm`、`bm2`、`bm_ab`、`bm_ceiling*` 测试文件**已于 2026-10-07 清理**
+   （UUSE 1MiB 类槽池 ~3GiB，写测数据勿超；删除后 GC 约 5min 起回收，
+   `list-targets` 的 UsedSize 下降即回收完成）。
 7. （可选）把性能矩阵/交接结论汇总进 `doc/performance/`。
 
 ---
