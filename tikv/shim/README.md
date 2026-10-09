@@ -15,6 +15,7 @@ Shard-116 的 TiKV 侧接入材料。
 | `rust/engine.rs` | TiKV `components/raft_log_engine/src/engine.rs` 的改造副本（enum base + `new_with_uuse` + `read_dir`/`create_dir` 转发） |
 | `../patches/apply-raft-engine-readdir.py` | raft-engine 目录列举/创建改走 `FileSystem` trait 的补丁 |
 | `../patches/apply-uuse-config.py` | TiKV 配置门控（`[raft-engine] uuse_conf`）+ 生产调用点分支的补丁 |
+| `../patches/apply-uuse-rocksdb-config.py` | RocksDB 侧门控（`[storage] uuse_conf` + `engine_rocks::get_env_with_uuse`）的补丁 |
 
 ## 关键实现说明
 
@@ -49,21 +50,26 @@ RAFT_ENGINE_SMOKE_PASS written=47 fetched=2
 RAFT_ENGINE_PROD_SMOKE_PASS written=47 fetched=2   # RaftLogEngine::new_with_uuse
 ```
 
-## 配置门控（raft-engine）
+## 配置门控（raft-engine 与 RocksDB）
 
-TiKV `[raft-engine]` 段新增 `uuse_conf`（默认空 = POSIX 文件系统）：
+TiKV `[storage]` 与 `[raft-engine]` 段新增 `uuse_conf`（默认空 = POSIX 文件系统）：
 
 ```toml
+[storage]
+data-dir = "/tikv-data"
+uuse_conf = "/root/code/config/uuse_nvme.conf"   # kvdb（与 raftdb）共享 env
+
 [raft-engine]
-dir = "/raft-engine"
-uuse_conf = "/root/code/config/uuse_nvme.conf"
+dir = "/tikv-data/raft-engine"
+uuse_conf = "/root/code/config/uuse_nvme.conf"   # raft 日志
 ```
 
-`uuse_conf` 非空时，`RaftLogEngine` 经 `ManagedFileSystem::new_with_uuse` 把日志放到
-UUSE 卷；`key_manager`（加密）与该组合 fail-closed。
+任一 `uuse_conf` 非空时，对应引擎的文件放到 UUSE 卷；`key_manager`（加密）与该
+组合 fail-closed。注意：`data_dir/LOCK`、panic mark、占位文件等非引擎直用点尚未
+路由（审计 §4），一期 bring-up 需要宿主目录存在（后续 Shard-117 关闭）。
 
 ## 待办
 
-- RocksDB 侧配置键与 `engine_rocks::get_env` 选择（Shard-117）；
+- 非引擎直用点（LOCK/panic mark/占位文件）路由或 fail-closed（Shard-117）；
 - `swappy_allocator.rs` spill 目录一期不启用；
 - 正式 fork/补丁栈（当前为 checkout 就地补丁，见 `tikv/spike/` 与 `tikv/patches/`）。
