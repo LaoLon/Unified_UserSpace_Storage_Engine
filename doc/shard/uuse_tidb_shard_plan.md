@@ -265,6 +265,19 @@ rename/delete/dirs）通过；RocksDB spike 能经 UUSE Env 打开/关闭引擎�
 
 ### Shard-117：RocksDB Env + raft-engine 写/恢复路径
 
+> 状态：进行中（2026-10-09/10）。真实 `tikv-server` bring-up 结果：
+> （a）raft-engine 单开 UUSE（`[raft-engine] uuse-conf`）：PD + TiKV + TiDB 单节点
+> 启动成功，SQL 写入 `COUNT=3`，宿主 `raft-engine/` 无数据文件（仅 LOCK/probe），
+> `uusectl check` `corruption=none`；
+> （b）双引擎同开 UUSE（`[storage] uuse-conf` + `[raft-engine] uuse-conf`）：第二个
+> 引擎 `ResourceBusy` FATAL —— UUSE 单进程单 engine，kvdb 与 raft-engine 必须共享
+> 同一个 UUSE engine（审计第 13 条，待实现）；
+> （c）kill -9 重启被宿主侧 `RaftDataStateMachine` 校验挡住（`Cannot find raft data
+> set`，审计第 12 条，待修复）；
+> （d）配置键为 kebab-case：`uuse-conf`（不是 `uuse_conf`）；全新数据目录需保持
+> db/raft 数据都不存在（validate(false)），PD 需清数据避免 store 地址重复。
+> 运行脚本：`tikv/run_single_node_vm.sh`。
+
 **目标**：让 RocksDB 与 raft-engine 的写、flush、compaction、恢复全部经 UUSE 闭环。
 
 **交付物**

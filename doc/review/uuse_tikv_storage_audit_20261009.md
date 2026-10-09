@@ -132,6 +132,8 @@
 | 9 | 日志/status/socket/pid | 运维输出 | 宿主白名单 |
 | 10 | encryption 元数据（`encryption` crate） | 密钥文件 | 一期禁用（`plaintext`），启用即 fail-closed |
 | 11 | raft-engine `src/file_pipe_log/mod.rs:111`、`src/file_pipe_log/pipe_builder.rs:269`、`src/swappy_allocator.rs:471` | 日志文件目录列举（`std::fs::read_dir`） | **已修复（Shard-116）**：`FileSystem` trait 增加 `read_dir`/`create_dir`（默认 fail-closed），`UuseFileSystem` 经 `getChildren`/`createDirectories` 实现，`ManagedFileSystem` 转发；`file_pipe_log/mod.rs` 与 `pipe_builder.rs` 改走 FS（补丁 `tikv/patches/apply-raft-engine-readdir.py`）；`swappy_allocator.rs`（spill 目录）一期不启用 |
+| 12 | TiKV `components/tikv_util/src/config.rs`（`RaftDataStateMachine::validate`、`raftengine_exists`/`raftdb_exists`）、`engine_rocks::RocksEngine::exists` | 启动前 raft data set / kvdb 存在性校验（宿主路径） | **待修复（Shard-117）**：kvdb 在宿主、raft 数据在 UUSE 时，重启报 `Cannot find raft data set`（FATAL）；需在 `uuse-conf` 设置时改走 UUSE FS 或跳过宿主校验（证据 2026-10-09 bring-up） |
+| 13 | TiKV 单进程双引擎 | kvdb（RocksDB env）与 raft-engine 各建一个 UUSE engine | **待修复（Shard-117）**：UUSE 单进程单 engine，第二个引擎 `ResourceBusy` FATAL；必须共享同一个 UUSE engine（shim 单例 + adapter 外部 engine 接入） |
 
 ---
 
