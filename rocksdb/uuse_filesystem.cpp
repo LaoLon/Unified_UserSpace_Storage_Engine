@@ -40,6 +40,14 @@
 #include "rocksdb/file_system.h"
 #include "rocksdb/version.h"
 
+/* RocksDB 9.x defines FSAllocationPtr; older versions (e.g. the 8.10.2 vendored
+ * by TiKV) declare the same unique_ptr type directly in FSReadRequest::fs_scratch. */
+#if !defined(ROCKSDB_MAJOR) || ROCKSDB_MAJOR < 9
+namespace rocksdb {
+using FSAllocationPtr = std::unique_ptr<void, std::function<void(void *)>>;
+} // namespace rocksdb
+#endif
+
 namespace uuse::rocksdb_adapter {
 
 namespace {

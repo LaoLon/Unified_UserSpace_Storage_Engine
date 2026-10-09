@@ -60,6 +60,40 @@ spike rc=0
    `Customizable::Name()` 必须实现；旧版 rust-rocksdb API（`DBOptions`/`Writable`/
    `DBVector`/`FlushOptions`）；最终链接需要 `-luring`。
 
+## 主体集成（2026-10-09，真机通过）
+
+在 spike 之后，把**真正的 UUSE FileSystem adapter** 接进了 TiKV 的 RocksDB 构建：
+
+- `apply-uuse-filesystem.py`（在 `apply-spike-env-ffi.py` 之后应用）：
+  - `librocksdb_sys/build.rs`：新增 adapter 的 cc 编译（`-std=c++20 -fexceptions
+    -fno-rtti`）+ `cargo:rustc-link-lib=dylib=uuse_core`（`UUSE_CORE_ROOT`/
+    `UUSE_CORE_BUILD` 可覆盖）；
+  - `c.cc`：`crocksdb_uuse_env_create(conf)` → `uuse::rocksdb_adapter::
+    createFileSystem(conf)` → `NewCompositeEnv(fs)`；
+  - `c.h`/`librocksdb_sys/src/lib.rs`：FFI 声明；
+  - `src/rocksdb.rs`：`Env::uuse(conf_path)`；
+  - TiKV `components/engine_rocks/examples/uuse_env_real.rs`：用真实 UUSE Env
+    打开 DB、put/get/flush。
+- UUSE 仓库侧适配：`rocksdb/uuse_filesystem.cpp` 增加 `FSAllocationPtr` 版本兼容
+  别名（RocksDB < 9 直接用 `std::unique_ptr<void, std::function<void(void*)>>`）。
+
+运行前置：`13:00.0` 绑 `uio_pci_generic`、`uusectl format --yes`、
+`LD_LIBRARY_PATH=/root/code/build-uuse`、`hugepages=1024`。
+
+结果（host4，2026-10-09）：
+
+```text
+build rc=0 / format rc=0 / run rc=0
+uuse env ok: db=/uuse-spike-db
+uuse: volume mounted: generation=1 devices=1 clean=1
+uuse: checkpoint written: slot=A/B kind=full ...
+uuse: async closure: accepted=1 terminal=1 published=1 child_submit=2 child_complete=2
+```
+
+即 TiKV 侧 RocksDB 的文件 I/O 已完整经过 UUSE adapter 落到 NVMe；`engine stopped`
+正常，hugepages 恢复 1024。遗留：`client destroyed without close after drain`
+生命周期告警（记入 Shard-118）；正式 fork/补丁栈仍待整理。
+
 ## 下一步（Shard-116 主体）
 
 - 把 `UuseSpikeFileSystem` 替换为真正的 UUSE FileSystem（复用/适配
