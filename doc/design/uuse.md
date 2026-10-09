@@ -109,6 +109,8 @@ UUSE 2.0                 ─ 新 raw-bdev 镜像 ─ C++20 core/FIO/RocksDB adap
 - RocksDB 8.9.1 `FileSystem` adapter；
 - FIO 3.42 external ioengine；
 - MySQL 8.0.46 InnoDB frontend（Phase 7，经 fork 的 `os_file` seam，见 §20）；
+- TiKV frontend（TiDB 的本地存储层；Phase 8，经 `components/file_system`/
+  `RocksDBEnv` seam，见 §21）；
 - 直接 SPDK bdev/NVMe 访问；
 - 文件 namespace、目录、rename、delete、extent allocation、sync 和 crash recovery；
 - direct buffer 和 bounded bounce buffer 两条数据路径；
@@ -126,6 +128,9 @@ UUSE 2.0                 ─ 新 raw-bdev 镜像 ─ C++20 core/FIO/RocksDB adap
 - 为通用 POSIX 重叠写、fd offset 或目录语义保留的 ticket/range compatibility path；
 - MySQL/MariaDB/InnoDB 的 POSIX 兼容层（`LD_PRELOAD`/FUSE/fd wrapper、Aria/MyISAM
   数据路径）：不提供；MySQL 8.0.46 只能经 fork 的 `os_file` seam 接入（Phase 7，§20）。
+- TiDB/TiKV 的 POSIX/FUSE 接入、TiFlash、TiKV encryption-at-rest、S3/cloud FS、
+  mmap 读写、`tikv-ctl` 直连 UUSE 数据目录：不提供；TiKV 只能经
+  `components/file_system` seam 接入（Phase 8，§21）。
 
 fork 保护仍可作为 core 的进程安全措施，但不再模拟 POSIX preload 行为：fork child
 调用 core 直接得到 `ForkedProcess` 错误。
@@ -1588,6 +1593,20 @@ reap        = T8 - T7      // 完成到 frontend 消费
 - trace on 时不改变 `spdk_submit == spdk_complete`，不引入 UAF/double resume；
 - 采样运行必须检查 `trace_dropped`；全量短跑要求 `trace_dropped == 0`。
 
+### 16.6 TiKV 验收
+
+TiKV frontend（Phase 8，§21）按以下矩阵验收：
+
+- 功能：最小 PD+TiKV 启动、TiKV 写负载与重启持久、kill -9 恢复（无已提交写丢失）、
+  跨进程顺序 reopen；SQL/DDL/事务/备份矩阵按执行计划 Shard-119；
+- 崩溃：在 data child 完成、RocksDB WAL sync 前后、MANIFEST/atomic flush 与目录
+  fsync 边界注入，检查 TiKV 重启可恢复、`uusectl check` `corruption=none`；
+- 无宿主落盘：strace 校验 `storage.data-dir` 内文件（db/raft/snap/import/lock）全部
+  落 UUSE namespace；宿主白名单外出现 datadir 文件即失败；
+- 禁用项：encryption/cloud/mmap/第二实例/`tikv-ctl` 探针必须 fail-closed；
+- 回归：每个 shard 出口执行 shard 计划 §0.3 的 L1–L4 门禁；RocksDB/MySQL 正式口径
+  回退 >5% 即失败。
+
 ## 17. 非功能目标、风险和停止条件
 
 ### 17.1 非功能目标
@@ -1624,6 +1643,12 @@ checkpoint region 必须容纳 namespace/inode/extent map/各 device allocator b
 | `File::sync` 无 data-only barrier | 组提交先行；任何 core 改动必须通过 RocksDB L4 无回退门禁 |
 | MySQL frontend 回归影响 RocksDB | shard 出口 L1–L4 门禁；默认值/ABI 冻结，MySQL 独立 `.conf` |
 | MySQL 提交路径剩余差距 | 已定位为 barrier 的设备往返（耐久性必需）+ SPDK 轮询；异步 journal writer 与 per-file sync 均实测回退（见 baseline 台账），不重复尝试 |
+| TiKV Rust FFI 生命周期/UB | 显式 C ABI + opaque handle + 版本检查；ASAN/TSAN 用例 |
+| TiKV 双 RocksDB 实例 + 高线程数 | per-thread registry 上限 + 共享回落 + 计数（复用 §20.4 机制） |
+| TiKV 绕过点遗漏 | 审计清单 + 每 shard strace 校验；datadir 文件必须落 UUSE |
+| TiKV punch hole 不支持 | 按审计 fail-closed 或显式降级并记录，禁止静默 no-op |
+| TiKV 与 3FS 实验室资源冲突 | 独立盘与时段约束；不占用已声明盘 |
+| TiKV 上游 rebase 冲突 | 改动限定 FS 工厂 + shim + 独立 patch 目录；版本冻结 |
 
 ### 17.3 立即停止条件
 
@@ -1636,7 +1661,9 @@ checkpoint region 必须容纳 namespace/inode/extent map/各 device allocator b
 - RocksDB/FIO error mapping、cancel、AbortIO、directory fsync 不完整；
 - MySQL datadir 文件落到宿主 OS、MySQL 路径 data mismatch 或崩溃恢复失败；
 - RocksDB/FIO 正式口径回退超过 5%（Phase 7 shard 门禁失败）；
-- 旧 Blobstore、POSIX fd 或 preload 代码重新进入 UUSE 2.0 build。
+- 旧 Blobstore、POSIX fd 或 preload 代码重新进入 UUSE 2.0 build；
+- TiKV 路径 data mismatch、崩溃恢复失败（store 无法启动或丢失已提交写）；
+- TiKV datadir 文件落到宿主 OS、或禁用项静默降级。
 
 ## 18. 实施顺序
 
@@ -1819,6 +1846,18 @@ checkpoint region 必须容纳 namespace/inode/extent map/各 device allocator b
 - 每个 shard 出口执行 RocksDB L1–L4 无回退门禁；执行计划见
   `doc/shard/hfs2.0_mysql_innodb_shard_plan.md`。
 
+### Phase 8：TiKV frontend（Shard-113 起）
+
+- 设计前置：本文 §3.1/§3.2/§16/§17/§21 更新完成后才能动代码；
+- 基座：VM 内 TiKV 8.x LTS fork（tag/commit 与 Cargo.lock 锁定的 rust-rocksdb
+  依赖冻结）+ 独立 `config/uuse_tidb.conf`；先固化 CTest/FIO/RocksDB/MySQL 基线
+  作为回归对照；
+- `components/file_system`/`RocksDBEnv` seam：C ABI shim、Rust `UuseFileSystem`、
+  路径路由与宿主白名单、绕过点修复、写/恢复路径；
+- per-thread Client registry 与停机顺序、功能矩阵、性能与 durability 评估、收口；
+- 每个 shard 出口执行 RocksDB/MySQL L1–L4 无回退门禁；执行计划见
+  `doc/shard/uuse_tidb_shard_plan.md`。
+
 ## 19. 最终定位
 
 > UUSE 2.0 是一个 C++20 coroutine-first、运行在应用进程内、直接管理 SPDK bdev/NVMe
@@ -1830,6 +1869,10 @@ checkpoint region 必须容纳 namespace/inode/extent map/各 device allocator b
 2026-09-24 起，Phase 7 在同一 core 上增加 MySQL 8.0.46 InnoDB frontend（§20）：它以
 fork 的 `os_file` seam 接入，不提供 POSIX 兼容层，也不改变 RocksDB/FIO 的契约与
 性能口径。
+
+2026-10-09 起，Phase 8 在同一 core 上增加 TiKV frontend（§21）：它以 TiKV
+`components/file_system`/`RocksDBEnv` seam 接入，不提供 POSIX 兼容层，也不改变
+RocksDB/FIO/MySQL 的契约与性能口径。
 
 UUSE 2.0 的第一条实现原则是：旧代码可以冻结，但不能以兼容性名义继续污染新架构；
 第二条原则是：coroutine 只用于表达非阻塞状态机，所有资源、错误、恢复和完成边界都
@@ -1974,3 +2017,77 @@ native AIO、页压缩/punch hole、clone、MyISAM/Aria 数据路径、`--daemon
   `freeDmaBuffer` 为 no-op，arena 析构负责兜底释放，不 double free；
 - 验收：`read_direct_user_children > 0`、copy-out 字节显著下降、`uusectl check`
   `corruption=none`、MySQL 功能/恢复矩阵与 §16.3 门禁不回退。
+
+## 21. TiKV frontend（Phase 8）
+
+> 审计依据：`doc/review/uuse_tikv_storage_audit_YYYYMMDD.md`（Shard-114 产出）；
+> 执行计划：`doc/shard/uuse_tidb_shard_plan.md`。
+> 本节只定义 Phase 8 的接入边界与契约，不修改 §11/§12/§20 的 RocksDB/FIO/MySQL
+> 契约、默认值、配置 schema 与性能口径。
+
+### 21.1 定位与范围
+
+- TiDB 的持久化层是 TiKV；TiDB server 与 PD 是独立进程，不进入 UUSE 边界。TiKV 的
+  本地存储（kvdb/raftdb 两个 RocksDB 实例、`db/`、`raft/`、`snap/`、`import/` 与
+  `lock`）以 UUSE 作为文件存储，接入方式为在 TiKV `components/file_system` 的
+  `FileSystem` trait 上新增 `UuseFileSystem` 实现（Rust + C ABI shim），由
+  `components/engine_rocks` 的 `RocksDBEnv` 适配到 rust-rocksdb `Env`；不是 POSIX
+  兼容层，core 不新增 POSIX `read/write/pread/pwrite` 入口，也不修改 RocksDB 本体；
+- 单进程、单 engine、bdev 独占语义与 §14.3 相同：第二实例、跨进程或同盘共享返回
+  `Busy`；fork child 返回 `ForkedProcess`；
+- RocksDB/FIO/MySQL 路径、`config/uuse_nvme.conf`/`uuse_mysql.conf` 与默认值不被修改；
+  TiKV 使用独立 `config/uuse_tidb.conf`；
+- 版本冻结：TiKV 8.x LTS（Gate 0 冻结 tag/commit 与 Cargo.lock 锁定的 rust-rocksdb
+  依赖）；具体 crate/文件/函数名以 Shard-114 审计（冻结版本）为准。
+
+### 21.2 file_system/RocksDBEnv seam 契约
+
+seam 位于 TiKV `components/file_system`（`FileSystem` trait / `EngineFileSystem`
+工厂）与 `components/engine_rocks`（`RocksDBEnv`）：
+
+- UUSE 侧提供 `tikv/shim` 的 C ABI（opaque engine/client/file/dir handle、
+  Status/errno 映射、版本与 ABI 检查）；Rust `UuseFileSystem` 不直接依赖 C++ 头；
+- `FileSystem` trait 覆盖：metadata/stat、open（read/write/append/direct）、read/write、
+  sync_all/sync_data、truncate、allocate、rename、delete、create_dir(_all)、
+  remove_dir(_all)、read_dir、link、copy、lock/unlock、set_times、punch_hole；缺失项
+  按 Shard-114 审计在 core 侧纯加法补齐（Shard-115）；
+- 两个 RocksDB 实例（kvdb/raftdb）必须都使用 `UuseFileSystem`；WAL/MANIFEST/CURRENT/
+  OPTIONS 的写、rename、atomic flush、link 与目录 fsync 必须经 UUSE；`File::sync`
+  触发 durable epoch，`File::datasync` 映射 sync_data；
+- `LOCK` 文件与 TiKV `data-dir/lock` 必须与 UUSE 进程锁共同保证第二实例 fail-closed，
+  不允许宿主锁绕过；
+- punch hole 一期不支持：按 Shard-114 结论 fail-closed 或显式降级并计数，禁止静默
+  no-op 导致空间不可回收；
+- mmap 读写、encryption-at-rest、S3/cloud FS 一期禁用；配置出现即失败关闭。
+
+### 21.3 路径路由与宿主白名单
+
+- `storage.data-dir`（含 `db/`、`raft/`、`snap/`、`import/` 与 `lock`）→ UUSE
+  namespace；
+- 宿主白名单：日志、status/监控输出、socket/pid、备份/导入的输出目录（显式配置，
+  不默认进 UUSE）；白名单之外不得出现 datadir 文件落到宿主 OS；
+- 每个 shard 出口用 strace 校验 datadir 无宿主落盘；审计列出的绕过点必须在 Phase 8
+  内关闭，不得把 datadir 文件静默落到宿主。
+
+### 21.4 线程与生命周期
+
+- 复用 §20.4 的 per-thread Client registry（惰性创建、weak 注册、线程退出自关、
+  上限回落共享并计数）；文件由进程级 owner client 持有，工作线程用自己的 client
+  `submitRead/submitWrite` 后本线程 `poll`；
+- 信号：SPDK/DPDK 线程以空信号掩码运行，必须在 TiKV 信号处理注册后安装转发
+  （SIGTERM/SIGINT；MySQL Shard-103 先例），保证 TiKV 正常停机路径不被默认动作杀死；
+- 停机顺序：停新提交 → drain outstanding → close Client → 关 handle →
+  `Engine::stop()`；任一层失败 fail-closed；
+- `tikv-server` 不作为 daemon/fork 运行；fork child 的 core 调用返回 `ForkedProcess`。
+
+### 21.5 禁用项（fail-closed）
+
+encryption-at-rest、S3/cloud FS、mmap 读写、多进程共享 bdev、`tikv-ctl` 直连 UUSE
+数据目录（一期）、把 TiKV 数据文件落到宿主 OS。禁用项配置出现时必须在启动阶段报错，
+不得静默走宿主路径或降级。
+
+### 21.6 验收
+
+- 功能/崩溃/无宿主落盘/禁用项矩阵按 §16.6 执行；
+- 每个 shard 出口执行 `doc/shard/uuse_tidb_shard_plan.md` §0.3 的 L1–L4 无回退门禁；
+- 执行计划、shard 编号与停止条件见 `doc/shard/uuse_tidb_shard_plan.md`。
