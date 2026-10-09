@@ -56,5 +56,12 @@ fi
 
 mkdir -p "$BUILD"
 cd "$SRC"
-CARGO_TARGET_DIR="$BUILD" cargo build --release --bin tikv-server --jobs "$JOBS"
+# rust-rocksdb does not propagate RocksDB's PLATFORM_LDFLAGS: when the vendored
+# RocksDB was built with io_uring (liburing present), the final link needs
+# -luring. Link the binary explicitly instead of plain cargo build.
+LINK_ARGS=()
+if ldconfig -p 2>/dev/null | grep -q 'liburing\.so'; then
+  LINK_ARGS+=(-C link-arg=-luring)
+fi
+CARGO_TARGET_DIR="$BUILD" cargo rustc -p tikv-server --release --jobs "$JOBS" -- "${LINK_ARGS[@]}"
 echo "tikv-server: $BUILD/release/tikv-server"

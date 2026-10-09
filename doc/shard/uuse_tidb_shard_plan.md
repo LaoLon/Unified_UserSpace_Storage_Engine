@@ -138,6 +138,12 @@ RocksDB 实例，并且已经把引擎文件操作抽象为 `components/file_sys
 
 ### Shard-113：设计更新、TiKV 基座与基线固化
 
+> 状态：基座完成（2026-10-09）。设计更新（`uuse.md` §3.1/§3.2/§16.6/§17/§18/§19/§21）
+> 已提交；TiKV v8.5.8 在 host4(.253) 构建通过（`tikv-server` 218 MiB，
+> `--version` 输出 8.5.8 Community）；构建兼容修复：CMake 4 policy、GCC 15→gcc-12、
+> io_uring `-luring` 链接、`JOBS=2` + 8 GiB swap + 构建期临时释放 hugepages。
+> 基线固化（CTest/FIO/RocksDB/MySQL）与资源预算待完成。
+
 **目标**：冻结范围、基座与对照基线，避免后续用 TiKV 收益掩盖 RocksDB/MySQL 回退。
 
 **交付物**

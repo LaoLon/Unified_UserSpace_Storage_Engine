@@ -6,7 +6,8 @@
 ## 状态（Shard-113）
 
 - 设计更新（§3.1/§3.2/§16.6/§17/§18/§19/§21）已完成；
-- 本目录为骨架：构建脚本与部署脚本在 VM 内首次运行后回填实测命令；
+- TiKV v8.5.8 已在 host4(.253) 构建通过（2026-10-09）：`tikv-server` 218 MiB，
+  `--version` 输出 `8.5.8 Community`；
 - Shard-114（存储绕过点审计）、Shard-115（UUSE 侧 API 补齐）、Shard-116（shim +
   `UuseFileSystem`）尚未开始；在 shim 落地前，`run_single_node_vm.sh` 只是形状文档，
   不构成可运行路径。
@@ -41,6 +42,10 @@ bash tikv/build_tikv_vm.sh
 - GCC 兼容：Ubuntu 26.04 默认 GCC 15 无法编译 grpcio-sys 捆绑的旧 abseil（实测
   `extension.h` 解析错误）；脚本在 CC/CXX 未设置时自动选择 `gcc-12`/`g++-12`（已在
   host4 验证的路径）；
+- 链接兼容：liburing 存在时 vendored RocksDB 启用 io_uring，rust-rocksdb 不传递
+  `-luring`；脚本对最终 `tikv-server` 显式补 `-C link-arg=-luring`；
+- 资源：host4 为 7.2 GiB，`JOBS=3` 实测 OOM（rustc 峰值 3.4 GiB）；使用 `JOBS=2`
+  + 8 GiB swap，并在构建期间临时释放 hugepages（结束恢复 1024）；
 - 依赖：Rust toolchain（冻结版本）、gcc/g++、cmake/make、libssl-dev、pkg-config；
   TiKV 源码必须在 VM 内通过 Git 获取与维护，禁止从 Windows 工作区同步；
 - 网络受限时通过 `~/.cargo/config.toml` 配置 crates 镜像，不写入脚本。
