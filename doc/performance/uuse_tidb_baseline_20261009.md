@@ -20,6 +20,7 @@
 | L1 | CTest 全量 | **29/29 通过**（3.21 s） |
 | L2 | FIO smoke（prep 写 + 4K randrw 50/50、2 jobs × QD32、10 s） | 读 **53476** / 写 **53629** IOPS，errors=0，closure `queued=reaped=1071153`、outstanding=0、token_mismatch=0 |
 | L3/L4 | RocksDB native-vs-UUSE A/B（threads 32/64，fresh format/phase，交错） | UUSE/native：写 97–110%、读 158–781%、readwhilewriting 93–117%（见 §3） |
+| L4 | FIO 正式同形状 gate（UUSE vs raw SPDK，5-run median） | M(1j32)：UUSE/raw **95.5%**、p99 比值 **0.92**；E(8j4)：**86.0%**、p99 比值 **0.20**；errors=0（见 §3b） |
 
 ## 2. 环境与口径
 
@@ -76,19 +77,36 @@ native ext4 与 UUSE 交错执行。
 4 个 UUSE phase 全部 `corruption=none`，`uuse-rocksdb io stats` 齐全，无
 error/failed 行。
 
-## 4. 证据路径
+## 3b. FIO 正式同形状 gate（UUSE vs raw SPDK）
 
+脚本：本机适配版（`temp_scripts/uuse_host4_fio_gate.sh`）；形状 M = 1 job × QD32、
+E = 8 jobs × QD4；4K randrw 50/50、256 MiB、10 s、5 轮交错、每轮全新 format/raw
+prep；raw 侧 `LD_PRELOAD=spdk_bdev` + `gen_nvme.sh` JSON。两侧 `taskset -c 0-3`。
+
+| 形状 | UUSE 读/写 IOPS（中位） | raw 读/写 IOPS（中位） | UUSE/raw | UUSE p99 | raw p99 | p99 比值 |
+|---|---:|---:|---:|---:|---:|---:|
+| M (1j32) | 50123 / 50049 | 52492 / 52422 | **95.5%** | 577.5 µs | 626.7 µs | **0.92** |
+| E (8j4) | 43705 / 43653 | 50804 / 50753 | **86.0%** | 626.7 µs | 3162.1 µs | **0.20** |
+
+两个形状均满足 §16.2 的 UUSE/raw ≥85% 与 p99 ≤110% 门槛，errors 全 0，5 轮无
+异常。CPU% 门槛（8 vCPU 口径 ≤500%）在 host4 4 vCPU 上未采集，不得按 8 vCPU
+口径引用。E 形状 raw 自身塌陷（p99 3.16 ms）与 §16.2 已记录的边界一致。
+
+## 4. 证据路径
 - `/home/uuse/uuse-baseline-20261009/`：FIO smoke（json/stderr/format）+
   `rocksdb-ab/`（33 个文件，156 K）；
 - `/build/uuse-baseline-rocksdb-20261009/`：A/B 原始 stdout/stderr/format/check；
+- `/build/uuse-baseline-fio-gate-20261009/`：gate 原始 json/stderr/format；
 - `/tmp/uuse-ctest.log`：CTest 全量输出；
 - 本机操作脚本：`temp_scripts/uuse_host4_*.sh`（Windows 工作区，git 忽略）。
 
 ## 5. 待补与边界
 
-- **FIO 正式 1j32/8j4 gate**：raw 对照插件 `/root/code/spdk/build/fio/spdk_bdev`
-  在位，待按 4 vCPU 适配后执行；
-- **MySQL 冒烟**：`/home/uuse/mysql-fork`、`/home/uuse/mysql-build` 在位，待执行；
+- **MySQL 冒烟（待重建 fork）**：host4 现有 `/home/uuse/mysql-build` 是 HFS 时代
+  构建（`hfs::` 命名空间、链接 `libhfs_core.so.2`），与 UUSE 2.0 core
+  （`uuse::`/`libuuse_core.so`）不兼容；需按 `mysql/patches/` 当前补丁栈在 VM 内
+  重建 MySQL 8.0.46 fork 后执行；
+- **FIO gate CPU%**：4 vCPU 环境未采集 8 vCPU 口径的 CPU 门槛；
 - RocksDB 9.11.2 与设计文本 8.9.1 的口径差异需在设计/计划中注明；
 - host4 根盘仅剩约 2.5 GiB，大体积证据统一写 `/build` 或 `/home/uuse` 小文件；
 - TiKV 基座构建口径（v8.5.8、gcc-12、`CMAKE_POLICY_VERSION_MINIMUM=3.5`、

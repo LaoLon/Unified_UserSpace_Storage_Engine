@@ -145,7 +145,9 @@ FUSE/POSIX 层，也不逐文件改写 TiKV。
 > 闭合）、RocksDB native-vs-UUSE A/B（s32/s64）；证据见
 > `doc/performance/uuse_tidb_baseline_20261009.md`。构建兼容修复：CMake 4 policy、
 > GCC 15→gcc-12、io_uring `-luring`、`JOBS=2` + swap + 构建期释放 hugepages。
-> 待补：FIO 正式 1j32/8j4 gate、MySQL 冒烟、资源预算回填。
+> FIO 正式同形状 gate 已通过（M 1j32：UUSE/raw 95.5%、p99 0.92；E 8j4：86.0%、
+> p99 0.20；errors=0）。待补：MySQL 冒烟（host4 现有 fork 为 HFS 时代构建
+> `hfs::`/`libhfs_core.so`，需按当前补丁重建）、资源预算回填。
 
 **目标**：冻结范围、基座与对照基线，避免后续用 TiKV 收益掩盖 RocksDB/MySQL 回退。
 
