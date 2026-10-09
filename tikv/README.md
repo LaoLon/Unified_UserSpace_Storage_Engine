@@ -36,6 +36,8 @@ bash tikv/build_tikv_vm.sh
   `/build/tikv-build`（nvme0n1，`0000:03:00.0`，ext4 label `tikv-build`）；
 - rust-toolchain 由 TiKV 仓库固定（v8.5.8 为 `nightly-2026-01-30`），rustup 安装在
   `/build/rustup` + `/build/cargo`；
+- CMake 4.x 兼容：脚本默认导出 `CMAKE_POLICY_VERSION_MINIMUM=3.5`（grpcio-sys 捆绑的
+  gRPC/c-ares 仍用旧 policy floor）；
 - 依赖：Rust toolchain（冻结版本）、gcc/g++、cmake/make、libssl-dev、pkg-config；
   TiKV 源码必须在 VM 内通过 Git 获取与维护，禁止从 Windows 工作区同步；
 - 网络受限时通过 `~/.cargo/config.toml` 配置 crates 镜像，不写入脚本。

@@ -10,6 +10,10 @@
 #   libssl-dev pkg-config, plus the frozen Rust toolchain (rustc/cargo).
 set -euo pipefail
 
+# CMake 4.x removed compatibility with cmake_minimum_required(<3.5); TiKV
+# v8.5.8's grpcio-sys bundles gRPC/c-ares that still use the old floor.
+export CMAKE_POLICY_VERSION_MINIMUM="${CMAKE_POLICY_VERSION_MINIMUM:-3.5}"
+
 TIKV_REF="${TIKV_REF:?set TIKV_REF to the frozen TiKV tag/commit (Gate 0)}"
 SRC="${SRC:-/home/uuse/tikv-fork}"
 BUILD="${BUILD:-/home/uuse/tikv-build}"
