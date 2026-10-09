@@ -166,6 +166,12 @@ int uuse_tikv_rename(uuse_tikv_engine *engine, const char *from, const char *to)
     return unwrap(engine->client->rename(from, to).wait());
 }
 
+int uuse_tikv_create_dirs(uuse_tikv_engine *engine, const char *path) {
+    if (engine == nullptr || path == nullptr) return -EINVAL;
+    std::lock_guard<std::mutex> lock(engine->mutex);
+    return unwrap(engine->client->createDirectories(path).wait());
+}
+
 int uuse_tikv_exists(uuse_tikv_engine *engine, const char *path, int *exists) {
     if (engine == nullptr || path == nullptr || exists == nullptr) return -EINVAL;
     std::lock_guard<std::mutex> lock(engine->mutex);

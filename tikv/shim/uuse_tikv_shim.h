@@ -32,6 +32,8 @@ int uuse_tikv_open(uuse_tikv_engine *engine, const char *path, unsigned flags,
 void uuse_tikv_close(uuse_tikv_file *file);
 int uuse_tikv_remove(uuse_tikv_engine *engine, const char *path);
 int uuse_tikv_rename(uuse_tikv_engine *engine, const char *from, const char *to);
+/* Creates every missing directory component of an absolute path. */
+int uuse_tikv_create_dirs(uuse_tikv_engine *engine, const char *path);
 /* Sets *exists to 1/0; returns 0 or negative errno. */
 int uuse_tikv_exists(uuse_tikv_engine *engine, const char *path, int *exists);
 

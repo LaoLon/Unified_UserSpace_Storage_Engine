@@ -223,9 +223,12 @@ datasync/sync/stat/allocatedBytes` 已覆盖大部分；预计补齐 `set_times`
 > NVMe 上 format 后打开 DB、put/get/flush 成功（`uuse env ok`，I/O 经 UUSE，
 > checkpoint 落盘，closure 闭合）。C ABI shim（`tikv/shim/`，CMake 目标
 > `uuse_tikv_shim` + smoke）真机 `SHIM_SMOKE_PASS`：engine mount、create/write/
-> append/pread/truncate/sync/exists/rename/remove 全部通过。待做：raft-engine
-> `UuseFileSystem`（Rust trait）+ `ManagedFileSystem` base 选择、`client destroyed
-> without close after drain` 生命周期告警（Shard-118）、正式 fork/补丁栈。
+> append/pread/truncate/sync/exists/rename/remove 全部通过。raft-engine Rust
+> `UuseFileSystem`（`tikv/shim/rust/`）真机 `RAFT_ENGINE_SMOKE_PASS written=47
+> fetched=2`：`Engine::open_with_file_system` + `write(sync)` + `fetch_entries_to`
+> 全走 UUSE。待做：`ManagedFileSystem` 集成（base 选择 + 加密/限速包装）、
+> `client destroyed without close after drain` 生命周期告警（Shard-118）、正式
+> fork/补丁栈。
 
 **目标**：建立最小可用闭环：`tikv/shim` 在 UUSE namespace 上完成
 create/open/read/write/rename/delete/目录等基础操作；raft-engine 经
