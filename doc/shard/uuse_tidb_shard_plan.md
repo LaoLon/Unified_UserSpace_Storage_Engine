@@ -226,9 +226,13 @@ datasync/sync/stat/allocatedBytes` 已覆盖大部分；预计补齐 `set_times`
 > append/pread/truncate/sync/exists/rename/remove 全部通过。raft-engine Rust
 > `UuseFileSystem`（`tikv/shim/rust/`）真机 `RAFT_ENGINE_SMOKE_PASS written=47
 > fetched=2`：`Engine::open_with_file_system` + `write(sync)` + `fetch_entries_to`
-> 全走 UUSE。待做：`ManagedFileSystem` 集成（base 选择 + 加密/限速包装）、
-> `client destroyed without close after drain` 生命周期告警（Shard-118）、正式
-> fork/补丁栈。
+> 全走 UUSE。生产 wrapper 改造（`ManagedFileSystem` enum base + `RaftLogEngine::
+> new_with_uuse`，见 `tikv/shim/rust/engine.rs`）已实现并编译通过；生产路径 smoke
+> 暴露 **raft-engine `std::fs::read_dir` 绕过**（目录列举不经 `FileSystem` trait，
+> `file_pipe_log/mod.rs:111`、`pipe_builder.rs:269`），需给 trait 增加 `read_dir`
+> 并由 UUSE FS 经 `Client::getChildren` 实现（待修）。其余待做：`ManagedFileSystem`
+> 配置键门控、`client destroyed without close after drain` 生命周期告警
+> （Shard-118）、正式 fork/补丁栈。
 
 **目标**：建立最小可用闭环：`tikv/shim` 在 UUSE namespace 上完成
 create/open/read/write/rename/delete/目录等基础操作；raft-engine 经
