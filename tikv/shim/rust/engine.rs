@@ -544,10 +544,16 @@ impl RaftLogEngine {
     }
 
     /// Opens a raft-engine instance whose files live on the UUSE volume
-    /// described by `conf_path` (Shard-116).
-    pub fn new_with_uuse(config: RaftEngineConfig, conf_path: &str) -> Result<Self> {
+    /// described by `conf_path` (Shard-116). `key_manager` fails closed
+    /// (the UUSE base does not support encryption).
+    pub fn new_with_uuse(
+        config: RaftEngineConfig,
+        key_manager: Option<Arc<DataKeyManager>>,
+        rate_limiter: Option<Arc<IoRateLimiter>>,
+        conf_path: &str,
+    ) -> Result<Self> {
         let file_system = Arc::new(
-            ManagedFileSystem::new_with_uuse(None, None, conf_path)
+            ManagedFileSystem::new_with_uuse(key_manager, rate_limiter, conf_path)
                 .map_err(|e| transfer_error(RaftEngineError::Io(e)))?,
         );
         Ok(RaftLogEngine(Arc::new(

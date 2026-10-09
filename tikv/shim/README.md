@@ -14,6 +14,7 @@ Shard-116 的 TiKV 侧接入材料。
 | `rust/uuse_fs_prod_smoke.rs` | 生产 wrapper 真机 smoke（`RaftLogEngine::new_with_uuse`） |
 | `rust/engine.rs` | TiKV `components/raft_log_engine/src/engine.rs` 的改造副本（enum base + `new_with_uuse` + `read_dir`/`create_dir` 转发） |
 | `../patches/apply-raft-engine-readdir.py` | raft-engine 目录列举/创建改走 `FileSystem` trait 的补丁 |
+| `../patches/apply-uuse-config.py` | TiKV 配置门控（`[raft-engine] uuse_conf`）+ 生产调用点分支的补丁 |
 
 ## 关键实现说明
 
@@ -48,9 +49,21 @@ RAFT_ENGINE_SMOKE_PASS written=47 fetched=2
 RAFT_ENGINE_PROD_SMOKE_PASS written=47 fetched=2   # RaftLogEngine::new_with_uuse
 ```
 
+## 配置门控（raft-engine）
+
+TiKV `[raft-engine]` 段新增 `uuse_conf`（默认空 = POSIX 文件系统）：
+
+```toml
+[raft-engine]
+dir = "/raft-engine"
+uuse_conf = "/root/code/config/uuse_nvme.conf"
+```
+
+`uuse_conf` 非空时，`RaftLogEngine` 经 `ManagedFileSystem::new_with_uuse` 把日志放到
+UUSE 卷；`key_manager`（加密）与该组合 fail-closed。
+
 ## 待办
 
-- 配置键门控（`storage.uuse.*`）替换示例级开关，使 TiKV server 生产路径生效
-  （Shard-116/117）；
+- RocksDB 侧配置键与 `engine_rocks::get_env` 选择（Shard-117）；
 - `swappy_allocator.rs` spill 目录一期不启用；
 - 正式 fork/补丁栈（当前为 checkout 就地补丁，见 `tikv/spike/` 与 `tikv/patches/`）。

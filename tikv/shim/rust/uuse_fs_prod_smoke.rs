@@ -29,7 +29,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut config = RaftEngineConfig::default();
     config.dir = dir.clone();
-    let engine = RaftLogEngine::new_with_uuse(config, &conf)?;
+    let engine = RaftLogEngine::new_with_uuse(config, None, None, &conf)?;
 
     let entries = vec![
         Entry {

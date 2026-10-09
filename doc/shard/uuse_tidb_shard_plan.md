@@ -234,8 +234,11 @@ datasync/sync/stat/allocatedBytes` 已覆盖大部分；预计补齐 `set_times`
 > （默认 fail-closed），UUSE FS 经 `getChildren`/`createDirectories` 实现，
 > `ManagedFileSystem` 转发（补丁 `tikv/patches/apply-raft-engine-readdir.py`）；
 > （b）析构顺序死锁——shim 引擎状态改为引用计数（文件句柄持引用，最后一个关闭才
-> 停引擎），修复 `Namespace::close` futex 挂起。其余待做：`storage.uuse.*` 配置键
-> 门控、`swappy_allocator` spill 目录一期不启用、正式 fork/补丁栈。
+> 停引擎），修复 `Namespace::close` futex 挂起。**配置门控完成**：TiKV
+> `[raft-engine] uuse_conf`（默认空）+ 两处生产调用点分支到 `new_with_uuse`；
+> `cargo check -p tikv` rc=0，生产 smoke 复测通过。其余待做：RocksDB 侧配置键与
+> `engine_rocks::get_env` 选择（Shard-117）、`swappy_allocator` spill 目录一期不启用、
+> 正式 fork/补丁栈。
 
 **目标**：建立最小可用闭环：`tikv/shim` 在 UUSE namespace 上完成
 create/open/read/write/rename/delete/目录等基础操作；raft-engine 经
