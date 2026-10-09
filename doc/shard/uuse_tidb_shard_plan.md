@@ -221,9 +221,11 @@ datasync/sync/stat/allocatedBytes` 已覆盖大部分；预计补齐 `set_times`
 > `apply-uuse-filesystem.py` 把真实 UUSE adapter 编进 `librocksdb_sys`，crocksdb
 > `crocksdb_uuse_env_create` + Rust `Env::uuse`；`engine_rocks` 示例在 uio 绑定的
 > NVMe 上 format 后打开 DB、put/get/flush 成功（`uuse env ok`，I/O 经 UUSE，
-> checkpoint 落盘，closure 闭合）。待做：raft-engine `UuseFileSystem`（Rust trait）
-> + `ManagedFileSystem` base 选择、`client destroyed without close after drain`
-> 生命周期告警（Shard-118）、正式 fork/补丁栈。
+> checkpoint 落盘，closure 闭合）。C ABI shim（`tikv/shim/`，CMake 目标
+> `uuse_tikv_shim` + smoke）真机 `SHIM_SMOKE_PASS`：engine mount、create/write/
+> append/pread/truncate/sync/exists/rename/remove 全部通过。待做：raft-engine
+> `UuseFileSystem`（Rust trait）+ `ManagedFileSystem` base 选择、`client destroyed
+> without close after drain` 生命周期告警（Shard-118）、正式 fork/补丁栈。
 
 **目标**：建立最小可用闭环：`tikv/shim` 在 UUSE namespace 上完成
 create/open/read/write/rename/delete/目录等基础操作；raft-engine 经

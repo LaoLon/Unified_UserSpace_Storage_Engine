@@ -537,3 +537,20 @@ add_custom_target(compile-commands ALL
   DEPENDS uuse_core uusectl
   VERBATIM
 )
+
+# TiKV C ABI shim (Shard-116): synchronous frontend over the UUSE core used by
+# the raft-engine FileSystem and future TiKV callers.
+add_library(uuse_tikv_shim SHARED tikv/shim/uuse_tikv_shim.cc)
+target_include_directories(uuse_tikv_shim PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+target_link_libraries(uuse_tikv_shim PRIVATE uuse_core Threads::Threads)
+set_target_properties(uuse_tikv_shim PROPERTIES OUTPUT_NAME "uuse_tikv_shim")
+
+# C ABI smoke test (real device; run manually on the VM).
+add_executable(uuse_tikv_shim_smoke tikv/shim/uuse_tikv_shim_smoke.cc)
+target_include_directories(uuse_tikv_shim_smoke PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/tikv/shim
+)
+target_link_libraries(uuse_tikv_shim_smoke PRIVATE uuse_tikv_shim uuse_core Threads::Threads)
+
