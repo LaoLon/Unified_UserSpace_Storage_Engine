@@ -138,11 +138,14 @@ FUSE/POSIX 层，也不逐文件改写 TiKV。
 
 ### Shard-113：设计更新、TiKV 基座与基线固化
 
-> 状态：基座完成（2026-10-09）。设计更新（`uuse.md` §3.1/§3.2/§16.6/§17/§18/§19/§21）
-> 已提交；TiKV v8.5.8 在 host4(.253) 构建通过（`tikv-server` 218 MiB，
-> `--version` 输出 8.5.8 Community）；构建兼容修复：CMake 4 policy、GCC 15→gcc-12、
-> io_uring `-luring` 链接、`JOBS=2` + 8 GiB swap + 构建期临时释放 hugepages。
-> 基线固化（CTest/FIO/RocksDB/MySQL）与资源预算待完成。
+> 状态：基座与基线主体完成（2026-10-09）。设计更新（`uuse.md`
+> §3.1/§3.2/§16.6/§17/§18/§19/§21）已提交；TiKV v8.5.8 在 host4(.253) 构建通过
+> （`tikv-server` 218 MiB，`--version` 输出 8.5.8 Community）；UUSE 在 host4 构建并
+> 固化基线：CTest 29/29、FIO smoke（读 53476/写 53629 IOPS、errors=0、closure
+> 闭合）、RocksDB native-vs-UUSE A/B（s32/s64）；证据见
+> `doc/performance/uuse_tidb_baseline_20261009.md`。构建兼容修复：CMake 4 policy、
+> GCC 15→gcc-12、io_uring `-luring`、`JOBS=2` + swap + 构建期释放 hugepages。
+> 待补：FIO 正式 1j32/8j4 gate、MySQL 冒烟、资源预算回填。
 
 **目标**：冻结范围、基座与对照基线，避免后续用 TiKV 收益掩盖 RocksDB/MySQL 回退。
 
