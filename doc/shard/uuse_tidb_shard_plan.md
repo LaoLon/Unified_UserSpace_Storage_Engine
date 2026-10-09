@@ -93,8 +93,8 @@ UUSE 是单进程、单 engine、bdev 独占；TiKV 与 RocksDB/MySQL 不会同�
 |---|---|---|---|
 | .250 host1 | 6 vCPU / 7.2 GiB / 3×20 GiB NVMe | 3FS storage node 10002（data1 用 NVME_0000；hugepages 当前为 0） | 不占用；二期 3 副本候选（需协调并恢复 hugepages=1024） |
 | .251 host2 | 6 vCPU / 7.2 GiB / 3×20 GiB NVMe | 3FS storage node 10001 + UUSE 目标盘 | 不占用 |
-| .252 host3 | 2 vCPU（2026-10-08 期间调为 4）/ 3.3 GiB | 3FS FUSE client；3 块数据盘空闲 | 备选 TiKV 节点 / 二期候选 |
-| .253 host4 | 2 vCPU（2026-10-08 期间调为 4）/ 3.3 GiB | 3FS FUSE client；3 块数据盘空闲 | **单节点 TiKV+UUSE 首选**（NVME_0002 @ `0000:13:00.0`） |
+| .252 host3 | 4 vCPU / 7.2 GiB（2026-10-09 实测；workspace.yaml 旧值 2 vCPU/3.3 GiB） | 3FS FUSE client；3 块数据盘空闲 | 备选 TiKV 节点 / 二期候选 |
+| .253 host4 | 4 vCPU / 7.2 GiB（2026-10-09 实测；workspace.yaml 旧值 2 vCPU/3.3 GiB） | 3FS FUSE client；3 块数据盘空闲 | **单节点 TiKV+UUSE 首选**（NVME_0002 @ `0000:13:00.0`） |
 | .254 host5 | 4 vCPU / 3.3 GiB / 3×20 GiB NVMe | 3FS manager（FDB/mgmtd/meta） | **PD + TiDB server** |
 
 部署口径：
@@ -102,10 +102,9 @@ UUSE 是单进程、单 engine、bdev 独占；TiKV 与 RocksDB/MySQL 不会同�
 - 单节点 v1：PD + TiDB server 在 .254；TiKV + UUSE 在 .253，独占
   `0000:13:00.0`（kernel `nvme2n1`，以 sysfs 核对）；不占用 3FS 实验室已声明盘
   （.251 全部、.250 的 data1 盘），不与 3FS client 性能口径重叠运行；
-- 资源预算：UUSE 需要 `vm.nr_hugepages=1024`（2 GiB），TiKV block cache/memtable 等
-  需裁剪（目标 ≤0.8 GiB）；`config/uuse_tidb.conf` 的 `dma_arena_mb` 与 TiKV 内存预算
-  在 Shard-113 固化。若 3.3 GiB 无法稳定运行，克隆一台 host2 规格（6 vCPU/7.2 GiB）
-  VM 作为 TiKV 节点，并在报告中记录；
+- 资源预算：UUSE 需要 `vm.nr_hugepages=1024`（2 GiB）；.253 实测 4 vCPU/7.2 GiB，
+  TiKV block cache/memtable 按 VM 剩余内存预算在 Shard-113 固化（无需按 3.3 GiB 口径
+  裁剪）；若资源不足再克隆 host2 规格（6 vCPU/7.2 GiB）VM，并在报告中记录；
 - 正式口径：真实 NVMe + `.conf`、trace/stats off、同会话交错 A/B（UUSE vs host ext4，
   同 VM 同盘）、5-run median、结果与证据写 VM `/home/uuse`；跨会话数字不得直接比较。
 
@@ -314,7 +313,7 @@ preload/FUSE/Blobstore 回流；无未记录临时边界。
 | punch hole 不支持 | 空间放大或 compaction 失败 | 按 114 结论 fail-closed 或显式降级并记录；禁止静默 no-op |
 | SPDK 线程空信号掩码 | SIGTERM 默认动作杀死 TiKV、跳过停机 | Shard-118 信号转发（MySQL Shard-103 先例） |
 | 上游 rebase 冲突 | 维护成本 | 改动限定 FS 工厂 + shim + 独立 patch 目录；版本冻结 |
-| 资源不足（4 vCPU/3.3 GiB） | OOM/不稳定 | Shard-113 资源预算；必要时克隆 6 vCPU VM |
+| 资源不足（4 vCPU/7.2 GiB 实测） | OOM/不稳定 | Shard-113 资源预算；必要时克隆 6 vCPU VM |
 | 与 3FS 实验室冲突 | 误占盘/性能污染 | §0.4 盘与时段约束；不占用已声明盘 |
 | Rust/TiKV 构建依赖（protoc/crates 镜像） | 基座无法构建 | Gate 0 固化 toolchain 与镜像；构建在 VM 内完成 |
 | 环境漂移 | 错误性能结论 | 同会话交错 A/B、native 首尾校准 |

@@ -27,11 +27,15 @@ trait 上新增 `UuseFileSystem`（Rust + C ABI shim），由 `components/engine
 ## VM 内构建
 
 ```bash
-export TIKV_REF=<frozen-tag-or-commit>
+export TIKV_REF=v8.5.8          # Gate 0 冻结
 bash tikv/build_tikv_vm.sh
 ```
 
-- 源码：`/home/uuse/tikv-fork`；构建目录：`/home/uuse/tikv-build`；
+- 源码：`/home/uuse/tikv-fork`；构建目录：`/home/uuse/tikv-build`（可用 `SRC`/`BUILD`
+  覆盖）；host4 根盘仅剩约 3 GiB，实际使用空闲 20G 数据盘：`/build/tikv-fork` +
+  `/build/tikv-build`（nvme0n1，`0000:03:00.0`，ext4 label `tikv-build`）；
+- rust-toolchain 由 TiKV 仓库固定（v8.5.8 为 `nightly-2026-01-30`），rustup 安装在
+  `/build/rustup` + `/build/cargo`；
 - 依赖：Rust toolchain（冻结版本）、gcc/g++、cmake/make、libssl-dev、pkg-config；
   TiKV 源码必须在 VM 内通过 Git 获取与维护，禁止从 Windows 工作区同步；
 - 网络受限时通过 `~/.cargo/config.toml` 配置 crates 镜像，不写入脚本。
