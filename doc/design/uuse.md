@@ -2028,11 +2028,15 @@ native AIO、页压缩/punch hole、clone、MyISAM/Aria 数据路径、`--daemon
 ### 21.1 定位与范围
 
 - TiDB 的持久化层是 TiKV；TiDB server 与 PD 是独立进程，不进入 UUSE 边界。TiKV 的
-  本地存储（kvdb/raftdb 两个 RocksDB 实例、`db/`、`raft/`、`snap/`、`import/` 与
-  `lock`）以 UUSE 作为文件存储，接入方式为在 TiKV `components/file_system` 的
-  `FileSystem` trait 上新增 `UuseFileSystem` 实现（Rust + C ABI shim），由
-  `components/engine_rocks` 的 `RocksDBEnv` 适配到 rust-rocksdb `Env`；不是 POSIX
-  兼容层，core 不新增 POSIX `read/write/pread/pwrite` 入口，也不修改 RocksDB 本体；
+  本地存储（kv RocksDB、默认 raft-engine、`db/`、`raft-engine/`、`snap/`、`import/`
+  与 `LOCK`）以 UUSE 作为文件存储。接入面按审计
+  `doc/review/uuse_tikv_storage_audit_20261009.md` 分为两处：
+  （a）RocksDB 侧在 C++ 层实现 `rocksdb::FileSystem`，经 crocksdb FFI 构造 `Env`
+  并注入 `engine_rocks` 的共享 env（rust-rocksdb 无通用 Rust Env trait，不存在可
+  直接实现的 `RocksDBEnv`）；（b）raft-engine 侧实现 Rust `FileSystem` trait 并替换
+  `ManagedFileSystem` 的 base FS。两者都经 `tikv/shim` C ABI 调 UUSE core；不是
+  POSIX 兼容层，core 不新增 POSIX `read/write/pread/pwrite` 入口，也不修改 RocksDB
+  本体（仅新增 FFI 构造）；
 - 单进程、单 engine、bdev 独占语义与 §14.3 相同：第二实例、跨进程或同盘共享返回
   `Busy`；fork child 返回 `ForkedProcess`；
 - RocksDB/FIO/MySQL 路径、`config/uuse_nvme.conf`/`uuse_mysql.conf` 与默认值不被修改；
@@ -2040,30 +2044,32 @@ native AIO、页压缩/punch hole、clone、MyISAM/Aria 数据路径、`--daemon
 - 版本冻结：TiKV 8.x LTS（Gate 0 冻结 tag/commit 与 Cargo.lock 锁定的 rust-rocksdb
   依赖）；具体 crate/文件/函数名以 Shard-114 审计（冻结版本）为准。
 
-### 21.2 file_system/RocksDBEnv seam 契约
+### 21.2 RocksDB Env / raft-engine FileSystem seam 契约
 
-seam 位于 TiKV `components/file_system`（`FileSystem` trait / `EngineFileSystem`
-工厂）与 `components/engine_rocks`（`RocksDBEnv`）：
+seam 分为 RocksDB Env 与 raft-engine FileSystem 两处（审计
+`doc/review/uuse_tikv_storage_audit_20261009.md` §2/§3）：
 
 - UUSE 侧提供 `tikv/shim` 的 C ABI（opaque engine/client/file/dir handle、
-  Status/errno 映射、版本与 ABI 检查）；Rust `UuseFileSystem` 不直接依赖 C++ 头；
-- `FileSystem` trait 覆盖：metadata/stat、open（read/write/append/direct）、read/write、
-  sync_all/sync_data、truncate、allocate、rename、delete、create_dir(_all)、
-  remove_dir(_all)、read_dir、link、copy、lock/unlock、set_times、punch_hole；缺失项
-  按 Shard-114 审计在 core 侧纯加法补齐（Shard-115）；
-- 两个 RocksDB 实例（kvdb/raftdb）必须都使用 `UuseFileSystem`；WAL/MANIFEST/CURRENT/
-  OPTIONS 的写、rename、atomic flush、link 与目录 fsync 必须经 UUSE；`File::sync`
-  触发 durable epoch，`File::datasync` 映射 sync_data；
-- `LOCK` 文件与 TiKV `data-dir/lock` 必须与 UUSE 进程锁共同保证第二实例 fail-closed，
+  Status/errno 映射、版本与 ABI 检查）；TiKV 侧不直接依赖 C++ 头；
+- RocksDB 侧：C++ `rocksdb::FileSystem` 覆盖 metadata/stat、open（read/write/append/
+  direct）、read/write、sync/range sync、truncate、allocate、rename、link、lock、
+  目录与文件属性；crocksdb 新增 FFI `Env(fs)` 构造，`engine_rocks::get_env` 按
+  `storage.uuse.*` 选择 UUSE base env；kv 与 raftdb 共享该 env；WAL/MANIFEST/
+  CURRENT/OPTIONS 的写、rename、atomic flush、link 与目录 fsync 必须经 UUSE；
+  `File::sync` 触发 durable epoch；
+- raft-engine 侧：Rust `FileSystem`（`create/open/delete/rename/reuse/new_reader/
+  new_writer` + `Handle.sync/file_size` + `WriteExt.allocate/truncate`）经 shim 调
+  UUSE；`ManagedFileSystem` 的 base 按配置选择；
+- 缺失项按 Shard-114 审计在 core 侧纯加法补齐（Shard-115）；`punch_hole` 一期
+  fail-closed 或显式降级并计数；
+- `LOCK` 文件与 TiKV `data-dir/LOCK` 必须与 UUSE 进程锁共同保证第二实例 fail-closed，
   不允许宿主锁绕过；
-- punch hole 一期不支持：按 Shard-114 结论 fail-closed 或显式降级并计数，禁止静默
-  no-op 导致空间不可回收；
 - mmap 读写、encryption-at-rest、S3/cloud FS 一期禁用；配置出现即失败关闭。
 
 ### 21.3 路径路由与宿主白名单
 
-- `storage.data-dir`（含 `db/`、`raft/`、`snap/`、`import/` 与 `lock`）→ UUSE
-  namespace；
+- `storage.data-dir`（含 `db/`、`raft-engine/`（默认）或 `raft/`、`snap/`、`import/`、
+  `LOCK`、panic mark 与占位文件）→ UUSE namespace；
 - 宿主白名单：日志、status/监控输出、socket/pid、备份/导入的输出目录（显式配置，
   不默认进 UUSE）；白名单之外不得出现 datadir 文件落到宿主 OS；
 - 每个 shard 出口用 strace 校验 datadir 无宿主落盘；审计列出的绕过点必须在 Phase 8

@@ -27,9 +27,9 @@
      不属于 UUSE 边界）；
    - §3.2 明确禁用项：encryption-at-rest、S3/cloud storage、FUSE/preload、TiFlash、
      fork/多进程共享 bdev、mmap 读写、`tikv-ctl` 直连 UUSE 数据目录（一期边界）；
-   - 新增 §21 TiDB/TiKV frontend 契约：`file_system`/`RocksDBEnv` seam、路径路由与宿主
-     白名单、handle 与线程 registry、停机顺序、失败关闭、`punch_hole` 语义、kvdb/raftdb
-     双 RocksDB 实例；
+   - 新增 §21 TiDB/TiKV frontend 契约：RocksDB Env（C++ `FileSystem` + crocksdb FFI）与
+     raft-engine `FileSystem` seam、路径路由与宿主白名单、handle 与线程 registry、
+     停机顺序、失败关闭、`punch_hole` 语义；
    - §16 增补 TiKV 验收（功能矩阵、崩溃断点、无宿主落盘 strace 证据）；
    - §17 增补风险（Rust FFI、双实例、线程数、信号、punch hole 空间放大）；
    - §18 增补 Phase 8。
@@ -117,8 +117,8 @@ UUSE 是单进程、单 engine、bdev 独占；TiKV 与 RocksDB/MySQL 不会同�
 | 113 | 8 | 设计更新、TiKV 基座、构建与基线固化 | M | - | 设计更新 + `tikv-server` 可编译 + 基线记录 |
 | 114 | 8 | TiKV 存储绕过点审计与路由清单 | M | 113 | 审计报告 + 每处路由决定 + 禁用项清单 |
 | 115 | 8 | UUSE 侧 API 补齐（纯加法，审计驱动） | S | 114 | 新增单测 + L1–L3 |
-| 116 | 8 | C ABI shim 与 Rust `UuseFileSystem`（基础接口闭环） | L | 115 | FileSystem 单测 + smoke + 无宿主落盘 + L1–L3 |
-| 117 | 8 | RocksDB Env 接线 + 写/恢复路径（kvdb/raftdb） | L | 116 | 写闭环 + kill -9 恢复 + `uusectl check` + L1–L3 |
+| 116 | 8 | C ABI shim + raft-engine `UuseFileSystem`（基础接口闭环） | L | 115 | FileSystem 单测 + smoke + 无宿主落盘 + L1–L3 |
+| 117 | 8 | RocksDB Env + raft-engine 写/恢复路径 | L | 116 | 写闭环 + kill -9 恢复 + `uusectl check` + L1–L3 |
 | 118 | 8 | 线程/生命周期（registry、信号、停机顺序） | M | 116 | 并发负载 + clean shutdown + 第二实例 Busy + L1–L3 |
 | 119 | 8 | 功能验收矩阵（SQL/DDL/事务/备份/跨进程） | M | 117/118 | 矩阵全过 + `uusectl check` + L1–L3 |
 | 120 | 8 | 性能与 durability（TiKV on UUSE vs host ext4） | M | 119 | 性能目标 + L4（RocksDB/MySQL 无回退） |
@@ -128,13 +128,13 @@ UUSE 是单进程、单 engine、bdev 独占；TiKV 与 RocksDB/MySQL 不会同�
 
 ## 2. Phase 8：TiDB/TiKV frontend
 
-接入定位：TiDB 的持久化层是 TiKV（Rust）；TiKV 的本地存储是 kvdb/raftdb 两个
-RocksDB 实例，并且已经把引擎文件操作抽象为 `components/file_system` 的
-`FileSystem` trait（`LocalFileSystem`/`EncryptedFileSystem`/`CloudFileSystem`），由
-`components/engine_rocks` 的 `RocksDBEnv` 适配到 rust-rocksdb `Env`。因此 UUSE
-接入点是**新增一个 `UuseFileSystem` 实现**（Rust + C ABI shim），而不是 FUSE/POSIX
-层，也不是逐文件改写 TiKV。具体 crate/文件/函数名以 Shard-114 审计（Gate 0 冻结
-版本）为准。
+接入定位：TiDB 的持久化层是 TiKV（Rust）；v8.5.8 的本地存储是 kv RocksDB + 默认
+raft-engine。Shard-114 审计（`doc/review/uuse_tikv_storage_audit_20261009.md`）确认
+接入面为两处：（a）RocksDB 侧在 C++ 层实现 `rocksdb::FileSystem`，经 crocksdb FFI
+构造 `Env` 并注入 `engine_rocks` 共享 env（rust-rocksdb 无通用 Rust Env trait，不存在
+可直接实现的 `RocksDBEnv`）；（b）raft-engine 侧实现 Rust `FileSystem` trait 并替换
+`ManagedFileSystem` 的 base FS。两者都经 `tikv/shim` C ABI 调 UUSE core，不是
+FUSE/POSIX 层，也不逐文件改写 TiKV。
 
 ### Shard-113：设计更新、TiKV 基座与基线固化
 
@@ -166,6 +166,11 @@ RocksDB 实例，并且已经把引擎文件操作抽象为 `components/file_sys
 **不做**：任何 shim/API/TiKV 源改动。
 
 ### Shard-114：TiKV 存储绕过点审计与路由清单
+
+> 状态：已完成（2026-10-09）。审计报告
+> `doc/review/uuse_tikv_storage_audit_20261009.md`：真实 seam 为 RocksDB C++
+> `FileSystem` + crocksdb FFI `Env`（非 Rust trait）与 raft-engine `FileSystem`
+> trait；列出 10 处非引擎直用点与路由决定；设计 §21.1/§21.2 已按审计修订。
 
 **目标**：冻结 seam 与路径路由，输出可执行的绕过点清单，避免 datadir 文件静默落宿主。
 
@@ -199,35 +204,40 @@ datasync/sync/stat/allocatedBytes` 已覆盖大部分；预计补齐 `set_times`
 
 **不做**：data-only `datasync`、punch hole 实现、任何已有 API 语义变更。
 
-### Shard-116：C ABI shim 与 Rust `UuseFileSystem`（基础接口闭环）
+### Shard-116：C ABI shim + raft-engine `UuseFileSystem`（基础接口闭环）
 
-**目标**：建立最小可用闭环：`UuseFileSystem` 经 shim 在 UUSE namespace 上完成
-create/open/read/write/rename/delete/目录等基础操作，并让 TiKV 用它打开引擎目录。
+**目标**：建立最小可用闭环：`tikv/shim` 在 UUSE namespace 上完成
+create/open/read/write/rename/delete/目录等基础操作；raft-engine 经
+`UuseFileSystem` 使用 UUSE；RocksDB 侧完成 crocksdb FFI `Env(fs)` 注入 spike。
 
 **交付物**
 
 - UUSE 侧 `tikv/shim/`：`libuuse_tikv_shim`（C ABI，opaque engine/client/file/dir
   handle、Status/errno 映射、线程 registry 骨架、版本与 ABI 检查）；
-- TiKV 侧 `components/uuse_file_system`（Rust，实现 `FileSystem` trait，`build.rs`
-  链接 shim）与最小 patch（FS 工厂按配置键选择 UUSE）；
+- raft-engine 侧 Rust `UuseFileSystem`（`FileSystem` trait + `Handle` + `WriteExt`，
+  `build.rs` 链接 shim）与 `ManagedFileSystem` base 的配置选择 patch；
+- RocksDB 侧 spike：crocksdb FFI `Env(fs)` 构造 + C++ `FileSystem` 最小实现
+  （create/open/read/write/sync/rename/delete/目录），验证注入链路；
 - 路径路由：`storage.data-dir` → UUSE namespace；日志/status/socket/pid → 宿主白名单；
 - 无宿主落盘校验脚本（strace 证据）。
 
-**验收**：Rust `FileSystem` trait 单测与独立 smoke（经 shim 的 create/write/read/
-rename/delete/dirs）通过；TiKV 经 `UuseFileSystem` 完成引擎目录初始化（不要求完整
+**验收**：raft-engine `FileSystem` 单测与独立 smoke（经 shim 的 create/write/read/
+rename/delete/dirs）通过；RocksDB spike 能经 UUSE Env 打开/关闭引擎目录（不要求完整
 启动）；`data_dir` 内文件不落宿主；L1–L3 无回退。
 
 **不做**：写/恢复结论、性能结论、`tikv-ctl` 支持。
 
-### Shard-117：RocksDB Env 接线 + 写/恢复路径（kvdb/raftdb）
+### Shard-117：RocksDB Env + raft-engine 写/恢复路径
 
-**目标**：让两个 RocksDB 实例的写、flush、compaction、恢复全部经 UUSE 闭环。
+**目标**：让 RocksDB 与 raft-engine 的写、flush、compaction、恢复全部经 UUSE 闭环。
 
 **交付物**
 
-- Env 接线验证：kvdb/raftdb 均使用 `UuseFileSystem`；
+- RocksDB Env 接线：kv 与 raftdb 共享 UUSE env；C++ `FileSystem` 覆盖 direct IO/
+  RangeSync/目录 fsync/LockFile；
+- raft-engine `UuseFileSystem` 写/恢复闭环（`Handle.sync`、`WriteExt.allocate`）；
 - WAL/MANIFEST/CURRENT/atomic flush/rename/link/dir fsync 路径打通；
-- `LOCK`/data_dir lock 与 UUSE 进程锁语义：第二实例 `Busy`/fail-closed；
+- `data_dir/LOCK`、panic mark、占位文件与 UUSE 进程锁语义：第二实例 fail-closed；
 - `fallocate`（`File::allocate`）与 direct IO 对齐；`punch_hole` 按 114 结论处理；
 - 按 114 清单修复绕过点；kill -9 断点恢复脚本。
 
@@ -318,6 +328,9 @@ preload/FUSE/Blobstore 回流；无未记录临时边界。
 | `File::sync` 无 data-only barrier | WAL per-commit 延迟 | 组提交先行；core 改动必须过 L4 |
 | punch hole 不支持 | 空间放大或 compaction 失败 | 按 114 结论 fail-closed 或显式降级并记录；禁止静默 no-op |
 | SPDK 线程空信号掩码 | SIGTERM 默认动作杀死 TiKV、跳过停机 | Shard-118 信号转发（MySQL Shard-103 先例） |
+| rust-rocksdb fork patch（crocksdb FFI/Rust Env） | 上游 rebase 成本 | 改动限定新增 FFI 构造 + 独立 patch 目录；版本冻结 |
+| RocksDB C++ FileSystem 方法面（direct IO/RangeSync/目录 fsync/LockFile） | 功能缺口 | 按审计 §2.2 逐项实现；punch hole 一期 fail-closed |
+| `data_dir/LOCK`/panic mark/占位文件直用点 | 宿主落盘/双挂载 | 审计 §4 清单逐项路由；strace 校验 |
 | 上游 rebase 冲突 | 维护成本 | 改动限定 FS 工厂 + shim + 独立 patch 目录；版本冻结 |
 | 资源不足（4 vCPU/7.2 GiB 实测） | OOM/不稳定 | Shard-113 资源预算；必要时克隆 6 vCPU VM |
 | 与 3FS 实验室冲突 | 误占盘/性能污染 | §0.4 盘与时段约束；不占用已声明盘 |
