@@ -38,6 +38,9 @@ bash tikv/build_tikv_vm.sh
   `/build/rustup` + `/build/cargo`；
 - CMake 4.x 兼容：脚本默认导出 `CMAKE_POLICY_VERSION_MINIMUM=3.5`（grpcio-sys 捆绑的
   gRPC/c-ares 仍用旧 policy floor）；
+- GCC 兼容：Ubuntu 26.04 默认 GCC 15 无法编译 grpcio-sys 捆绑的旧 abseil（实测
+  `extension.h` 解析错误）；脚本在 CC/CXX 未设置时自动选择 `gcc-12`/`g++-12`（已在
+  host4 验证的路径）；
 - 依赖：Rust toolchain（冻结版本）、gcc/g++、cmake/make、libssl-dev、pkg-config；
   TiKV 源码必须在 VM 内通过 Git 获取与维护，禁止从 Windows 工作区同步；
 - 网络受限时通过 `~/.cargo/config.toml` 配置 crates 镜像，不写入脚本。

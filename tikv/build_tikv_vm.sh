@@ -14,6 +14,11 @@ set -euo pipefail
 # v8.5.8's grpcio-sys bundles gRPC/c-ares that still use the old floor.
 export CMAKE_POLICY_VERSION_MINIMUM="${CMAKE_POLICY_VERSION_MINIMUM:-3.5}"
 
+# Ubuntu 26.04 ships GCC 15, which cannot compile the old abseil bundled in
+# grpcio-sys 0.10.3. Prefer gcc-12/g++-12 when present and CC/CXX are unset.
+if [ -z "${CC:-}" ] && command -v gcc-12 >/dev/null; then export CC=gcc-12; fi
+if [ -z "${CXX:-}" ] && command -v g++-12 >/dev/null; then export CXX=g++-12; fi
+
 TIKV_REF="${TIKV_REF:?set TIKV_REF to the frozen TiKV tag/commit (Gate 0)}"
 SRC="${SRC:-/home/uuse/tikv-fork}"
 BUILD="${BUILD:-/home/uuse/tikv-build}"
