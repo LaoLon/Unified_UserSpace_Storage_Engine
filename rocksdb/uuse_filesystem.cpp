@@ -248,6 +248,9 @@ struct UuseContext {
     std::shared_ptr<uuse::Engine> engine;
     std::shared_ptr<uuse::Client> client;
     std::unique_ptr<AsyncReadDispatcher> asyncDispatcher;
+    /* True when this context created the engine and must stop it; false for
+     * the shared-engine path where the shim owns the lifecycle. */
+    bool ownsEngine = true;
     /* [rocksdb].worker_direct_reads, env-overridable for diagnostics. */
     bool workerDirectReads = true;
     /* Lets reads and size queries observe appended bytes before they reach
@@ -1336,7 +1339,9 @@ UuseContext::~UuseContext() {
     asyncDispatcher.reset();
     client.reset();
     if (engine != nullptr) {
-        engine->stop().wait();
+        if (ownsEngine) {
+            engine->stop().wait();
+        }
         engine.reset();
     }
 }
@@ -1762,6 +1767,10 @@ public:
                       rocksdb::IODebugContext *) override {}
 
     /* Persists user data and file metadata through the UUSE durable epoch path. */
+    /* SyncWAL() requires the WAL file to declare thread-safe sync; UUSE's
+     * File::sync is a namespace-level durable barrier. */
+    bool IsSyncThreadSafe() const override { return true; }
+
     rocksdb::IOStatus Sync(const rocksdb::IOOptions &, rocksdb::IODebugContext *) override {
         if (file_ == nullptr) {
             return rocksdb::IOStatus::InvalidArgument("writable file is closed");
@@ -2310,6 +2319,33 @@ private:
 
 } // namespace
 
+/* Builds the adapter context over an already-mounted engine. `config` is
+ * optional: without it the adapter uses defaults (shared-engine path). */
+std::shared_ptr<rocksdb::FileSystem> buildFileSystem(std::shared_ptr<uuse::Engine> engine,
+                                                     bool ownsEngine,
+                                                     const uuse::Config *config) {
+    const bool workerDirectReads = config != nullptr ? configuredWorkerDirectReads(*config) : true;
+    const std::string frontendCpus = config != nullptr ? config->frontendCpus : std::string();
+    auto context = std::make_shared<UuseContext>();
+    context->engine = std::move(engine);
+    context->ownsEngine = ownsEngine;
+    context->workerDirectReads = workerDirectReads;
+    context->asyncDispatcher = std::make_unique<AsyncReadDispatcher>(
+        1024, configuredFrontendCpu(frontendCpus), configuredCompletionBatch(), workerDirectReads);
+    uuse::ClientOptions clientOptions;
+    clientOptions.completionWake = &AsyncReadDispatcher::wake;
+    clientOptions.completionWakeContext = context->asyncDispatcher.get();
+    auto client = uuse::Client::create(*context->engine, clientOptions);
+    if (!client.ok()) return nullptr;
+    context->client = std::move(client).value();
+    context->asyncDispatcher->setClient(context->client);
+    auto dispatcherStarted = context->asyncDispatcher->start();
+    if (!dispatcherStarted.ok()) {
+        return nullptr;
+    }
+    return std::make_shared<UuseFileSystem>(std::move(context));
+}
+
 /* Builds and mounts one shared UUSE engine for the RocksDB FileSystem. */
 std::shared_ptr<rocksdb::FileSystem>
 createFileSystem(const std::string &configPath) {
@@ -2320,25 +2356,14 @@ createFileSystem(const std::string &configPath) {
     auto owned = std::shared_ptr<uuse::Engine>(std::move(engine).value());
     auto mounted = owned->mount().wait();
     if (!mounted.ok() || !mounted.value().ok()) return nullptr;
-    const bool workerDirectReads = configuredWorkerDirectReads(config.value());
-    auto context = std::make_shared<UuseContext>();
-    context->engine = owned;
-    context->workerDirectReads = workerDirectReads;
-    context->asyncDispatcher = std::make_unique<AsyncReadDispatcher>(
-        1024, configuredFrontendCpu(config.value().frontendCpus),
-        configuredCompletionBatch(), workerDirectReads);
-    uuse::ClientOptions clientOptions;
-    clientOptions.completionWake = &AsyncReadDispatcher::wake;
-    clientOptions.completionWakeContext = context->asyncDispatcher.get();
-    auto client = uuse::Client::create(*owned, clientOptions);
-    if (!client.ok()) return nullptr;
-    context->client = std::move(client).value();
-    context->asyncDispatcher->setClient(context->client);
-    auto dispatcherStarted = context->asyncDispatcher->start();
-    if (!dispatcherStarted.ok()) {
-        return nullptr;
-    }
-    return std::make_shared<UuseFileSystem>(std::move(context));
+    return buildFileSystem(std::move(owned), true, &config.value());
+}
+
+/* Shares an already-mounted engine owned by the shim (kvdb + raft-engine). */
+std::shared_ptr<rocksdb::FileSystem>
+createFileSystemWithEngine(std::shared_ptr<uuse::Engine> engine) {
+    if (engine == nullptr) return nullptr;
+    return buildFileSystem(std::move(engine), false, nullptr);
 }
 
 /* Injects UUSE into DBOptions::env without transferring raw ownership to UUSE. */

@@ -15,10 +15,23 @@ Shard-116 的 TiKV 侧接入材料。
 | `rust/engine.rs` | TiKV `components/raft_log_engine/src/engine.rs` 的改造副本（enum base + `new_with_uuse` + `read_dir`/`create_dir` 转发） |
 | `../patches/apply-raft-engine-readdir.py` | raft-engine 目录列举/创建改走 `FileSystem` trait 的补丁 |
 | `../patches/apply-uuse-config.py` | TiKV 配置门控（`[raft-engine] uuse_conf`）+ 生产调用点分支的补丁 |
-| `../patches/apply-uuse-rocksdb-config.py` | RocksDB 侧门控（`[storage] uuse_conf` + `engine_rocks::get_env_with_uuse`）的补丁 |
+| `../patches/apply-uuse-rocksdb-config.py` | RocksDB 侧门控（`[storage] uuse-conf` + `engine_rocks::get_env_with_uuse`）的补丁 |
+| `../patches/apply-uuse-shared-engine.py` | 单进程共享 UUSE engine（shim 单例 + adapter `createFileSystemWithEngine` + crocksdb 接线）的补丁 |
+| `../patches/apply-uuse-validation-skip.py` | `uuse-conf` 设置时跳过宿主 raft data set 校验（Shard-117）的补丁 |
 
 ## 关键实现说明
 
+- **单进程共享引擎（Shard-117）**：`uuse_tikv_engine_open` 按 `.conf` 路径维护进程级
+  单例（weak_ptr 注册表）；RocksDB adapter 经 `createFileSystemWithEngine` 复用同一
+  engine（`ownsEngine=false`，不接管生命周期），crocksdb 句柄进程级保活；kvdb 与
+  raft-engine 因此共用一个 UUSE engine。
+- **宿主校验跳过（Shard-117）**：`uuse-conf` 设置时跳过 `RaftDataStateMachine` 的
+  宿主数据校验（引擎数据在 UUSE 卷，宿主路径看不到；补丁
+  `apply-uuse-validation-skip.py`）。
+- **WAL SyncWAL（Shard-117）**：RocksDB `SyncWAL()` 要求 WAL 文件
+  `IsSyncThreadSafe()==true`；adapter 的 `UuseWritableFile` 已声明（UUSE
+  `File::sync` 是 namespace 级屏障），否则 TiKV bootstrap 报
+  `SyncWAL() is not supported for this implementation of WAL file`。
 - **引用计数生命周期**：`UuseEngineState` 由引擎句柄与文件句柄共享；前端先丢 FS、后丢
   reader/writer 时（raft-engine 的字段析构顺序）不会在文件仍打开时停引擎，最后一个句柄
   释放才 `client close + drain + engine stop`（修复 gdb 定位的 `Namespace::close` 死锁）。

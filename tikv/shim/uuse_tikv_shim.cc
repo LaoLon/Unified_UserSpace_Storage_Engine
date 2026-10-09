@@ -13,6 +13,7 @@
  * + operation level); every call unwraps both layers. */
 
 #include "uuse_tikv_shim.h"
+#include "uuse_tikv_shim.hpp"
 
 #include <cerrno>
 #include <cstring>
@@ -20,6 +21,7 @@
 #include <mutex>
 #include <span>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -82,7 +84,7 @@ uuse::OpenFlags toOpenFlags(unsigned flags) {
 /* Reference-counted engine state shared by the engine handle and file
  * handles; the engine stops when the last reference goes away. */
 struct UuseEngineState {
-    std::unique_ptr<uuse::Engine> engine;
+    std::shared_ptr<uuse::Engine> engine;
     std::shared_ptr<uuse::Client> client;
     std::mutex mutex; /* serializes the shared path-op client */
 
@@ -98,6 +100,16 @@ struct UuseEngineState {
         }
     }
 };
+
+namespace {
+
+/* Process-wide singleton per .conf: kvdb (RocksDB env) and raft-engine share
+ * one UUSE engine. Entries are weak so a fully released engine can be
+ * recreated later. */
+std::mutex gEngineRegistryMutex;
+std::unordered_map<std::string, std::weak_ptr<UuseEngineState>> gEngineRegistry;
+
+} // namespace
 
 struct uuse_tikv_engine {
     std::shared_ptr<UuseEngineState> state;
@@ -136,17 +148,27 @@ extern "C" {
 
 int uuse_tikv_engine_open(const char *confPath, uuse_tikv_engine **out) {
     if (confPath == nullptr || out == nullptr) return -EINVAL;
-    auto config = uuse::parseConfigFile(confPath);
-    if (!config.ok()) return toErrno(config.status());
-    auto engine = uuse::Engine::create(config.value());
-    if (!engine.ok()) return toErrno(engine.status());
-    const int mountRc = unwrap(engine.value()->mount().wait());
-    if (mountRc != 0) return mountRc;
-    auto client = uuse::Client::create(*engine.value());
-    if (!client.ok()) return toErrno(client.status());
-    auto state = std::make_shared<UuseEngineState>();
-    state->engine = std::move(engine.value());
-    state->client = std::move(client.value());
+    const std::string key(confPath);
+    std::shared_ptr<UuseEngineState> state;
+    {
+        std::lock_guard<std::mutex> lock(gEngineRegistryMutex);
+        auto it = gEngineRegistry.find(key);
+        if (it != gEngineRegistry.end()) state = it->second.lock();
+        if (state == nullptr) {
+            auto config = uuse::parseConfigFile(confPath);
+            if (!config.ok()) return toErrno(config.status());
+            auto engine = uuse::Engine::create(config.value());
+            if (!engine.ok()) return toErrno(engine.status());
+            const int mountRc = unwrap(engine.value()->mount().wait());
+            if (mountRc != 0) return mountRc;
+            auto client = uuse::Client::create(*engine.value());
+            if (!client.ok()) return toErrno(client.status());
+            state = std::make_shared<UuseEngineState>();
+            state->engine = std::shared_ptr<uuse::Engine>(std::move(engine).value());
+            state->client = std::move(client.value());
+            gEngineRegistry[key] = state;
+        }
+    }
     auto *handle = new uuse_tikv_engine();
     handle->state = std::move(state);
     *out = handle;
@@ -297,3 +319,11 @@ long long uuse_tikv_file_size(uuse_tikv_file *file) {
 }
 
 } // extern "C"
+
+std::shared_ptr<uuse::Engine> uuse_tikv_engine_shared_engine(uuse_tikv_engine *engine) {
+    return engine != nullptr && engine->state != nullptr ? engine->state->engine : nullptr;
+}
+
+std::shared_ptr<uuse::Client> uuse_tikv_engine_shared_client(uuse_tikv_engine *engine) {
+    return engine != nullptr && engine->state != nullptr ? engine->state->client : nullptr;
+}
