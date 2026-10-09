@@ -217,6 +217,12 @@ datasync/sync/stat/allocatedBytes` 已覆盖大部分；预计补齐 `set_times`
 
 ### Shard-116：C ABI shim + raft-engine `UuseFileSystem`（基础接口闭环）
 
+> 状态：进行中（2026-10-09）。RocksDB 注入链路 spike 已通过（`tikv/spike/`）：
+> crocksdb FFI `Env(fs)`（`NewCompositeEnv`）+ 自定义 `FileSystemWrapper` 子类，
+> TiKV `engine_rocks` example 打开 DB 并 put/get/flush 成功，SST/WAL/MANIFEST/
+> CURRENT/OPTIONS/LOCK 全部落在映射目录。待做：UUSE FileSystem（8.10.2 适配 +
+> C 回调桥）、raft-engine `UuseFileSystem`、正式 fork/补丁栈。
+
 **目标**：建立最小可用闭环：`tikv/shim` 在 UUSE namespace 上完成
 create/open/read/write/rename/delete/目录等基础操作；raft-engine 经
 `UuseFileSystem` 使用 UUSE；RocksDB 侧完成 crocksdb FFI `Env(fs)` 注入 spike。

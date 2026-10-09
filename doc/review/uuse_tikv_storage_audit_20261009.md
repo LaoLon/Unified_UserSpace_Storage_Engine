@@ -177,8 +177,8 @@
 
 ## 8. 未决问题
 
-- crocksdb FFI 增加 `Env(fs)` 构造是否足够，还是需要 `CompositeEnvWrapper`（内部
-  头文件）——Shard-116 首个 spike；
+- ~~crocksdb FFI 增加 `Env(fs)` 构造是否足够~~：已验证足够（`NewCompositeEnv(fs)`，
+  2026-10-09 spike，见 `tikv/spike/`）；不需要内部 `CompositeEnvWrapper` 头文件；
 - RocksDB `FileSystem` 的 `punch_hole`/`fallocate` 语义与 UUSE 能力映射；
 - snap/import 的 hard_link/copy_and_sync 在 UUSE namespace 的等价实现
   （`Client::link` 已有；copy 走 read/write）；
