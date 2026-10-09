@@ -4,32 +4,29 @@
  * operations go through uuse::File coroutines. Per-thread clients and the
  * worker-direct path are Shard-118 work.
  *
+ * Lifecycle: the engine state is reference counted. File handles hold a
+ * reference, so dropping the frontend filesystem before its readers/writers
+ * (raft-engine does this) cannot stop the engine while files are still open;
+ * the engine closes with the last handle.
+ *
  * Note: Task<Result<T>>::wait() yields a nested Result<Result<T>> (task level
  * + operation level); every call unwraps both layers. */
 
 #include "uuse_tikv_shim.h"
 
 #include <cerrno>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <span>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "uuse/config.hpp"
 #include "uuse/core.hpp"
 #include "uuse/file.hpp"
 #include "uuse/types.hpp"
-
-struct uuse_tikv_engine {
-    std::unique_ptr<uuse::Engine> engine;
-    std::shared_ptr<uuse::Client> client;
-    std::mutex mutex; /* serializes the shared path-op client */
-};
-
-struct uuse_tikv_file {
-    std::shared_ptr<uuse::File> file;
-};
 
 namespace {
 
@@ -80,6 +77,39 @@ uuse::OpenFlags toOpenFlags(unsigned flags) {
     return out;
 }
 
+} // namespace
+
+/* Reference-counted engine state shared by the engine handle and file
+ * handles; the engine stops when the last reference goes away. */
+struct UuseEngineState {
+    std::unique_ptr<uuse::Engine> engine;
+    std::shared_ptr<uuse::Client> client;
+    std::mutex mutex; /* serializes the shared path-op client */
+
+    ~UuseEngineState() {
+        if (client) {
+            (void)unwrap(client->close().wait());
+            client.reset();
+        }
+        if (engine) {
+            (void)unwrap(engine->drain().wait());
+            (void)unwrap(engine->stop().wait());
+            engine.reset();
+        }
+    }
+};
+
+struct uuse_tikv_engine {
+    std::shared_ptr<UuseEngineState> state;
+};
+
+struct uuse_tikv_file {
+    std::shared_ptr<UuseEngineState> state;
+    std::shared_ptr<uuse::File> file;
+};
+
+namespace {
+
 long long doReadWrite(uuse_tikv_file *file, const void *writeData, void *readBuf,
                       size_t len, uint64_t offset, bool isWrite) {
     if (file == nullptr || file->file == nullptr) return -EINVAL;
@@ -114,35 +144,35 @@ int uuse_tikv_engine_open(const char *confPath, uuse_tikv_engine **out) {
     if (mountRc != 0) return mountRc;
     auto client = uuse::Client::create(*engine.value());
     if (!client.ok()) return toErrno(client.status());
+    auto state = std::make_shared<UuseEngineState>();
+    state->engine = std::move(engine.value());
+    state->client = std::move(client.value());
     auto *handle = new uuse_tikv_engine();
-    handle->engine = std::move(engine.value());
-    handle->client = std::move(client.value());
+    handle->state = std::move(state);
     *out = handle;
     return 0;
 }
 
 void uuse_tikv_engine_close(uuse_tikv_engine *engine) {
     if (engine == nullptr) return;
-    if (engine->client) {
-        (void)unwrap(engine->client->close().wait());
-        engine->client.reset();
-    }
-    if (engine->engine) {
-        (void)unwrap(engine->engine->drain().wait());
-        (void)unwrap(engine->engine->stop().wait());
-        engine->engine.reset();
-    }
+    /* Releasing the owner reference is enough: open file handles keep the
+     * state (and the engine) alive until they are closed. */
+    engine->state.reset();
     delete engine;
 }
 
 int uuse_tikv_open(uuse_tikv_engine *engine, const char *path, unsigned flags,
                    uuse_tikv_file **out) {
-    if (engine == nullptr || path == nullptr || out == nullptr) return -EINVAL;
-    std::lock_guard<std::mutex> lock(engine->mutex);
+    if (engine == nullptr || engine->state == nullptr || path == nullptr || out == nullptr) {
+        return -EINVAL;
+    }
+    auto state = engine->state;
+    std::lock_guard<std::mutex> lock(state->mutex);
     std::shared_ptr<uuse::File> file;
-    const int rc = unwrap(engine->client->open(path, toOpenFlags(flags)).wait(), &file);
+    const int rc = unwrap(state->client->open(path, toOpenFlags(flags)).wait(), &file);
     if (rc != 0) return rc;
     auto *handle = new uuse_tikv_file();
+    handle->state = std::move(state);
     handle->file = std::move(file);
     *out = handle;
     return 0;
@@ -151,31 +181,66 @@ int uuse_tikv_open(uuse_tikv_engine *engine, const char *path, unsigned flags,
 void uuse_tikv_close(uuse_tikv_file *file) {
     if (file == nullptr) return;
     file->file.reset();
+    file->state.reset();
     delete file;
 }
 
 int uuse_tikv_remove(uuse_tikv_engine *engine, const char *path) {
-    if (engine == nullptr || path == nullptr) return -EINVAL;
-    std::lock_guard<std::mutex> lock(engine->mutex);
-    return unwrap(engine->client->remove(path).wait());
+    if (engine == nullptr || engine->state == nullptr || path == nullptr) return -EINVAL;
+    std::lock_guard<std::mutex> lock(engine->state->mutex);
+    return unwrap(engine->state->client->remove(path).wait());
 }
 
 int uuse_tikv_rename(uuse_tikv_engine *engine, const char *from, const char *to) {
-    if (engine == nullptr || from == nullptr || to == nullptr) return -EINVAL;
-    std::lock_guard<std::mutex> lock(engine->mutex);
-    return unwrap(engine->client->rename(from, to).wait());
+    if (engine == nullptr || engine->state == nullptr || from == nullptr || to == nullptr) {
+        return -EINVAL;
+    }
+    std::lock_guard<std::mutex> lock(engine->state->mutex);
+    return unwrap(engine->state->client->rename(from, to).wait());
 }
 
 int uuse_tikv_create_dirs(uuse_tikv_engine *engine, const char *path) {
-    if (engine == nullptr || path == nullptr) return -EINVAL;
-    std::lock_guard<std::mutex> lock(engine->mutex);
-    return unwrap(engine->client->createDirectories(path).wait());
+    if (engine == nullptr || engine->state == nullptr || path == nullptr) return -EINVAL;
+    std::lock_guard<std::mutex> lock(engine->state->mutex);
+    return unwrap(engine->state->client->createDirectories(path).wait());
+}
+
+long long uuse_tikv_read_dir(uuse_tikv_engine *engine, const char *path,
+                             char *buf, size_t bufLen) {
+    if (engine == nullptr || engine->state == nullptr || path == nullptr) return -EINVAL;
+    std::lock_guard<std::mutex> lock(engine->state->mutex);
+    std::vector<std::string> names;
+    std::string cursor;
+    for (;;) {
+        auto outer = engine->state->client->getChildren(path, cursor, 256).wait();
+        if (!outer.ok()) return toErrno(outer.status());
+        auto inner = std::move(outer).value();
+        if (!inner.ok()) return toErrno(inner.status());
+        auto page = std::move(inner).value();
+        for (const auto &entry : page.entries) {
+            if (!entry.directory) names.push_back(entry.name);
+        }
+        if (page.nextCursor.empty()) break;
+        cursor = page.nextCursor;
+    }
+    size_t needed = 0;
+    for (const auto &name : names) needed += name.size() + 1;
+    if (buf == nullptr || bufLen < needed) return static_cast<long long>(needed);
+    size_t offset = 0;
+    for (const auto &name : names) {
+        std::memcpy(buf + offset, name.data(), name.size());
+        offset += name.size();
+        buf[offset++] = '\0';
+    }
+    return 0;
 }
 
 int uuse_tikv_exists(uuse_tikv_engine *engine, const char *path, int *exists) {
-    if (engine == nullptr || path == nullptr || exists == nullptr) return -EINVAL;
-    std::lock_guard<std::mutex> lock(engine->mutex);
-    auto outer = engine->client->stat(path).wait();
+    if (engine == nullptr || engine->state == nullptr || path == nullptr || exists == nullptr) {
+        return -EINVAL;
+    }
+    std::lock_guard<std::mutex> lock(engine->state->mutex);
+    auto outer = engine->state->client->stat(path).wait();
     if (!outer.ok()) return toErrno(outer.status());
     auto inner = std::move(outer).value();
     if (inner.ok()) {

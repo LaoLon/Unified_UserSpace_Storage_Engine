@@ -45,6 +45,12 @@ extern "C" {
         to: *const c_char,
     ) -> c_int;
     fn uuse_tikv_create_dirs(engine: *mut UuseEngineOpaque, path: *const c_char) -> c_int;
+    fn uuse_tikv_read_dir(
+        engine: *mut UuseEngineOpaque,
+        path: *const c_char,
+        buf: *mut c_char,
+        buf_len: usize,
+    ) -> i64;
     fn uuse_tikv_pread(
         file: *mut UuseFileOpaque,
         buf: *mut c_void,
@@ -314,5 +320,45 @@ impl FileSystem for UuseFileSystem {
 
     fn new_writer(&self, handle: Arc<UuseHandle>) -> io::Result<UuseWriter> {
         Ok(UuseWriter { handle, offset: 0 })
+    }
+
+    fn create_dir<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
+        let path = c_path(path.as_ref())?;
+        let rc = unsafe { uuse_tikv_create_dirs(self.engine, path.as_ptr()) };
+        if rc != 0 {
+            return Err(io_error(rc as i64));
+        }
+        Ok(())
+    }
+
+    fn read_dir<P: AsRef<Path>>(&self, path: P) -> io::Result<Vec<String>> {
+        let path = c_path(path.as_ref())?;
+        let needed =
+            unsafe { uuse_tikv_read_dir(self.engine, path.as_ptr(), std::ptr::null_mut(), 0) };
+        if needed < 0 {
+            return Err(io_error(needed));
+        }
+        if needed == 0 {
+            return Ok(Vec::new());
+        }
+        let mut buf = vec![0u8; needed as usize];
+        let rc = unsafe {
+            uuse_tikv_read_dir(
+                self.engine,
+                path.as_ptr(),
+                buf.as_mut_ptr() as *mut c_char,
+                buf.len(),
+            )
+        };
+        if rc != 0 {
+            return Err(io_error(rc));
+        }
+        let mut names = Vec::new();
+        for part in buf.split(|b| *b == 0) {
+            if !part.is_empty() {
+                names.push(String::from_utf8_lossy(part).into_owned());
+            }
+        }
+        Ok(names)
     }
 }

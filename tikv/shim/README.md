@@ -8,9 +8,21 @@ Shard-116 的 TiKV 侧接入材料。
 |---|---|
 | `uuse_tikv_shim.h` / `uuse_tikv_shim.cc` | C ABI shim：engine open/close、open/remove/rename/create_dirs/exists、pread/pwrite/append/truncate/allocate/sync/file_size（错误为负 errno） |
 | `uuse_tikv_shim_smoke.cc` | C ABI 真机 smoke（create/write/append/pread/truncate/sync/exists/rename/remove） |
-| `rust/uuse_file_system.rs` | raft-engine `FileSystem` trait 的 UUSE 实现（经 C ABI） |
+| `rust/uuse_file_system.rs` | raft-engine `FileSystem` trait 的 UUSE 实现（经 C ABI；含 `read_dir`/`create_dir`） |
 | `rust/build.rs` | 把 `libuuse_tikv_shim.so` 链接进 `raft_log_engine`（`UUSE_CORE_BUILD` 可覆盖） |
 | `rust/uuse_fs_smoke.rs` | raft-engine 真机 smoke（write/sync/fetch） |
+| `rust/uuse_fs_prod_smoke.rs` | 生产 wrapper 真机 smoke（`RaftLogEngine::new_with_uuse`） |
+| `rust/engine.rs` | TiKV `components/raft_log_engine/src/engine.rs` 的改造副本（enum base + `new_with_uuse` + `read_dir`/`create_dir` 转发） |
+| `../patches/apply-raft-engine-readdir.py` | raft-engine 目录列举/创建改走 `FileSystem` trait 的补丁 |
+
+## 关键实现说明
+
+- **引用计数生命周期**：`UuseEngineState` 由引擎句柄与文件句柄共享；前端先丢 FS、后丢
+  reader/writer 时（raft-engine 的字段析构顺序）不会在文件仍打开时停引擎，最后一个句柄
+  释放才 `client close + drain + engine stop`（修复 gdb 定位的 `Namespace::close` 死锁）。
+- **目录操作**：`read_dir` 经 `Client::getChildren` 游标分页返回 NUL 分隔文件名；
+  `create_dir` 经 `Client::createDirectories`；raft-engine trait 默认实现 fail-closed，
+  禁止回退宿主 `std::fs`。
 
 ## 构建（UUSE 仓库）
 
@@ -33,11 +45,12 @@ cmake --build build-uuse -j3 --target uuse_tikv_shim uuse_tikv_shim_smoke
 ```text
 SHIM_SMOKE_PASS
 RAFT_ENGINE_SMOKE_PASS written=47 fetched=2
+RAFT_ENGINE_PROD_SMOKE_PASS written=47 fetched=2   # RaftLogEngine::new_with_uuse
 ```
 
 ## 待办
 
-- `ManagedFileSystem` 集成：把 `base_file_system` 换成配置选择的
-  `UuseFileSystem`（含加密/限速包装），使 TiKV 生产路径生效（Shard-116/117）；
-- 生命周期告警 `client destroyed without close after drain`（Shard-118）；
-- 正式 fork/补丁栈（当前为 checkout 就地补丁，见 `tikv/spike/`）。
+- 配置键门控（`storage.uuse.*`）替换示例级开关，使 TiKV server 生产路径生效
+  （Shard-116/117）；
+- `swappy_allocator.rs` spill 目录一期不启用；
+- 正式 fork/补丁栈（当前为 checkout 就地补丁，见 `tikv/spike/` 与 `tikv/patches/`）。

@@ -131,7 +131,7 @@
 | 8 | `cmd/tikv-ctl` | 直接打开 data dir | 一期禁用（fail-closed） |
 | 9 | 日志/status/socket/pid | 运维输出 | 宿主白名单 |
 | 10 | encryption 元数据（`encryption` crate） | 密钥文件 | 一期禁用（`plaintext`），启用即 fail-closed |
-| 11 | raft-engine `src/file_pipe_log/mod.rs:111`、`src/file_pipe_log/pipe_builder.rs:269`、`src/swappy_allocator.rs:471` | 日志文件目录列举（`std::fs::read_dir`） | `FileSystem` trait 无 `read_dir`；需给 trait 增加 `read_dir` 并让 UUSE FS 经 `Client::getChildren` 实现（Shard-116 补丁，待做） |
+| 11 | raft-engine `src/file_pipe_log/mod.rs:111`、`src/file_pipe_log/pipe_builder.rs:269`、`src/swappy_allocator.rs:471` | 日志文件目录列举（`std::fs::read_dir`） | **已修复（Shard-116）**：`FileSystem` trait 增加 `read_dir`/`create_dir`（默认 fail-closed），`UuseFileSystem` 经 `getChildren`/`createDirectories` 实现，`ManagedFileSystem` 转发；`file_pipe_log/mod.rs` 与 `pipe_builder.rs` 改走 FS（补丁 `tikv/patches/apply-raft-engine-readdir.py`）；`swappy_allocator.rs`（spill 目录）一期不启用 |
 
 ---
 

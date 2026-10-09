@@ -481,6 +481,20 @@ impl FileSystem for ManagedFileSystem {
             })
         }
     }
+
+    fn create_dir<P: AsRef<Path>>(&self, path: P) -> IoResult<()> {
+        match &self.base_file_system {
+            BaseFileSystem::Default(fs) => fs.create_dir(path),
+            BaseFileSystem::Uuse(fs) => fs.create_dir(path),
+        }
+    }
+
+    fn read_dir<P: AsRef<Path>>(&self, path: P) -> IoResult<Vec<String>> {
+        match &self.base_file_system {
+            BaseFileSystem::Default(fs) => fs.read_dir(path),
+            BaseFileSystem::Uuse(fs) => fs.read_dir(path),
+        }
+    }
 }
 
 /// Convert a cf to id for encoding.
