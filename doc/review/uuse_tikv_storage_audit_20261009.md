@@ -183,3 +183,36 @@
 - snap/import 的 hard_link/copy_and_sync 在 UUSE namespace 的等价实现
   （`Client::link` 已有；copy 走 read/write）；
 - raft-kv1（raftdb）是否需要一期支持，或一期只支持默认 raft-engine（建议后者）。
+
+## 9. Shard-115 API 映射结论（2026-10-09）
+
+结论：**UUSE core 无需新增 API**；两个 seam 的依赖都能由现有公开 API 覆盖，
+RocksDB 侧直接复用现有 adapter 实现（差异只在 8.10.2 头文件适配，属 Shard-116）。
+
+### 9.1 raft-engine `FileSystem` → UUSE API
+
+| raft-engine | UUSE |
+|---|---|
+| `create(path)` | `Client::open(path, Create\|Truncate)` |
+| `open(path, perm)` | `Client::open(path)` / `Create` |
+| `delete(path)` | `Client::remove(path)` |
+| `rename` / `reuse` | `Client::rename`（reuse 默认实现即 rename） |
+| `delete_metadata` / `exists_metadata` | 加密禁用；默认实现（Ok/false） |
+| `new_reader(handle)` | `File::read(buffers, offset)`（pread 语义） |
+| `new_writer(handle)` | `File::write(buffers, offset)` / `append` |
+| `Handle.truncate` | `File::truncate` |
+| `Handle.file_size` | `File::stat().logicalSize` |
+| `Handle.sync` | `File::sync` |
+| `WriteExt.truncate` | `File::truncate` |
+| `WriteExt.allocate` | `File::allocate` |
+
+### 9.2 RocksDB `FileSystem` → 复用现有 adapter
+
+- 现有 `rocksdb/uuse_filesystem.cpp`（52 个 override，含 `GetFileModificationTime`、
+  `LockFile/UnlockFile` 宿主锁 + `flock`、`punch_hole` 继承默认 fail-closed）已覆盖
+  接口；core API 使用面：`client->open/getChildren/link/remove/rename/submitRead/
+  poll/close`、`engine->acquireDmaBuffer/releaseDmaBuffer/freeDataBytes/stop`、
+  `file->stat/sync`；
+- TiKV vendored RocksDB 是 **8.10.2**（adapter 目标 9.11.2），需要按 8.10.2 头文件
+  适配（可选接口差异，如 `SupportedOps`/`kFSBuffer` 的有无），属 Shard-116 spike；
+- 不新增 core API；若 spike 发现缺口，按 shard 计划 §0.3 纯加法单独成 sub-shard。

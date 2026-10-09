@@ -197,6 +197,12 @@ FUSE/POSIX 层，也不逐文件改写 TiKV。
 
 ### Shard-115：UUSE 侧 API 补齐（纯加法）
 
+> 状态：已完成（2026-10-09，映射结论，无 core 改动）。见审计 §9：raft-engine
+> `FileSystem` 全部方法可由现有 `Client/File` API 覆盖；RocksDB 侧复用现有
+> `rocksdb/uuse_filesystem.cpp` adapter（52 个 override，LockFile 宿主锁 +
+> flock、punch_hole 默认 fail-closed）；RocksDB 8.10.2 头文件适配归 Shard-116
+> spike。若 spike 发现缺口，按 §0.3 纯加法单独成 sub-shard。
+
 **目标**：按审计补齐 `FileSystem` 实现所需的最小依赖，不修改现有语义。
 
 **交付物**（预计，以 Shard-114 为准）：现有 `Client::open/remove/rename/link/
