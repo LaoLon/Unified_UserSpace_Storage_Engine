@@ -8,12 +8,20 @@
 
 ## 应用顺序
 
-> **前置**：rust-rocksdb cargo checkout 需要先应用两个 spike 前序补丁
+> **前置 1（rust-rocksdb checkout）**：先应用两个 spike 前序补丁
 > （`tikv/spike/apply-spike-env-ffi.py` → `tikv/spike/apply-uuse-filesystem.py`），
 > 表 3 的 shared-engine 补丁依赖它们建立的 `crocksdb_uuse_env_create` /
-> `Env::uuse` 锚点。完整重建顺序：spike-env-ffi → uuse-filesystem →
-> （下表 1–9）→ 构建。`cargo fetch` 必须先于 checkout 补丁（checkout 目录由
-> fetch 创建）。
+> `Env::uuse` 锚点。
+> **前置 2（raft_log_engine 文件安装）**：表 1 的 config 补丁把生产调用点改为
+> `RaftLogEngine::new_with_uuse`，该构造函数与 UUSE FileSystem 由以下文件提供
+> （从 `tikv/shim/rust/` 安装，非锚点补丁）：
+> - `engine.rs` → `components/raft_log_engine/src/engine.rs`（含 `new_with_uuse`）
+> - `uuse_file_system.rs` → `components/raft_log_engine/src/uuse_file_system.rs`
+> - `build.rs` → `components/raft_log_engine/build.rs`（链接 `libuuse_tikv_shim`）
+> - `lib.rs` 增加 `pub mod uuse_file_system;`
+>
+> 完整重建顺序：cargo fetch → spike-env-ffi → uuse-filesystem → （下表 1–9）→
+> raft_log_engine 文件安装 → 构建。
 
 | # | 补丁 | 目标 | 作用 | 引入 |
 |---|---|---|---|---|
