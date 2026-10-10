@@ -131,6 +131,41 @@ VM 重启导致 `/build` 丢失后完整重建（TiKV v8.5.8 + 11 补丁，同�
 95% 门槛为贴线；混合 p99 本次 107.5% 在门槛内（§2b 的 117.6% 为另一会话结果）。
 结论：功能矩阵 26/26 通过；性能达标项与边界在会话间存在 ±3pp 级波动，记录两轮数据。
 
+## 4d. apply/worker 同步窗口化（Shard-120 trace 归因后续，2026-10-10 晚）
+
+**trace 归因（read_write 60 s，trace_sample=1，`trace-analysis-rw-*.txt`）**：
+
+| 点位对 | always-sync | apply 窗口 1 ms | worker 窗口 5 ms |
+|---|---:|---:|---:|
+| `FsyncBegin→FsyncEnd` n | 55,169 | 57,540 | **21,856** |
+| p50 | 182.5 µs | 170.6 µs | 138.3 µs |
+| p99 | 1,678 µs | 1,618 µs | 1,462 µs |
+| 累计 | 17.4 s | 16.3 s | **5.3 s** |
+| 主源（source 3 = async write worker） | 50,855 | — | **10,822** |
+
+- 真正的同步来源是 **async write worker**（`components/raftstore/src/store/async_io/
+  write.rs`）：apply-state 的 kvdb 写与 raft 日志写均硬编码 `sync=true`（每次 raft
+  append 一次），不是 apply 线程的 `write_to_db`；1 ms 窗口打在 apply 线程因此无效。
+- 修复：`apply-uuse-worker-sync-window.py` 给 worker 两处同步加 5 ms 窗口；apply
+  线程 `write_to_db` 的窗口（`apply-uuse-apply-sync.py`）保留。
+
+**同盘 A/B（5 轮交错、8 线程 × 60 s）**：
+
+| 变体 | point_select 比值 | read_write tps 比值 | read_write p99 比值 |
+|---|---:|---:|---:|
+| always-sync（§4c） | 94.9% | 90.9% | 107.5% |
+| apply 窗口 1 ms | 97.8% | 93.3% | 109.4% |
+| **worker 窗口 5 ms** | **98.4%** | **93.7%** | 109.5% |
+| （崩溃前会话，always-sync） | 97.9% | 89.5% | 117.6% |
+
+绝对 UUSE read_write tps：217 → 355 → **378**；屏障 55k → 58k → **21.8k**；同步累计
+17.4 s → 16.3 s → **5.3 s**。功能矩阵 **26/26**、closure **5/5**（205,800 行 SIGTERM
+重启持久、`uusectl check corruption=none`）全过。
+
+**语义边界（RPO）**：worker 窗口把单节点实验室的崩溃 RPO 放宽到 ≤5 ms（apply-state
+与 raft 日志）；优雅退出仍无条件全同步（**RPO=0 不变**，shutdown 双引擎 sync 保留）。
+对比 ext4 页缓存掉电窗口 ~5 s，仍严格得多。已写入 `tikv/README.md` §6。
+
 ## 5. FIO 正式 gate（L4）
 
 M（1j32）：UUSE 读 47708 / 写 47641 IOPS，raw 51036 / 50965 → **93.5%**；

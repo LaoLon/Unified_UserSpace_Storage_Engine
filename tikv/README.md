@@ -88,7 +88,8 @@ split/GC/kill -9 与 SIGTERM 重启/跨进程 reopen/dumpling 备份恢复。
 | 边界 | 现象/影响 | 规避与去向 |
 |---|---|---|
 | fast-reorg ingest 未闭环 | `ADD INDEX` 走 SST importer（宿主 FS 写 SST + engine ingest 找不到）→ `IngestSST Io(NotFound)` 重试 | 设 `tidb_ddl_enable_fast_reorg=OFF` 走经典回填；路由待修（审计第 6 条） |
-| 混合读写 p99 | UUSE 52.9 ms vs 宿主 45.0 ms（117.6% >110% 门槛） | 根因=apply 强制同步（durability 必需）；可选 group commit/atomic flush 收敛（Shard-120 记录） |
+| 混合读写 p99 | 多次会话 117.6%（崩溃前）/107.5%/109.5%（窗口化后） | worker/apply 同步窗口化（5 ms）已实施；trace 归因与前后对比见 `doc/performance/uuse_tidb_shard120_20261010.md` §4d |
+| 崩溃 RPO（kill -9） | 未 sync 尾部丢失窗口 ≤5 ms（apply-state 与 raft 日志；优雅退出 RPO=0） | 单节点实验室口径；worker/apply 5 ms 同步窗口（`apply-uuse-worker-sync-window.py`、`apply-uuse-apply-sync.py`）；对比 ext4 页缓存 ~5 s 仍严格 |
 | kill -9 durability | 未 sync 的尾部随进程退出丢失（与 ext4 掉电语义对齐） | 优雅退出（SIGTERM）已由双引擎 sync 闭合；不要依赖 kill -9 持久性 |
 | 错误面 | 第二实例/挂载失败统一报 `uuse env create failed`，丢失底层 errno | 审计 §8 待办：shim 透传 last-error |
 | 宿主白名单 | `data_dir/LOCK`、panic mark、`last_tikv.toml`、raft-engine `LOCK`、日志/status | 运维机制，无引擎数据；见审计 §4 行 1–5、9、15 |
