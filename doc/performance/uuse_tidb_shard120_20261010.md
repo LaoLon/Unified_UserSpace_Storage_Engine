@@ -113,6 +113,24 @@ UUSE 侧 uio + 每 phase 全新 format），640k keys × 1 KiB、cache 1 GiB、
   `append_calls=633885 flush_calls=634153 sync_calls=195 ... live_*=0`）与无 error
   扫描；混合写路径的 apply 强制同步代价见 §2（TiKV A/B）。
 
+## 4c. 重建后复测（2026-10-10 晚，同盘 A/B）
+
+VM 重启导致 `/build` 丢失后完整重建（TiKV v8.5.8 + 11 补丁，同一代码），
+复测同盘 A/B（5 轮交错、8 线程 × 60 s；结果目录
+`/build/tidb/perf-ab-target-20261010-174050`）：
+
+| 基准 | UUSE 中位 | 宿主中位 | 比值 | 门槛 | 判定 |
+|---|---:|---:|---:|---|---|
+| point_select tps | 13207 | 13917 | **94.9%** | ≥95% | 贴线未达（差 0.1pp） |
+| point_select p99 | 1.89 ms | 1.79 ms | 105.6% | ≤110% | PASS |
+| read_write tps | 217 | 238 | **90.9%** | ≥85% | PASS |
+| read_write p99 | 61.1 ms | 56.8 ms | **107.5%** | ≤110% | PASS（较 §2b 的 117.6% 改善） |
+
+逐轮分布：宿主侧点读 13.9–14.1k（±1%）；UUSE 侧 11.9–13.4k（±6%，偶发低点拉低中位）。
+点读比值在两次同盘会话间为 97.9%（§2b）与 94.9%（本节）→ 处于 UUSE 侧波动区间内，
+95% 门槛为贴线；混合 p99 本次 107.5% 在门槛内（§2b 的 117.6% 为另一会话结果）。
+结论：功能矩阵 26/26 通过；性能达标项与边界在会话间存在 ±3pp 级波动，记录两轮数据。
+
 ## 5. FIO 正式 gate（L4）
 
 M（1j32）：UUSE 读 47708 / 写 47641 IOPS，raw 51036 / 50965 → **93.5%**；
@@ -121,7 +139,6 @@ E（8j4）：UUSE 42241 / 42214，raw 47002 / 46989 → **89.9%**；p99 643 µs 
 → **0.20**。errors 全 0（5 轮）。原始 JSON：`/build/uuse-shard120-fio-gate-20261010`。
 
 ## 6. 边界与待补
-
 - **MySQL 冒烟（延后）**：`/home/uuse/mysql-fork` 未应用 `mysql/patches/` 补丁栈，
   现有 `/home/uuse/mysql-build` 链接 HFS 时代 `libhfs_core.so.2`；按当前补丁栈重建
   MySQL 8.0.46 需数小时，本 shard 不执行，Shard-121 收口时处理。Shard-118 的 core
