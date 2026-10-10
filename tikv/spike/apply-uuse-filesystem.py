@@ -178,6 +178,17 @@ def main() -> int:
         before=True,
     )
 
+    # The librocksdb_sys FFI declaration is renamed above; update the spike
+    # method's call site so the crate still compiles (the spike example is not
+    # part of the product path).
+    rs = CO / "src/rocksdb.rs"
+    rs_text = rs.read_text(encoding="utf-8")
+    rs_old = "crocksdb_ffi::crocksdb_uuse_spike_env_create(path.as_ptr())"
+    rs_new = "crocksdb_ffi::crocksdb_uuse_env_create(path.as_ptr())"
+    if rs_text.count(rs_old) == 1:
+        rs.write_text(rs_text.replace(rs_old, rs_new), encoding="utf-8")
+        print("renamed spike FFI call site")
+
     example_dir = TIKV / "components/engine_rocks/examples"
     example_dir.mkdir(parents=True, exist_ok=True)
     (example_dir / "uuse_env_real.rs").write_text(EXAMPLE, encoding="utf-8")
