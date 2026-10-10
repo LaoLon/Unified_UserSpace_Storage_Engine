@@ -187,6 +187,10 @@ for round in $(seq 1 "$ROUNDS"); do
 done
 
 stop_stack
+# Restore the uio binding/mount state so later UUSE tooling (uusectl format,
+# matrix runs) finds the device as expected.
+umount "$MOUNT" 2>/dev/null || true
+bind_uio 2>/dev/null || true
 cd /build
 python3 /build/uuse_perf_ab_summary.py "$R" | tee "$R/summary.txt" || true
 echo "PERF_AB_TARGET_DONE"

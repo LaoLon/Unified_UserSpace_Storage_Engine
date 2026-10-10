@@ -230,3 +230,37 @@ RocksDB 侧直接复用现有 adapter 实现（差异只在 8.10.2 头文件适�
 - TiKV vendored RocksDB 是 **8.10.2**（adapter 目标 9.11.2），需要按 8.10.2 头文件
   适配（可选接口差异，如 `SupportedOps`/`kFSBuffer` 的有无），属 Shard-116 spike；
 - 不新增 core API；若 spike 发现缺口，按 shard 计划 §0.3 纯加法单独成 sub-shard。
+
+---
+
+## 10. 实现结果回填（Shard-121 收口，2026-10-10）
+
+Phase 8（Shard-113…121）实现完成；§4 各绕过点最终状态：
+
+| # | 绕过点 | 最终状态 |
+|---|---|---|
+| 1 | 宿主 `data_dir/LOCK` | **已关闭**：`uuse-conf` 下跳过，UUSE 进程锁 fail-closed（矩阵第二实例探针通过） |
+| 2 | `$TMPDIR/TIKV_LOCK_FILES` | 宿主白名单（保持，无引擎数据） |
+| 3 | reserve 占位 | **已关闭**：跳过 + 模板 `reserve-*=0GB` |
+| 4 | panic mark | 宿主白名单（保持） |
+| 5 | snap 传输 | UUSE 路由（单节点无 snapshot 场景，未单独实测） |
+| 6 | SST importer / fast-reorg ingest | **部分修复**：`Create` 父目录链已修（`NotFound` panic 消失）；ingest 路由未闭环 → 经典回填（`tidb_ddl_enable_fast_reorg=OFF`）；待修 |
+| 7 | 备份输出 | 宿主/对象存储白名单（dumpling 备份恢复矩阵通过） |
+| 8 | `tikv-ctl` 直连 | 一期禁用（未实现探针） |
+| 9 | 日志/status/socket/pid | 宿主白名单 + `info-log-dir` 显式配置 |
+| 10 | encryption 元数据 | fail-closed（矩阵 `probe.encryption` 通过） |
+| 11 | raft-engine `read_dir`/`create_dir` | **已修复**：trait 增量（默认 fail-closed）+ 改走 FS（`apply-raft-engine-readdir.py`） |
+| 12 | 宿主 raft data set 校验 | **已修复**：`uuse-conf` 跳过（`apply-uuse-validation-skip.py`；kill -9/重启持久通过） |
+| 13 | 单进程双引擎 | **已修复**：shim 进程级单例 + adapter `createFileSystemWithEngine`（`apply-uuse-shared-engine.py`） |
+| 14 | RocksDB `SyncWAL` | **已修复**：`UuseWritableFile::IsSyncThreadSafe()=true` |
+| 15 | 宿主 LOCK/panic/`last_tikv.toml`/raft-engine `LOCK` 等 | 宿主白名单（保持） |
+
+未闭环/待办（记录在案，不静默降级）：
+- fast-reorg ingest 路由（本表 6）；
+- `uuse env create failed` 错误面透传（§8 未决）；
+- snap/import 的 `hard_link`/`copy_and_sync` 语义收尾；
+- MySQL 同盘冒烟（fork 需按 `mysql/patches/` 重建；根盘磁盘不足）；
+- kill -9 未 sync 尾部（与 ext4 掉电语义对齐，优雅退出已闭合）。
+
+实现证据与边界：`doc/performance/uuse_tidb_shard120_20261010.md`、
+`tikv/README.md` §6、`doc/bug.md` #48–#50、`tikv/patches/README.md`。

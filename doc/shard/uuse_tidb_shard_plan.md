@@ -419,6 +419,21 @@ RocksDB/MySQL 回退换取 TiKV 收益。
 
 ### Shard-121：收口
 
+> 状态：**完成（2026-10-10；MySQL 冒烟记录边界）**。
+> （a）支持边界文档：`tikv/README.md`（状态/架构/版本冻结/构建运行/配置模板/
+> 支持范围/禁用项/已知边界/补丁栈/证据）；
+> （b）回填：`doc/design/uuse.md` §21.6 实现状态、审计
+> `doc/review/uuse_tikv_storage_audit_20261009.md` §10 逐条最终状态；
+> （c）补丁清单与 rebase 说明：`tikv/patches/README.md`（9 个补丁、幂等/回退/
+> 版本升级锚点说明）；
+> （d）证据归档：`/home/uuse/uuse-tikv-20261010/tikv-shard120-evidence.tar.gz`
+> （1.7 MB：性能 A/B、closure、功能矩阵、RocksDB A/B、FIO gate、L1/L2）；
+> （e）最终回归：功能矩阵 26/26（收口复跑）+ Shard-118/120 的 closure/生命周期/
+> CTest/RocksDB/FIO 全绿；无 preload/FUSE/Blobstore 回流（架构为显式 seam，
+> 见 `tikv/README.md` §2）。
+> **边界**：MySQL 同盘冒烟未执行（fork 停留 HFS 时代、根盘 2.1 GiB、全量重建需
+> 数小时）——按 `mysql/build_mysql_vm.sh` 独立会话执行；其余待办见审计 §10。
+
 **交付物**
 
 - TiKV 支持边界文档（版本、禁用项、参数模板、`tikv-ctl`/备份边界、已知边界）；
