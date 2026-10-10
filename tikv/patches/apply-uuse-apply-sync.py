@@ -37,11 +37,30 @@ def main() -> int:
     patch(
         rel,
         "        let need_sync = self.sync_log_hint && !self.disable_wal;\n",
-        "        // UUSE local engine (Phase 8): without a kernel page cache, unsynced\n"
-        "        // kv writes do not survive a process exit; always sync apply batches\n"
-        "        // so the durable applied index keeps up with raft log compaction\n"
-        "        // (Shard-118).\n"
-        "        let need_sync = !self.disable_wal;\n",
+        "        // UUSE local engine (Phase 8): bounded-window apply sync. UUSE has no\n"
+        "        // kernel page cache, so unsynced kv writes do not survive a process\n"
+        "        // exit; syncing every apply batch is safe but pays one checkpoint\n"
+        "        // barrier per batch (Shard-120 trace: 55k barriers/60 s, p50 182 us).\n"
+        "        // Sync at most once per window (1 ms) and still honor explicit sync\n"
+        "        // requests; the shutdown path syncs unconditionally and raft log GC\n"
+        "        // keeps a >=50 entry margin over the applied index, so the window\n"
+        "        // stays inside the compaction safety margin.\n"
+        "        const UUSE_APPLY_SYNC_WINDOW_NS: u64 = 1_000_000;\n"
+        "        static UUSE_APPLY_LAST_SYNC_NS: AtomicU64 = AtomicU64::new(0);\n"
+        "        let need_sync = if self.disable_wal {\n"
+        "            false\n"
+        "        } else if self.sync_log_hint {\n"
+        "            true\n"
+        "        } else {\n"
+        "            let now = timespec_to_ns(monotonic_raw_now());\n"
+        "            let last = UUSE_APPLY_LAST_SYNC_NS.load(Ordering::Relaxed);\n"
+        "            if now.saturating_sub(last) >= UUSE_APPLY_SYNC_WINDOW_NS {\n"
+        "                UUSE_APPLY_LAST_SYNC_NS.store(now, Ordering::Relaxed);\n"
+        "                true\n"
+        "            } else {\n"
+        "                false\n"
+        "            }\n"
+        "        };\n",
     )
     print("UUSE_APPLY_SYNC_PATCH_DONE")
     return 0

@@ -33,7 +33,11 @@
 | 6 | `apply-raft-engine-readdir.py` | raft-engine `src/env/mod.rs`、`src/file_pipe_log/*` | `FileSystem` trait 增加 `read_dir`/`create_dir`（默认 fail-closed），目录列举改走 trait | Shard-116 |
 | 7 | `apply-raft-engine-sync-fix.py` | raft-engine `src/engine.rs` | `Engine::sync()` 直连 `pipe_log.sync(LogQueue::Append)`（原实现经空 batch 提前返回为空操作） | Shard-118 |
 | 8 | `apply-uuse-shutdown-sync.py` | TiKV `components/server/src/server.rs` | `run_impl` 保留 engines（信号线程用 clone）；`TiKV::stop()` 依次 `KvEngine::sync()` + `RaftEngine::sync()` | Shard-118 |
-| 9 | `apply-uuse-apply-sync.py` | TiKV `components/raftstore/src/store/fsm/apply.rs` | apply 批次强制同步（`need_sync = !disable_wal`），持久 applied 跟上 raft 日志压缩 | Shard-118 |
+| 9 | `apply-uuse-apply-sync.py` | TiKV `components/raftstore/src/store/fsm/apply.rs` | apply 批次同步：有界窗口（1 ms，`sync_log_hint` 仍强制、shutdown 无条件同步），持久 applied 保持在 raft 日志压缩安全边界内 | Shard-118/120 |
+
+> 说明：`apply-uuse-apply-sync.py` 生成窗口版（1 ms）。对已应用 always-sync 版的
+> checkout，用 `apply-uuse-apply-sync-window.py` 做增量替换（Shard-120 trace 归因后
+> 的优化：55k 屏障/60s → 窗口化后按 ~1ms 合并）。
 
 > 注：表 3 的 shared-engine 补丁假设 spike 前序补丁已插入
 > `crocksdb_uuse_spike_env_create`（spike 版）文本；若 spike 脚本的插入文本与
