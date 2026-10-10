@@ -140,7 +140,7 @@ crocksdb_env_t* crocksdb_uuse_spike_env_create(const char* base_path) {
   auto fs = std::make_shared<UuseSpikeFileSystem>(
       std::string(base_path == nullptr ? "" : base_path));
   crocksdb_env_t* result = new crocksdb_env_t;
-  result->rep = new rocksdb::Env(fs);
+  result->rep = rocksdb::NewCompositeEnv(fs).release();
   result->is_default = false;
   result->block_cipher = nullptr;
   result->encryption_provider = nullptr;

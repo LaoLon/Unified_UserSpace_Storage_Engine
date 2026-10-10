@@ -8,6 +8,13 @@
 
 ## 应用顺序
 
+> **前置**：rust-rocksdb cargo checkout 需要先应用两个 spike 前序补丁
+> （`tikv/spike/apply-spike-env-ffi.py` → `tikv/spike/apply-uuse-filesystem.py`），
+> 表 3 的 shared-engine 补丁依赖它们建立的 `crocksdb_uuse_env_create` /
+> `Env::uuse` 锚点。完整重建顺序：spike-env-ffi → uuse-filesystem →
+> （下表 1–9）→ 构建。`cargo fetch` 必须先于 checkout 补丁（checkout 目录由
+> fetch 创建）。
+
 | # | 补丁 | 目标 | 作用 | 引入 |
 |---|---|---|---|---|
 | 1 | `apply-uuse-config.py` | TiKV `src/config/mod.rs`、`components/raft_log_engine` 生产调用点 | `[raft-engine] uuse_conf` 配置门控 + `new_with_uuse` 分支 | Shard-116 |
@@ -19,6 +26,11 @@
 | 7 | `apply-raft-engine-sync-fix.py` | raft-engine `src/engine.rs` | `Engine::sync()` 直连 `pipe_log.sync(LogQueue::Append)`（原实现经空 batch 提前返回为空操作） | Shard-118 |
 | 8 | `apply-uuse-shutdown-sync.py` | TiKV `components/server/src/server.rs` | `run_impl` 保留 engines（信号线程用 clone）；`TiKV::stop()` 依次 `KvEngine::sync()` + `RaftEngine::sync()` | Shard-118 |
 | 9 | `apply-uuse-apply-sync.py` | TiKV `components/raftstore/src/store/fsm/apply.rs` | apply 批次强制同步（`need_sync = !disable_wal`），持久 applied 跟上 raft 日志压缩 | Shard-118 |
+
+> 注：表 3 的 shared-engine 补丁假设 spike 前序补丁已插入
+> `crocksdb_uuse_spike_env_create`（spike 版）文本；若 spike 脚本的插入文本与
+> filesystem 补丁的替换锚点漂移（2026-10-10 重建实测），按锚点报错修正 spike
+> 脚本的 `result->rep` 行（必须为 `rocksdb::NewCompositeEnv(fs).release()`）。
 
 ## 幂等与回退
 
