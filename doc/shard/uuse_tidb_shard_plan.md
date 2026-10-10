@@ -272,8 +272,13 @@ rename/delete/dirs）通过；RocksDB spike 能经 UUSE Env 打开/关闭引擎�
 > `uusectl check` checkpoint 有效（txid 76/77）、`corruption=none`。
 > 补丁：`apply-uuse-shared-engine.py`、`apply-uuse-validation-skip.py`；脚本
 > `tikv/run_single_node_vm.sh`。审计第 12/13/14 条均已修复。
-> 其余待做：`swappy_allocator` spill 目录一期不启用、非引擎直用点（LOCK/panic mark/
-> 占位文件）收尾、性能与 durability（Shard-120）、正式 fork/补丁栈。
+> **非引擎直用点收尾（2026-10-10）**：`uuse-conf` 时跳过宿主 `data_dir/LOCK` 与
+> reserve 占位（补丁 `apply-uuse-nonengine-closeout.py`）；RocksDB/raftdb
+> `info-log-dir` 显式落宿主日志目录；自包含脚本复测通过（`uuse engines: 1`、
+> SQL/kill -9/`corruption=none`），宿主 `tikv-data` 仅剩 `last_tikv.toml` +
+> raft-engine `LOCK`/挂起探针（审计第 15 条白名单）。
+> 其余待做：`swappy_allocator` spill 目录一期不启用、功能矩阵（Shard-119）、
+> 性能与 durability（Shard-120）、正式 fork/补丁栈。
 
 **目标**：让 RocksDB 与 raft-engine 的写、flush、compaction、恢复全部经 UUSE 闭环。
 

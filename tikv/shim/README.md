@@ -32,6 +32,10 @@ Shard-116 的 TiKV 侧接入材料。
   `IsSyncThreadSafe()==true`；adapter 的 `UuseWritableFile` 已声明（UUSE
   `File::sync` 是 namespace 级屏障），否则 TiKV bootstrap 报
   `SyncWAL() is not supported for this implementation of WAL file`。
+- **非引擎直用点（Shard-117）**：`uuse-conf` 设置时跳过宿主 `data_dir/LOCK` 与
+  reserve 占位（UUSE 进程锁是互斥手段；宿主 reserve 不保护 UUSE 卷）；panic mark、
+  `last_tikv.toml`、RocksDB/raftdb `info-log-dir` 归宿主白名单；补丁
+  `apply-uuse-nonengine-closeout.py`。
 - **引用计数生命周期**：`UuseEngineState` 由引擎句柄与文件句柄共享；前端先丢 FS、后丢
   reader/writer 时（raft-engine 的字段析构顺序）不会在文件仍打开时停引擎，最后一个句柄
   释放才 `client close + drain + engine stop`（修复 gdb 定位的 `Namespace::close` 死锁）。

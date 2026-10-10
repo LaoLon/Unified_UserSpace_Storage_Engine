@@ -121,20 +121,21 @@
 
 | # | 位置 | 用途 | 路由决定 |
 |---|---|---|---|
-| 1 | `components/server/src/common.rs:171-185`（`init_fs`） | `data_dir/LOCK`：`File::create` + `try_lock_exclusive` | UUSE namespace lock 或与 UUSE 进程锁合并；失败必须 fail-closed |
+| 1 | `components/server/src/common.rs:171-185`（`init_fs`） | `data_dir/LOCK`：`File::create` + `try_lock_exclusive` | **已修复（Shard-117）**：`uuse-conf` 设置时跳过宿主 LOCK，依赖 UUSE engine 进程锁（第二实例由 UUSE `Busy` fail-closed）；补丁 `apply-uuse-nonengine-closeout.py` |
 | 2 | `components/server/src/common.rs:147-170`、`423-437` | `$TMPDIR/TIKV_LOCK_FILES/*` 冲突地址锁 | 宿主白名单（保持 host，不进入 UUSE） |
-| 3 | `components/server/src/common.rs:193-216` | `data_dir/SPACE_PLACEHOLDER_FILE` + `reserve_space_for_recover` | UUSE 等价物（`File::allocate`）或 fail-closed；禁止静默 no-op |
-| 4 | `components/server/src/common.rs:186-192` | `data_dir/panic_mark_file` | UUSE namespace（同 datadir 语义） |
+| 3 | `components/server/src/common.rs:193-216` | `data_dir/SPACE_PLACEHOLDER_FILE` + `reserve_space_for_recover` | **已修复（Shard-117）**：`uuse-conf` 设置时跳过宿主 reserve 占位并告警（宿主 reserve 不保护 UUSE 卷）；模板 `reserve-space=0`；补丁同上 |
+| 4 | `components/server/src/common.rs:186-192` | `data_dir/panic_mark_file` | 宿主白名单（v1）：panic 安全标记，panic 路径不做 UUSE I/O |
 | 5 | `src/server/snap.rs`、`src/server/tablet_snap.rs:39` | snap 文件传输（`OpenOptions`） | `data_dir/snap` → UUSE namespace |
 | 6 | `components/sst_importer/src/util.rs:33-101`、`sst_importer.rs:309/353/636` | import 文件（hard_link/copy_and_sync/read_dir/remove_dir_all） | `data_dir/import` → UUSE namespace；外部导入源路径保持宿主 |
 | 7 | `components/backup/src/*` | 备份输出（本地/S3） | 宿主或对象存储白名单；不默认进 UUSE |
 | 8 | `cmd/tikv-ctl` | 直接打开 data dir | 一期禁用（fail-closed） |
-| 9 | 日志/status/socket/pid | 运维输出 | 宿主白名单 |
+| 9 | 日志/status/socket/pid | 运维输出 | 宿主白名单；RocksDB/raftdb `info-log-dir` 显式指向日志目录（运行模板已配） |
 | 10 | encryption 元数据（`encryption` crate） | 密钥文件 | 一期禁用（`plaintext`），启用即 fail-closed |
 | 11 | raft-engine `src/file_pipe_log/mod.rs:111`、`src/file_pipe_log/pipe_builder.rs:269`、`src/swappy_allocator.rs:471` | 日志文件目录列举（`std::fs::read_dir`） | **已修复（Shard-116）**：`FileSystem` trait 增加 `read_dir`/`create_dir`（默认 fail-closed），`UuseFileSystem` 经 `getChildren`/`createDirectories` 实现，`ManagedFileSystem` 转发；`file_pipe_log/mod.rs` 与 `pipe_builder.rs` 改走 FS（补丁 `tikv/patches/apply-raft-engine-readdir.py`）；`swappy_allocator.rs`（spill 目录）一期不启用 |
 | 12 | TiKV `components/tikv_util/src/config.rs`（`RaftDataStateMachine::validate`、`raftengine_exists`/`raftdb_exists`）、`engine_rocks::RocksEngine::exists` | 启动前 raft data set / kvdb 存在性校验（宿主路径） | **已修复（Shard-117）**：`uuse-conf` 设置时跳过宿主校验（补丁 `apply-uuse-validation-skip.py`）；实测 kill -9 重启持久通过 |
 | 13 | TiKV 单进程双引擎 | kvdb（RocksDB env）与 raft-engine 各建一个 UUSE engine | **已修复（Shard-117）**：shim 进程级单例（weak_ptr 注册表）+ adapter `createFileSystemWithEngine`（`ownsEngine=false`）+ crocksdb 接线；实测双引擎同开 UUSE、SQL 写入/kill -9 恢复通过（补丁 `apply-uuse-shared-engine.py`） |
 | 14 | RocksDB `DBImpl::SyncWAL` | WAL 文件 `IsSyncThreadSafe()` 默认 false → bootstrap `NotSupported` | **已修复（Shard-117）**：`UuseWritableFile::IsSyncThreadSafe()=true`（UUSE `File::sync` 为 namespace 级屏障） |
+| 15 | `data_dir/last_tikv.toml`、server 创建的空目录（db/snap/import/raft-engine/log-backup-temp）、raft-engine `LOCK`、`.raft_disk_fail_fast_probe.tmp`/`.kv_disk_fail_fast_probe.tmp` | pre-engine 配置持久化、目录占位、raft-engine 宿主锁、磁盘挂起探针 | 宿主白名单（无引擎数据文件；锁/探针为运维机制，namespace 目录由 UUSE FS 按需创建） |
 
 ---
 
