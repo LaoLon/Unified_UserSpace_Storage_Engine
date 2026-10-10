@@ -58,8 +58,96 @@ Bug 等级：**致命 > 严重 > 一般**。
 - 45：已修复（engine 未 stop 时析构崩溃：析构兜底停止 runtime）。
 - 46：已修复（同进程 remount 崩溃，与 #45 同源）。
 - 47：待处理（同进程 remount 后数据路径读挂起；跨进程恢复不受影响）。
+- 48：已修复（Shard-118，ParentLatch/shim 就绪 condvar 锁外 notify 的栈对象 UAF 窗口）。
+- 49：已修复（Shard-118，设备测试无 CTest 资源锁，`ctest -j` 并行驱动同一 NVMe 挂起）。
+- 50：已修复（Shard-118，TiKV 正常退出丢 kvdb/raft 尾部；UUSE 无页缓存 + 异步写路径）。
 
 ## Bug 记录
+
+### 50. TiKV 正常退出丢 kvdb/raft 尾部（UUSE 无页缓存），重启报 may lose data
+
+- **状态**：已修复
+- **等级**：严重（优雅停机后重启拒绝启动：`entry at apply index ... doesn't exist`）
+- **时间**：2026-10-10（Shard-118 并发 closure）
+- **现象**：并发负载（8 写 2 读 45s，12–19 万行）后 SIGTERM 优雅停机，重启 TiKV 立即
+  FATAL：`failed to start raft_server: [region N] entry at apply index
+  701/922/1398/2578/12 ... doesn't exist, may lose data`；宿主 ext4 同负载对照
+  RESTART_OK 且行数完整（162,160）。
+- **排查过程**：
+  1. 顺序写入 20 万行复现不出；并发小事务负载稳定复现（3 次）。
+  2. 关闭 raft 日志回收（`enable-log-recycle=false`）仍复现 → 非回收路径。
+  3. 宿主 ext4 同负载 + SIGTERM + 重启通过（行数完整）→ 排除 TiKV 关闭时序通用问题，
+     指向 UUSE 持久化差异。
+  4. shim 探针：`File::sync` 后 `_exit`（跳过析构）文件尺寸与数据存活；不 sync 也存活
+     （引擎周期 checkpoint 已提交已写数据）→ 已落 UUSE 的数据本身持久。
+  5. raft-engine 两阶段探针（写 200 条 `sync=false` → `Engine::sync()` → 退出 → 重开）：
+     修复后 `REOPEN fetched=200 max_index=200`。
+  6. 失败现场恢复探针：region 16 `last_index=4433`（raft 日志完好）、任意起点
+     ≤4400 都 `EntriesCompacted`（日志已 GC 压缩到尾部）；TiKV 报的 apply index 是
+     **kvdb 回退后的 applied**，而压缩状态（admin 请求同步写）比 applied 持久 →
+     applied < truncated → 条目已被压缩 → fatal。region 14 同样（applied=12，
+     日志压缩边界 ≈19）。
+  7. 源码核对：`get_sync_log_from_request` 普通请求走 header `sync_log`（默认 false）；
+     apply `need_sync = sync_log_hint`（普通写 false）→ raft 日志与 kvdb apply 均异步
+     fsync；`Engine::write` 对空 batch 提前返回使 `Engine::sync()` 成空操作；
+     `run_impl` 把 engines `take()` 进信号线程（日志实证 `engines already released`）。
+- **根因**：TiKV 正常写路径（raft 日志 + kvdb apply）为异步 fsync，ext4 靠进程退出后的
+  页缓存兜底；UUSE 无页缓存，未 sync 的尾部随进程退出丢失。压缩状态经 admin 同步写
+  落盘后，kvdb applied 回退到压缩点之前 → 重启无法从日志补放 → fail-closed 拒绝启动。
+- **修复**（补丁栈）：
+  - `apply-raft-engine-sync-fix.py`：raft-engine `Engine::sync()` 直连
+    `pipe_log.sync(LogQueue::Append)`（原实现经空 batch 提前返回为空操作）；
+  - `apply-uuse-shutdown-sync.py`：`run_impl` 保留 engines（信号线程用 clone）；
+    `TiKV::stop()` 在 `raft_server.stop()` 后依次 `KvEngine::sync()` 与
+    `RaftEngine::sync()`（带 info/error 日志）；
+  - `apply-uuse-apply-sync.py`：apply 批次强制同步（`need_sync = !disable_wal`），
+    保持持久 applied 跟上 raft 日志压缩进度。
+- **验证结果**：closure 复测 `PASS=5 FAIL=0`（负载 187,740 行 → SIGTERM → 重启
+  `restart.persist rows=187740` → `uusectl.check corruption=none`）；矩阵回归 26/26；
+  生命周期用例与 CTest 不受影响。
+- **边界**：kill -9 仍可能丢未 sync 的尾部（与 ext4 掉电语义对齐）；apply 同步的吞吐
+  代价由 Shard-120 量化后再决定是否收敛为可配置项。
+
+### 49. 设备测试无 CTest 资源锁，`ctest -j` 并行驱动同一 NVMe 挂起
+
+- **状态**：已修复
+- **等级**：一般（测试基建；不影响产品运行路径，但使并行门禁不可用）
+- **时间**：2026-10-10（Shard-118 出口门禁）
+- **现象**：`ctest --test-dir build-uuse -j2` 在 `spdk_runtime_test` 卡死 1h44m；
+  日志停在 `[CPU MAP] metadata reactor`，主线程等 `SpdkRuntime::start` 的 condvar，
+  metadata reactor 线程在 `spdk_thread_poll` 循环。
+- **排查过程**：单独重跑 `spdk_runtime_test` 秒过（`spdk_runtime_test: ok`）；检查
+  LastTest.log 发现同时刻另一个设备测试（`data_path_device_test`/`format_mount_test`
+  等）也在运行，两个进程各自经 uio 独占驱动同一块 NVMe。
+- **根因**：8 个设备测试（engine_lifecycle/spdk_runtime/format_mount/journal_device/
+  file_api/file_data/data_path_device/snapshot_cache_device）均独占同一设备，但
+  CMake 未声明测试资源，`ctest -j` 允许并行调度。
+- **修复**：给全部设备测试加 `RESOURCE_LOCK uuse_device`（`CMakeLists.txt`），
+  `ctest -j` 自动串行化设备测试；非设备测试仍可并行。
+- **验证结果**：`ctest -j2` 29/29 通过（1.9s，设备测试真实执行：
+  `format_mount_test: ok`、`spdk_runtime_test: ok`、`file_data_test: ok`、
+  `file_api_test: ok`）。
+
+### 48. ParentLatch / shim 就绪 condvar 在锁外 notify（栈对象 UAF 窗口）
+
+- **状态**：已修复
+- **等级**：严重（等待方可在广播进行中析构栈上 condvar，负载下可致 UAF/崩溃）
+- **时间**：2026-10-10（Shard-118 TSAN 生命周期用例）
+- **现象**：TSAN 运行 `uuse_tikv_shim_lifecycle` 报 data race：
+  `~ParentLatch`（`src/core/data_path.cpp:26`，main 线程 `pthread_cond_destroy`）
+  对 `childCallback`（SPDK reactor 线程 `pthread_cond_broadcast`）；
+  `UuseEngineState::startClient`（shim 栈 condvar 析构）对 client 线程广播。
+- **排查过程**：`ParentLatch` 是 `DataPath::execute` 的栈对象，子完成回调在锁外
+  `notify_all`；等待方观察到 `pending==0` 即返回并析构 latch，而回调线程可能仍在
+  `pthread_cond_broadcast` 内部。shim `startClient` 的就绪 condvar 同样在锁外广播。
+- **根因**：condvar 的销毁与广播之间没有互斥保证；POSIX 要求销毁时不得有线程正在
+  等待或即将广播。
+- **修复**：两处均改为在持锁临界区内 `notify_all`（通知完成前不释放 mutex，等待方
+  取得锁返回时广播已结束）。core 侧 `src/core/data_path.cpp`、shim 侧
+  `tikv/shim/uuse_tikv_shim.cc`。
+- **验证结果**：TSAN 复跑（`tikv/shim/tsan.supp` 仅压制 SPDK 未插桩边界
+  `controlSubmitTrampoline`/`submitControlIo`）后上述报告消失、**0 warnings**；
+  6 用例 `SHIM_LIFECYCLE_PASS`；ASAN 干净；`ctest -j2` 29/29。
 
 ### 37. RocksDB async dispatcher 在活动 I/O 时可能丢唤醒并永久休眠
 

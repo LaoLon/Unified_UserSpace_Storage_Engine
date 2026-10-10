@@ -1,0 +1,8 @@
+# ThreadSanitizer suppressions for the UUSE/TiKV integration (Shard-118).
+#
+# SPDK/DPDK are prebuilt without instrumentation, so the happens-before edges
+# of spdk_thread_send_msg and bdev completions are invisible to TSAN. Only the
+# frames that sit directly on that boundary are suppressed; instrumented UUSE
+# and shim code must stay clean.
+race:uuse::SpdkRuntime::Impl::controlSubmitTrampoline
+race:uuse::SpdkRuntime::Impl::submitControlIo

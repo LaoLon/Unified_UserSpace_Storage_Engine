@@ -2086,6 +2086,37 @@ seam 分为 RocksDB Env 与 raft-engine FileSystem 两处（审计
   `Engine::stop()`；任一层失败 fail-closed；
 - `tikv-server` 不作为 daemon/fork 运行；fork child 的 core 调用返回 `ForkedProcess`。
 
+> 实现注记（Shard-118，2026-10-10）：
+> - RocksDB adapter 侧已按上款实现 worker-direct per-thread client（DirectWorkerEntry
+>   池 + dispatcher），沿用 MySQL Shard-106/108 机制；
+> - raft-engine shim 侧一期采用「共享 client + 专用 frontend 线程」：client 由
+>   engine state 自带的线程创建与关闭（core 要求 `Client::close` 在 frontend thread
+>   调用，而最后句柄可能由任意线程释放）；路径操作由调用线程经 mutex 串行执行，
+>   文件数据操作经 `File` 协程在调用线程 `wait()` 自驱动。per-thread registry 对
+>   raft-engine 路径操作（open/remove/rename/exists 低频）收益有限，推迟到 Shard-120
+>   按路径操作竞争数据决定是否引入；
+> - 信号：实测 TiKV 8.5 用 `signal_hook` 注册进程级 handler（专用 signal 线程），
+>   SIGTERM 走 `signal_handler.rs` graceful shutdown，SPDK 线程空掩码不影响，
+>   无需额外转发（矩阵日志证据 `receive signal 15, starting graceful shutdown...`）。
+> - 关闭同步（Shard-118）：TiKV 正常写路径为异步 fsync（raft 日志按 header `sync_log`
+>   默认 false；kvdb apply `need_sync = sync_log_hint` 普通写 false），ext4 靠进程退出后的
+>   页缓存兜底；UUSE 无页缓存，未 sync 的尾部随进程退出丢失。压缩状态经 admin 同步写
+>   落盘后，kvdb applied 回退到压缩点之前 → 重启报
+>   `entry at apply index ... doesn't exist`（宿主 ext4 同负载对照通过）。修复：
+>   （a）`run_impl` 不再把 engines `take()` 进信号线程（改为 clone，信号线程只用于
+>   统计 dump），`TiKV::stop()` 因此能访问 engines；
+>   （b）`TiKV::stop()` 在 `raft_server.stop()` 后依次 `KvEngine::sync()`（kvdb WAL）
+>   与 `RaftEngine::sync()`（raft 日志）；
+>   （c）raft-engine `Engine::sync()` 因 `write` 对空 batch 提前返回而是空操作，
+>   改为直连 `pipe_log.sync(LogQueue::Append)`；
+>   （d）apply 批次强制同步（`need_sync = !disable_wal`）：UUSE 上异步 apply 写入
+>   无法在进程退出后存活，持久 applied 必须跟上 raft 日志压缩进度。
+>   补丁：`tikv/patches/apply-uuse-shutdown-sync.py`、
+>   `tikv/patches/apply-raft-engine-sync-fix.py`、
+>   `tikv/patches/apply-uuse-apply-sync.py`。kill -9 仍可能丢未 sync 的尾部
+>   （与 ext4 掉电语义对齐），优雅退出已闭合；apply 同步的吞吐代价由 Shard-120
+>   量化后再决定是否收敛为可配置项。
+
 ### 21.5 禁用项（fail-closed）
 
 encryption-at-rest、S3/cloud FS、mmap 读写、多进程共享 bdev、`tikv-ctl` 直连 UUSE

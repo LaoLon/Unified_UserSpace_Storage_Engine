@@ -68,8 +68,11 @@ void childCallback(void *ctx, int status) {
         if (latch->pending != 0) {
             --latch->pending;
         }
+        /* Notify under the lock: the waiter destroys the stack latch as soon as
+         * it observes pending == 0, so the condvar must not be touched after
+         * the lock is released (Shard-118 TSAN). */
+        latch->cv.notify_all();
     }
-    latch->cv.notify_all();
 }
 
 /* Arms the latch before submission so a fast completion cannot be lost. */

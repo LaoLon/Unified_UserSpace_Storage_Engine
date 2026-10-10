@@ -2,7 +2,10 @@
  *
  * v1 uses one shared path-op Client serialized by a mutex; file data
  * operations go through uuse::File coroutines. Per-thread clients and the
- * worker-direct path are Shard-118 work.
+ * worker-direct path are Shard-118 work. The shared client is created and
+ * closed on a dedicated frontend thread owned by the engine state, because the
+ * core requires close() to run on the client's frontend thread while the last
+ * handle can be dropped by any thread (Shard-118 lifecycle test case 2).
  *
  * Lifecycle: the engine state is reference counted. File handles hold a
  * reference, so dropping the frontend filesystem before its readers/writers
@@ -16,11 +19,13 @@
 #include "uuse_tikv_shim.hpp"
 
 #include <cerrno>
+#include <condition_variable>
 #include <cstring>
 #include <memory>
 #include <mutex>
 #include <span>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -82,16 +87,62 @@ uuse::OpenFlags toOpenFlags(unsigned flags) {
 } // namespace
 
 /* Reference-counted engine state shared by the engine handle and file
- * handles; the engine stops when the last reference goes away. */
+ * handles; the engine stops when the last reference goes away.  The shared
+ * client is created and closed on a dedicated frontend thread owned by this
+ * state (core contract: close() must run on the client's frontend thread),
+ * while path ops from callers are serialized by `mutex`. */
 struct UuseEngineState {
     std::shared_ptr<uuse::Engine> engine;
     std::shared_ptr<uuse::Client> client;
     std::mutex mutex; /* serializes the shared path-op client */
 
+    std::thread clientThread; /* frontend thread of `client` */
+    std::mutex closeMutex;
+    std::condition_variable closeCv;
+    bool closeRequested = false;
+
+    /* Starts the client thread and creates the shared client on it.  Returns 0
+     * or a negative errno. */
+    int startClient() {
+        std::mutex readyMutex;
+        std::condition_variable readyCv;
+        bool ready = false;
+        int rc = 0;
+        clientThread = std::thread([this, &readyMutex, &readyCv, &ready, &rc]() {
+            auto created = uuse::Client::create(*engine);
+            if (created.ok()) {
+                client = std::move(created).value();
+            } else {
+                rc = toErrno(created.status());
+            }
+            {
+                std::lock_guard<std::mutex> lock(readyMutex);
+                ready = true;
+                /* Notify under the lock: the opener destroys the stack condvar
+                 * right after wait() returns. */
+                readyCv.notify_all();
+            }
+            /* Stay alive so the client can be closed on its own thread. */
+            std::unique_lock<std::mutex> lock(closeMutex);
+            closeCv.wait(lock, [this] { return closeRequested; });
+            if (client) {
+                (void)unwrap(client->close().wait());
+                client.reset();
+            }
+        });
+        std::unique_lock<std::mutex> lock(readyMutex);
+        readyCv.wait(lock, [&ready] { return ready; });
+        return rc;
+    }
+
     ~UuseEngineState() {
-        if (client) {
-            (void)unwrap(client->close().wait());
-            client.reset();
+        {
+            std::lock_guard<std::mutex> lock(closeMutex);
+            closeRequested = true;
+        }
+        closeCv.notify_all();
+        if (clientThread.joinable()) {
+            clientThread.join();
         }
         if (engine) {
             (void)unwrap(engine->drain().wait());
@@ -161,11 +212,10 @@ int uuse_tikv_engine_open(const char *confPath, uuse_tikv_engine **out) {
             if (!engine.ok()) return toErrno(engine.status());
             const int mountRc = unwrap(engine.value()->mount().wait());
             if (mountRc != 0) return mountRc;
-            auto client = uuse::Client::create(*engine.value());
-            if (!client.ok()) return toErrno(client.status());
             state = std::make_shared<UuseEngineState>();
             state->engine = std::shared_ptr<uuse::Engine>(std::move(engine).value());
-            state->client = std::move(client.value());
+            const int clientRc = state->startClient();
+            if (clientRc != 0) return clientRc;
             gEngineRegistry[key] = state;
         }
     }

@@ -248,6 +248,14 @@ foreach(test_name IN LISTS UUSE_TESTS)
   add_test(NAME ${test_name} COMMAND ${test_name})
 endforeach()
 
+# Device-backed tests own the single UUSE NVMe exclusively; serialize them so
+# `ctest -j` cannot make two processes drive the same uio device (Shard-118).
+if(UUSE_WITH_SPDK)
+  set_tests_properties(engine_lifecycle_test spdk_runtime_test format_mount_test
+    journal_device_test file_api_test file_data_test
+    PROPERTIES RESOURCE_LOCK uuse_device)
+endif()
+
 # Internal SPDK adapter test compiles its non-exported implementation directly.
 add_executable(spdk_async_backend_test
   tests/spdk_async_backend_test.cpp
@@ -465,6 +473,7 @@ if(UUSE_WITH_SPDK)
   target_link_libraries(data_path_device_test PRIVATE Threads::Threads)
   uuse_link_spdk(data_path_device_test)
   add_test(NAME data_path_device_test COMMAND data_path_device_test)
+  set_tests_properties(data_path_device_test PROPERTIES RESOURCE_LOCK uuse_device)
 
   # Device-backed per-inode snapshot-cache test (review P1-1).
   add_executable(snapshot_cache_device_test tests/snapshot_cache_device_test.cpp ${UUSE_CORE_SRC})
@@ -479,6 +488,7 @@ if(UUSE_WITH_SPDK)
   target_link_libraries(snapshot_cache_device_test PRIVATE Threads::Threads)
   uuse_link_spdk(snapshot_cache_device_test)
   add_test(NAME snapshot_cache_device_test COMMAND snapshot_cache_device_test)
+  set_tests_properties(snapshot_cache_device_test PROPERTIES RESOURCE_LOCK uuse_device)
 endif()
 
 # Namespace/inode/directory-index structure test (internal sources, no SPDK).
@@ -553,4 +563,12 @@ target_include_directories(uuse_tikv_shim_smoke PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/tikv/shim
 )
 target_link_libraries(uuse_tikv_shim_smoke PRIVATE uuse_tikv_shim uuse_core Threads::Threads)
+
+# C ABI lifecycle test (Shard-118): refcounted engine state, thread exit with
+# open files, repeated open/close, shared handles, fork-child fail-closed.
+add_executable(uuse_tikv_shim_lifecycle tikv/shim/uuse_tikv_shim_lifecycle.cc)
+target_include_directories(uuse_tikv_shim_lifecycle PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/tikv/shim
+)
+target_link_libraries(uuse_tikv_shim_lifecycle PRIVATE uuse_tikv_shim uuse_core Threads::Threads)
 

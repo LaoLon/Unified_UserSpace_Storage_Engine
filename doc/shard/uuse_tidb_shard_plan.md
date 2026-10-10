@@ -300,6 +300,36 @@ rename/delete/dirs）通过；RocksDB spike 能经 UUSE Env 打开/关闭引擎�
 
 ### Shard-118：线程与生命周期
 
+> 状态：进行中（2026-10-10）。已核实/完成：
+> （a）**信号**：TiKV 自身用 `signal_hook` 注册进程级 handler（专用 signal 线程），
+> 实测 SIGTERM 走 `signal_handler.rs` graceful shutdown（矩阵日志 `receive signal
+> 15, starting graceful shutdown...`），SPDK 线程空掩码不影响，无需额外转发；
+> （b）**生命周期缺陷（已修）**：core 要求 `Client::close` 在创建线程（frontend
+> thread）调用；shim 共享 client 原先由首个调用线程创建、engine state 可能由任意
+> 线程析构 → close 被拒（`client destroyed without close`）且元数据未收尾。修复：
+> engine state 自带专用 client 线程，client 创建/关闭都在该线程，路径操作仍由调用
+> 线程经 mutex 串行（core 允许），文件数据操作经 `File` 在调用线程自驱动；
+> （c）**元数据持久化语义**：namespace create/remove 随 `File::sync` 的 durable
+> epoch 跨挂载可见（用例按此实现）；
+> （d）新增 `uuse_tikv_shim_lifecycle` 6 用例（engine 先关+文件后关、线程退出持文件、
+> 8 次重复建链、共享句柄、fork 子进程 -ECHILD、参数防护），真机
+> `SHIM_LIFECYCLE_PASS`，ASAN 干净；TSAN 复跑（`tikv/shim/tsan.supp` 仅压制 SPDK
+> 未插桩的控制路径边界帧）**0 警告**；
+> （e）TSAN 抓到并修复 core `ParentLatch` 锁外 notify（栈 condvar UAF 窗口，
+> bug.md #48）；设备测试补 `RESOURCE_LOCK uuse_device`（bug.md #49），
+> `ctest -j2` 29/29 通过；
+> （f）并发负载 closure 复现「SIGTERM 后重启报 raft 日志缺条目」：根因三层——
+> UUSE 无内核页缓存且 TiKV 正常写路径异步 fsync（raft 日志 `sync=false`、kvdb apply
+> `need_sync=false`）；raft-engine `Engine::sync()` 空 batch 空操作；engines 被
+> `take()` 进信号线程使 `stop()` 无法访问。修复补丁栈：`apply-raft-engine-sync-fix.py`
+> （`Engine::sync` 直连 `pipe_log.sync`）、`apply-uuse-shutdown-sync.py`（保留 engines +
+> 关闭 sync 双引擎）、`apply-uuse-apply-sync.py`（apply 批次强制同步）。宿主 ext4
+> 同负载对照通过，确认差异在 UUSE 持久化语义。
+> 出口结果（2026-10-10）：closure `PASS=5 FAIL=0`（187,740 行 → SIGTERM → 重启行数完整
+> → `uusectl check corruption=none`）；矩阵回归 26/26；`uuse_tikv_shim_lifecycle`
+> 6/6（ASAN 干净、TSAN 0 警告）；`ctest -j2` 29/29。边界：kill -9 仍可能丢未 sync
+> 尾部（与 ext4 掉电语义对齐）；apply 同步吞吐代价由 Shard-120 量化。
+
 **目标**：让 TiKV 后台线程（raftstore/apply/read pool/backup/import/compaction）在 UUSE
 上有确定的生命周期。
 

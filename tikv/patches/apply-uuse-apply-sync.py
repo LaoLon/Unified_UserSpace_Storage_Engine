@@ -1,0 +1,51 @@
+#!/usr/bin/env python3
+"""Shard-118: always sync apply batches (kvdb WAL) under the UUSE integration.
+
+Without a kernel page cache, TiKV's async kv writes do not survive a process
+exit, so the durable applied index falls behind the (admin-synced) raft log
+compaction and the next start fails with "entry at apply index ... doesn't
+exist". Syncing every apply batch keeps the durable applied index in step with
+the log GC, at the cost of one kvdb fsync per apply batch."""
+
+from __future__ import annotations
+
+import pathlib
+import shutil
+
+TIKV = pathlib.Path("/build/tikv-fork")
+BACKUP = pathlib.Path("/build/spike-backup")
+
+
+def patch(rel: str, old: str, new: str) -> None:
+    path = TIKV / rel
+    text = path.read_text(encoding="utf-8")
+    count = text.count(old)
+    if count != 1:
+        raise SystemExit(f"anchor count {count} != 1 in {rel}")
+    path.write_text(text.replace(old, new, 1), encoding="utf-8")
+    print(f"patched {rel}")
+
+
+def main() -> int:
+    BACKUP.mkdir(parents=True, exist_ok=True)
+    rel = "components/raftstore/src/store/fsm/apply.rs"
+    dst = BACKUP / ("apply_sync_" + rel.replace("/", "_"))
+    if not dst.exists():
+        shutil.copy2(TIKV / rel, dst)
+        print(f"backup {dst}")
+
+    patch(
+        rel,
+        "        let need_sync = self.sync_log_hint && !self.disable_wal;\n",
+        "        // UUSE local engine (Phase 8): without a kernel page cache, unsynced\n"
+        "        // kv writes do not survive a process exit; always sync apply batches\n"
+        "        // so the durable applied index keeps up with raft log compaction\n"
+        "        // (Shard-118).\n"
+        "        let need_sync = !self.disable_wal;\n",
+    )
+    print("UUSE_APPLY_SYNC_PATCH_DONE")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
