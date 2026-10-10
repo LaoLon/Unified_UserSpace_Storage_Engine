@@ -320,6 +320,21 @@ rename/delete/dirs）通过；RocksDB spike 能经 UUSE Env 打开/关闭引擎�
 
 ### Shard-119：功能验收矩阵
 
+> 状态：**功能矩阵全过（2026-10-10）**：`PASS=26 FAIL=0`（结果目录
+> `/build/tidb/functional-matrix-20261010-062537`，含 matrix.log/dump/uusectl
+> check 证据）；矩阵入口固化于 `tikv/run_functional_matrix_vm.sh`。
+> 第一轮矩阵发现并修复：
+> （a）`ALTER TABLE ... ADD INDEX` 触发 SST importer 在 `import/` 下建文件 →
+> namespace 父目录不存在 → `NotFound` panic；adapter `Create` 打开时自动创建
+> namespace 父目录链（审计第 6 条部分修复）；
+> （b）fast-reorg ingest 路径未闭环（importer 宿主 FS 写 SST + engine ingest 找不到
+> → `IngestSST Io(NotFound)` 重试循环）；矩阵以 `tidb_ddl_enable_fast_reorg=OFF`
+> 走经典回填并记录该边界（审计 §8 待决）。
+> 矩阵覆盖：CRUD、DDL（add/drop column/index）、乐观/悲观事务与重复键拒绝、
+> ADMIN CHECK、region split、GC safe point、kill -9/SIGTERM 重启持久、跨进程
+> reopen、dumpling 备份恢复、第二实例/encryption fail-closed、`uusectl check
+> corruption=none`。
+
 **目标**：以用户可见语义收口功能正确性。
 
 **交付物**

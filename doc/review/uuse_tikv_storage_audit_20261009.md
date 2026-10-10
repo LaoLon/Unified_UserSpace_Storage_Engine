@@ -126,7 +126,7 @@
 | 3 | `components/server/src/common.rs:193-216` | `data_dir/SPACE_PLACEHOLDER_FILE` + `reserve_space_for_recover` | **已修复（Shard-117）**：`uuse-conf` 设置时跳过宿主 reserve 占位并告警（宿主 reserve 不保护 UUSE 卷）；模板 `reserve-space=0`；补丁同上 |
 | 4 | `components/server/src/common.rs:186-192` | `data_dir/panic_mark_file` | 宿主白名单（v1）：panic 安全标记，panic 路径不做 UUSE I/O |
 | 5 | `src/server/snap.rs`、`src/server/tablet_snap.rs:39` | snap 文件传输（`OpenOptions`） | `data_dir/snap` → UUSE namespace |
-| 6 | `components/sst_importer/src/util.rs:33-101`、`sst_importer.rs:309/353/636` | import 文件（hard_link/copy_and_sync/read_dir/remove_dir_all） | `data_dir/import` → UUSE namespace；外部导入源路径保持宿主 |
+| 6 | `components/sst_importer/src/util.rs:33-101`、`sst_importer.rs:309/353/636` | import 文件（hard_link/copy_and_sync/read_dir/remove_dir_all） | `data_dir/import` → UUSE namespace；外部导入源路径保持宿主。**部分修复（Shard-119）**：adapter `Create` 打开时自动创建 namespace 父目录链，修复 `SstImporter::new_txn_writer` 的 `NotFound` panic；**SST ingest 未闭环**：importer 用宿主 `file_system`（std::fs）写 SST、engine 在 namespace 找不到 → `IngestSST Io(NotFound)`；矩阵以 `tidb_ddl_enable_fast_reorg=OFF` 绕过，ingest 路由待修 |
 | 7 | `components/backup/src/*` | 备份输出（本地/S3） | 宿主或对象存储白名单；不默认进 UUSE |
 | 8 | `cmd/tikv-ctl` | 直接打开 data dir | 一期禁用（fail-closed） |
 | 9 | 日志/status/socket/pid | 运维输出 | 宿主白名单；RocksDB/raftdb `info-log-dir` 显式指向日志目录（运行模板已配） |
@@ -187,6 +187,15 @@
 - RocksDB `FileSystem` 的 `punch_hole`/`fallocate` 语义与 UUSE 能力映射；
 - snap/import 的 hard_link/copy_and_sync 在 UUSE namespace 的等价实现
   （`Client::link` 已有；copy 走 read/write）；
+- **SST ingest 路由（Shard-119 新增）**：fast-reorg ADD INDEX 的 SST 由 importer
+  用宿主 `file_system`（std::fs）写入 `data_dir/import`，engine（UUSE Env）在
+  namespace 中找不到该文件 → `IngestSST Io(NotFound)`，TiDB DDL 无限重试；矩阵以
+  `tidb_ddl_enable_fast_reorg=OFF`（经典回填）绕过。收口方案二选一：
+  （a）patch importer 的文件操作改走 engine FS；（b）engine ingest 前把宿主 SST
+  导入 namespace（copy 到 `data_dir/import` 的 UUSE 映射路径）；
+- **错误面（Shard-119 新增）**：rust-rocksdb `Env::uuse` 在 shim 返回 null 时统一
+  报 "uuse env create failed"，丢失底层 errno（如第二实例的 `Busy`）；建议 shim
+  暴露 last-error/errno、crocksdb 侧透传；
 - raft-kv1（raftdb）是否需要一期支持，或一期只支持默认 raft-engine（建议后者）。
 
 ## 9. Shard-115 API 映射结论（2026-10-09）

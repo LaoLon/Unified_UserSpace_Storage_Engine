@@ -285,7 +285,24 @@ rocksdb::IOStatus openFile(const std::shared_ptr<UuseContext> &context,
     if (context == nullptr || context->client == nullptr) {
         return rocksdb::IOStatus::InvalidArgument("UUSE context is not initialized");
     }
-    auto outer = context->client->open(uusePath(path), flags).wait();
+    const std::string mapped = uusePath(path);
+    /* RocksDB/TiKV create files under directories that the host server created
+     * outside the UUSE namespace (import/snap/...); create the parent chain in
+     * the namespace before the first Create open (Shard-119). */
+    if (hasFlag(flags, uuse::OpenFlags::Create)) {
+        const std::size_t slash = mapped.find_last_of('/');
+        if (slash != std::string::npos && slash > 0) {
+            auto created = context->client->createDirectories(mapped.substr(0, slash)).wait();
+            if (!created.ok()) {
+                return toIoStatus(created);
+            }
+            auto status = std::move(created).value();
+            if (!status.ok()) {
+                return toIoStatus(status);
+            }
+        }
+    }
+    auto outer = context->client->open(mapped, flags).wait();
     if (!outer.ok()) {
         return toIoStatus(outer);
     }
