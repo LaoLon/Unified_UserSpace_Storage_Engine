@@ -104,8 +104,8 @@ def main() -> int:
     )
     patch(
         CO / "librocksdb_sys/build.rs",
-        '    link_cpp(&mut build);\n    build.warnings(false).compile("libcrocksdb.a");\n}',
-        adapter_cc + "}",
+        '    link_cpp(&mut build);\n    build.warnings(false).compile("libcrocksdb.a");\n',
+        adapter_cc,
     )
 
     patch(
