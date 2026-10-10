@@ -64,6 +64,7 @@ stop_stack() {
 
 bind_uio() {
   local D=/sys/bus/pci/devices/$BDF cur
+  modprobe uio_pci_generic 2>/dev/null || true
   echo uio_pci_generic > "$D/driver_override"
   if [ -e "$D/driver" ]; then
     cur=$(basename "$(readlink -f "$D/driver")")
@@ -73,7 +74,7 @@ bind_uio() {
     echo "$BDF" > /sys/bus/pci/drivers/uio_pci_generic/bind
   # Clear the override so a later kernel-nvme bind is not forced back to uio.
   printf '\n' > "$D/driver_override"
-  echo "uio bound: $(readlink -f /sys/bus/pci/devices/$BDF/driver | xargs basename)"
+  echo "uio bound: $(basename "$(readlink -f "$D/driver")")"
 }
 
 # Binds the kernel nvme driver, formats ext4 on the namespace and mounts it.
