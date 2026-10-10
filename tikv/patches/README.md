@@ -34,10 +34,14 @@
 | 7 | `apply-raft-engine-sync-fix.py` | raft-engine `src/engine.rs` | `Engine::sync()` 直连 `pipe_log.sync(LogQueue::Append)`（原实现经空 batch 提前返回为空操作） | Shard-118 |
 | 8 | `apply-uuse-shutdown-sync.py` | TiKV `components/server/src/server.rs` | `run_impl` 保留 engines（信号线程用 clone）；`TiKV::stop()` 依次 `KvEngine::sync()` + `RaftEngine::sync()` | Shard-118 |
 | 9 | `apply-uuse-apply-sync.py` | TiKV `components/raftstore/src/store/fsm/apply.rs` | apply 批次同步：有界窗口（5 ms，`sync_log_hint` 仍强制、shutdown 无条件同步），持久 applied 保持在 raft 日志压缩安全边界内 | Shard-118/120 |
+| 10 | `apply-uuse-worker-sync-window.py` | TiKV `components/raftstore/src/store/async_io/write.rs` | async write worker 的 apply-state kvdb 写与 raft 日志写：`sync=true` 硬编码改为 5 ms 有界窗口（Shard-120 trace 归因：51k 屏障/60s 的主来源） | Shard-120 |
 
 > 说明：`apply-uuse-apply-sync.py` 生成窗口版（5 ms）。对已应用 always-sync 版的
 > checkout，用 `apply-uuse-apply-sync-window.py` 做增量替换（Shard-120 trace 归因后
 > 的优化：55k 屏障/60s → 5 ms 窗口按 apply 间隔合并）。
+> `apply-uuse-worker-sync-window.py`：async write worker 的 apply-state kvdb 写与
+> raft 日志写同步窗口（同一 5 ms）；**语义边界**：单节点实验室 RPO ≤5 ms
+> （优雅退出仍 RPO=0，shutdown 双引擎 sync 保留）。
 
 > 注：表 3 的 shared-engine 补丁假设 spike 前序补丁已插入
 > `crocksdb_uuse_spike_env_create`（spike 版）文本；若 spike 脚本的插入文本与
