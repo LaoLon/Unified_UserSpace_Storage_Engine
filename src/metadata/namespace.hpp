@@ -261,7 +261,10 @@ private:
         std::size_t extentCount = 0;
     };
     struct CheckpointEntry {
-        std::string name;
+        /* Name bytes live in CheckpointView::names (one arena per checkpoint)
+         * so the freeze performs no per-name allocation. */
+        std::uint64_t nameOffset = 0;
+        std::uint32_t nameLength = 0;
         std::uint64_t child = 0;
     };
     struct CheckpointView {
@@ -271,6 +274,7 @@ private:
         std::uint64_t namespaceBytes = 0;
         std::vector<CheckpointInode> inodes;
         std::vector<CheckpointEntry> entries;
+        std::vector<char> names;
         std::vector<ExtentDescriptor> extents;
         std::vector<std::uint64_t> freeSlots;
         std::vector<std::vector<std::byte>> allocators;

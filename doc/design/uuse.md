@@ -1545,6 +1545,21 @@ Repair-94 追加不改变既有点位语义的请求关联点：
 append-only event id，并按 request id 成对采样，离线工具可据此计算 frontend、parent、
 shard 和 bdev 分段延迟；旧的 `BDEV_*` 和 `ShardBackend*` 点位保持原参数布局。
 
+Shard-9.5 追加（同样 append-only，旧点位参数布局不变）：
+
+- `SYNC_PHASE = 60`：一次 barrier 分段耗时，参数 `(phase, epoch, elapsed_ns, extra)`；
+  phase 取值 `1=join_wait, 2=window, 3=staged_take, 4=journal_append,
+  5=prepare_durable, 6=require_full, 7=snapshot, 8=ckpt_write, 9=flush,
+  10=publish`（`src/common/trace.hpp` 的 `SyncPhaseId`）；
+- `SYNC_BATCH = 61`：一次 barrier 服务的 sync 批次，参数
+  `(served_syncs, target_epoch, staged_records, checkpoint_kind)`，kind `0=none,
+  1=delta, 2=full`；
+- `CHKPT_FREEZE.arg3` 由 0 改为 namespace-lock freeze 纳秒数（原字段未使用）。
+
+归因流程不变：`stats` 先定位层级 → `trace_sample` 拉取分段分布 → 结构修复 →
+trace off 重跑正式门禁；MinIO 侧实例见
+`doc/performance/minio_shard95_attribution.md`。
+
 关键延迟链（每段独立统计 p50/p99，不允许只报总数）：
 
 ```text

@@ -1125,9 +1125,13 @@ Task<Result<WriteResult>> File::write(std::span<const IoVec> buffers, std::uint6
         co_return makeError<WriteResult>(reservations.status(), reservations.message());
     }
     if (!reservations.value().empty()) {
-        /* Zero only the parts of the new extents that this write does not
-         * cover; fully covered extents need no zero fill at all. */
+        /* Zero only the parts of the newly reserved extents that fall inside
+         * the file's post-write logical size and are not covered by this write.
+         * Bytes beyond that size are not readable, so the 1 MiB extent tail of
+         * a small metadata write no longer costs a full-extent zero fill; a
+         * later grow zeroes the newly exposed range in truncate (Shard-9.5). */
         const std::uint64_t extentBytes = state.namespaceState->extentBytes();
+        const std::uint64_t newSize = std::max(knownEof, offset + total);
         for (const metadata::ExtentAllocation &allocation : reservations.value()) {
             const std::uint32_t deviceId =
                 static_cast<std::uint32_t>(allocation.run.deviceId);
@@ -1150,10 +1154,11 @@ Task<Result<WriteResult>> File::write(std::span<const IoVec> buffers, std::uint6
                                                          zeroed.message());
                     }
                 }
-                if (coverEnd < extentEnd) {
+                const std::uint64_t zeroEnd = std::min(extentEnd, newSize);
+                if (coverEnd < zeroEnd) {
                     auto zeroed = state.dataPlane->zeroRange(
                         deviceId, physicalStart + i, coverEnd - extentStart,
-                        extentEnd - coverEnd, extentBytes);
+                        zeroEnd - coverEnd, extentBytes);
                     if (!zeroed.ok()) {
                         state.namespaceState->releaseExtents(impl_->handle,
                                                              reservations.value());
@@ -1273,7 +1278,53 @@ Task<Result<void>> File::truncate(std::uint64_t size) {
     if (state.namespaceState == nullptr) {
         co_return Result<void>(Status::InvalidState, "engine is not mounted");
     }
-    co_return state.namespaceState->truncateFile(impl_->handle, size);
+    std::uint64_t oldSize = 0;
+    if (state.dataPlane != nullptr) {
+        auto before = state.namespaceState->stat(impl_->handle);
+        if (!before.ok()) {
+            co_return makeError(before.status(), before.message());
+        }
+        oldSize = before.value().logicalSize;
+    }
+    auto truncated = state.namespaceState->truncateFile(impl_->handle, size);
+    if (!truncated.ok()) {
+        co_return truncated;
+    }
+    /* Growing must not expose stale bytes of already mapped extents; writes
+     * only zero the part of a new extent that lies inside the file size, so the
+     * newly exposed range is zeroed here (Shard-9.5). */
+    if (size > oldSize && state.dataPlane != nullptr) {
+        auto extents = state.namespaceState->extents(impl_->handle);
+        if (!extents.ok()) {
+            co_return makeError(extents.status(), extents.message());
+        }
+        const std::uint64_t extentBytes = state.namespaceState->extentBytes();
+        for (const metadata::ExtentDescriptor &descriptor : extents.value()) {
+            const std::uint64_t logicalStart = descriptor.logicalExtent * extentBytes;
+            const std::uint64_t logicalEnd = logicalStart + descriptor.count * extentBytes;
+            const std::uint64_t start = std::max(oldSize, logicalStart);
+            const std::uint64_t end = std::min(size, logicalEnd);
+            if (start >= end) {
+                continue;
+            }
+            for (std::uint64_t i = 0; i < descriptor.count; ++i) {
+                const std::uint64_t extentStart = logicalStart + i * extentBytes;
+                const std::uint64_t extentEnd = extentStart + extentBytes;
+                const std::uint64_t zeroStart = std::max(start, extentStart);
+                const std::uint64_t zeroEnd = std::min(end, extentEnd);
+                if (zeroStart >= zeroEnd) {
+                    continue;
+                }
+                auto zeroed = state.dataPlane->zeroRange(
+                    descriptor.deviceId, descriptor.physicalExtent + i,
+                    zeroStart - extentStart, zeroEnd - zeroStart, extentBytes);
+                if (!zeroed.ok()) {
+                    co_return makeError(zeroed.status(), zeroed.message());
+                }
+            }
+        }
+    }
+    co_return Result<void>(Status::Ok);
 }
 
 Task<Result<void>> File::datasync() {

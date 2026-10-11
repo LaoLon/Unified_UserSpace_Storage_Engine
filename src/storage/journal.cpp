@@ -506,6 +506,11 @@ struct Journal::Impl {
         const auto writeStart = std::chrono::steady_clock::now();
         auto write = device->writeBatch(ranges);
         stats::counters().syncCheckpointWrite.record(elapsedNs(writeStart));
+        trace::event(trace::EventId::SyncPhase,
+                     static_cast<std::uint64_t>(trace::SyncPhaseId::CheckpointWrite),
+                     checkpoint.txid, elapsedNs(writeStart),
+                     static_cast<std::uint64_t>(checkpoint.record.size() +
+                                                superblockRecord.record.size()));
         if (!write.ok()) {
             return write;
         }
@@ -1229,6 +1234,10 @@ Result<std::uint64_t> Journal::appendLocked(std::span<const JournalRecord> recor
         sequence + 1 + records.size(), static_cast<std::uint16_t>(Commit), txid, 0,
         txCrc, {});
     auto written = impl.writeSlots(sequence, transaction);
+    trace::event(trace::EventId::SyncPhase,
+                 static_cast<std::uint64_t>(trace::SyncPhaseId::JournalAppend),
+                 txid, static_cast<std::uint64_t>(slotCount),
+                 static_cast<std::uint64_t>(transaction.size()));
     if (!written.ok()) {
         return makeError<std::uint64_t>(written.status(), written.message());
     }
@@ -1303,6 +1312,10 @@ Result<void> Journal::checkpointLocked(bool deferFlush, bool forceFullBase) {
         const auto snapshotStart = std::chrono::steady_clock::now();
         auto saved = impl.target->saveSnapshot(impl.lastTxid, snapshot);
         stats::counters().syncCheckpointSnapshot.record(elapsedNs(snapshotStart));
+        trace::event(trace::EventId::SyncPhase,
+                     static_cast<std::uint64_t>(trace::SyncPhaseId::Snapshot),
+                     checkpointTxid, elapsedNs(snapshotStart),
+                     static_cast<std::uint64_t>(snapshot.size()));
         if (!saved.ok()) {
             trace::event(trace::EventId::ChkptEnd, checkpointTxid,
                          static_cast<std::uint64_t>(saved.status()));

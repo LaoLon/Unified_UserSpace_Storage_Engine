@@ -572,3 +572,27 @@ target_include_directories(uuse_tikv_shim_lifecycle PRIVATE
 )
 target_link_libraries(uuse_tikv_shim_lifecycle PRIVATE uuse_tikv_shim uuse_core Threads::Threads)
 
+# MinIO C ABI shim (Phase 9, Shard-9.1): disk-seam frontend for the MinIO fork
+# (file handle abstraction, bounded directory iteration, recursive delete).
+add_library(uuse_minio_shim SHARED minio/shim/uuse_minio_shim.cc)
+target_include_directories(uuse_minio_shim PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/minio/shim
+)
+target_link_libraries(uuse_minio_shim PRIVATE uuse_core Threads::Threads)
+set_target_properties(uuse_minio_shim PROPERTIES OUTPUT_NAME "uuse_minio_shim")
+
+# C ABI smoke (real device; run manually on the VM).
+add_executable(uuse_minio_shim_smoke minio/shim/uuse_minio_shim_smoke.cc)
+target_include_directories(uuse_minio_shim_smoke PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/minio/shim
+)
+target_link_libraries(uuse_minio_shim_smoke PRIVATE uuse_minio_shim uuse_core Threads::Threads)
+
+# C ABI lifecycle test (refcount, thread exit, dir handles, stats, fork).
+add_executable(uuse_minio_shim_lifecycle minio/shim/uuse_minio_shim_lifecycle.cc)
+target_include_directories(uuse_minio_shim_lifecycle PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/minio/shim
+)
+target_link_libraries(uuse_minio_shim_lifecycle PRIVATE uuse_minio_shim uuse_core Threads::Threads)
+

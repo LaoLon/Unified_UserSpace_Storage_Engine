@@ -123,6 +123,12 @@ std::size_t InodeExtentMap::size() const noexcept { return extents_.size(); }
 
 std::vector<ExtentDescriptor> InodeExtentMap::snapshot() const { return extents_; }
 
+/* Appends the committed descriptors without an intermediate allocation; the
+ * checkpoint freeze copies thousands of inode maps per barrier (Shard-9.5). */
+void InodeExtentMap::appendTo(std::vector<ExtentDescriptor> &out) const {
+    out.insert(out.end(), extents_.begin(), extents_.end());
+}
+
 Result<void> InodeExtentMap::restore(std::span<const ExtentDescriptor> descriptors) {
     std::vector<ExtentDescriptor> restored(descriptors.begin(), descriptors.end());
     std::uint64_t previousEnd = 0;

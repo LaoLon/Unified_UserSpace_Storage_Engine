@@ -1863,7 +1863,9 @@ struct SpdkRuntime::Impl {
                 return makeError(Status::InvalidArgument, "control I/O is limited to 1 MiB");
             }
             io->blocks = size / blockSize;
-            io->dma = spdk_dma_zmalloc(size, 4096, nullptr);
+            /* Non-zeroing DMA: writes copy the payload in immediately and
+             * reads overwrite the buffer before it is consumed (Shard-9.5). */
+            io->dma = spdk_dma_malloc(size, 4096, nullptr);
             if (io->dma == nullptr) {
                 return makeError(Status::NoMemory, "DMA allocation failed");
             }
@@ -1966,7 +1968,9 @@ struct SpdkRuntime::Impl {
             io->device = index;
             io->offsetBlocks = range.offsetBlocks;
             io->blocks = range.buffer.size() / blockSize;
-            io->dma = spdk_dma_zmalloc(range.buffer.size(), 4096, nullptr);
+            /* Non-zeroing DMA: the payload is copied in immediately, so the
+             * zero fill of spdk_dma_zmalloc would be wasted work (Shard-9.5). */
+            io->dma = spdk_dma_malloc(range.buffer.size(), 4096, nullptr);
             if (io->dma == nullptr) {
                 return makeError(Status::NoMemory, "DMA allocation failed");
             }

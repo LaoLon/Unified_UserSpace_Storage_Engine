@@ -71,6 +71,24 @@ enum class EventId : std::uint16_t {
     OpPoolAcquire = 57,
     DmaOwns = 58,
     FeSubmitBegin = 59,
+    /* Appended for Shard-9.5 write-path barrier attribution: one record per
+     * barrier phase plus one record per served sync batch. */
+    SyncPhase = 60,
+    SyncBatch = 61,
+};
+
+/* Phase ids carried in SyncPhase.arg0 (append-only, Shard-9.5). */
+enum class SyncPhaseId : std::uint64_t {
+    JoinWait = 1,       /* joiner waiting for the running batch */
+    Window = 2,         /* group-commit coalescing sleep */
+    StagedTake = 3,     /* staged metadata record extraction */
+    JournalAppend = 4,  /* staged record transaction write */
+    PrepareDurable = 5, /* durable-size staging under the namespace lock */
+    RequireFull = 6,    /* full-checkpoint requirement under the journal lock */
+    Snapshot = 7,       /* checkpoint view freeze + encode */
+    CheckpointWrite = 8,/* checkpoint record + superblock device write */
+    Flush = 9,          /* durability device flush */
+    Publish = 10,       /* durable epoch publication */
 };
 
 inline constexpr std::uint16_t kTraceFormatVersion = 2;

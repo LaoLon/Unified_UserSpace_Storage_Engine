@@ -196,6 +196,9 @@ struct Engine::Impl {
         Status status = Status::Ok;
         std::string message;
         bool completed = false;
+        /* Shard-9.5 attribution: sync callers served and staged records. */
+        std::uint64_t served = 0;
+        std::uint64_t records = 0;
         std::condition_variable condition;
     };
 
@@ -425,8 +428,10 @@ Task<Result<void>> Engine::mount() {
     impl.namespaceState->setCheckpointFreezeObserver(
         [](const metadata::Namespace::CheckpointFreezeStats &freeze) {
             stats::counters().syncCheckpointFreeze.record(freeze.freezeNs);
+            /* arg3 carries the namespace-lock freeze time for Shard-9.5
+             * attribution; older readers ignored the unused field. */
             trace::event(trace::EventId::ChkptFreeze, freeze.txid, freeze.inodes,
-                         freeze.entries);
+                         freeze.entries, freeze.freezeNs);
         });
     /* §7.3: install the namespace lock-wait hook only while tracing is active
      * so the metadata fast path stays a single null check otherwise. */
@@ -793,6 +798,19 @@ Result<void> Engine::syncMetadata(std::uint64_t epoch) {
         return makeError(Status::InvalidArgument, "sync epoch is ahead of logical epoch");
     }
     stats::counters().syncCalls.fetch_add(1, std::memory_order_relaxed);
+    /* Shard-9.5 attribution: each barrier phase reports its elapsed time and
+     * the served sync count reports how many callers the barrier covered. */
+    const auto phaseEvent = [](trace::SyncPhaseId phase, std::uint64_t epochArg,
+                               std::uint64_t elapsedNs, std::uint64_t extra = 0) {
+        trace::event(trace::EventId::SyncPhase, static_cast<std::uint64_t>(phase),
+                     epochArg, elapsedNs, extra);
+    };
+    const auto elapsedNs = [](const std::chrono::steady_clock::time_point &start) {
+        return static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - start)
+                .count());
+    };
     while (true) {
         std::shared_ptr<Impl::SyncBatch> batch;
         bool leader = false;
@@ -814,6 +832,7 @@ Result<void> Engine::syncMetadata(std::uint64_t epoch) {
             } else {
                 batch = std::make_shared<Impl::SyncBatch>();
                 batch->targetEpoch = epoch;
+                batch->served = 1;
                 impl_->syncBatch = batch;
                 leader = true;
             }
@@ -821,10 +840,13 @@ Result<void> Engine::syncMetadata(std::uint64_t epoch) {
 
         if (!leader) {
             std::unique_lock<std::mutex> syncLock(impl_->syncMutex);
+            const auto joinStart = std::chrono::steady_clock::now();
             batch->condition.wait(syncLock, [&batch] { return batch->completed; });
+            phaseEvent(trace::SyncPhaseId::JoinWait, epoch, elapsedNs(joinStart), 1);
             stats::counters().syncJoiners.fetch_add(1, std::memory_order_relaxed);
             if (epoch <= batch->frozenTargetEpoch &&
                 !SpdkRuntime::instance().dataFlushPending()) {
+                batch->served += 1;
                 trace::event(trace::EventId::FsyncEnd, epoch,
                              static_cast<std::uint64_t>(batch->status), 2ULL);
                 return Result<void>(batch->status, batch->message);
@@ -838,8 +860,10 @@ Result<void> Engine::syncMetadata(std::uint64_t epoch) {
         /* Let concurrent sync callers join the same full-snapshot transaction.
          * This is a coalescing window, never a durability timeout. */
         if (impl_->config.maxGroupCommitWaitUs != 0) {
+            const auto windowStart = std::chrono::steady_clock::now();
             std::this_thread::sleep_for(std::chrono::microseconds(
                 impl_->config.maxGroupCommitWaitUs));
+            phaseEvent(trace::SyncPhaseId::Window, epoch, elapsedNs(windowStart));
         }
         std::uint64_t targetEpoch = epoch;
         {
@@ -855,6 +879,7 @@ Result<void> Engine::syncMetadata(std::uint64_t epoch) {
                      static_cast<std::uint64_t>(epoch));
         const bool checkpointNeeded = targetEpoch > impl_->namespaceState->durableEpoch();
         bool prepared = false;
+        std::uint64_t checkpointKind = 0; /* 0=none, 1=delta, 2=full */
         /* Phase 1 (metadata, uuse.md §9.3): namespace-shape changes and
          * journal compaction write the full snapshot; journaled mutations are
          * appended after the data flush so a failed flush cannot leave durable
@@ -863,21 +888,32 @@ Result<void> Engine::syncMetadata(std::uint64_t epoch) {
             checkpointNeeded && (impl_->namespaceState->checkpointRequired() ||
                                  impl_->journal->needsCheckpoint());
         const auto checkpointPhase = [&]() {
+            const auto stagedStart = std::chrono::steady_clock::now();
             /* Namespace shape changes cannot be replayed from the journal record
              * format, so they force a full base; journal-backed deltas only
              * cover windows without shape changes (uuse.md §10.4 b). */
             const bool shapeChanged = impl_->namespaceState->checkpointRequired();
             if (shapeChanged) {
+                const auto requireStart = std::chrono::steady_clock::now();
                 impl_->journal->requireFullCheckpoint();
+                phaseEvent(trace::SyncPhaseId::RequireFull, targetEpoch,
+                           elapsedNs(requireStart));
             }
             const bool fullCheckpoint =
                 shapeChanged || impl_->journal->nextCheckpointWillBeFull();
+            checkpointKind = fullCheckpoint ? 2 : 1;
             auto staged = impl_->namespaceState->takeStagedRecords();
             impl_->namespaceState->clearPendingRecords();
+            phaseEvent(trace::SyncPhaseId::StagedTake, targetEpoch,
+                       elapsedNs(stagedStart), staged.records.size());
             if (!fullCheckpoint && !staged.records.empty()) {
+                batch->records = staged.records.size();
+                const auto appendStart = std::chrono::steady_clock::now();
                 auto appended = impl_->journal->append(staged.records,
                                                        /*flushDevice=*/false,
                                                        /*applyToTarget=*/false);
+                phaseEvent(trace::SyncPhaseId::JournalAppend, targetEpoch,
+                           elapsedNs(appendStart), staged.records.size());
                 if (!appended.ok()) {
                     impl_->namespaceState->requireCheckpoint();
                     result = makeError(appended.status(), appended.message());
@@ -886,7 +922,10 @@ Result<void> Engine::syncMetadata(std::uint64_t epoch) {
                 stats::counters().journalTransactions.fetch_add(1,
                                                                 std::memory_order_relaxed);
             }
+            const auto prepareStart = std::chrono::steady_clock::now();
             auto durable = impl_->namespaceState->prepareDurableEpoch(targetEpoch);
+            phaseEvent(trace::SyncPhaseId::PrepareDurable, targetEpoch,
+                       elapsedNs(prepareStart));
             if (!durable.ok()) {
                 impl_->namespaceState->requireCheckpoint();
                 result = durable;
@@ -911,11 +950,15 @@ Result<void> Engine::syncMetadata(std::uint64_t epoch) {
          * device flush below makes data, journal slots and checkpoint records
          * durable together, so the barrier still needs one round trip. */
         if (result.ok() && checkpointNeeded && !checkpointPath) {
+            const auto appendStart = std::chrono::steady_clock::now();
             auto batch = impl_->namespaceState->takeStagedRecords();
             if (!batch.records.empty()) {
+                impl_->syncBatch->records = batch.records.size();
                 auto appended = impl_->journal->append(batch.records,
                                                        /*flushDevice=*/false,
                                                        /*applyToTarget=*/false);
+                phaseEvent(trace::SyncPhaseId::JournalAppend, targetEpoch,
+                           elapsedNs(appendStart), batch.records.size());
                 if (!appended.ok()) {
                     /* The staged records are gone; the next barrier snapshots. */
                     impl_->namespaceState->requireCheckpoint();
@@ -924,6 +967,9 @@ Result<void> Engine::syncMetadata(std::uint64_t epoch) {
                     stats::counters().journalTransactions.fetch_add(
                         1, std::memory_order_relaxed);
                 }
+            } else {
+                phaseEvent(trace::SyncPhaseId::JournalAppend, targetEpoch,
+                           elapsedNs(appendStart), 0);
             }
         }
         /* Phase 3 (durability): one device flush covers every write completed
@@ -937,6 +983,8 @@ Result<void> Engine::syncMetadata(std::uint64_t epoch) {
                     break;
                 }
             }
+            phaseEvent(trace::SyncPhaseId::Flush, targetEpoch,
+                       elapsedNs(deviceFlushStart));
             stats::counters().syncDeviceFlush.record(
                 static_cast<std::uint64_t>(
                     std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -951,7 +999,10 @@ Result<void> Engine::syncMetadata(std::uint64_t epoch) {
             }
         }
         if (result.ok() && checkpointNeeded) {
+            const auto publishStart = std::chrono::steady_clock::now();
             result = impl_->namespaceState->publishDurableEpoch(targetEpoch);
+            phaseEvent(trace::SyncPhaseId::Publish, targetEpoch,
+                       elapsedNs(publishStart));
         }
         if (!result.ok() && prepared) {
             /* A failed barrier must not leave staged durable sizes behind. */
@@ -973,6 +1024,9 @@ Result<void> Engine::syncMetadata(std::uint64_t epoch) {
             batch->completed = true;
         }
         batch->condition.notify_all();
+        /* One batch report: served syncs, target epoch, staged records, kind. */
+        trace::event(trace::EventId::SyncBatch, batch->served, targetEpoch,
+                     batch->records, checkpointKind);
         trace::event(trace::EventId::FsyncEnd, targetEpoch,
                      static_cast<std::uint64_t>(result.status()), 3ULL);
         return result;

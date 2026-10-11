@@ -39,6 +39,9 @@ public:
     bool empty() const noexcept;
     std::size_t size() const noexcept;
     std::vector<ExtentDescriptor> snapshot() const;
+    /* Appends the committed descriptors to `out` (checkpoint freeze fast path;
+     * avoids one allocation per inode). */
+    void appendTo(std::vector<ExtentDescriptor> &out) const;
     Result<void> restore(std::span<const ExtentDescriptor> descriptors);
 
     Result<std::size_t> lookup(std::uint64_t offset, std::uint64_t length,
