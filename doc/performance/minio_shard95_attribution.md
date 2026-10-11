@@ -79,9 +79,14 @@ GET 78%→83%，GET p99 保持优于 ext4。**gate 仍未达标**（PUT ≈62%�
   range、versioning、bigdir 1000、copy、remove、stat）；
 - 崩溃矩阵：写入循环中 `kill -9` → 重启 → **ACK 对象 149/149 完整、
   sweep 60/60 无半成品**；`uusectl check corruption=none`；
+- **zero-fill 语义探针**（`temp_scripts/minio_shard95_zerofill_probe.cc`，
+  19/19 PASS）：512 B 写入 → truncate 增长到 1 MiB+64 KiB → 已写头、
+  写后间隙、extent 尾部、增长尾部全部按 0 读取；增长后再写/中段覆盖
+  不破坏相邻字节；`corruption=none`；
 - CTest **29/29**（含 `namespace_test` 快照往返、`journal_test`
   checkpoint 往返、`data_path_device_test`）；
-- 四节点集群恢复后跨节点读校验 60/60（.250 写、.251/.253 读）。
+- 四节点集群恢复后跨节点读校验 60/60（.250 写、.252/.253 读），
+  `/minio/health/cluster` 200。
 
 ## 6. 剩余差距与下一步（未实施）
 
