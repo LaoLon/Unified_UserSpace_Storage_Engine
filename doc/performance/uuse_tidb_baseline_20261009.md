@@ -1,4 +1,7 @@
-# UUSE × TiKV Phase 8 基线（Shard-113，2026-10-09）
+# UUSE × TiKV Phase 8 基线（Shard-113 初版 + Shard-118…120 终态，2026-10-09/10）
+
+> 本文件是 Phase 8 的**唯一基线入口**：初版（Shard-113）记录功能/性能门禁基线，
+> 终态（§6）记录 TiKV 功能与性能的最终验收结果与同步窗口化结论。
 
 > 环境：host4（.253）4 vCPU / 7.2 GiB / `vm.nr_hugepages=1024`；目标盘
 > `VMware NVME_0002`（`0000:13:00.0`，序列号 `VMware NVME_0002`），
@@ -98,7 +101,14 @@ prep；raw 侧 `LD_PRELOAD=spdk_bdev` + `gen_nvme.sh` JSON。两侧 `taskset -c 
 - `/build/uuse-baseline-rocksdb-20261009/`：A/B 原始 stdout/stderr/format/check；
 - `/build/uuse-baseline-fio-gate-20261009/`：gate 原始 json/stderr/format；
 - `/tmp/uuse-ctest.log`：CTest 全量输出；
-- 本机操作脚本：`temp_scripts/uuse_host4_*.sh`（Windows 工作区，git 忽略）。
+- **终态证据（§6）**：`/build/tidb/perf-ab-target-*`（同盘 A/B）、
+  `/build/tidb/functional-matrix-*`、`/build/tidb/closure-*`、
+  `/build/uuse-shard120-20261010/`（L1/L2）、`/build/uuse-shard120-rocksdb-20261010/`、
+  `/build/uuse-shard120-fio-gate-20261010/`、`/build/tidb/trace-analysis-rw-*.txt`
+  （同步归因解析）；归档
+  `/home/uuse/uuse-tikv-20261010/tikv-shard120-evidence.tar.gz`；
+- 本机操作脚本：`temp_scripts/uuse_host4_*.sh`、`temp_scripts/uuse_*`（Windows 工作区，
+  git 忽略；可复现入口见 `tikv/run_*.sh` 与 `tikv/patches/`）。
 
 ## 5. 待补与边界
 
@@ -110,4 +120,59 @@ prep；raw 侧 `LD_PRELOAD=spdk_bdev` + `gen_nvme.sh` JSON。两侧 `taskset -c 
 - RocksDB 9.11.2 与设计文本 8.9.1 的口径差异需在设计/计划中注明；
 - host4 根盘仅剩约 2.5 GiB，大体积证据统一写 `/build` 或 `/home/uuse` 小文件；
 - TiKV 基座构建口径（v8.5.8、gcc-12、`CMAKE_POLICY_VERSION_MINIMUM=3.5`、
-  `-luring` 链接）见 `tikv/README.md`。
+  `-luring` 链接）见 `tikv/README.md`；
+- **崩溃 RPO ≤5 ms**（同步窗口化的语义边界）与 fast-reorg ingest 未闭环等
+  TiKV 侧边界见 §6.4 与 `tikv/README.md` §6。
+
+## 6. TiKV 终态：功能与性能（Shard-118…120，2026-10-10）
+
+### 6.1 功能与 durability 出口
+
+| 出口 | 结果 | 证据 |
+|---|---|---|
+| 功能矩阵（Shard-119） | **26/26** | `/build/tidb/functional-matrix-*` |
+| 并发 closure（Shard-118） | **5/5**（~20 万行 SIGTERM 重启持久、`uusectl check corruption=none`） | `/build/tidb/closure-*` |
+| 生命周期用例（Shard-118） | 6/6，ASAN 干净、TSAN 0 警告 | `tikv/shim/uuse_tikv_shim_lifecycle.cc` |
+| L1 CTest | 29/29 | `/build/uuse-shard120-20261010/ctest.txt` |
+| L2 FIO smoke | 读 50238 / 写 50346，errors=0，closure 闭合 | 同上 |
+| L3/L4 RocksDB A/B（640k keys，同盘交错） | 写 96.1–107.7%、混合读写 95.7–112.6%，无 >5% 回退 | `/build/uuse-shard120-rocksdb-20261010/` |
+| L4 FIO gate | M 93.5%（p99 0.96）、E 89.9%（p99 0.20），errors=0 | `/build/uuse-shard120-fio-gate-20261010/` |
+
+### 6.2 同盘 TiKV A/B（UUSE vs 宿主 ext4，同一目标 NVMe，5 轮交错）
+
+最终口径（worker/apply 5 ms 同步窗口）：
+
+| 基准 | UUSE 中位 | 宿主中位 | 比值 | 门槛 | 判定 |
+|---|---:|---:|---:|---|---|
+| point_select tps | 18534 | 18838 | **98.4%** | ≥95% | PASS |
+| point_select p99 | 1.30 ms | 1.27 ms | 102.4% | ≤110% | PASS |
+| read_write tps | 378 | 404 | **93.7%** | ≥85% | PASS |
+| read_write p99 | 33.12 ms | 30.26 ms | 109.5% | ≤110% | PASS |
+
+三变体对比（绝对值为同日会话参考；比率为同会话口径）：
+
+| 变体 | fsync 屏障/60 s | 同步累计 | 点读比值 | 混合 tps 比值 | 混合 p99 比值 |
+|---|---:|---:|---:|---:|---:|
+| always-sync（Shard-118 修复版） | 55,169 | 17.4 s | 94.9% | 90.9% | 107.5% |
+| apply 窗口 1 ms | 57,540 | 16.3 s | 97.8% | 93.3% | 109.4% |
+| **worker+apply 窗口 5 ms** | **21,856** | **5.3 s** | **98.4%** | **93.7%** | 109.5% |
+| （崩溃前会话，always-sync） | — | — | 97.9% | 89.5% | 117.6% |
+
+### 6.3 同步路径 trace 归因（read_write 60 s，`trace_sample=1`）
+
+- 主来源是 **async write worker**（`components/raftstore/src/store/async_io/write.rs`）：
+  apply-state 的 kvdb 写与 raft 日志写原为每次 raft append 硬编码 `sync=true`
+  （~51k 屏障/60 s，p50 182 µs / p99 1.68 ms）；apply 线程的 `write_to_db` 不是主导
+  路径。
+- 修复补丁：`tikv/patches/apply-uuse-worker-sync-window.py`（worker 两处 5 ms 窗口）、
+  `apply-uuse-apply-sync.py`（apply 线程 5 ms 窗口）。
+- 窗口后：屏障 55k→**21.8k**、同步累计 17.4 s→**5.3 s**；主源 50,855→10,822。
+- 原始解析：`/build/tidb/trace-analysis-rw-*.txt`（原始 trace 已清理）。
+
+### 6.4 边界（RPO）
+
+- 同步窗口使单节点实验室的**崩溃 RPO ≤5 ms**（apply-state 与 raft 日志）；优雅退出
+  仍无条件全同步（**RPO=0**，shutdown 双引擎 sync 保留）；对比 ext4 页缓存掉电窗口
+  ~5 s 仍严格。
+- 其余边界（fast-reorg ingest 未闭环、`tikv-ctl` 禁用、错误面透传等）见
+  `tikv/README.md` §6 与 `doc/review/uuse_tikv_storage_audit_20261009.md` §10。

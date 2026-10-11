@@ -14,7 +14,7 @@ Phase 8 全部 shard（113–121）已完成：
 | 功能矩阵（Shard-119） | **26/26 PASS** | `doc/shard/uuse_tidb_shard_plan.md` §Shard-119 |
 | 生命周期用例（Shard-118） | 6/6，ASAN 干净、TSAN 0 警告 | `shim/uuse_tikv_shim_lifecycle.cc`、`shim/tsan.supp` |
 | 并发 closure（Shard-118） | 5/5（18.7 万行负载 → SIGTERM → 重启行数完整） | `run_concurrent_closure_vm.sh` |
-| 性能同盘 A/B（Shard-120） | 点读 97.9%、混合 tps 89.5% 通过；混合 p99 117.6% 边界 | `doc/performance/uuse_tidb_shard120_20261010.md` |
+| 性能同盘 A/B（Shard-120） | 终态：点读 98.4%、混合 tps 93.7%、p99 102.4%/109.5% 全部通过（同步窗口化后） | `doc/performance/uuse_tidb_baseline_20261009.md` §6 |
 | RocksDB/FIO 无回退门禁（Shard-120） | CTest 29/29、RocksDB A/B 无 >5% 回退、FIO gate M 93.5%/E 89.9% | 同上 |
 
 ## 2. 架构（实现口径）
@@ -88,7 +88,7 @@ split/GC/kill -9 与 SIGTERM 重启/跨进程 reopen/dumpling 备份恢复。
 | 边界 | 现象/影响 | 规避与去向 |
 |---|---|---|
 | fast-reorg ingest 未闭环 | `ADD INDEX` 走 SST importer（宿主 FS 写 SST + engine ingest 找不到）→ `IngestSST Io(NotFound)` 重试 | 设 `tidb_ddl_enable_fast_reorg=OFF` 走经典回填；路由待修（审计第 6 条） |
-| 混合读写 p99 | 多次会话 117.6%（崩溃前）/107.5%/109.5%（窗口化后） | worker/apply 同步窗口化（5 ms）已实施；trace 归因与前后对比见 `doc/performance/uuse_tidb_shard120_20261010.md` §4d |
+| 混合读写 p99 | 终态 109.5%（≤110% 门槛内；早期会话 117.6% 已收敛） | worker/apply 同步窗口化（5 ms）已实施；trace 归因与前后对比见 `doc/performance/uuse_tidb_baseline_20261009.md` §6 |
 | 崩溃 RPO（kill -9） | 未 sync 尾部丢失窗口 ≤5 ms（apply-state 与 raft 日志；优雅退出 RPO=0） | 单节点实验室口径；worker/apply 5 ms 同步窗口（`apply-uuse-worker-sync-window.py`、`apply-uuse-apply-sync.py`）；对比 ext4 页缓存 ~5 s 仍严格 |
 | kill -9 durability | 未 sync 的尾部随进程退出丢失（与 ext4 掉电语义对齐） | 优雅退出（SIGTERM）已由双引擎 sync 闭合；不要依赖 kill -9 持久性 |
 | 错误面 | 第二实例/挂载失败统一报 `uuse env create failed`，丢失底层 errno | 审计 §8 待办：shim 透传 last-error |
@@ -107,5 +107,5 @@ raft-engine 两处改动作用于 cargo git checkout，改后需清 raft-engine 
   `/build/tidb/closure-*`、`/build/tidb/perf-ab-target-*`；
 - 门禁：`/build/uuse-shard120-20261010/`、`/build/uuse-shard120-rocksdb-20261010/`、
   `/build/uuse-shard120-fio-gate-20261010/`；
-- 汇总文档：`doc/performance/uuse_tidb_shard120_20261010.md`、
+- 汇总文档：`doc/performance/uuse_tidb_baseline_20261009.md`（§6 终态）、
   `doc/review/uuse_tikv_storage_audit_20261009.md`、`doc/bug.md` #48–#50。

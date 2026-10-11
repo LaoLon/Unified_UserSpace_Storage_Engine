@@ -161,9 +161,10 @@ journal 重放丢记录——出现任一即回退修复，不做性能结论。
   布局在 UUSE 上实现 put/get/overwrite/delete + CRC32C + sync，并用
   64 KiB/512 KiB/4 MiB 随机读写微基准与 `chunk_engine` 的负载形状对照；
   先回答"UUSE 能不能支撑 chunk 数据面"。
-  - 形状探针已完成（2026-10-04，.250）：见
-    `doc/performance/uuse_chunk_shape_probe_20261004.md`——64k 随机读 48.2K IOPS、
-    512k/4m 带宽 3.0–4.0 GiB/s，无软件错误，数据面可行性通过。
+  - 形状探针已完成（2026-10-04，.250）：64k 随机读 48.2K IOPS、512k/4m 带宽
+    3.0–4.0 GiB/s，无软件错误，数据面可行性通过（原探针报告
+    `doc/performance/uuse_chunk_shape_probe_20261004.md` 已随性能目录清理，可从
+    Git 历史查询）。
   - PoC 工具已完成（2026-10-04）：`tools/uuse_chunkstore_poc.cpp`——固定 slot
     布局（64K/512K/4M 三档 × 2 文件 × 32 slot）、append-only 元数据 journal
     （PUT/DELETE 记录 + 记录 CRC，重挂载重放）、COW overwrite + free list、

@@ -847,8 +847,8 @@ Bug 等级：**致命 > 严重 > 一般**。
   该上限对 journal 小事务合理，但 checkpoint 记录可达数百 MB。
 - **修复**：`controlWriteBatch` 内部按 `kMaxControlBatchWrites` 分批顺序提交；
   崩溃落在批间时由 checkpoint CRC/generation 校验拒绝旧槽位。
-- **验证结果**：200k/1M inode 基准 sync 与 checkpoint 正常；见
-  `doc/performance/hfs2_meta_bench_20260929.md`。
+- **验证结果**：200k/1M inode 基准 sync 与 checkpoint 正常（原证据
+  `doc/performance/hfs2_meta_bench_20260929.md` 已随性能目录清理，可从 Git 历史查询）。
 
 ### 44. replay 每事务 before-image 导致 O(事务数 × namespace) 重挂载
 

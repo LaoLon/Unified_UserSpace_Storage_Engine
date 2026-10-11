@@ -262,5 +262,5 @@ Phase 8（Shard-113…121）实现完成；§4 各绕过点最终状态：
 - MySQL 同盘冒烟（fork 需按 `mysql/patches/` 重建；根盘磁盘不足）；
 - kill -9 未 sync 尾部（与 ext4 掉电语义对齐，优雅退出已闭合）。
 
-实现证据与边界：`doc/performance/uuse_tidb_shard120_20261010.md`、
+实现证据与边界：`doc/performance/uuse_tidb_baseline_20261009.md` §6、
 `tikv/README.md` §6、`doc/bug.md` #48–#50、`tikv/patches/README.md`。

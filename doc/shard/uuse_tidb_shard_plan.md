@@ -382,22 +382,22 @@ rename/delete/dirs）通过；RocksDB spike 能经 UUSE Env 打开/关闭引擎�
 
 ### Shard-120：性能与 durability
 
-> 状态：**完成（2026-10-10，混合 p99 记录边界）**。结果
-> `doc/performance/uuse_tidb_shard120_20261010.md`，证据
-> `/build/tidb/perf-ab-target-20261010-151716`、`/build/uuse-shard120-*`。
+> 状态：**完成（2026-10-10）**。结果与终态基线
+> `doc/performance/uuse_tidb_baseline_20261009.md` §6（初版基线 + 终态），证据
+> `/build/tidb/perf-ab-target-*`、`/build/uuse-shard120-*`、`/build/tidb/trace-analysis-rw-*.txt`。
 > （a）同盘 TiKV A/B（同一目标 NVMe、8 线程 × 60 s、5-run median、交错）：
-> 点读 tps **97.9%**（≥95% 通过）、p99 101.8%；混合 tps **89.5%**（≥85% 通过）、
-> **p99 117.6%（>110%，记录边界）**。边界根因：Shard-118 的 apply 强制同步
-> （UUSE 无页缓存，撤销即数据丢失路径）；ext4 侧 apply 异步不受影响。可选收敛：
-> group commit/atomic flush 优化 apply-state barrier（独立 core sub-shard，未做）。
+> 初测点读 97.9%、混合 tps 89.5%、**混合 p99 117.6%（记录边界）**；trace 归因
+> 定位同步主来源为 async write worker（apply-state/raft 日志硬编码 `sync=true`，
+> ~51k 屏障/60 s），实施 worker+apply 5 ms 同步窗口后：点读 **98.4%**、混合 tps
+> **93.7%**、p99 102.4%/109.5% 全部通过；屏障 55k→**21.8k**、同步累计 17.4 s→**5.3 s**。
+> 语义边界：单节点实验室崩溃 RPO ≤5 ms（优雅退出仍 RPO=0）。
 > （b）L1 CTest 29/29；L2 FIO smoke 读 50238/写 50346、errors=0、closure 闭合；
 > L4 FIO gate M 93.5%（p99 0.96）、E 89.9%（p99 0.20）、errors=0。
 > （c）RocksDB native-vs-UUSE A/B（640k keys、32/64 线程、同盘交错）：写 96.1–107.7%、
 > 混合读写 95.7–112.6%，无 >5% 回退；无 error/corruption。
 > （d）group commit 评估：core 既有 `SyncBatch` + `max_group_commit_wait_us=200`
 > 合并窗口；Shard-118 未改 `File::sync`/`syncMetadata` 路径（字节级不变）。
-> 未做：MySQL 同盘冒烟（fork 未按补丁栈重建，Shard-121 处理）；apply 同步的吞吐
-> 收敛优化（group commit sub-shard）。
+> 未做：MySQL 同盘冒烟（fork 未按补丁栈重建，Shard-121 记录边界）。
 
 **目标**：验证 TiKV 性能可接受，同时证明 RocksDB/MySQL 无回退。
 

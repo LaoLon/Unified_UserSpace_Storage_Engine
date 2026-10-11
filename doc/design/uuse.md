@@ -2131,9 +2131,9 @@ encryption-at-rest、S3/cloud FS、mmap 读写、多进程共享 bdev、`tikv-ct
 
 > **实现状态（Shard-121 收口，2026-10-10）**：Phase 8（Shard-113…121）已完成。
 > 功能矩阵 26/26、并发 closure 5/5、生命周期用例 6/6（ASAN/TSAN 干净）、
-> CTest 29/29；TiKV 同盘性能 A/B 点读 97.9%、混合 tps 89.5% 通过，混合 p99
-> 117.6% 记录边界（apply 强制同步的 durability 代价，见
-> `doc/performance/uuse_tidb_shard120_20261010.md`）；RocksDB/FIO 门禁无回退。
+> CTest 29/29；TiKV 同盘性能 A/B（同步窗口化终态）点读 98.4%、混合 tps 93.7%、
+> p99 102.4%/109.5% 全部通过（trace 归因、三变体对比与 RPO 边界见
+> `doc/performance/uuse_tidb_baseline_20261009.md` §6）；RocksDB/FIO 门禁无回退。
 > 支持范围、禁用项、已知边界（fast-reorg ingest、kill -9 语义、错误面、MySQL
 > 冒烟延后等）与补丁栈见 `tikv/README.md` 与 `tikv/patches/README.md`；
 > 实现过程中发现并修复的真实缺陷见 `doc/bug.md` #48–#50。
