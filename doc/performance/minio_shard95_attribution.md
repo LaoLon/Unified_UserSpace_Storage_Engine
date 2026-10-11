@@ -85,8 +85,9 @@ GET 78%→83%，GET p99 保持优于 ext4。**gate 仍未达标**（PUT ≈62%�
   不破坏相邻字节；`corruption=none`；
 - CTest **29/29**（含 `namespace_test` 快照往返、`journal_test`
   checkpoint 往返、`data_path_device_test`）；
-- 四节点集群恢复后跨节点读校验 60/60（.250 写、.252/.253 读），
-  `/minio/health/cluster` 200。
+- 四节点集群滚动部署新 core/shim（四台 `libuuse_core.so.2` 同为
+  `ce449c30…`）后复测：集群功能矩阵 **21/21**（经 .250 端点）、
+  .250 写 + .252/.253 读 **60/60**、`/minio/health/cluster` 四台 200。
 
 ## 6. 剩余差距与下一步（未实施）
 
