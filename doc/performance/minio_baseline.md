@@ -67,14 +67,18 @@
   |---|---|
   | 远端 c16 PUT → **UUSE 服务端** | **505.92 MiB/s** ✅（GET 709.45 ✅） |
   | 远端 c16 PUT → **ext4 服务端** | **0.34 MiB/s** ❌（p50 30.05s；GET 侧 829.50 ✅） |
+  | **远端 c16 PUT → stock MinIO（同 ext4 形态、md5 `7a0a9d84…`）** | **0.34 MiB/s** ❌（与 fork **完全一致**；GET 824.90 ✅） |
+  | stock 回环 c16 PUT（同实例） | 903.21 MiB/s ✅ |
   | 远端**顺序** PUT → ext4（60×1MiB） | 0.503s 完成（≈120 MiB/s）✅ |
   | 回环 c16 PUT（同实例） | 757–911 MiB/s ✅ |
   | 设备本体（dd 512MiB 缓冲/direct + fsync） | 1.9 / 1.5 GB/s、fsync 0.00s ✅ |
   | strace（停摆中全量 10s） | 最慢是 Go futex（≤6.5s）、无慢 I/O；4355×nanosleep、1281×mkdirat |
-  → 异常**特指 ext4 后端 + 远端客户端 + 并发 PUT**（UUSE 后端不受影响），
-  **不是** .250 VM 退化（重启后复现）、不是设备、不是网络（顺序写与 GET 均正常）。
-  根因未定位（疑似 MinIO 在该组合下的 Go 层争用，需 pprof/goroutine 分析），列待查。
-  **远端腿数据：UUSE 侧有效并采纳；ext4 侧无效，不计入对比。**
+  → 异常**特指 ext4 后端 + 远端客户端 + 并发 PUT**，且 **stock 上游二进制精确复现
+  （0.34 vs 0.34）→ 不是 fork 问题**；也不是 .250 VM 退化（重启后复现）、不是设备、
+  不是网络（顺序写/回环/GET 均正常）。**UUSE 后端免疫（505.9 ✅，同场景快约 1500×）**
+  ——直写路径绕开 ext4 ordered-journal/页缓存与并发远端写的交互。根因未定位
+  （环境/上游层面；疑与 `pci=nomsi` 下单队列内核 NVMe + 并发远端写有关），列待查。
+  **远端腿数据：UUSE 侧有效并采纳；ext4（fork 与 stock）侧无效，不计入对比。**
 - 2 客户端 + 2 存储拓扑（负扩展观察，UUSE 内部 1↔2 客户端对照）：
   `minio/README.md` §2。
 - ext4 + `MINIO_API_ODIRECT=on`（dio）对照实验：未做（计划见会话记录）。
