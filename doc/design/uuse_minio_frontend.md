@@ -458,9 +458,9 @@ int uuse_minio_version(char *buf, size_t len); /* ABI/version check */
 > `UUSE_TEST_FORCE_CHECKPOINT` 测试钩子（设计 §5.8）。A/B：**PUT 47%→103%
 > （已达标）**、GET 78%→71%（ext4 冷缓存 GET 3249 MiB/s 为设备带宽限制，
 > UUSE 读路径探针峰值 5270 MiB/s@8 线程，GET 差距在每对象小读排队 +
-> MinIO 自身开销）；GET p99 0.72–0.78x（优于 ext4）；gate 仍未全达标，
+> MinIO 自身开销）；GET p99 0.72–0.78x（优于 ext4）；gate 当时尚未全达标，
 > 剩余差距与 Round 3 方向见 `doc/performance/minio_shard95_attribution.md`
-> §10。
+> §10（**2026-10-12 已冻结，见文首与 §7.4**）。
 >
 > **Round 4（元数据缓存，2026-10-12）**：按用户决策实现「仅元数据」有界缓存
 > （**shim 层**，core 无页缓存不变）：≤64 KiB 元数据文件、64 MiB + LRU 上限、
@@ -471,7 +471,7 @@ int uuse_minio_version(char *buf, size_t len); /* ABI/version check */
 > 分 reactor、`maxChildBytes` 拆分子传输均回退。剩余 GET 差距为设备在单
 > qpair、QD≈8–16 下的持续读吞吐（≈2.0–2.5GB/s）vs ext4 内核多队列
 > （2.7–3.2GB/s）；引擎读路径自身 8 线程顺序读 5270 MiB/s，差距在并发深度/
-> 驱动路径。9.5 保持开放。
+> 驱动路径。9.5（**2026-10-12 冻结，见文首与 §7.4**）。
 >
 > **实现状态（Shard-9.2 完成，2026-10-11）**：Go 侧盘层抽象
 > `minio/internal/uuseos/` + `cmd` 补丁栈（`minio/patches/apply-uuse-seam.py`，
