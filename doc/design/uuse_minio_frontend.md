@@ -473,6 +473,14 @@ int uuse_minio_version(char *buf, size_t len); /* ABI/version check */
 > （2.7–3.2GB/s）；引擎读路径自身 8 线程顺序读 5270 MiB/s，差距在并发深度/
 > 驱动路径。9.5（**2026-10-12 冻结，见文首与 §7.4**）。
 >
+> **2+2 拓扑验证（2026-10-12，用户要求）**：MinIO 拆为 2 服务端（.250/.251，
+> 2 盘 EC:1：写 quorum 2/读 quorum 1）+ 2 外部客户端（.252/.253）：外部矩阵
+> 24/24、跨节点 verify/sweep 60/60、kill 一端后读 60/60 而**写挂起**（>90s
+> 无错误返回，恢复后写/校验/清扫全部复原）；单客户端 PUT 233–243 /
+> GET 454–458 MiB/s（errors=0，链路实际 ≈3.8–4 Gbps）。2 客户端并发聚合未
+> 取到（.252 测试中整机失联，需宿主侧重启）。详见 `minio/README.md` §2
+> "2 存储 + 2 客户端"行与"环境备注（2026-10-12 拓扑测试）"。
+>
 > **实现状态（Shard-9.2 完成，2026-10-11）**：Go 侧盘层抽象
 > `minio/internal/uuseos/` + `cmd` 补丁栈（`minio/patches/apply-uuse-seam.py`，
 > 24 锚点）已在 251 真机跑通端到端：**bucket/PUT/GET（字节一致）/LIST/remove
