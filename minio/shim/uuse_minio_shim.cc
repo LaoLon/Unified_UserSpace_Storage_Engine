@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <list>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -69,6 +70,179 @@ struct ShimOpStats {
     std::atomic<std::uint64_t> maxNs{0};
     std::atomic<std::uint64_t> waitNs{0};
     std::atomic<std::uint64_t> waitMaxNs{0};
+};
+
+/* Bounded content cache for small metadata files (xl.meta, format.json,
+ * disk-id, healing markers). MinIO re-reads these 4 KiB metadata files on
+ * every object access; without a host page cache each read is a device round
+ * trip that queues behind multi-hundred-microsecond payload transfers (see
+ * doc/performance/minio_shard95_attribution.md section 12). The cache lives in
+ * the shim (frontend), not in the core, and keeps the core's data semantics:
+ *  - only files whose whole content fits kMetaCacheMaxFileBytes are cached;
+ *  - every cached read revalidates (size, mtime, generation) through the file
+ *    handle's in-memory stat, so a missed invalidation still misses;
+ *  - every mutation through the shim (write/truncate/allocate/open with
+ *    truncate/remove/remove_all/rename) invalidates the affected paths;
+ *  - bounded by total bytes with LRU eviction; disabled with
+ *    UUSE_MINIO_META_CACHE=0; counters exposed through the shim diag. */
+constexpr std::size_t kMetaCacheMaxFileBytes = 64 * 1024;
+
+std::atomic<std::uint64_t> g_metaCacheHits{0};
+std::atomic<std::uint64_t> g_metaCacheMisses{0};
+std::atomic<std::uint64_t> g_metaCacheInserts{0};
+std::atomic<std::uint64_t> g_metaCacheStale{0};
+std::atomic<std::uint64_t> g_metaCacheBytes{0};
+std::atomic<std::uint64_t> g_metaCacheInvalidations{0};
+
+/* Cache byte budget from the environment (MiB, default 64, 0 disables). */
+std::size_t metaCacheBudgetBytes() {
+    const char *disabled = std::getenv("UUSE_MINIO_META_CACHE");
+    if (disabled != nullptr && std::strcmp(disabled, "0") == 0) {
+        return 0;
+    }
+    const char *megabytes = std::getenv("UUSE_MINIO_META_CACHE_MB");
+    long long value = 64;
+    if (megabytes != nullptr && *megabytes != '\0') {
+        char *end = nullptr;
+        const long long parsed = std::strtoll(megabytes, &end, 10);
+        if (end != megabytes && *end == '\0' && parsed >= 0) {
+            value = parsed;
+        }
+    }
+    return static_cast<std::size_t>(value) * 1024 * 1024;
+}
+
+class MetaCache {
+public:
+    explicit MetaCache(std::size_t maxBytes) : maxBytes_(maxBytes) {}
+
+    bool enabled() const noexcept { return maxBytes_ != 0; }
+
+    /* Serves [offset, offset+len) from the cache when an entry exists and the
+     * caller's validated stat still matches it. */
+    bool read(const std::string &path, const uuse::FileStat &stat, std::uint64_t offset,
+              void *out, std::size_t len, long long *bytes) {
+        if (maxBytes_ == 0 || len == 0 || out == nullptr) {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto found = entries_.find(path);
+        if (found == entries_.end()) {
+            g_metaCacheMisses.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        Entry &entry = found->second;
+        if (entry.size != stat.logicalSize || entry.mtimeNs != stat.mtimeNs ||
+            entry.generation != stat.generation) {
+            g_metaCacheStale.fetch_add(1, std::memory_order_relaxed);
+            eraseLocked(found);
+            return false;
+        }
+        if (offset >= entry.size) {
+            g_metaCacheMisses.fetch_add(1, std::memory_order_relaxed);
+            return false; /* EOF: the real read reports the short read */
+        }
+        const std::size_t available = static_cast<std::size_t>(entry.size - offset);
+        const std::size_t take = std::min(len, available);
+        std::memcpy(out, entry.data.data() + offset, take);
+        touchLocked(path, entry);
+        *bytes = static_cast<long long>(take);
+        g_metaCacheHits.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+
+    void insert(const std::string &path, const uuse::FileStat &stat, const void *data,
+                std::size_t size) {
+        if (maxBytes_ == 0 || size == 0 || size > kMetaCacheMaxFileBytes ||
+            data == nullptr) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto existing = entries_.find(path);
+        if (existing != entries_.end()) {
+            eraseLocked(existing);
+        }
+        while (bytes_ + size > maxBytes_ && !lru_.empty()) {
+            const auto victim = entries_.find(lru_.back());
+            if (victim == entries_.end()) {
+                lru_.pop_back();
+                continue;
+            }
+            eraseLocked(victim);
+        }
+        if (bytes_ + size > maxBytes_) {
+            return;
+        }
+        Entry entry;
+        entry.data.assign(reinterpret_cast<const std::byte *>(data),
+                          reinterpret_cast<const std::byte *>(data) + size);
+        entry.size = stat.logicalSize;
+        entry.mtimeNs = stat.mtimeNs;
+        entry.generation = stat.generation;
+        lru_.push_front(path);
+        entry.lru = lru_.begin();
+        entries_.emplace(path, std::move(entry));
+        bytes_ += size;
+        g_metaCacheInserts.fetch_add(1, std::memory_order_relaxed);
+        g_metaCacheBytes.store(bytes_, std::memory_order_relaxed);
+    }
+
+    void invalidate(const std::string &path) {
+        if (maxBytes_ == 0) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto found = entries_.find(path);
+        if (found != entries_.end()) {
+            eraseLocked(found);
+        }
+    }
+
+    /* Drops every entry at or below the prefix (directory rename/remove_all). */
+    void invalidatePrefix(const std::string &prefix) {
+        if (maxBytes_ == 0) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (auto it = entries_.begin(); it != entries_.end();) {
+            if (it->first.compare(0, prefix.size(), prefix) == 0) {
+                it = eraseLocked(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+private:
+    struct Entry {
+        std::vector<std::byte> data;
+        std::uint64_t size = 0;
+        std::uint64_t mtimeNs = 0;
+        std::uint32_t generation = 0;
+        std::list<std::string>::iterator lru;
+    };
+
+    void touchLocked(const std::string &path, Entry &entry) {
+        lru_.erase(entry.lru);
+        lru_.push_front(path);
+        entry.lru = lru_.begin();
+    }
+
+    /* Erases one entry and returns the next iterator. */
+    std::unordered_map<std::string, Entry>::iterator eraseLocked(
+        std::unordered_map<std::string, Entry>::iterator it) {
+        bytes_ -= it->second.data.size();
+        lru_.erase(it->second.lru);
+        g_metaCacheBytes.store(bytes_, std::memory_order_relaxed);
+        g_metaCacheInvalidations.fetch_add(1, std::memory_order_relaxed);
+        return entries_.erase(it);
+    }
+
+    std::mutex mutex_;
+    std::unordered_map<std::string, Entry> entries_;
+    std::list<std::string> lru_;
+    std::size_t bytes_ = 0;
+    std::size_t maxBytes_ = 0;
 };
 
 struct ShimDiag {
@@ -152,6 +326,29 @@ struct ShimDiag {
      * readable when the process never closes the engine gracefully. */
     void dumpAndReset() noexcept {
         if (!enabled) return;
+        const std::uint64_t hits = g_metaCacheHits.load(std::memory_order_relaxed);
+        const std::uint64_t misses = g_metaCacheMisses.load(std::memory_order_relaxed);
+        const std::uint64_t inserts = g_metaCacheInserts.load(std::memory_order_relaxed);
+        const std::uint64_t stale = g_metaCacheStale.load(std::memory_order_relaxed);
+        const std::uint64_t invalidations =
+            g_metaCacheInvalidations.load(std::memory_order_relaxed);
+        const std::uint64_t bytes = g_metaCacheBytes.load(std::memory_order_relaxed);
+        if (hits != 0 || misses != 0 || inserts != 0 || bytes != 0) {
+            std::fprintf(stderr,
+                         "uuse-shim-diag: meta_cache hits=%llu misses=%llu inserts=%llu "
+                         "stale=%llu evictions=%llu bytes=%llu\n",
+                         static_cast<unsigned long long>(hits),
+                         static_cast<unsigned long long>(misses),
+                         static_cast<unsigned long long>(inserts),
+                         static_cast<unsigned long long>(stale),
+                         static_cast<unsigned long long>(invalidations),
+                         static_cast<unsigned long long>(bytes));
+            g_metaCacheHits.store(0, std::memory_order_relaxed);
+            g_metaCacheMisses.store(0, std::memory_order_relaxed);
+            g_metaCacheInserts.store(0, std::memory_order_relaxed);
+            g_metaCacheStale.store(0, std::memory_order_relaxed);
+            g_metaCacheInvalidations.store(0, std::memory_order_relaxed);
+        }
         dump();
         static const char *const bucketNames[] = {"lt4k", "lt64k", "lt1m", "ge1m"};
         for (std::size_t bucket = 0; bucket < 4; ++bucket) {
@@ -322,6 +519,8 @@ struct UuseMinioEngineState {
     std::mutex mutex; /* serializes the shared path-op client */
     std::uint64_t maxInodes = 0; /* [metadata] max_inodes snapshot */
     std::uint32_t metadataBlockSize = 0; /* [storage] metadata_block_size */
+    /* Bounded metadata content cache (UUSE_MINIO_META_CACHE[_MB]). */
+    MetaCache metaCache{metaCacheBudgetBytes()};
 
     std::thread clientThread; /* frontend thread of `client` */
     std::mutex closeMutex;
@@ -403,6 +602,7 @@ struct uuse_minio_engine {
 struct uuse_minio_file {
     std::shared_ptr<UuseMinioEngineState> state;
     std::shared_ptr<uuse::File> file;
+    std::string path; /* namespace path, used by the metadata cache */
 };
 
 struct uuse_minio_dir {
@@ -580,9 +780,15 @@ int uuse_minio_open(uuse_minio_engine *engine, const char *path, unsigned flags,
             return rc;
         }
     }
+    /* A create/truncate may replace the file content; any write through the
+     * returned handle invalidates the cache entry again on completion. */
+    if ((flags & (UUSE_MINIO_OPEN_CREATE | UUSE_MINIO_OPEN_TRUNCATE)) != 0) {
+        state->metaCache.invalidate(path);
+    }
     auto *handle = new uuse_minio_file();
     handle->state = std::move(state);
     handle->file = std::move(file);
+    handle->path = path;
     *out = handle;
     return 0;
 }
@@ -601,11 +807,36 @@ long long uuse_minio_pread(uuse_minio_file *file, void *buf, size_t len,
     ShimOpScope diag(ShimOp::Pread);
     auto *bytes = reinterpret_cast<std::byte *>(buf);
     if (bytes == nullptr) return -EINVAL;
+    /* Metadata fast path: small reads are served from the bounded shim cache
+     * when the handle's (size, mtime, generation) still match. Payload reads
+     * (>= kMetaCacheMaxFileBytes) always go to the device. */
+    uuse::FileStat stat{};
+    bool haveStat = false;
+    if (len <= kMetaCacheMaxFileBytes && file->state->metaCache.enabled()) {
+        auto current = file->file->stat();
+        if (current.ok()) {
+            stat = current.value();
+            haveStat = true;
+            long long served = 0;
+            if (file->state->metaCache.read(file->path, stat, offset, bytes, len,
+                                            &served)) {
+                shimDiag().recordIo(true, len, steadyNs() - diag.startNs_);
+                return served;
+            }
+        }
+    }
     uuse::IoVec vec{bytes, len};
     auto outer = file->file->read(std::span<uuse::IoVec>(&vec, 1), offset).wait();
     uuse::ReadResult value{};
     const int rc = unwrap(std::move(outer), &value);
     shimDiag().recordIo(true, len, steadyNs() - diag.startNs_);
+    if (rc == 0 && haveStat && offset == 0 && value.bytes > 0 &&
+        value.bytes <= kMetaCacheMaxFileBytes &&
+        stat.logicalSize == static_cast<std::uint64_t>(value.bytes)) {
+        /* A full-file read: populate the cache for the next access. */
+        file->state->metaCache.insert(file->path, stat, bytes,
+                                      static_cast<std::size_t>(value.bytes));
+    }
     return rc != 0 ? rc : static_cast<long long>(value.bytes);
 }
 
@@ -621,6 +852,10 @@ long long uuse_minio_pwrite(uuse_minio_file *file, const void *buf, size_t len,
     uuse::WriteResult value{};
     const int rc = unwrap(std::move(outer), &value);
     shimDiag().recordIo(false, len, steadyNs() - diag.startNs_);
+    if (rc == 0) {
+        /* The path content changed; cached metadata must not survive. */
+        file->state->metaCache.invalidate(file->path);
+    }
     return rc != 0 ? rc : static_cast<long long>(value.bytes);
 }
 
@@ -633,7 +868,11 @@ int uuse_minio_fdatasync(uuse_minio_file *file) {
 int uuse_minio_ftruncate(uuse_minio_file *file, uint64_t size) {
     if (file == nullptr || file->file == nullptr) return -EINVAL;
     ShimOpScope diag(ShimOp::Ftruncate);
-    return unwrap(file->file->truncate(size).wait());
+    const int rc = unwrap(file->file->truncate(size).wait());
+    if (rc == 0) {
+        file->state->metaCache.invalidate(file->path);
+    }
+    return rc;
 }
 
 int uuse_minio_fstat(uuse_minio_file *file, uuse_minio_stat *out) {
@@ -648,7 +887,11 @@ int uuse_minio_fstat(uuse_minio_file *file, uuse_minio_stat *out) {
 int uuse_minio_allocate(uuse_minio_file *file, uint64_t offset, uint64_t length) {
     if (file == nullptr || file->file == nullptr) return -EINVAL;
     ShimOpScope diag(ShimOp::Allocate);
-    return unwrap(file->file->allocate(offset, length).wait());
+    const int rc = unwrap(file->file->allocate(offset, length).wait());
+    if (rc == 0) {
+        file->state->metaCache.invalidate(file->path);
+    }
+    return rc;
 }
 
 int uuse_minio_path_stat(uuse_minio_engine *engine, const char *path,
@@ -722,6 +965,7 @@ int uuse_minio_remove(uuse_minio_engine *engine, const char *path,
     auto state = engine->state;
     ShimOpScope diag(ShimOp::Remove);
     auto lock = lockClientWait(state->mutex, diag);
+    state->metaCache.invalidate(path);
     if (removed != nullptr) {
         uuse::FileStat value;
         const int statRc = unwrap(state->client->stat(path).wait(), &value);
@@ -741,6 +985,7 @@ int uuse_minio_remove_all(uuse_minio_engine *engine, const char *path,
     auto state = engine->state;
     ShimOpScope diag(ShimOp::RemoveAll);
     auto lock = lockClientWait(state->mutex, diag);
+    state->metaCache.invalidatePrefix(path);
     const int rc = removeRecursiveLocked(state, path, 0);
     if (rc != 0) setError(errbuf, errlen, "remove_all failed");
     return rc;
@@ -756,6 +1001,8 @@ int uuse_minio_rename(uuse_minio_engine *engine, const char *from,
     auto state = engine->state;
     ShimOpScope diag(ShimOp::Rename);
     auto lock = lockClientWait(state->mutex, diag);
+    state->metaCache.invalidatePrefix(from);
+    state->metaCache.invalidatePrefix(to);
     const int rc = unwrap(state->client->rename(from, to).wait());
     if (rc != 0) setError(errbuf, errlen, "rename failed");
     return rc;

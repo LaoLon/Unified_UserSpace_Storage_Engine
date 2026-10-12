@@ -493,6 +493,9 @@ Task<Result<void>> Engine::mount() {
                              nullptr);
     IoPlanner::Config plannerConfig;
     plannerConfig.blockSize = metaBlock;
+    /* One contiguous child per request: splitting large transfers into smaller
+     * children measurably lowered throughput on this virtual NVMe (Shard-9.6
+     * negative result), so keep the full child span. */
     plannerConfig.maxChildBytes = 1U << 20;
     plannerConfig.maxChildren = 64;
     /* Use the native-sector planner only when every mounted device has the

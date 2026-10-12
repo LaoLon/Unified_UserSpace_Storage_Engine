@@ -460,6 +460,17 @@ int uuse_minio_version(char *buf, size_t len); /* ABI/version check */
 > 剩余差距与 Round 3 方向见 `doc/performance/minio_shard95_attribution.md`
 > §10。
 >
+> **Round 4（元数据缓存，2026-10-12）**：按用户决策实现「仅元数据」有界缓存
+> （**shim 层**，core 无页缓存不变）：≤64 KiB 元数据文件、64 MiB + LRU 上限、
+> 每次命中用内存 stat（size/mtime/generation）复核、写/truncate/allocate/
+> open(TRUNC)/remove(_all)/rename 严格失效、`UUSE_MINIO_META_CACHE=0` 可关、
+> 计数经 shim diag。实测小读平均 1627→977µs（−40%）；最终 A/B：PUT 106%
+> （r1 ✅）、**GET 71.3%/76.0%（❌）、GET p99 0.73x（✅）**。负结果：
+> 分 reactor、`maxChildBytes` 拆分子传输均回退。剩余 GET 差距为设备在单
+> qpair、QD≈8–16 下的持续读吞吐（≈2.0–2.5GB/s）vs ext4 内核多队列
+> （2.7–3.2GB/s）；引擎读路径自身 8 线程顺序读 5270 MiB/s，差距在并发深度/
+> 驱动路径。9.5 保持开放。
+>
 > **实现状态（Shard-9.2 完成，2026-10-11）**：Go 侧盘层抽象
 > `minio/internal/uuseos/` + `cmd` 补丁栈（`minio/patches/apply-uuse-seam.py`，
 > 24 锚点）已在 251 真机跑通端到端：**bucket/PUT/GET（字节一致）/LIST/remove

@@ -2261,6 +2261,15 @@ encryption-at-rest、S3/cloud FS、mmap 读写、多进程共享 bdev、`tikv-ct
   版本检查，风格对齐 TiKV shim；v1 实现为「每 `.conf` 弱引用注册表 + 共享
   path-op client（专用 frontend 线程 + mutex）+ 文件数据在调用线程 coroutine」；
   per-thread client（worker-direct）按 §4.2 留作性能优化项；
+- **shim 元数据缓存（Shard-9.6 选项 A）**：MinIO 每次对象访问都会重读
+  4 KiB 级元数据（xl.meta/format.json/disk-id/healing 标记），UUSE 无宿主页
+  缓存时这些读都要落设备且排在 payload 传输之后（§22 性能说明）。shim 层提供
+  「仅元数据」的有界内容缓存：整文件 ≤64 KiB、默认 64 MiB 上限 + LRU、
+  每次命中用句柄的内存 stat（size/mtime/generation）复核、写/truncate/
+  allocate/带 TRUNCATE 的 open/remove/remove_all/rename 经同一 shim 立即失效
+  （含目录前缀）、`UUSE_MINIO_META_CACHE=0` 可关、命中/失效计数经 shim diag
+  输出。对象 payload 与 bitrot 校验语义不变（core 仍无页缓存）；该缓存属
+  MinIO frontend 的适配层行为，不改变 core 契约；
 - **生命周期**：engine 在 `newXLStorage` 构造时打开（早于该盘任何目录探测）；
   engine state 引用计数，最后一个 File/Client 引用释放时 `Engine::stop()`；
   `.minio.sys` 文件锁（flock）由 engine 进程锁覆盖或 fail-closed。

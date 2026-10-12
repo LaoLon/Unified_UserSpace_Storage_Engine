@@ -176,7 +176,46 @@ barrier 成本（mean ≈0.49 ms）。
 - zero-fill 语义探针 **19/19**（含 truncate-on-create 路径）；
 - 四节点滚动部署（四台 `libuuse_core.so.2` md5 `2ae84cb1…`）+ 跨节点读 60/60。
 
-## 12. Round 3：GET 读路径归因（2026-10-12）
+## 12. Round 4：元数据缓存（选项 A，2026-10-12）与复测
+
+> 按时间线 Round 3 的 GET 读路径归因见 §13、replay 幂等修复见 §14；本节记录
+> 其后的 Round 4 实现与复测。
+
+按用户决策实现"仅元数据"缓存（**shim 层，不进 core**），严格失效语义：
+
+- 范围：整文件 ≤ 64 KiB 的元数据文件（xl.meta/format.json/disk-id/healing 标记）；
+  对象 payload（1 MiB part）恒走设备，bitrot 校验语义不变；
+- 读取校验：每次命中都用文件句柄的**内存 stat**（size/mtime/generation）
+  复核，缓存失效遗漏时仍会 miss；
+- 失效：写/truncate/allocate/带 TRUNCATE 的 open/remove/remove_all/rename
+  经同一 shim 立即失效（含目录前缀失效）；
+- 有界：默认 64 MiB 字节上限 + LRU；`UUSE_MINIO_META_CACHE=0` 关闭、
+  `UUSE_MINIO_META_CACHE_MB` 调上限；命中/失效计数经 shim diag 输出。
+
+**实测效果**（trace/diag 单节点）：
+
+| 项 | 无缓存 | 有缓存 |
+|---|---|---|
+| GET 窗口 4 KiB pread 平均 | 1627 µs | **977 µs（−40%）** |
+| 缓存命中率（小读） | — | ≈50%（每对象 2 次小读：1 miss 填充 + 1 hit） |
+| GET 吞吐（正式 A/B） | 71.4%/70.3% | **71.3%/76.0%** |
+| GET p99 | 0.76x/0.78x | 0.73x/0.73x ✓ |
+| PUT（同轮） | 103.3%/103.7% | 106.0%（r1 ✓；r2 出现 ENOSPC 卷满，无效） |
+
+**负结果（已回退）**：① 读请求按大小分 reactor（第二 SPDK 队列）→ GET 1938→1790
+MiB/s；② `maxChildBytes` 1 MiB→256 KiB（每请求 4 个子传输加深设备流水）→
+读探针 −12~21%、混合小读 −12%。
+
+**剩余差距的最终结论**：缓存消除了元数据重复读的**次数**，但 GET 仍受
+**设备在单 qpair、QD≈8–16 下的持续读吞吐（≈2.0–2.5 GB/s）**限制，而 ext4 的
+内核多队列在同一冷缓存负载下可达 2.7–3.2 GB/s；UUSE 读路径自身在 8 线程
+顺序读可达 5270 MiB/s（探针），说明差距来自**并发深度/驱动路径**而非引擎读
+带宽。要再进一步需要：内核级多队列（SPDK 侧多 qpair 需设备/驱动配合）、
+payload 级缓存（超出"无页缓存"边界，需设计评审）或 MinIO 侧降低每对象读
+次数。**当前 gate：PUT ✅、GET p99 ✅、GET 吞吐 ❌（≈74%）**。
+
+
+## 13. Round 3：GET 读路径归因（2026-10-12）
 
 - **CPU 不是瓶颈**：GET 期间 `mpstat` 全核 idle≈78%（usr 15%/sys 5%，六核均衡）→ 不是 CPU 饥饿。
 - **设备级队头阻塞是主因**：`temp_scripts/minio_shard95_readprobe.cc` 混合模式
@@ -198,7 +237,7 @@ barrier 成本（mean ≈0.49 ms）。
   xl.meta 重复读（MinIO 侧）、读/元数据分设备队列（需设备侧支持）、
   worker-direct 读（减少每请求线程往返）。
 
-## 13. Round 3 关键缺陷修复：replay 幂等性（2026-10-12）
+## 14. Round 3 关键缺陷修复：replay 幂等性（2026-10-12）
 
 **现象**：四节点集群滚动 `kill -9` 重启后，.251/.253 的 mount 失败：
 `metadata journal replay failed: target rejected txid 6080 record type 15 object
