@@ -805,7 +805,7 @@ RequestParentComplete→CqPush→FeReap` 的推导与 p50/p99；`trace-manifest.
 
 - CTest 29/29、`hfsctl check` `corruption=none`、closure 全闭合；
 - 同形状 FIO gate（§16.2 修订后）：1j32 HFS/raw 90.6%、p99 1.00；8j4 120.8%、p99 0.19；
-- **MySQL 同盘门禁**（`run_shard105_samedisk_vm.sh`）：读 96.4%/98.9%、写 98.6%/91.2%
+- **MySQL 同盘门禁**（当次脚本 `run_shard105_samedisk_vm.sh`，已随 shard 过程脚本清理）：读 96.4%/98.9%、写 98.6%/91.2%
   → 吞吐达标（≥85%）；写 p99 117.6%/128.7% 未达标（≤110%）；历史 65.2% 是非对称
   口径（HFS 在 NVMe、native 在 VM 根盘 ext4），同盘口径下差距消失；
 - **RocksDB 同盘对照**（32 线程，1.28M keys）：fillseq 105.4%、fillrandom 102.2%、
