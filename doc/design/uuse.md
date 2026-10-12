@@ -111,6 +111,7 @@ UUSE 2.0                 ─ 新 raw-bdev 镜像 ─ C++20 core/FIO/RocksDB adap
 - MySQL 8.0.46 InnoDB frontend（Phase 7，经 fork 的 `os_file` seam，见 §20）；
 - TiKV frontend（TiDB 的本地存储层；Phase 8，经 `components/file_system`/
   `RocksDBEnv` seam，见 §21）；
+- MinIO S3 frontend（Phase 9，fork 的 `cmd/xl-storage` 盘层 seam，见 §22）；
 - 直接 SPDK bdev/NVMe 访问；
 - 文件 namespace、目录、rename、delete、extent allocation、sync 和 crash recovery；
 - direct buffer 和 bounded bounce buffer 两条数据路径；
@@ -131,6 +132,9 @@ UUSE 2.0                 ─ 新 raw-bdev 镜像 ─ C++20 core/FIO/RocksDB adap
 - TiDB/TiKV 的 POSIX/FUSE 接入、TiFlash、TiKV encryption-at-rest、S3/cloud FS、
   mmap 读写、`tikv-ctl` 直连 UUSE 数据目录：不提供；TiKV 只能经
   `components/file_system` seam 接入（Phase 8，§21）。
+- MinIO 的 gateway/NAS/S3-over-S3 模式、通用 POSIX 兼容层、SSE/KMS 加密、
+  ILM 转 tier、Kafka/NATS 事件、多进程共享同一 UUSE 卷：不提供；MinIO 只能经
+  fork 的盘层 seam 接入（Phase 9，§22）。
 
 fork 保护仍可作为 core 的进程安全措施，但不再模拟 POSIX preload 行为：fork child
 调用 core 直接得到 `ForkedProcess` 错误。
@@ -1684,6 +1688,14 @@ checkpoint region 必须容纳 namespace/inode/extent map/各 device allocator b
 | TiKV punch hole 不支持 | 按审计 fail-closed 或显式降级并记录，禁止静默 no-op |
 | TiKV 与 3FS 实验室资源冲突 | 独立盘与时段约束；不占用已声明盘 |
 | TiKV 上游 rebase 冲突 | 改动限定 FS 工厂 + shim + 独立 patch 目录；版本冻结 |
+| MinIO 上游已归档（无安全修复） | 冻结 tag + 独立补丁栈（`minio/patches/`）；升级须重跑审计与全矩阵 |
+| MinIO `statfs`/rotational/inode 宿主探测误导 | 容量/FS 类型/inode 全部由 shim 应答；宿主探测 fail-closed（§5.6） |
+| MinIO xattr（盘级写/删计数）缺失 | v1 fail-closed + 日志（设计 §5.7 Q2） |
+| MinIO cgo/Go 线程模型与 client 归属冲突 | per-thread registry + 上限回落 + 计数；文件由进程 owner client 持有 |
+| MinIO datadir 文件落到宿主 OS | 审计清单 + 每 shard strace 校验；宿主白名单外出现即失败 |
+| MinIO shape change 恢复语义 | shape 记录可回放 + replay 幂等 + checkpoint 原子性不变量（§9.3、bug #51） |
+| MinIO 同盘/同拓扑 A/B 回退 >5% | 早测 + trace 归因 + 结构性修复；GET 差距（无页缓存/小读队头阻塞）按已知差异记录，不用豁免改写 gate |
+| MinIO 与 3FS 实验争抢 lab VM | 集群口径 .250–.253；3FS 暂停/恢复手册；不做未记录的破坏性操作 |
 
 ### 17.3 立即停止条件
 
@@ -1698,7 +1710,10 @@ checkpoint region 必须容纳 namespace/inode/extent map/各 device allocator b
 - RocksDB/FIO 正式口径回退超过 5%（Phase 7 shard 门禁失败）；
 - 旧 Blobstore、POSIX fd 或 preload 代码重新进入 UUSE 2.0 build；
 - TiKV 路径 data mismatch、崩溃恢复失败（store 无法启动或丢失已提交写）；
-- TiKV datadir 文件落到宿主 OS、或禁用项静默降级。
+- TiKV datadir 文件落到宿主 OS、或禁用项静默降级；
+- MinIO 路径 data mismatch、kill -9 后已 ACK 对象丢失或目录残缺、集群 heal 无法补齐；
+- MinIO datadir 文件落到宿主 OS、或禁用项（SSE/KMS/ILM/gateway/xattr）静默降级；
+- MinIO 同盘/同拓扑 A/B 回退超过 5%（即低于 95% gate）。
 
 ## 18. 实施顺序
 
@@ -1893,6 +1908,19 @@ checkpoint region 必须容纳 namespace/inode/extent map/各 device allocator b
 - 每个 shard 出口执行 RocksDB/MySQL L1–L4 无回退门禁；执行计划见
   `doc/shard/uuse_tidb_shard_plan.md`。
 
+### Phase 9：MinIO S3 frontend（Shard-9.0 起）
+
+- 设计前置：§3.1/§3.2/§17/§22 更新完成后才能动代码；
+- 基座：VM 内 MinIO 冻结 tag（`RELEASE.2025-10-15T17-29-55Z`，上游已归档）
+  + Go 1.24.8 + 独立 `config/uuse_minio_nodeN.conf`；先固化 CTest/FIO/RocksDB/
+  MySQL/TiKV 基线作为回归对照；
+- seam：`internal/uuseos` 盘层抽象 + `cmd` 锚点补丁栈（`minio/patches/`）+
+  `minio/shim` C ABI；容量/FS 类型/inode 全部由 shim 应答；绕过点（目录枚举、
+  `RemoveAll`、`os.ReadFile`）函数级替换；每 shard strace 校验无宿主落盘；
+- 功能/崩溃矩阵（单节点 9.3、四节点 9.4）、同盘与同拓扑 A/B（9.5，≥95% gate）、
+  收口（9.6：支持边界、补丁栈登记、设计回填、bug 归档）；
+- 每个 shard 出口执行既有 frontend（RocksDB/FIO/MySQL/TiKV）无回退门禁。
+
 ## 19. 最终定位
 
 > UUSE 2.0 是一个 C++20 coroutine-first、运行在应用进程内、直接管理 SPDK bdev/NVMe
@@ -1908,6 +1936,10 @@ fork 的 `os_file` seam 接入，不提供 POSIX 兼容层，也不改变 RocksD
 2026-10-09 起，Phase 8 在同一 core 上增加 TiKV frontend（§21）：它以 TiKV
 `components/file_system`/`RocksDBEnv` seam 接入，不提供 POSIX 兼容层，也不改变
 RocksDB/FIO/MySQL 的契约与性能口径。
+
+2026-10-11 起，Phase 9 在同一 core 上增加 MinIO S3 frontend（§22）：它以 fork 的
+`cmd/xl-storage` 盘层 seam（`internal/uuseos` + `minio/shim` C ABI）接入，不提供
+POSIX 兼容层，也不改变 RocksDB/FIO/MySQL/TiKV 的契约与性能口径。
 
 UUSE 2.0 的第一条实现原则是：旧代码可以冻结，但不能以兼容性名义继续污染新架构；
 第二条原则是：coroutine 只用于表达非阻塞状态机，所有资源、错误、恢复和完成边界都
@@ -2172,3 +2204,115 @@ encryption-at-rest、S3/cloud FS、mmap 读写、多进程共享 bdev、`tikv-ct
 > 支持范围、禁用项、已知边界（fast-reorg ingest、kill -9 语义、错误面、MySQL
 > 冒烟延后等）与补丁栈见 `tikv/README.md` 与 `tikv/patches/README.md`；
 > 实现过程中发现并修复的真实缺陷见 `doc/bug.md` #48–#50。
+
+## 22. MinIO S3 frontend（Phase 9）
+
+> 设计依据：`doc/design/uuse_minio_frontend.md`（提案与完整设计）；
+> 接入点审计：`doc/review/uuse_minio_storage_audit_20261011.md`；
+> 执行记录/支持边界：`minio/README.md`；性能归因：
+> `doc/performance/minio_shard95_attribution.md`。
+> 本节只定义 Phase 9 的接入边界与契约，不修改 §11/§12/§20/§21 的
+> RocksDB/FIO/MySQL/TiKV 契约、默认值、配置 schema 与性能口径。
+
+### 22.1 定位与范围
+
+- MinIO 的 S3 协议、对象语义、纠删码（erasure coding）、bitrot、heal/rebalance
+  完整保留；UUSE 作为每节点本地盘后端，承担 bdev 独占、namespace、extent
+  分配、journal/checkpoint 与 crash recovery。接入面是 `cmd/xl-storage` 盘层
+  文件操作（收口在 `cmd/os-instrumented.go` + `internal/ioutil`），**不是**
+  POSIX 兼容层，不做 gateway/NAS/S3-over-S3、加密（SSE/KMS）、ILM tier 或
+  事件通知；
+- 单进程、单 engine、bdev 独占语义与 §14.3 相同：第二实例 `Busy`、fork child
+  `ForkedProcess`；每节点 1 个 MinIO 进程 + 每盘 1 个 UUSE engine；
+- 多节点：4 节点单 erasure set（lab 口径 .250–.253，每节点 1 盘）；
+- 版本冻结：MinIO `RELEASE.2025-10-15T17-29-55Z`（commit
+  `9e49d5e7a648f00e26f2246f4dc28e6b07f8c84a`，上游 2026-04-25 归档 read-only）、
+  Go 1.24.0/toolchain 1.24.8；补丁栈 `minio/patches/`（锚点替换，幂等可重放）；
+- MinIO 使用独立 `config/uuse_minio_nodeN.conf`；`MINIO_UUSE_DRIVES="盘根=conf"`
+  声明 UUSE 盘，且**所有节点的该环境值必须完全一致**（否则 MinIO 拒启）；
+- 上游已归档无 rebase 需求；升级 tag 必须重跑 Shard-9.0 审计与全矩阵。
+
+### 22.2 盘层 seam 契约
+
+- **句柄抽象**：`internal/uuseos.File` 覆盖实测方法面
+  `Read/ReadAt/Write/Seek/Truncate/Stat/Sync/Close`；`openFile`/`openFileSync`/
+  `openFileDirect` 三个出口统一进 `uuseos.OpenFile`，`cmd` 内 31 处句柄调用点
+  零改动（drop-in 接口，`Fd()` 返回无效描述符、O_DIRECT 探测对 UUSE 盘直接走
+  shim open）；
+- **独立路径函数级替换**：目录枚举（`openFileWithFD` + `syscall.ReadDirent`
+  不构成可移植句柄面）→ `uuseos.ReadDir*`（cursor 分页、有界）；`RemoveAll`
+  → shim 递归删除（不得保留宿主 `os.RemoveAll` 兜底）；`os.ReadFile` 两处直用
+  → `uuseos.ReadFile`；
+- **路由**：进程级注册表按盘根前缀查找；UUSE 盘上的任何操作必须经 cgo → shim，
+  **禁止宿主回落**（fail-closed + 计数）；未注册路径保持 stock os；跨盘或混合
+  后端 `Rename` 返回 `EXDEV`；
+- **持久化映射**：对象 part 写 `Fdatasync` → `File::sync`（namespace 级 barrier，
+  强于 data-only）；小 xl.meta `O_DSYNC`（`writeMode`）→ **Close 前一次
+  `File::sync`**（含 `O_APPEND` 的 EOF 语义）；≥`DirectioAlignSize` 的 xl.meta
+  走 direct + `Fdatasync`；`Rename`/`Remove`/`moveToTrash` 走 journal 事务；
+  ACK 即 durable（单盘 quorum；未 ACK 尾部按覆盖语义保留上一已提交版本或不可见，
+  不出现撕裂对象）；
+- **容量与身份**：`getDiskInfo`/`DiskInfo`/`diskAlmostFilled`/inode 校验全部由
+  shim 应答（`deviceCapacityBytes()`/`freeDataBytes()`/`DataExtentStats` +
+  `max_inodes` 换算），`FSType` 合成、`rotational=false`；宿主 `statfs`/
+  mountinfo 探测对 UUSE 盘 fail-closed（§5.6）；
+- **xattr**（盘级写/删计数）：v1 fail-closed + 日志（决策 Q2）；
+- **C ABI**（`minio/shim`）：opaque `engine/client/file/dir` handle + 负 errno +
+  版本检查，风格对齐 TiKV shim；v1 实现为「每 `.conf` 弱引用注册表 + 共享
+  path-op client（专用 frontend 线程 + mutex）+ 文件数据在调用线程 coroutine」；
+  per-thread client（worker-direct）按 §4.2 留作性能优化项；
+- **生命周期**：engine 在 `newXLStorage` 构造时打开（早于该盘任何目录探测）；
+  engine state 引用计数，最后一个 File/Client 引用释放时 `Engine::stop()`；
+  `.minio.sys` 文件锁（flock）由 engine 进程锁覆盖或 fail-closed。
+
+### 22.3 路径路由与宿主白名单
+
+- drive 根及以下（`bucket/object/xl.meta`、`part.N`、`.minio.sys/tmp`、
+  `.minio.sys/multipart`、`.trash`）→ UUSE namespace；
+- 宿主白名单：日志/console/证书/临时文件、pprof 输出目录、锚目录本身的
+  `stat`/`mkdir`（锚目录在宿主上仅为空目录，不承载任何 MinIO 数据文件）；
+- 每个 shard 出口用 strace 校验 datadir 无宿主落盘（HOST-GATE-PASS，四节点
+  同时挂表 + 完整矩阵，白名单外出现即失败）。
+
+### 22.4 线程与生命周期
+
+- cgo 边界全部同步调用，无 Go → C++ 回调面；client 归属遵循 core 契约
+  （`Client::close` 在 frontend 线程调用）；Go runtime 的线程创建/销毁由
+  registry 上限 + 回收兜底；
+- 信号：SPDK 线程空信号掩码 + MinIO `signal.Notify`（复用 MySQL Shard-103
+  转发先例；TiKV 8.5 实测 `signal_hook` 无需转发，MinIO 侧按同样方式核对）；
+- 停机顺序：拒绝新请求 → drain outstanding → 关闭全部 File/Client →
+  `Engine::stop()`；任一层失败 fail-closed。
+
+### 22.5 禁用项（fail-closed）
+
+gateway/NAS/S3-over-S3、SSE/KMS、ILM tier、Kafka/NATS 事件、通用 mmap、
+多进程共享同一 UUSE 卷、宿主路径写 datadir、xattr 静默 no-op。禁用项配置出现
+必须在启动阶段失败关闭，不得静默走宿主路径或降级。
+
+### 22.6 验收
+
+- 功能/崩溃/无宿主落盘/禁用项矩阵按 `uuse_minio_frontend.md` §7.2/§7.3 执行；
+- 性能 gate（用户 2026-10-11 确认，单节点与分布式统一）：同盘 A/B
+  PUT/GET/mixed ≥95%、p99 ≤110%、errors=0；**UUSE 无宿主页缓存**的差异必须在
+  报告中列出（不是豁免，比值仍按 gate 判定）；
+- 每个 shard 出口执行 RocksDB/FIO/MySQL/TiKV 无回退门禁（Phase 7/8 口径不变）。
+
+> **实现状态（Shard-9.0–9.5，2026-10-11/12）**：
+> - **9.0**：版本冻结 + 接入点审计（file:line 全清单）完成；
+> - **9.1**：`minio/shim` C ABI 落地（smoke 14/14、lifecycle 8/8、
+>   `corruption=none`）；
+> - **9.2**：`internal/uuseos` + `cmd` 补丁栈（锚点替换、可重放）单节点跑通；
+> - **9.3**：单节点功能 **21/21**；崩溃矩阵（真实路径 kill -9）全部已 ACK 对象
+>   完整、sweep 无半成品；修复 **O_DSYNC 忽略**（RPO 缺口）与 `O_APPEND`；
+>   RPO 边界 = 客户端 ACK 即 durable；
+> - **9.4**：4 节点单 erasure set 完成：跨节点读写字节一致、单节点宕机韧性、
+>   逐节点 namespace 核对、集群 heal 1101 对象、**HOST-GATE-PASS**（四台同时
+>   strace 下宿主文件操作数为 0）；
+> - **9.5**（开放）：同盘 A/B **PUT 103%（达标 ✅）**、GET ≈71%（未达标 ❌）、
+>   GET p99 0.76x（达标 ✅）；归因见
+>   `doc/performance/minio_shard95_attribution.md`（写路径短板=每次 barrier 全量
+>   checkpoint → shape change 可回放修复；读路径短板=设备对小读的队头阻塞 +
+>   无页缓存）。结构性修复：shape change 可回放 journal 记录（append-only 类型
+>   15–19）+ checkpoint/staged 记录原子性 + replay 幂等（bug #51）；
+> - 已知边界与 Round 4 方向：`minio/README.md` §6 与归因报告 §12。

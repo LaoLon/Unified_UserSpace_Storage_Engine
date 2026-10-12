@@ -176,22 +176,63 @@ LD_LIBRARY_PATH=/root/code/build-uuse \
   --address :9000 --console-address :9001
 ```
 
-## 5. 补丁栈登记（Shard-9.2 起填充）
+## 5. 补丁栈登记（Shard-9.2 起填充，2026-10-12 定稿）
 
-| 顺序 | 补丁 | 目标 | 内容 |
-|---|---|---|---|
-| 待定 | `apply-internal-uuseos.py` | `internal/uuseos/`（新增）+ `cmd/` | 句柄抽象 + 分流 |
-| 待定 | `apply-cmd-seam.py` | `cmd/os-instrumented.go`、`cmd/xl-storage.go` | 收口层接线（审计 §2/§3） |
-| 待定 | `apply-readdir.py` | `cmd/os_unix.go`、`cmd/os-readdir-common.go` | 目录枚举函数级替换 |
-| 待定 | `apply-removeall.py` | `cmd/os-reliable.go` | RemoveAll → UUSE 递归删除 |
-| 待定 | `apply-capacity.py` | `cmd/xl-storage.go`、`internal/disk` | 容量/身份/rotational 应答 |
-| 待定 | `apply-lifecycle.py` | `cmd/xl-storage.go`（`newXLStorage`/`Close`） | engine 打开/关闭挂接 |
+单一补丁脚本 `patches/apply-uuse-seam.py`（锚点字符串替换，幂等可重放；对
+冻结 tag `RELEASE.2025-10-15T17-29-55Z` 的干净树执行；缺锚点或非唯一即失败）。
+共 **4 个文件、39 处替换** + 每文件 import 注入（`internal/uuseos`）：
 
-规则：每个补丁为锚点字符串替换脚本（参考 `tikv/patches/` 风格），从干净
-冻结 tag 可完整重放；上游已归档，无 rebase 需求。
+| 文件 | 替换数 | 内容（锚点） |
+|---|---|---|
+| `cmd/xl-storage.go` | 26 | `openFileDirect/openFileSync/openFile` 三出口句柄化；`ReadFile`/`ReadFileStream`/`readMetadataWithDMTime`/`readAllDataWithDMTime`/`bitrotVerify`/`writeAllDirect` open 路由；`writeAllDirect` 的 `CopyAligned` 原生句柄保护与 UUSE 分支；write 句柄类型；healing 标记读、`format.json` 读、`getDiskInfo`、`ListDir`；`RenameData`（含 legacy）dst xl.meta 读路由；engine 挂载钩子（`newXLStorage` 早于任何盘访问） |
+| `cmd/os-instrumented.go` | 7 | `RemoveAll`、`MkdirAll`、`Rename`、`Lstat`、`Remove`、`Stat`、`Mkdir` 分流 |
+| `cmd/os_unix.go` | 4 | `readDirFn`、`readDirWithOpts`、`osMkdirAll`、`access` 分流 |
+| `cmd/metacache-walk.go` | 2 | 目录项元数据读、legacy 元数据读路由 |
 
-## 6. 支持边界（Shard-9.6 收口前占位）
+- 句柄抽象（`internal/uuseos`，仓库内新增）：`File` 接口
+  `Read/ReadAt/Write/Seek/Truncate/Stat/Sync/Close`（drop-in，含 `Fd()`/`Name()`）；
+  `uuse_paths.go` 注册表路由 + `ReadFile`/`Stat`/`MkdirAll`/`Remove`/`Rename` 分流；
+  `dir_native_linux.go` 宿主路径枚举；`fallback.go` 无 cgo 回退；
+- 应用步骤（严格退出码）：
+  `python3 patches/apply-uuse-seam.py <minio-tree>` →
+  `gofmt -w cmd/xl-storage.go cmd/os-instrumented.go cmd/os_unix.go cmd/metacache-walk.go internal/uuseos/*.go`；
+- 构建：`CGO_ENABLED=1 CGO_LDFLAGS="-L<shim-dir> -luuse_core" go build -p 2 -ldflags "-r <shim-dir>" -o minio-bin .`
+  （**main 在仓库根**，`./cmd/` 是库包）；
+- 上游已归档，无 rebase 需求；改动与上游文件分离登记（本表 + 脚本内锚点注释）。
 
-- 目标：4 节点单 erasure set（.250–.253），每节点 1 个 UUSE 盘；
-- 性能 gate：同拓扑 UUSE ≥ ext4 95%（PUT/GET/mixed），p99 ≤ 110%；
-- 禁用项与 fail-closed 清单见设计 §5.7；支持边界最终版本在 Shard-9.6 冻结。
+## 6. 支持边界（Shard-9.6 冻结，2026-10-12）
+
+**支持范围**
+
+- 拓扑：4 节点单 erasure set（.250/.251/.252/.253，每节点 1 个 UUSE 盘，单盘
+  `Nvme0n1`@`0000:13:00.0`，per-node `.conf`；`MINIO_UUSE_DRIVES` 全节点一致）；
+  单节点（1 盘）用于开发/冒烟与同盘 A/B，不作为分布式验收替代；
+- MinIO 版本：`RELEASE.2025-10-15T17-29-55Z`（Go 1.24.8）；补丁栈见 §5；
+- 已验收能力：S3 基本对象/尺寸（0–12 MiB+）、multipart、range、versioning、
+  bigdir 列举（1000+）、copy、remove、stat（矩阵 21/21，单节点与四节点）；
+  跨节点读写、单节点宕机韧性、集群 heal、滚动重启、kill -9 恢复（ACK 即
+  durable）、四节点同时 strace 无宿主落盘（HOST-GATE-PASS）；
+- 性能（2026-10-12 同盘 A/B，8s 腿×2×2、INTx、warp 回环 QD16 1 MiB、errors=0）：
+  **PUT 103.3%/103.7%（gate ✅）**、PUT p50 0.98x、p99 0.93–0.98x；
+  **GET 71.4%/70.3%（gate ❌，开放）**、GET p99 0.76x/0.78x（✅）；
+  分布式 A/B gate 尚未按口径测量（网络受限，需同时报告绝对值）。
+
+**已知边界（记录，不作豁免）**
+
+- **UUSE 无宿主页缓存**：GET 冷读行为与 ext4 不同（ext4 元数据读命中页缓存）；
+  实测 GET 差距主要来自**设备对小读的队头阻塞**（4 KiB 读排在 1 MiB 传输后）
+  与每对象多次小读，见 `doc/performance/minio_shard95_attribution.md` §10/§12；
+- xattr（盘级写/删计数）v1 fail-closed + 日志（决策 Q2 未启用持久计数）；
+- `flock` 语义由 engine 进程锁覆盖（`.minio.sys` 锁文件不做真 flock）；
+- 每节点 1 盘（单 erasure set 的最小拓扑）；4 盘/节点需要先按 §6.2 收敛
+  `dma_arena_mb` 等资源预算；
+- `.minio.sys/batch-jobs` 的 `dir_open` ENOENT 日志噪音（与 stock 未对照，
+  疑似 benign）；
+- 上游归档：无安全修复，仅实验室内部分发（AGPLv3，决策 Q4）。
+
+**禁用项（fail-closed）**：gateway/NAS/S3-over-S3、SSE/KMS、ILM tier、
+Kafka/NATS 事件、mmap、多进程共享同一 UUSE 卷、宿主路径写 datadir。
+
+**未完成（9.5 开放项）**：GET 吞吐 gate；分布式 A/B gate；验收矩阵缺证据项
+（bitrot 静默位翻转注入、`mc admin heal --dry-run`、multipart 断点续传/abort、
+超长路径、inode 上限错误面、xattr/KMS/ILM fail-closed 行为验证）。

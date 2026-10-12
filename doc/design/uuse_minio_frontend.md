@@ -1,6 +1,10 @@
 # UUSE MinIO frontend 设计（Phase 9 提案）
 
-> 状态：**待评审**（2026-10-11）。评审通过前不进入实现。
+> 状态：**已实现（Shard-9.0–9.5，2026-10-11/12）**；9.5 性能 gate 仍开放
+> （PUT 103% ✅ / GET ≈71% ❌，见 `doc/performance/minio_shard95_attribution.md`）。
+> 收敛后的架构/边界/契约以 `doc/design/uuse.md` **§22** 为准（本文件保留提案与
+> 完整设计过程）。评审与实施记录：`doc/review/uuse_minio_storage_audit_20261011.md`、
+> `minio/README.md`。
 >
 > 定位：本文是 UUSE 2.0 clean-break 架构（`doc/design/uuse.md`）上的第五个 frontend
 > 提案（Phase 9），与前四个同构：
@@ -825,15 +829,18 @@ MinIO 同盘/同拓扑 A/B 回退 >5%（即低于 95% gate）。
 
 ---
 
-## 10. 对 `uuse.md` 的必要增补（评审通过后执行）
+## 10. 对 `uuse.md` 的必要增补（2026-10-12 已执行）
 
 1. §3.1 支持列表新增“MinIO S3 frontend（Phase 9）”；§3.2 保持“无 POSIX 兼容层”
-   表述不变（MinIO 接入是应用内替换，不是兼容层）；
-2. 新增 §22 “MinIO frontend（Phase 9）”，内容以本文 §1–§7 收敛；
-3. §17.2 风险表新增 MinIO 行；§17.3 停止条件新增 MinIO 条目；
-4. §18 实施顺序追加 Phase 9（Shard-9.0…9.6）；
+   表述不变（MinIO 接入是应用内替换，不是兼容层）——**已执行**；
+2. 新增 §22 “MinIO frontend（Phase 9）”，内容以本文 §1–§7 收敛——**已执行**
+   （`doc/design/uuse.md` §22，含实现状态与支持边界指针）；
+3. §17.2 风险表新增 MinIO 行；§17.3 停止条件新增 MinIO 条目——**已执行**；
+4. §18 实施顺序追加 Phase 9（Shard-9.0…9.6）——**已执行**；
 5. `doc/shard/` 新增 shard 计划（或并入现有计划文件）；`config/` 新增
-   `uuse_minio_nodeN.conf`。
+   `uuse_minio_nodeN.conf`——执行记录改为收敛在 `minio/README.md`（本环境以
+   `/etc/uuse-minio.conf` 为唯一运行配置，四节点一致），`doc/shard/` 不新增
+   计划文件。
 
 ---
 
