@@ -5,6 +5,10 @@
 > `minio/README.md` §2（9.5 行）。本轮结论全部来自真实 `Nvme0n1`
 > （`0000:13:00.0`，INTx）单节点 UUSE + warp 负载，trace 数据由
 > `temp_scripts/minio_shard95_trace_analyze.py` 离线解析。
+>
+> 轮次：**Round 1**（零填充裁剪 + freeze/encode 快路径 + DMA 非零填充）与
+> **Round 2**（shape change 可回放 → barrier 不再写全量 checkpoint，本页 §8–§10）。
+> Round 1 结论保留在 §1–§7，Round 2 追加在 §8 起。
 
 ## 1. 方法与口径
 
@@ -102,13 +106,72 @@ barrier 的 `snapshot` + `ckpt_write` 都随 namespace 规模 O(N) 增长，
 3. 数据路径：把 extent 尾部 zero-fill 改为读时惰性置零（需扩展
    extent 初始化语义），进一步压缩元数据写放大。
 
-## 7. 环境观察（待后续复现）
+## 7. 环境观察（已定位）
 
 单节点崩溃验证后的某次 mount 曾报
-`stored geometry does not match device 'Nvme0n1'`（此前同一卷多次
-mount/check 均正常），随后 `uusectl format` 打印的几何与卷内记录完全一致
-（`blocks=5242880 data_start=198656 data_blocks=5044224`），重新 format 后
-wipe/集群恢复全部正常；用“format→mount→kill -9→check×2→mount”复现失败。
-已记录：疑与 lifecycle（`updateCleanShutdown`）与 journal 两套 superblock
-写入者各自交替 A/B slot 的时序有关，与本轮改动无关（本轮改动不触碰
-superblock 几何字段），留待专项排查。
+`stored geometry does not match device 'Nvme0n1'`。**已定位**：CTest 的
+设备测试（`file_api_test`/`journal_device_test`/`data_path_device_test`）用
+`test_support.hpp` 的测试配置（`journal_mb=64`/`checkpoint_mb=128）对同一块
+NVMe 做 `format`，几何与 `/etc/uuse-minio.conf`（`256/512`）不同；此后用
+目标 conf mount 必然几何不匹配。处理：跑完设备测试后用目标 conf
+`uusectl format --yes` 再 wipe/拉起。与本轮 core 改动无关。
+
+## 8. Round 2：shape change 可回放（结构性修复）
+
+Round 1 的归因结论指向唯一的结构性差距：MinIO 每个 PUT 的
+create/rename 都是 shape change，`checkpointRequired()` 使**每个 barrier 写
+全量快照**（payload O(namespace)）。Round 2 把 shape change 变成可回放
+journal 记录：
+
+| 改动 | 位置 | 说明 |
+|---|---|---|
+| 记录扩展传输 | `include/uuse/journal.hpp`、`src/storage/journal.cpp` | `RecordPayload.reserved1` = 扩展字节数；扩展跟在固定 32B 头之后、同一 4 KiB slot 内；事务 CRC 覆盖扩展；replay 校验长度一致 |
+| 形状记录类型（append-only） | 同上 | `CreateInode=15`、`RemoveEntry=16`、`RenameEntry=17`、`LinkEntry=18`、`FreeInode=19` |
+| 扩展编码 | `src/metadata/namespace.cpp` | `[u8 nameCount][u8 len][name]…[u64 v0..v2]`：create 带 mtime/ctime；rename 带被替换 inode 与"运行时是否已释放"标志 |
+| staging | `create`/`remove`/`rename`/`link`/`close`（孤儿释放）| 不再 `requireCheckpointLocked()`；`O_TRUNC` 打开已存在文件改为 `applyTruncateLocked` + `Truncate` 记录（与 replay 完全一致） |
+| replay | `Namespace::applyJournalRecord` | 精确复刻 live mutation：slot/generation 复用、freeSlots、allocator 释放决策（按记录标志） |
+| 测试钩子 | `UUSE_TEST_FORCE_CHECKPOINT` | 需要检查点失败注入的测试显式强制 full checkpoint（shape 不再隐式触发） |
+
+效果（trace on，6 s warp PUT）：**barrier（leader）p50 3.9 ms → 0.62 ms**，
+每次 barrier 的成本 = window + journal 事务写 + flush；checkpoint 数
+**1787–2130 full → 每轮 2 full + 3–4 delta**（full base 只在 ring 80% 时写，
+约每 6 s 一次重负载）；journal 事务（BEGIN+records+COMMIT）成为主要
+barrier 成本（mean ≈0.49 ms）。
+
+## 9. Round 2 A/B（8 s 腿 × 2×2，trace off，同盘 INTx）
+
+| 指标 | ext4 r1/r2 | UUSE r1/r2 | 比值 |
+|---|---|---|---|
+| PUT 吞吐 | 871.7 / 869.1 MiB/s | **900.2 / 901.1 MiB/s** | **103.3% / 103.7% ✅** |
+| PUT p50 | 17.8 / 17.9 ms | 17.5 / 17.5 ms | 0.98x ✅ |
+| PUT p99 | 32.2 / 32.6 ms | 31.5 / 30.4 ms | 0.98x / 0.93x ✅ |
+| GET 吞吐 | 2721.9 / 2758.0 MiB/s | 1944.7 / 1938.8 MiB/s | **71.4% / 70.3% ❌** |
+| GET p99 | 18.2 / 18.5 ms | 13.9 / 14.4 ms | **0.76x / 0.78x ✅** |
+| errors | 0 | 0 | — |
+
+注：PUT 腿由 12 s 缩短到 8 s——优化后 12 s PUT 会写满 20 GiB 卷
+（1 MiB 小文件各占 1 MiB extent，空间放大 ≈2×）。ext4 腿同步缩短保持口径。
+
+## 10. GET 差距分析（Round 2 归因）
+
+- **ext4 冷缓存 GET = 3249 MiB/s**（GET 前 `drop_caches`）——ext4 的 GET 是
+  设备带宽限制（≈3.2 GB/s），不是页缓存假象；
+- **UUSE 读路径本身很快**（`temp_scripts/minio_shard95_readprobe.cc`，1 MiB
+  pread，96 MiB 文件）：1 线程 2825 MiB/s（p50 326 µs，设备单流上限）、
+  4 线程 4087、8 线程 **5270**（p50 1410 µs）、16 线程 4397、32 线程 3780；
+- **MinIO GET 窗口的 shim 计时**：1 MiB pread（9405 次）avg **2440 µs**、
+  xl.meta 小读（18839 次）avg **1627 µs**（PUT 窗口同类小读仅 392 µs）——
+  小读排在大读队列之后（单设备队列串行），每对象 ≈2.4+1.6×2 ≈ 5.6 ms I/O，
+  叠加 MinIO 自身 ≈4 ms/对象（bitrot/HTTP/Go）→ 对象延迟 8.2 ms（ext4 4.3 ms）。
+- 结论：GET 短板不在引擎读带宽，而在**每对象请求数（大读 + 2 次小读）与
+  单设备队列下的排队延迟**。下一步候选：减少 xl.meta 重复读、读请求与
+  元数据请求分队列/分 reactor、worker-direct 读（调用线程直接 poll）。
+
+## 11. Round 2 验证
+
+- 单节点功能矩阵 **21/21**；四节点集群矩阵 **21/21**（经 .250 端点）；
+- 崩溃矩阵：写循环中 `kill -9` → 重启 → **ACK 180/180 完整、sweep 60/60
+  无半成品**（journal-only 恢复：head=13351、tail=0、corruption=none）；
+- CTest **29/29**（含新增 shape-replay 往返用例与 journal 扩展传输用例）；
+- zero-fill 语义探针 **19/19**（含 truncate-on-create 路径）；
+- 四节点滚动部署（四台 `libuuse_core.so.2` md5 `2ae84cb1…`）+ 跨节点读 60/60。

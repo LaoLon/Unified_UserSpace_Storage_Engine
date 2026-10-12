@@ -125,6 +125,80 @@ std::uint64_t systemNowNs(void *) {
         std::chrono::duration_cast<std::chrono::nanoseconds>(now).count());
 }
 
+/* Shape-record extension (Shard-9.5): the name-bearing payload transported
+ * opaquely by the journal. Layout (little-endian scalars):
+ *   [u8 nameCount][u8 len0][name0][u8 len1][name1][u64 v0][u64 v1][u64 v2]
+ * Record-specific scalars: CreateInode = mtime/ctime, RemoveEntry/LinkEntry =
+ * 0, RenameEntry = replaced inode id and its freed flag. */
+constexpr std::size_t kShapeExtensionScalars = 3;
+
+void putShapeName(std::vector<std::byte> &out, std::string_view name) {
+    out.push_back(static_cast<std::byte>(name.size()));
+    const auto *raw = reinterpret_cast<const std::byte *>(name.data());
+    out.insert(out.end(), raw, raw + name.size());
+}
+
+void putShapeScalar(std::vector<std::byte> &out, std::uint64_t value) {
+    const auto *raw = reinterpret_cast<const std::byte *>(&value);
+    out.insert(out.end(), raw, raw + sizeof(value));
+}
+
+/* Builds one shape extension with one or two names and three scalars. */
+std::vector<std::byte> makeShapeExtension(std::string_view name0, std::string_view name1,
+                                          std::uint64_t v0, std::uint64_t v1,
+                                          std::uint64_t v2) {
+    std::vector<std::byte> ext;
+    ext.reserve(2 + name0.size() + name1.size() +
+                kShapeExtensionScalars * sizeof(std::uint64_t));
+    ext.push_back(static_cast<std::byte>(name1.empty() ? 1 : 2));
+    putShapeName(ext, name0);
+    if (!name1.empty()) {
+        putShapeName(ext, name1);
+    }
+    putShapeScalar(ext, v0);
+    putShapeScalar(ext, v1);
+    putShapeScalar(ext, v2);
+    return ext;
+}
+
+/* Decodes one shape extension; every name must be a valid non-empty name. */
+bool parseShapeExtension(std::span<const std::byte> ext, std::string *name0,
+                         std::string *name1, std::uint64_t *v0, std::uint64_t *v1,
+                         std::uint64_t *v2) {
+    std::size_t cursor = 0;
+    if (ext.empty()) {
+        return false;
+    }
+    const std::uint8_t nameCount = std::to_integer<std::uint8_t>(ext[cursor++]);
+    if (nameCount < 1 || nameCount > 2) {
+        return false;
+    }
+    for (std::uint8_t index = 0; index < nameCount; ++index) {
+        if (cursor >= ext.size()) {
+            return false;
+        }
+        const std::size_t length = std::to_integer<std::uint8_t>(ext[cursor++]);
+        if (length == 0 || length > kMaxNameBytes || ext.size() - cursor < length) {
+            return false;
+        }
+        std::string name(reinterpret_cast<const char *>(ext.data() + cursor), length);
+        cursor += length;
+        if (index == 0) {
+            *name0 = std::move(name);
+        } else if (name1 != nullptr) {
+            *name1 = std::move(name);
+        }
+    }
+    for (std::uint64_t *value : {v0, v1, v2}) {
+        if (ext.size() - cursor < sizeof(std::uint64_t)) {
+            return false;
+        }
+        std::memcpy(value, ext.data() + cursor, sizeof(std::uint64_t));
+        cursor += sizeof(std::uint64_t);
+    }
+    return cursor == ext.size();
+}
+
 } // namespace
 
 Namespace::Namespace(const NamespaceConfig &config, Clock clock, void *clockContext)
@@ -478,9 +552,13 @@ Result<FileHandle> Namespace::create(std::string_view path, bool exclusive, bool
                                              "path exists with another type");
             }
             if (truncate && !existing.directory) {
-                existing.logicalSize = 0;
-                touch(existing, nowNs(), true);
-                requireCheckpointLocked();
+                /* Releasing the mapped extents keeps the live mutation and the
+                 * replayed Truncate record identical (Shard-9.5). */
+                auto truncated = applyTruncateLocked(existing, 0);
+                if (!truncated.ok()) {
+                    return makeError<FileHandle>(truncated.status(), truncated.message());
+                }
+                stageRecord(JournalRecord{JournalRecordType::Truncate, existing.id, 0, 0});
             }
             ++existing.openCount;
             ++stats_.opens;
@@ -515,8 +593,11 @@ Result<FileHandle> Namespace::create(std::string_view path, bool exclusive, bool
     namespaceBytes_ += entryCost;
     ++stats_.creates;
     ++stats_.opens;
-    /* Namespace shape changes stay on the full checkpoint path (§9.3). */
-    requireCheckpointLocked();
+    /* Shape changes are journaled as name-bearing records (Shard-9.5) so a
+     * barrier can stay on the delta path instead of a full checkpoint. */
+    stageRecord(JournalRecord{JournalRecordType::CreateInode, inodeId, parentId,
+                              directory ? 1ULL : 0ULL,
+                              makeShapeExtension(name, {}, now, now, 0)});
     return makeHandle(inodeId);
 }
 
@@ -545,6 +626,8 @@ Result<void> Namespace::remove(std::string_view path) {
         return makeError(resolved.status(), resolved.message());
     }
     const std::uint64_t inodeId = resolved.value().inode;
+    const std::uint64_t parentId = resolved.value().parent;
+    const std::string_view name = resolved.value().name;
     if (inodeId == kRootInodeId) {
         return makeError(Status::InvalidArgument, "cannot remove the root directory");
     }
@@ -553,20 +636,23 @@ Result<void> Namespace::remove(std::string_view path) {
         return makeError(Status::InvalidArgument, "directory not empty");
     }
     const std::uint64_t now = nowNs();
-    const std::uint64_t entryCost = entryBytes(resolved.value().name);
+    const std::uint64_t entryCost = entryBytes(name);
     {
-        Inode &parent = inodes_[resolved.value().parent];
-        unlinkEntry(parent, resolved.value().name);
+        Inode &parent = inodes_[parentId];
+        unlinkEntry(parent, name);
         touch(parent, now, true);
     }
     namespaceBytes_ -= entryCost;
     --inode.linkCount;
     touch(inode, now, true);
-    if (inode.linkCount == 0 && inode.openCount == 0) {
+    const bool freed = inode.linkCount == 0 && inode.openCount == 0;
+    if (freed) {
         freeInode(inodeId);
     }
     ++stats_.removes;
-    requireCheckpointLocked();
+    stageRecord(JournalRecord{JournalRecordType::RemoveEntry, parentId, inodeId,
+                              freed ? 1ULL : 0ULL,
+                              makeShapeExtension(name, {}, 0, 0, 0)});
     return Result<void>(Status::Ok);
 }
 
@@ -628,6 +714,7 @@ Result<void> Namespace::rename(std::string_view from, std::string_view to) {
 
     /* All checks passed: the mutation below cannot fail or expose a partial
      * state to other clients (the namespace mutex covers the whole rename). */
+    bool replacedFreed = false;
     if (replacedId != 0) {
         Inode &toParent = inodes_[toParentId];
         unlinkEntry(toParent, toName);
@@ -637,6 +724,7 @@ Result<void> Namespace::rename(std::string_view from, std::string_view to) {
         touch(target, now, false);
         if (target.linkCount == 0 && target.openCount == 0) {
             freeInode(replacedId);
+            replacedFreed = true;
         }
     }
     {
@@ -657,7 +745,12 @@ Result<void> Namespace::rename(std::string_view from, std::string_view to) {
     }
     touch(inode, now, false);
     ++stats_.renames;
-    requireCheckpointLocked();
+    /* The record carries both names plus the replaced inode and whether the
+     * live mutation freed it, so replay mirrors the allocator exactly. */
+    stageRecord(JournalRecord{JournalRecordType::RenameEntry, fromParentId, toParentId,
+                              inodeId,
+                              makeShapeExtension(fromName, toName, replacedId,
+                                                 replacedFreed ? 1ULL : 0ULL, 0)});
     return Result<void>(Status::Ok);
 }
 
@@ -692,7 +785,8 @@ Result<void> Namespace::link(std::string_view from, std::string_view to) {
     ++inode.linkCount;
     touch(parent, now, true);
     touch(inode, now, false);
-    requireCheckpointLocked();
+    stageRecord(JournalRecord{JournalRecordType::LinkEntry, target.value().inode, inode.id,
+                              0, makeShapeExtension(name, {}, 0, 0, 0)});
     return Result<void>(Status::Ok);
 }
 
@@ -775,8 +869,11 @@ Result<void> Namespace::close(FileHandle handle) {
     }
     --inode.openCount;
     if (inode.id != kRootInodeId && inode.linkCount == 0 && inode.openCount == 0) {
-        freeInode(inode.id);
-        requireCheckpointLocked();
+        const std::uint64_t freedId = inode.id;
+        freeInode(freedId);
+        /* The close-time orphan release is journaled so replay keeps the same
+         * allocator and free-slot state (Shard-9.5). */
+        stageRecord(JournalRecord{JournalRecordType::FreeInode, freedId, 0, 0, {}});
     }
     return Result<void>(Status::Ok);
 }
@@ -1261,6 +1358,212 @@ Result<void> Namespace::applyJournalRecord(const JournalRecord &record) {
             return makeError(Status::NotFound, "replayed Truncate inode is missing");
         }
         return applyTruncateLocked(*inode, record.arg0);
+    }
+    /* Shape records (Shard-9.5). Replay mirrors the live mutation exactly,
+     * including the recorded free decisions, so allocator and free-slot state
+     * stay identical to the crashed process. */
+    case JournalRecordType::CreateInode: {
+        std::string name;
+        std::uint64_t mtimeNs = 0;
+        std::uint64_t ctimeNs = 0;
+        std::uint64_t unused = 0;
+        if (!parseShapeExtension(record.ext, &name, nullptr, &mtimeNs, &ctimeNs,
+                                 &unused)) {
+            return makeError(Status::Corrupt, "invalid CreateInode extension");
+        }
+        const std::uint64_t inodeId = record.objectId;
+        const std::uint64_t parentId = record.arg0;
+        if (inodeId == 0 || parentId == 0 || parentId >= inodes_.size() ||
+            inodeId > config_.maxInodes) {
+            return makeError(Status::Corrupt, "replayed CreateInode range is invalid");
+        }
+        if (inodeId < inodes_.size() && inodes_[inodeId].id != 0) {
+            return makeError(Status::Corrupt, "replayed CreateInode slot is occupied");
+        }
+        /* Grow the slot vector before taking any inode references: resize may
+         * move existing elements. */
+        const auto freeIt = std::find(freeSlots_.begin(), freeSlots_.end(), inodeId);
+        const bool reused = freeIt != freeSlots_.end();
+        if (inodeId >= inodes_.size()) {
+            inodes_.resize(inodeId + 1);
+        }
+        Inode &parent = inodes_[parentId];
+        if (!parent.directory || parent.index == nullptr) {
+            return makeError(Status::Corrupt,
+                             "replayed CreateInode parent is not a directory");
+        }
+        if (parent.index->byName.find(name) != parent.index->byName.end()) {
+            return makeError(Status::Corrupt, "replayed CreateInode entry exists");
+        }
+        Inode &inode = inodes_[inodeId];
+        const std::uint32_t nextGeneration = inode.generation + 1;
+        if (reused) {
+            freeSlots_.erase(freeIt);
+        }
+        inode = Inode{};
+        inode.id = inodeId;
+        inode.generation = reused ? (nextGeneration == 0 ? 1 : nextGeneration) : 1;
+        inode.directory = (record.arg1 & 1ULL) != 0;
+        inode.parent = parentId;
+        inode.mtimeNs = mtimeNs;
+        inode.ctimeNs = ctimeNs;
+        inode.linkCount = 1;
+        inode.openCount = 0;
+        inode.extents.configure(config_.extentBytes);
+        if (inode.directory) {
+            inode.index = std::make_shared<DirectoryIndex>();
+        }
+        namespaceBytes_ += config_.bytesPerInode + entryBytes(name);
+        ++stats_.inodes;
+        linkEntry(parent, name, inodeId);
+        return Result<void>(Status::Ok);
+    }
+    case JournalRecordType::RemoveEntry: {
+        std::string name;
+        std::uint64_t unused0 = 0;
+        std::uint64_t unused1 = 0;
+        std::uint64_t unused2 = 0;
+        if (!parseShapeExtension(record.ext, &name, nullptr, &unused0, &unused1,
+                                 &unused2)) {
+            return makeError(Status::Corrupt, "invalid RemoveEntry extension");
+        }
+        const std::uint64_t parentId = record.objectId;
+        const std::uint64_t childId = record.arg0;
+        const bool freed = (record.arg1 & 1ULL) != 0;
+        if (parentId >= inodes_.size() || childId == 0 || childId >= inodes_.size()) {
+            return makeError(Status::Corrupt, "replayed RemoveEntry range is invalid");
+        }
+        Inode &parent = inodes_[parentId];
+        if (!parent.directory || parent.index == nullptr) {
+            return makeError(Status::Corrupt,
+                             "replayed RemoveEntry parent is not a directory");
+        }
+        const auto entry = parent.index->byName.find(name);
+        if (entry == parent.index->byName.end() || entry->second != childId) {
+            return makeError(Status::Corrupt, "replayed RemoveEntry entry is missing");
+        }
+        unlinkEntry(parent, name);
+        namespaceBytes_ -= entryBytes(name);
+        Inode &child = inodes_[childId];
+        if (child.id != childId || child.linkCount == 0) {
+            return makeError(Status::Corrupt, "replayed RemoveEntry child is missing");
+        }
+        --child.linkCount;
+        if (freed) {
+            if (child.linkCount != 0) {
+                return makeError(Status::Corrupt,
+                                 "replayed RemoveEntry freed a linked inode");
+            }
+            freeInode(childId);
+        }
+        return Result<void>(Status::Ok);
+    }
+    case JournalRecordType::RenameEntry: {
+        std::string fromName;
+        std::string toName;
+        std::uint64_t replacedId = 0;
+        std::uint64_t replacedFreed = 0;
+        std::uint64_t unused = 0;
+        if (!parseShapeExtension(record.ext, &fromName, &toName, &replacedId,
+                                 &replacedFreed, &unused)) {
+            return makeError(Status::Corrupt, "invalid RenameEntry extension");
+        }
+        const std::uint64_t fromParentId = record.objectId;
+        const std::uint64_t toParentId = record.arg0;
+        const std::uint64_t childId = record.arg1;
+        if (fromParentId >= inodes_.size() || toParentId >= inodes_.size() ||
+            childId == 0 || childId >= inodes_.size() ||
+            (replacedId != 0 && replacedId >= inodes_.size())) {
+            return makeError(Status::Corrupt, "replayed RenameEntry range is invalid");
+        }
+        Inode &fromParent = inodes_[fromParentId];
+        Inode &toParent = inodes_[toParentId];
+        if (!fromParent.directory || fromParent.index == nullptr ||
+            !toParent.directory || toParent.index == nullptr) {
+            return makeError(Status::Corrupt,
+                             "replayed RenameEntry parent is not a directory");
+        }
+        const auto source = fromParent.index->byName.find(fromName);
+        if (source == fromParent.index->byName.end() || source->second != childId) {
+            return makeError(Status::Corrupt, "replayed RenameEntry source is missing");
+        }
+        if (replacedId != 0) {
+            const auto target = toParent.index->byName.find(toName);
+            if (target == toParent.index->byName.end() || target->second != replacedId) {
+                return makeError(Status::Corrupt,
+                                 "replayed RenameEntry target is missing");
+            }
+            unlinkEntry(toParent, toName);
+            namespaceBytes_ -= entryBytes(toName);
+            Inode &replaced = inodes_[replacedId];
+            if (replaced.id != replacedId || replaced.linkCount == 0) {
+                return makeError(Status::Corrupt,
+                                 "replayed RenameEntry replaced inode is missing");
+            }
+            --replaced.linkCount;
+            if (replacedFreed != 0) {
+                if (replaced.linkCount != 0) {
+                    return makeError(Status::Corrupt,
+                                     "replayed RenameEntry freed a linked inode");
+                }
+                freeInode(replacedId);
+            }
+        }
+        unlinkEntry(fromParent, fromName);
+        namespaceBytes_ -= entryBytes(fromName);
+        linkEntry(toParent, toName, childId);
+        namespaceBytes_ += entryBytes(toName);
+        Inode &inode = inodes_[childId];
+        if (inode.id != childId) {
+            return makeError(Status::Corrupt, "replayed RenameEntry inode is missing");
+        }
+        if (inode.directory) {
+            inode.parent = toParentId;
+        }
+        return Result<void>(Status::Ok);
+    }
+    case JournalRecordType::LinkEntry: {
+        std::string name;
+        std::uint64_t unused0 = 0;
+        std::uint64_t unused1 = 0;
+        std::uint64_t unused2 = 0;
+        if (!parseShapeExtension(record.ext, &name, nullptr, &unused0, &unused1,
+                                 &unused2)) {
+            return makeError(Status::Corrupt, "invalid LinkEntry extension");
+        }
+        const std::uint64_t parentId = record.objectId;
+        const std::uint64_t childId = record.arg0;
+        if (parentId >= inodes_.size() || childId == 0 || childId >= inodes_.size()) {
+            return makeError(Status::Corrupt, "replayed LinkEntry range is invalid");
+        }
+        Inode &parent = inodes_[parentId];
+        if (!parent.directory || parent.index == nullptr) {
+            return makeError(Status::Corrupt,
+                             "replayed LinkEntry parent is not a directory");
+        }
+        Inode &child = inodes_[childId];
+        if (child.id != childId || child.directory) {
+            return makeError(Status::Corrupt, "replayed LinkEntry child is invalid");
+        }
+        if (parent.index->byName.find(name) != parent.index->byName.end()) {
+            return makeError(Status::Corrupt, "replayed LinkEntry entry exists");
+        }
+        linkEntry(parent, name, childId);
+        namespaceBytes_ += entryBytes(name);
+        ++child.linkCount;
+        return Result<void>(Status::Ok);
+    }
+    case JournalRecordType::FreeInode: {
+        const std::uint64_t inodeId = record.objectId;
+        if (inodeId == 0 || inodeId >= inodes_.size()) {
+            return makeError(Status::Corrupt, "replayed FreeInode range is invalid");
+        }
+        Inode &inode = inodes_[inodeId];
+        if (inode.id != inodeId || inode.linkCount != 0 || inode.openCount != 0) {
+            return makeError(Status::Corrupt, "replayed FreeInode inode is not free");
+        }
+        freeInode(inodeId);
+        return Result<void>(Status::Ok);
     }
     default:
         return makeError(Status::NotSupported,

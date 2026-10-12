@@ -692,8 +692,17 @@ journal 开始。
 已实施的记录路径（Shard-107）：`SET_SIZE`/`ALLOC`/`FREE`/`SET_TIMES`/`TRUNCATE` 由对应
 mutation 直接 stage（`arg1` 打包 extent run：device/start/count），barrier 在数据 flush
 之前把整笔事务（BEGIN+records+COMMIT）作为**一次连续写**追加，随后同一次设备 flush
-一并落盘；`CREATE`/`LINK`/`UNLINK`/`RENAME` 等 namespace 形状变化与 journal 压缩仍走
-全量 checkpoint（`checkpointRequired`），checkpoint 快照覆盖已 stage 的记录。
+一并落盘。
+
+**Shard-9.5 更新（2026-10-12）**：`CREATE`/`LINK`/`UNLINK`/`RENAME` 形状变化改为
+**可回放记录**（append-only 类型 `CreateInode=15`/`RemoveEntry=16`/`RenameEntry=17`/
+`LinkEntry=18`/`FreeInode=19`）：`RecordPayload.reserved1` 携带变长扩展长度，扩展
+（同一 4 KiB slot 内）承载 1–2 个名字与记录专用标量（create 的 mtime/ctime、rename 的
+被替换 inode 与"运行时是否已释放"标志）；replay 精确复刻 live mutation（含 allocator
+与 free-slot 决策），因此 barrier 常规走 journal 事务 + delta checkpoint，
+全量 base 只在 ring 使用率到达 `checkpoint_force_percent`（80%）或记录不可打包时写。
+journal 压缩（`checkpoint_required`）仍保留为兜底：无记录可打包的 mutation 与
+`UUSE_TEST_FORCE_CHECKPOINT` 测试钩子都会强制下一 barrier 走全量快照。
 replay 侧 `ALLOC` 按 checkpoint 中的 allocator 状态把 run 从 FREE/RESERVED/INITIALIZED
 逐级推进到 COMMITTED（`markReserved` → `markInitialized` → `commit`），`FREE` 幂等。
 
@@ -845,7 +854,11 @@ RocksDB 回调映射：`Append`=buffered；`Flush`=logical（**不** durable）�
 - **shape 变更约束**：journal 记录格式（objectId/arg0/arg1）不能携带名字，
   Create/Link/Unlink/Rename 不写 journal（原设计由全量快照覆盖）；因此 shape 变更
   置 `checkpointRequired` 并强制下一次 checkpoint 写 **full base**，delta 只覆盖
-  无 shape 变更的窗口（SetSize/Alloc/Free/Truncate/SetTimes 可 replay）；
+  无 shape 变更的窗口（SetSize/Alloc/Free/Truncate/SetTimes 可 replay）。
+  **Shard-9.5 修订（2026-10-12）**：该约束已解除——`RecordPayload.reserved1` +
+  变长扩展让 CreateInode/RemoveEntry/RenameEntry/LinkEntry/FreeInode 携带名字并
+  可 replay（见 §9.3 更新），shape 变更不再强制 full base；`checkpointRequired`
+  仅作为不可打包 mutation 的兜底；
 - 写 full base 的时机：无有效 base、窗口 `head - baseSequence` ≥ 75% ring、或
   ring 将满（append 内部触发）；其余 checkpoint 写 delta；
 - 写槽位：始终写**非 base**槽位，保证 base 槽位在任何 delta 之后仍有效；

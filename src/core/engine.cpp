@@ -877,6 +877,11 @@ Result<void> Engine::syncMetadata(std::uint64_t epoch) {
         const auto barrierStart = std::chrono::steady_clock::now();
         trace::event(trace::EventId::FsyncBegin, targetEpoch,
                      static_cast<std::uint64_t>(epoch));
+        /* Test-only: force the full checkpoint path so checkpoint-failure
+         * injections stay reachable after shape changes became journaled. */
+        if (test_hooks::checkpointForceRequested()) {
+            impl_->namespaceState->requireCheckpoint();
+        }
         const bool checkpointNeeded = targetEpoch > impl_->namespaceState->durableEpoch();
         bool prepared = false;
         std::uint64_t checkpointKind = 0; /* 0=none, 1=delta, 2=full */

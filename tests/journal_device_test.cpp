@@ -90,6 +90,18 @@ int main() {
             UUSE_TEST_CHECK(journal.ok());
             for (std::uint64_t i = 1; i <= 4; ++i) {
                 auto appended = journal.value()->append({setSize(7, i * 100)}, true);
+                if (!appended.ok()) {
+                    const auto &stats = journal.value()->stats();
+                    std::printf("append %llu failed: status=%u message=%s "
+                                "head=%llu tail=%llu lastTxid=%llu usage=%.1f%%\n",
+                                static_cast<unsigned long long>(i),
+                                static_cast<unsigned>(appended.status()),
+                                appended.message().c_str(),
+                                static_cast<unsigned long long>(stats.head),
+                                static_cast<unsigned long long>(stats.tail),
+                                static_cast<unsigned long long>(stats.lastTxid),
+                                journal.value()->usageRatio() * 100.0);
+                }
                 UUSE_TEST_CHECK(appended.ok());
                 UUSE_TEST_CHECK(appended.value() == i);
             }

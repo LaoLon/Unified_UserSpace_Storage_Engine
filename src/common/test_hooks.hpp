@@ -25,6 +25,18 @@ inline bool crashRequested(const char *point) noexcept {
     return std::strcmp(value, point) == 0;
 }
 
+/* True when the test forces the next durability barrier onto the full
+ * checkpoint path. Shape changes are journaled (Shard-9.5), so tests that need
+ * a checkpoint (for example to exercise a checkpoint flush failure) must ask
+ * for one explicitly. */
+inline bool checkpointForceRequested() noexcept {
+    const char *value = std::getenv("UUSE_TEST_FORCE_CHECKPOINT");
+    if (value == nullptr || *value == '\0') {
+        return false;
+    }
+    return std::strcmp(value, "0") != 0;
+}
+
 /* Terminates the process without cleanup, simulating a hard crash. When
  * UUSE_TEST_CRASH_ARM_FILE is set, the hook stays inert until that file exists,
  * which lets the workload arm the crash after the database is open. The first

@@ -86,6 +86,9 @@ public:
             values[record.objectId] = record.arg0;
         } else if (record.type == uuse::JournalRecordType::Create) {
             values[record.objectId] = 1;
+        } else if (record.type == uuse::JournalRecordType::CreateInode) {
+            values[record.objectId] = 1;
+            lastExt = record.ext;
         }
         ++applied;
         return ok();
@@ -117,6 +120,7 @@ public:
     std::uint64_t snapshotTxid() const noexcept override { return txid_; }
 
     std::map<std::uint64_t, std::uint64_t> values;
+    std::vector<std::byte> lastExt;
     std::uint64_t applied = 0;
     std::uint64_t failAfter = std::numeric_limits<std::uint64_t>::max();
 
@@ -235,6 +239,31 @@ int main() {
         UUSE_TEST_CHECK(coordinator.stats().lastBatchRequests == 2);
         UUSE_TEST_CHECK(coordinator.stats().lastBatchRecords == 2);
         UUSE_TEST_CHECK(target.values[1] == 200);
+    }
+
+    /* 0b. Record extension bytes survive append, checkpoint and replay. */
+    {
+        Fixture fixture;
+        UUSE_TEST_CHECK(fixture.valid());
+        UUSE_TEST_CHECK(fixture.format() == 0);
+        MemoryTarget writer;
+        auto journal = fixture.open(&writer);
+        UUSE_TEST_CHECK(journal != nullptr);
+        const std::vector<std::byte> ext{std::byte{2}, std::byte{3}, std::byte{'a'},
+                                         std::byte{'b'}, std::byte{'c'}, std::byte{7},
+                                         std::byte{0}, std::byte{0}, std::byte{0}};
+        uuse::JournalRecord record{uuse::JournalRecordType::CreateInode, 11, 1, 0, ext};
+        UUSE_TEST_CHECK(journal->append({setSize(9, 42)}, true).ok());
+        UUSE_TEST_CHECK(journal->checkpoint().ok());
+        UUSE_TEST_CHECK(journal->append({record}, true).ok());
+        UUSE_TEST_CHECK(journal->flush().ok());
+        MemoryTarget reader;
+        auto reopened = fixture.open(&reader);
+        UUSE_TEST_CHECK(reopened != nullptr);
+        UUSE_TEST_CHECK(reopened->replay().ok());
+        UUSE_TEST_CHECK(reader.lastExt == ext);
+        UUSE_TEST_CHECK(reader.values[11] == 1);
+        UUSE_TEST_CHECK(reader.values[9] == 42);
     }
 
     /* 1. append, replay into a fresh target, checkpoint resume */

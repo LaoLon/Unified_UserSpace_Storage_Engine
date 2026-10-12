@@ -537,6 +537,122 @@ int main() {
         UUSE_TEST_CHECK(perInodeBytes < 1024.0); /* design §17.1 budget */
     }
 
+    /* Shape-record replay round-trip (Shard-9.5): mutations journaled as
+     * name-bearing records must rebuild the exact namespace and allocator
+     * state from the base snapshot, including create/remove/rename (with and
+     * without replacement), link, truncate-on-open and orphan frees. */
+    {
+        NamespaceConfig config = testConfig(4096, 16ULL << 20);
+        config.extentBytes = 4096;
+        config.deviceExtents = {64};
+        config.deviceStartExtents = {0};
+        auto created = Namespace::create(config, fakeClock, nullptr);
+        UUSE_TEST_CHECK(created.ok());
+        Namespace &ns = *created.value();
+        std::vector<std::byte> base;
+        UUSE_TEST_CHECK(ns.saveSnapshot(0, base).ok());
+        (void)ns.takeStagedRecords();
+
+        UUSE_TEST_CHECK(ns.create("/a", false, false, false).ok());
+        UUSE_TEST_CHECK(ns.create("/d", false, false, true).ok());
+        auto b = ns.create("/d/b", false, false, false);
+        auto c = ns.create("/d/c", false, false, false);
+        UUSE_TEST_CHECK(b.ok() && c.ok());
+        UUSE_TEST_CHECK(ns.setSize(b.value(), 8192).ok());
+        auto reserved = ns.reserveExtents(b.value(), 0, 8192);
+        UUSE_TEST_CHECK(reserved.ok() && !reserved.value().empty());
+        UUSE_TEST_CHECK(ns.commitExtents(b.value(), reserved.value()).ok());
+        UUSE_TEST_CHECK(ns.rename("/d/b", "/d/e").ok());
+        /* Replacement: /d/c replaces /d/e and frees the replaced inode. */
+        UUSE_TEST_CHECK(ns.rename("/d/c", "/d/e").ok());
+        UUSE_TEST_CHECK(ns.link("/a", "/d/a-link").ok());
+        UUSE_TEST_CHECK(ns.remove("/d/a-link").ok());
+        UUSE_TEST_CHECK(ns.truncateFile(b.value(), 0).ok());
+        UUSE_TEST_CHECK(ns.remove("/d/e").ok());
+        /* Orphan path: open, remove (kept alive), then close (frees). */
+        auto orphan = ns.create("/d/orphan", false, false, false);
+        UUSE_TEST_CHECK(orphan.ok());
+        UUSE_TEST_CHECK(ns.remove("/d/orphan").ok());
+        UUSE_TEST_CHECK(ns.close(orphan.value()).ok());
+        /* Truncate-on-create of an existing file. */
+        UUSE_TEST_CHECK(ns.create("/a", false, true, false).ok());
+
+        const auto staged = ns.takeStagedRecords();
+        UUSE_TEST_CHECK(!staged.records.empty());
+
+        auto restored = Namespace::create(config, fakeClock, nullptr);
+        UUSE_TEST_CHECK(restored.ok());
+        Namespace &replayed = *restored.value();
+        UUSE_TEST_CHECK(replayed.loadSnapshot(base).ok());
+        for (const auto &record : staged.records) {
+            auto applied = replayed.applyJournalRecord(record);
+            if (!applied.ok()) {
+                std::printf("replay failed: type=%u status=%u message=%s\n",
+                            static_cast<unsigned>(record.type),
+                            static_cast<unsigned>(applied.status()),
+                            applied.message().c_str());
+            }
+            UUSE_TEST_CHECK(applied.ok());
+        }
+
+        /* Structure, sizes and link counts must match. */
+        const char *paths[] = {"/a", "/d", "/d/e", "/d/a-link", "/d/orphan"};
+        for (const char *path : paths) {
+            const auto expected = ns.stat(path);
+            const auto actual = replayed.stat(path);
+            UUSE_TEST_CHECK(expected.ok() == actual.ok());
+            if (!expected.ok()) {
+                continue;
+            }
+            UUSE_TEST_CHECK(expected.value().inodeId == actual.value().inodeId);
+            UUSE_TEST_CHECK(expected.value().directory == actual.value().directory);
+            UUSE_TEST_CHECK(expected.value().linkCount == actual.value().linkCount);
+            UUSE_TEST_CHECK(expected.value().logicalSize == actual.value().logicalSize);
+            if (!expected.value().directory) {
+                UUSE_TEST_CHECK(expected.value().mtimeNs == actual.value().mtimeNs);
+                UUSE_TEST_CHECK(expected.value().ctimeNs == actual.value().ctimeNs);
+            }
+        }
+        /* Directory listings must match exactly (names and child ids). */
+        for (const char *dir : {"/", "/d"}) {
+            auto expectedPage = ns.getChildren(dir, "", 128);
+            auto actualPage = replayed.getChildren(dir, "", 128);
+            UUSE_TEST_CHECK(expectedPage.ok() && actualPage.ok());
+            UUSE_TEST_CHECK(expectedPage.value().entries.size() ==
+                            actualPage.value().entries.size());
+            for (std::size_t index = 0; index < expectedPage.value().entries.size();
+                 ++index) {
+                UUSE_TEST_CHECK(expectedPage.value().entries[index].name ==
+                                actualPage.value().entries[index].name);
+                UUSE_TEST_CHECK(expectedPage.value().entries[index].inodeId ==
+                                actualPage.value().entries[index].inodeId);
+            }
+        }
+        /* Extent maps and allocator counters must match. */
+        const auto expectedExtents = ns.extents(b.value());
+        const auto actualExtents = replayed.extents(b.value());
+        UUSE_TEST_CHECK(expectedExtents.ok() && actualExtents.ok());
+        UUSE_TEST_CHECK(expectedExtents.value().size() == actualExtents.value().size());
+        for (std::size_t index = 0;
+             index < expectedExtents.value().size() && index < actualExtents.value().size();
+             ++index) {
+            UUSE_TEST_CHECK(expectedExtents.value()[index].physicalExtent ==
+                            actualExtents.value()[index].physicalExtent);
+            UUSE_TEST_CHECK(expectedExtents.value()[index].count ==
+                            actualExtents.value()[index].count);
+        }
+        const auto expectedPool = ns.extentPoolStats();
+        const auto actualPool = replayed.extentPoolStats();
+        UUSE_TEST_CHECK(expectedPool.free == actualPool.free);
+        UUSE_TEST_CHECK(expectedPool.freeRuns == actualPool.freeRuns);
+        UUSE_TEST_CHECK(expectedPool.committed == actualPool.committed);
+        /* Free-slot state must match: creating a fresh file picks the same id. */
+        auto expectedNext = ns.create("/d/next", false, false, false);
+        auto actualNext = replayed.create("/d/next", false, false, false);
+        UUSE_TEST_CHECK(expectedNext.ok() && actualNext.ok());
+        UUSE_TEST_CHECK(expectedNext.value().inodeId == actualNext.value().inodeId);
+    }
+
     std::printf("namespace_test: ok\n");
     return 0;
 }

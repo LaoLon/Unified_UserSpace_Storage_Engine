@@ -431,22 +431,30 @@ int uuse_minio_version(char *buf, size_t len); /* ABI/version check */
 > 分布核对、strace 无宿主落盘、4 节点扩展。本轮共修复 **12 个真实缺陷**（含
 > 分布式 `oDirect` panic），详见 `minio/README.md` §2/§3.2。
 >
-> **实现状态（Shard-9.5 性能归因与优化，2026-10-12）**：trace 归因确认
-> 写路径短板 = **每次 barrier 的全量 checkpoint**（MinIO 每对象 create/rename
-> 都是 shape change，`checkpointRequired()` 使 delta 计数为 0）：barrier
-> p50 3.4–3.9ms，内部 `snapshot`(freeze+encode) 1.5–2.0ms + `ckpt_write`
-> 1.7–1.9ms，payload 随 namespace 线性增长（≈141B/slot，p50 1.3MB）；
-> 数据路径另有 extent 尾部 zero-fill 写放大（512B xl.meta → ≈1MiB 零写）。
-> 本轮纯加法优化：①`File::write` 的 zero-fill 只覆盖**写后文件大小以内**
-> 的范围，`File::truncate` 增长时对已映射区间补零——不变量（文件大小内
-> 未写字节读为 0）保持，设备写放大 ≈3×→≈1×；②checkpoint freeze/encode
-> 快路径（`InodeExtentMap::appendTo`、目录名 arena、raw-cursor 两遍编码、
-> 按 hash 桶遍历目录项）；③控制路径 `spdk_dma_malloc` 去零填充；
-> ④trace 追加 `SYNC_PHASE`/`SYNC_BATCH` 与 `CHKPT_FREEZE.arg3`（append-only，
-> 旧布局不变，uuse.md §16.5 同步）。A/B：PUT 47%→≈62%、GET 78%→83%、
-> GET p99 0.72–0.74x（优于 ext4）；gate 仍未达标，剩余差距与
-> “增量 checkpoint / shape change 可回放”方向见
-> `doc/performance/minio_shard95_attribution.md`。
+> **实现状态（Shard-9.5 性能归因与优化，2026-10-12）**：**Round 1** trace
+> 归因确认写路径短板 = **每次 barrier 的全量 checkpoint**（MinIO 每对象
+> create/rename 都是 shape change）：barrier p50 3.4–3.9ms，内部
+> `snapshot`(freeze+encode) 1.5–2.0ms + `ckpt_write` 1.7–1.9ms，payload 随
+> namespace 线性增长（≈141B/slot，p50 1.3MB）；数据路径另有 extent 尾部
+> zero-fill 写放大（512B xl.meta → ≈1MiB 零写）。优化：①`File::write` 的
+> zero-fill 只覆盖**写后文件大小以内**，`File::truncate` 增长时对已映射区间
+> 补零——不变量（文件大小内未写字节读为 0）保持，设备写放大 ≈3×→≈1×；
+> ②checkpoint freeze/encode 快路径（`InodeExtentMap::appendTo`、目录名
+> arena、raw-cursor 两遍编码、按 hash 桶遍历）；③控制路径
+> `spdk_dma_malloc` 去零填充；④trace 追加 `SYNC_PHASE`/`SYNC_BATCH` 与
+> `CHKPT_FREEZE.arg3`（append-only，旧布局不变，uuse.md §16.5 同步）。
+> **Round 2** 结构性修复：**shape change 改为 journal 可回放记录**
+> （append-only 类型 `CreateInode/RemoveEntry/RenameEntry/LinkEntry/FreeInode`，
+> `RecordPayload.reserved1` 变长扩展携带名字；replay 精确复刻 live mutation
+> 含 allocator 与 free-slot 决策），barrier 常规只写 journal 事务 + delta
+> checkpoint（barrier p50 3.9ms→0.62ms，checkpoint 由每轮 1800+ full 降为
+> 2 full + 3–4 delta）；`uuse.md` §9.3/§10.4(b) 已同步修订，新增
+> `UUSE_TEST_FORCE_CHECKPOINT` 测试钩子（设计 §5.8）。A/B：**PUT 47%→103%
+> （已达标）**、GET 78%→71%（ext4 冷缓存 GET 3249 MiB/s 为设备带宽限制，
+> UUSE 读路径探针峰值 5270 MiB/s@8 线程，GET 差距在每对象小读排队 +
+> MinIO 自身开销）；GET p99 0.72–0.78x（优于 ext4）；gate 仍未全达标，
+> 剩余差距与 Round 3 方向见 `doc/performance/minio_shard95_attribution.md`
+> §10。
 >
 > **实现状态（Shard-9.2 完成，2026-10-11）**：Go 侧盘层抽象
 > `minio/internal/uuseos/` + `cmd` 补丁栈（`minio/patches/apply-uuse-seam.py`，

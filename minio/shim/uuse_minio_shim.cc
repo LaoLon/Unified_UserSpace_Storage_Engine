@@ -74,10 +74,31 @@ struct ShimOpStats {
 struct ShimDiag {
     bool enabled = false;
     std::array<ShimOpStats, static_cast<std::size_t>(ShimOp::Count)> ops;
+    /* Size-bucketed read/write latency: <4K, <64K, <1M, >=1M. */
+    std::array<std::atomic<std::uint64_t>, 4> preadCounts{};
+    std::array<std::atomic<std::uint64_t>, 4> preadNs{};
+    std::array<std::atomic<std::uint64_t>, 4> pwriteCounts{};
+    std::array<std::atomic<std::uint64_t>, 4> pwriteNs{};
 
     ShimDiag() {
         const char *value = std::getenv("UUSE_MINIO_SHIM_DIAG");
         enabled = value != nullptr && *value != '\0';
+    }
+
+    static std::size_t sizeBucket(std::size_t bytes) noexcept {
+        if (bytes < 4096) return 0;
+        if (bytes < 65536) return 1;
+        if (bytes < (1U << 20)) return 2;
+        return 3;
+    }
+
+    void recordIo(bool read, std::size_t bytes, std::uint64_t elapsedNs) noexcept {
+        if (!enabled) return;
+        const std::size_t bucket = sizeBucket(bytes);
+        auto &counts = read ? preadCounts : pwriteCounts;
+        auto &totals = read ? preadNs : pwriteNs;
+        counts[bucket].fetch_add(1, std::memory_order_relaxed);
+        totals[bucket].fetch_add(elapsedNs, std::memory_order_relaxed);
     }
 
     void record(ShimOp op, std::uint64_t elapsedNs, std::uint64_t wait) noexcept {
@@ -132,6 +153,35 @@ struct ShimDiag {
     void dumpAndReset() noexcept {
         if (!enabled) return;
         dump();
+        static const char *const bucketNames[] = {"lt4k", "lt64k", "lt1m", "ge1m"};
+        for (std::size_t bucket = 0; bucket < 4; ++bucket) {
+            const std::uint64_t reads = preadCounts[bucket].load(std::memory_order_relaxed);
+            if (reads != 0) {
+                std::fprintf(stderr,
+                             "uuse-shim-diag: op=pread bucket=%s calls=%llu avg_us=%llu\n",
+                             bucketNames[bucket],
+                             static_cast<unsigned long long>(reads),
+                             static_cast<unsigned long long>(
+                                 preadNs[bucket].load(std::memory_order_relaxed) / reads /
+                                 1000));
+            }
+            const std::uint64_t writes = pwriteCounts[bucket].load(std::memory_order_relaxed);
+            if (writes != 0) {
+                std::fprintf(stderr,
+                             "uuse-shim-diag: op=pwrite bucket=%s calls=%llu avg_us=%llu\n",
+                             bucketNames[bucket],
+                             static_cast<unsigned long long>(writes),
+                             static_cast<unsigned long long>(
+                                 pwriteNs[bucket].load(std::memory_order_relaxed) / writes /
+                                 1000));
+            }
+        }
+        for (std::size_t bucket = 0; bucket < 4; ++bucket) {
+            preadCounts[bucket].store(0, std::memory_order_relaxed);
+            preadNs[bucket].store(0, std::memory_order_relaxed);
+            pwriteCounts[bucket].store(0, std::memory_order_relaxed);
+            pwriteNs[bucket].store(0, std::memory_order_relaxed);
+        }
         for (ShimOpStats &stats : ops) {
             stats.count.store(0, std::memory_order_relaxed);
             stats.totalNs.store(0, std::memory_order_relaxed);
@@ -555,6 +605,7 @@ long long uuse_minio_pread(uuse_minio_file *file, void *buf, size_t len,
     auto outer = file->file->read(std::span<uuse::IoVec>(&vec, 1), offset).wait();
     uuse::ReadResult value{};
     const int rc = unwrap(std::move(outer), &value);
+    shimDiag().recordIo(true, len, steadyNs() - diag.startNs_);
     return rc != 0 ? rc : static_cast<long long>(value.bytes);
 }
 
@@ -569,6 +620,7 @@ long long uuse_minio_pwrite(uuse_minio_file *file, const void *buf, size_t len,
     auto outer = file->file->write(std::span<const uuse::IoVec>(&vec, 1), offset).wait();
     uuse::WriteResult value{};
     const int rc = unwrap(std::move(outer), &value);
+    shimDiag().recordIo(false, len, steadyNs() - diag.startNs_);
     return rc != 0 ? rc : static_cast<long long>(value.bytes);
 }
 

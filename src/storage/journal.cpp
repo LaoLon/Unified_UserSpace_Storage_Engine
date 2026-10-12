@@ -1026,6 +1026,7 @@ Result<void> Journal::replayLocked() {
     std::vector<std::byte> slot;
     std::vector<std::byte> recordBuffer;
     std::vector<RecordPayload> records;
+    std::vector<std::vector<std::byte>> recordExtensions;
 
     while ((sequence - impl.tail) < impl.journalBlocks) {
         Result<void> error{Status::Ok};
@@ -1057,6 +1058,7 @@ Result<void> Journal::replayLocked() {
         }
         records.clear();
         recordBuffer.clear();
+        recordExtensions.clear();
         bool stop = false;
         for (std::uint32_t i = 0; i < begin.recordCount; ++i) {
             SlotHeader record{};
@@ -1069,7 +1071,7 @@ Result<void> Journal::replayLocked() {
             if (recordState != SlotState::Valid ||
                 record.type != static_cast<std::uint16_t>(JournalRecordType::Record) ||
                 record.txid != begin.txid ||
-                record.payloadSize != sizeof(RecordPayload)) {
+                record.payloadSize < sizeof(RecordPayload)) {
                 if (recordState == SlotState::Empty) {
                     stop = true; /* crash between BEGIN and COMMIT */
                 } else if (!error.ok()) {
@@ -1083,9 +1085,23 @@ Result<void> Journal::replayLocked() {
             }
             RecordPayload payload{};
             std::memcpy(&payload, slot.data() + sizeof(SlotHeader), sizeof(payload));
+            const std::size_t extensionBytes =
+                record.payloadSize - sizeof(RecordPayload);
+            if (payload.reserved1 != extensionBytes) {
+                impl.corruption =
+                    "record extension length mismatch at sequence " +
+                    std::to_string(sequence + 1 + i);
+                stop = true;
+                break;
+            }
             records.push_back(payload);
+            recordExtensions.emplace_back(
+                slot.begin() + sizeof(SlotHeader) + sizeof(RecordPayload),
+                slot.begin() + sizeof(SlotHeader) + record.payloadSize);
             const auto *raw = reinterpret_cast<const std::byte *>(&payload);
             recordBuffer.insert(recordBuffer.end(), raw, raw + sizeof(payload));
+            recordBuffer.insert(recordBuffer.end(), recordExtensions.back().begin(),
+                                recordExtensions.back().end());
         }
         if (stop) {
             break;
@@ -1122,12 +1138,14 @@ Result<void> Journal::replayLocked() {
              * is unrecoverable corruption and aborts the mount, so no
              * per-transaction before-image is captured (it made replay
              * O(transactions x namespace)). */
-            for (const auto &payload : records) {
+            for (std::size_t index = 0; index < records.size(); ++index) {
+                const auto &payload = records[index];
                 JournalRecord record;
                 record.type = static_cast<JournalRecordType>(payload.type);
                 record.objectId = payload.objectId;
                 record.arg0 = payload.arg0;
                 record.arg1 = payload.arg1;
+                record.ext = recordExtensions[index];
                 auto applied = impl.target->apply(record);
                 if (!applied.ok()) {
                     impl.corruption = "target rejected txid " + std::to_string(begin.txid) +
@@ -1198,16 +1216,34 @@ Result<std::uint64_t> Journal::appendLocked(std::span<const JournalRecord> recor
 
     const std::uint64_t txid = impl.lastTxid + 1;
     using enum JournalRecordType;
+    /* Per-record payloads: the fixed RecordPayload plus the optional extension
+     * bytes. Each record keeps its own slot, so the extension is bounded by the
+     * slot payload area and the transaction CRC covers every byte. */
+    std::vector<std::size_t> recordLengths;
+    recordLengths.reserve(records.size());
     std::vector<std::byte> payloads;
     payloads.reserve(records.size() * sizeof(RecordPayload));
     for (const auto &record : records) {
+        if (record.ext.size() >
+            std::numeric_limits<std::uint32_t>::max()) {
+            return makeError<std::uint64_t>(Status::InvalidArgument,
+                                            "journal record extension is too large");
+        }
+        if (sizeof(RecordPayload) + record.ext.size() + sizeof(SlotHeader) >
+            impl.blockSize) {
+            return makeError<std::uint64_t>(Status::InvalidArgument,
+                                            "journal record does not fit one slot");
+        }
         RecordPayload payload{};
         payload.type = static_cast<std::uint16_t>(record.type);
+        payload.reserved1 = static_cast<std::uint32_t>(record.ext.size());
         payload.objectId = record.objectId;
         payload.arg0 = record.arg0;
         payload.arg1 = record.arg1;
         const auto *raw = reinterpret_cast<const std::byte *>(&payload);
         payloads.insert(payloads.end(), raw, raw + sizeof(payload));
+        payloads.insert(payloads.end(), record.ext.begin(), record.ext.end());
+        recordLengths.push_back(sizeof(payload) + record.ext.size());
     }
     const std::uint32_t txSeed = crc32c(&txid, sizeof(txid));
     const std::uint32_t txCrc = crc32c(payloads.data(), payloads.size(), txSeed);
@@ -1220,13 +1256,15 @@ Result<std::uint64_t> Journal::appendLocked(std::span<const JournalRecord> recor
     impl.buildSlot(std::span<std::byte>(transaction.data(), impl.blockSize), sequence,
                    static_cast<std::uint16_t>(Begin), txid,
                    static_cast<std::uint32_t>(records.size()), 0, {});
+    std::size_t payloadOffset = 0;
     for (std::size_t i = 0; i < records.size(); ++i) {
         impl.buildSlot(
             std::span<std::byte>(transaction.data() + (1 + i) * impl.blockSize,
                                  impl.blockSize),
             sequence + 1 + i, static_cast<std::uint16_t>(Record), txid, 0, 0,
-            std::span<const std::byte>(payloads).subspan(i * sizeof(RecordPayload),
-                                                         sizeof(RecordPayload)));
+            std::span<const std::byte>(payloads).subspan(payloadOffset,
+                                                         recordLengths[i]));
+        payloadOffset += recordLengths[i];
     }
     impl.buildSlot(
         std::span<std::byte>(transaction.data() + (1 + records.size()) * impl.blockSize,

@@ -15,7 +15,10 @@ namespace uuse {
 class Engine;
 
 /* Journal record types; ids are frozen and only appended. Structural types
- * (Begin/Commit) frame a transaction, the others are metadata operations. */
+ * (Begin/Commit) frame a transaction, the others are metadata operations.
+ * Create/Link/Unlink/Rename carried no name until Shard-9.5 appended the
+ * name-bearing shape records (CreateInode/RemoveEntry/RenameEntry/LinkEntry/
+ * FreeInode); their ids stay reserved for the frozen layout. */
 enum class JournalRecordType : std::uint16_t {
     Begin = 1,
     Commit = 2,
@@ -31,15 +34,23 @@ enum class JournalRecordType : std::uint16_t {
     SetTimes = 12,
     Truncate = 13,
     Checkpoint = 14,
+    /* Appended for journal-replayable shape changes (Shard-9.5). */
+    CreateInode = 15,
+    RemoveEntry = 16,
+    RenameEntry = 17,
+    LinkEntry = 18,
+    FreeInode = 19,
 };
 
-/* One metadata operation inside a transaction. The fixed fields keep the
- * generic replay mechanism testable before real metadata semantics land. */
+/* One metadata operation inside a transaction. `ext` carries the optional
+ * name-bearing payload of the shape records; the journal transports it
+ * opaquely and bounds it by the slot payload area. */
 struct JournalRecord {
     JournalRecordType type = JournalRecordType::Create;
     std::uint64_t objectId = 0;
     std::uint64_t arg0 = 0;
     std::uint64_t arg1 = 0;
+    std::vector<std::byte> ext;
 };
 
 /* Replay target: the in-memory metadata state machine. */

@@ -181,15 +181,9 @@ int main() {
                 /* Both barriers now flush data and checkpoint metadata. */
                 UUSE_TEST_CHECK(first.value()->datasync().wait().value().ok());
                 /* A checkpoint slot write must not publish without its flush.
-                 * Namespace shape changes are not journaled, so create+remove
-                 * forces the snapshot path for the next barrier. */
-                {
-                    auto forced = client->open("/db/.checkpoint-force", OpenFlags::Create)
-                                      .wait()
-                                      .value();
-                    UUSE_TEST_CHECK(forced.ok());
-                }
-                UUSE_TEST_CHECK(client->remove("/db/.checkpoint-force").wait().value().ok());
+                 * Shape changes are journaled (Shard-9.5), so the test asks for
+                 * a forced full checkpoint through the test hook. */
+                UUSE_TEST_CHECK(::setenv("UUSE_TEST_FORCE_CHECKPOINT", "1", 1) == 0);
                 std::vector<std::byte> checkpointPattern(4096, std::byte{0x3C});
                 IoVec checkpointVec{checkpointPattern.data(), checkpointPattern.size()};
                 UUSE_TEST_CHECK(first.value()
@@ -213,6 +207,7 @@ int main() {
                 UUSE_TEST_CHECK(checkpointRetryStat.ok() &&
                                checkpointRetryStat.value().durableSize ==
                                    checkpointRetryStat.value().logicalSize);
+                UUSE_TEST_CHECK(::unsetenv("UUSE_TEST_FORCE_CHECKPOINT") == 0);
                 UUSE_TEST_CHECK(first.value()->sync().wait().value().ok());
                 /* Data is durable, but the metadata commit boundary must still
                  * reject publication and allow a later retry. */
