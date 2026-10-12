@@ -46,11 +46,18 @@ struct ChildCallbackContext {
     ParentLatch *latch = nullptr;
     ChildExecution *child = nullptr;
     bool writePhase = false;
+    /* Device range copied at submission for read-path attribution (Shard-9.5). */
+    std::uint64_t offsetBlocks = 0;
+    std::uint32_t blocks = 0;
 };
 
 void childCallback(void *ctx, int status) {
     auto *context = static_cast<ChildCallbackContext *>(ctx);
     trace::event(trace::EventId::BdevComplete, static_cast<std::uint64_t>(status));
+    trace::event(trace::EventId::DataIoDone,
+                 static_cast<std::uint64_t>(context->child->ioBuffer.size()),
+                 context->offsetBlocks, context->writePhase ? 1ULL : 0ULL,
+                 static_cast<std::uint64_t>(status));
     /* Test-only delays make completion and RMW lifetime boundaries
      * deterministic; the cached hook keeps device completions getenv-free. */
     const test_hooks::DataIoDelaySetting delay =
@@ -337,8 +344,9 @@ Result<void> DataPath::execute(const ExtentMap &map, std::span<std::byte> readBu
             runtime_.dataReactorCount() == 0
                 ? config_.reactorIndex
                 : runtime_.dataReactorForDevice(child.deviceId);
-        callbackContexts[i] = ChildCallbackContext{&latch, &executions[i],
-                                                   write && !needsRmw};
+        callbackContexts[i] = ChildCallbackContext{
+            &latch, &executions[i], write && !needsRmw, deviceOffset,
+            static_cast<std::uint32_t>(deviceBlocks)};
         Result<void> submit =
             needsRmw || !write
                 ? runtime_.submitDataRead(reactorIndex, child.deviceId,
@@ -403,7 +411,9 @@ Result<void> DataPath::execute(const ExtentMap &map, std::span<std::byte> readBu
             runtime_.dataReactorCount() == 0
                 ? config_.reactorIndex
                 : runtime_.dataReactorForDevice(child.deviceId);
-        callbackContexts[i] = ChildCallbackContext{&latch, &executions[i], true};
+        callbackContexts[i] = ChildCallbackContext{
+            &latch, &executions[i], true, rmwOffset,
+            static_cast<std::uint32_t>(child.spanBytes / deviceBlockBytes)};
         const Result<void> submit = runtime_.submitDataWrite(
             reactorIndex, child.deviceId, executions[i].ioBuffer.data(), rmwOffset,
             child.spanBytes / deviceBlockBytes, childCallback, &callbackContexts[i]);

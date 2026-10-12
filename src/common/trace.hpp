@@ -75,6 +75,9 @@ enum class EventId : std::uint16_t {
      * barrier phase plus one record per served sync batch. */
     SyncPhase = 60,
     SyncBatch = 61,
+    /* Appended for Shard-9.5 read-path attribution: one record per completed
+     * sync data-path I/O with its device range and status. */
+    DataIoDone = 62,
 };
 
 /* Phase ids carried in SyncPhase.arg0 (append-only, Shard-9.5). */

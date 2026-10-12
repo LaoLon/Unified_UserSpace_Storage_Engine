@@ -161,6 +161,10 @@ int runCheck(const uuse::Config &config) {
             mounted.ok() ? mounted.value().message() : mounted.message();
         std::fprintf(stderr, "uusectl: mount failed, falling back to scan-only check: %s\n",
                      mountError.c_str());
+        /* Release the process lock (and the runtime) before the scan engine
+         * opens the same volume, otherwise the fallback fails on the lock. */
+        (void)engine->stop().wait();
+        engine.reset();
         auto scanEngine = uuse::Engine::create(config);
         if (!scanEngine.ok()) {
             std::fprintf(stderr, "uusectl: scan engine create failed: %s\n",

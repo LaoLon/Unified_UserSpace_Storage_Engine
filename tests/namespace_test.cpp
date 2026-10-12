@@ -653,6 +653,71 @@ int main() {
         UUSE_TEST_CHECK(expectedNext.value().inodeId == actualNext.value().inodeId);
     }
 
+    /* Idempotency: records whose mutations a checkpoint snapshot already
+     * contains (staged after the barrier's take but before the snapshot
+     * freeze) must replay as no-ops, not as corruption. */
+    {
+        NamespaceConfig config = testConfig(4096, 16ULL << 20);
+        config.extentBytes = 4096;
+        config.deviceExtents = {64};
+        config.deviceStartExtents = {0};
+        auto source = Namespace::create(config, fakeClock, nullptr);
+        UUSE_TEST_CHECK(source.ok());
+        Namespace &ns = *source.value();
+        UUSE_TEST_CHECK(ns.create("/idem", false, false, true).ok());
+        auto file = ns.create("/idem/file", false, false, false);
+        UUSE_TEST_CHECK(file.ok());
+        UUSE_TEST_CHECK(ns.setSize(file.value(), 8192).ok());
+        auto reserved = ns.reserveExtents(file.value(), 0, 8192);
+        UUSE_TEST_CHECK(reserved.ok() && !reserved.value().empty());
+        UUSE_TEST_CHECK(ns.commitExtents(file.value(), reserved.value()).ok());
+        UUSE_TEST_CHECK(ns.rename("/idem/file", "/idem/moved").ok());
+        auto link = ns.link("/idem/moved", "/idem/link");
+        UUSE_TEST_CHECK(link.ok());
+        UUSE_TEST_CHECK(ns.remove("/idem/link").ok());
+        const auto staged = ns.takeStagedRecords();
+        UUSE_TEST_CHECK(!staged.records.empty());
+        /* The snapshot now covers every staged mutation. */
+        std::vector<std::byte> covered;
+        UUSE_TEST_CHECK(ns.saveSnapshot(1, covered).ok());
+        auto restored = Namespace::create(config, fakeClock, nullptr);
+        UUSE_TEST_CHECK(restored.ok());
+        Namespace &replayed = *restored.value();
+        UUSE_TEST_CHECK(replayed.loadSnapshot(covered).ok());
+        for (const auto &record : staged.records) {
+            auto applied = replayed.applyJournalRecord(record);
+            if (!applied.ok()) {
+                std::printf("idempotent replay failed: type=%u status=%u message=%s\n",
+                            static_cast<unsigned>(record.type),
+                            static_cast<unsigned>(applied.status()),
+                            applied.message().c_str());
+            }
+            UUSE_TEST_CHECK(applied.ok());
+        }
+        const auto expected = ns.stat("/idem/moved");
+        const auto actual = replayed.stat("/idem/moved");
+        UUSE_TEST_CHECK(expected.ok() && actual.ok());
+        UUSE_TEST_CHECK(expected.value().inodeId == actual.value().inodeId);
+        UUSE_TEST_CHECK(expected.value().logicalSize == actual.value().logicalSize);
+        auto expectedHandle = ns.open("/idem/moved");
+        auto actualHandle = replayed.open("/idem/moved");
+        UUSE_TEST_CHECK(expectedHandle.ok() && actualHandle.ok());
+        const auto expectedExtents = ns.extents(expectedHandle.value());
+        const auto actualExtents = replayed.extents(actualHandle.value());
+        UUSE_TEST_CHECK(expectedExtents.ok() && actualExtents.ok());
+        UUSE_TEST_CHECK(expectedExtents.value().size() == actualExtents.value().size());
+        for (std::size_t index = 0;
+             index < expectedExtents.value().size() && index < actualExtents.value().size();
+             ++index) {
+            UUSE_TEST_CHECK(expectedExtents.value()[index].physicalExtent ==
+                            actualExtents.value()[index].physicalExtent);
+        }
+        const auto expectedPool = ns.extentPoolStats();
+        const auto actualPool = replayed.extentPoolStats();
+        UUSE_TEST_CHECK(expectedPool.committed == actualPool.committed);
+        UUSE_TEST_CHECK(expectedPool.free == actualPool.free);
+    }
+
     std::printf("namespace_test: ok\n");
     return 0;
 }

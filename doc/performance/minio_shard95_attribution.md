@@ -175,3 +175,60 @@ barrier 成本（mean ≈0.49 ms）。
 - CTest **29/29**（含新增 shape-replay 往返用例与 journal 扩展传输用例）；
 - zero-fill 语义探针 **19/19**（含 truncate-on-create 路径）；
 - 四节点滚动部署（四台 `libuuse_core.so.2` md5 `2ae84cb1…`）+ 跨节点读 60/60。
+
+## 12. Round 3：GET 读路径归因（2026-10-12）
+
+- **CPU 不是瓶颈**：GET 期间 `mpstat` 全核 idle≈78%（usr 15%/sys 5%，六核均衡）→ 不是 CPU 饥饿。
+- **设备级队头阻塞是主因**：`temp_scripts/minio_shard95_readprobe.cc` 混合模式
+  （一半线程 1 MiB、一半 4 KiB）：
+  | 线程 | 1 MiB p50 | 4 KiB p50 | 1 MiB 聚合 | 4 KiB 聚合 |
+  |---|---|---|---|---|
+  | 8 | 798µs | **811µs** | 4733 MiB/s | 18.5 MiB/s |
+  | 16 | 1617µs | 1522µs | 4713 MiB/s | 18.4 MiB/s |
+  | 32 | 4262µs | 4096µs | 3622 MiB/s | 14.1 MiB/s |
+  纯 4 KiB（无大读）时 p50 仅 143–196µs → **小读的 1.1–1.5 ms 延迟来自排在
+  1 MiB 传输之后**（设备/单队列层面），不是引擎读带宽（纯读峰值 5270 MiB/s@8 线程）。
+- **分 reactor 试验（负结果，已回退）**：按 I/O 大小把 ≤64 KiB 请求放到第二个
+  same-NUMA reactor（独立 SPDK 队列）：小读 p50 1462→1153µs，但 GET 吞吐
+  1938→1790 MiB/s（额外 reactor 挤占 Go 运行时且设备仍是共享瓶颈）→ 代码与
+  `data_reactors=2` 配置均回退。
+- **结论**：GET 差距 = ①设备对小读的队头阻塞（MinIO 每对象 1 大读 + ~2 小读，
+  小读必须排在 1 MiB 传输之后）＋ ②ext4 的元数据读命中页缓存（UUSE 无页缓存，
+  每对象多 ~2 次设备小读）。两者都不在引擎读带宽上；Round 4 候选：减少
+  xl.meta 重复读（MinIO 侧）、读/元数据分设备队列（需设备侧支持）、
+  worker-direct 读（减少每请求线程往返）。
+
+## 13. Round 3 关键缺陷修复：replay 幂等性（2026-10-12）
+
+**现象**：四节点集群滚动 `kill -9` 重启后，.251/.253 的 mount 失败：
+`metadata journal replay failed: target rejected txid 6080 record type 15 object
+5425 ... replayed CreateInode slot is occupied`（随后同一场景又出现
+`record type 8 ... extent overlaps existing mapping`）。
+
+**根因**：checkpoint 快照与 staged 记录之间存在**非原子窗口**——barrier 先
+`takeStagedRecords()`，随后 `saveSnapshot()` 冻结视图；在这两步之间应用的
+mutation 会**既进入快照、又留在 pendingRecords_**，被下一个 barrier 追加到
+base sequence 之后 → 恢复时被二次应用。旧记录类型（SetSize/Alloc/Free/…）
+天然幂等所以从未暴露；新增的 shape 记录（CreateInode 等）不幂等 → 挂载
+fail-closed。
+
+**修复**（纯加法 + 语义收紧）：
+1. `Namespace::saveSnapshot` 在同一 namespace 锁内**丢弃快照已覆盖的 staged
+   记录**（冻结之后产生的记录仍留给下一个 barrier）→ 关闭窗口；
+2. replay 对可二次应用的记录**幂等化**（`CreateInode`/`RemoveEntry`/
+   `RenameEntry`/`LinkEntry`/`FreeInode`/`Alloc`：已存在且一致的形态视为已应用）
+   → 旧卷也能恢复；
+3. `tests/namespace_test.cpp` 新增幂等回归用例（staged 记录 + 覆盖快照 →
+   replay 必须全部 no-op 且状态一致）；
+4. `tools/uusectl.cpp`：mount 失败后的 scan-only 回退先 `stop()` 释放进程锁
+   （此前回退必然因 `/tmp/uuse.lock` 失败，掩盖真实错误）。
+
+**验证**：修复后 .251/.253 的旧卷**全部挂载成功且 namespace 完整**
+（root 7 项：`.minio.sys` + bigdir/crash/matrix/quad/warp-quad）；单节点矩阵
+21/21、崩溃矩阵 ACK 180/180 + sweep 60/60、CTest 29/29（含新回归用例）；
+四节点集群重建后 matrix 21/21 + 跨节点读 60/60。
+
+**环境缺陷（已定位）**：.251 的 `minio-wipe` 是**旧二进制**
+（md5 `244f3228…` vs 其余三台 `a76dac02…`），wipe 输出 `MINIO-WIPE-PASS`
+（缺 RESET 步骤）→ 留下陈旧 `format.json` → 新集群 bootstrap 死锁在
+"waiting for all servers"。重新分发当前 wipe 工具后集群一次成型。
