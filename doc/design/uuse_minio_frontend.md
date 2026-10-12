@@ -1,7 +1,9 @@
 # UUSE MinIO frontend 设计（Phase 9 提案）
 
-> 状态：**已实现（Shard-9.0–9.5，2026-10-11/12）**；9.5 性能 gate 仍开放
-> （PUT 103% ✅ / GET ≈71% ❌，见 `doc/performance/minio_shard95_attribution.md`）。
+> 状态：**已实现并冻结（Shard-9.0–9.6，2026-10-11/12）**；性能口径按用户
+> 2026-10-12 决定**冻结**：PUT 达标（103–106% ✅）、GET p99 达标（0.73–0.95x ✅）、
+> GET 吞吐按已归因边界记录（62–76%，不再追求 gate），见
+> `doc/performance/minio_shard95_attribution.md` §12/§15。
 > 收敛后的架构/边界/契约以 `doc/design/uuse.md` **§22** 为准（本文件保留提案与
 > 完整设计过程）。评审与实施记录：`doc/review/uuse_minio_storage_audit_20261011.md`、
 > `minio/README.md`。
@@ -792,6 +794,18 @@ max_extents_per_file = 65536
   标注瓶颈归属；不得用"网络受限"豁免比值。
 - 已知差异记录：UUSE 无宿主页缓存 → GET 命中冷数据的行为与 ext4 不同；
   该差异在报告中必须列出（不是回退）。
+- **性能口径冻结（用户 2026-10-12 决定，取代本节的 gate 追求）**：
+  - 冻结结论：PUT ≥95% ✅（103.3–106.0%）、GET p99 ≤110% ✅（0.73–0.95x）、
+    errors=0；**GET 吞吐不再追求 gate**，冻结值 62.1–76.0%（随 ext4 页缓存状态/
+    数据集大小；GET-only 口径 62.1%，混合口径 71.3–76.0%）；
+  - 冻结依据：GET 差距已完整归因——① 设备在单 qpair、QD≈8–16 下持续读吞吐
+    ≈2.0–2.5 GB/s vs ext4 内核多队列 2.7–3.3 GB/s；② 无宿主页缓存导致每对象
+    ~2 次元数据小读（已由 shim 元数据缓存消除约一半，净收益 +4.6%）；
+    ③ 负结果已回退：size-based reactor 拆分、`maxChildBytes` 子传输拆分；
+  - **不引入通用 page cache / payload 级缓存**（2026-10-12 分析结论）：MySQL/
+    RocksDB/TiKV 自带 buffer pool/block cache 且正式口径用 direct I/O；3FS 缓存
+    属客户端 + storage 侧 chunk metadata；MinIO 是唯一"无自有缓存"例外，
+    已由 shim 元数据缓存覆盖。若需重开本 gate，触发条件见归因报告 §15。
 
 ### 7.5 与既有 frontend 的回归
 
@@ -820,7 +834,8 @@ max_extents_per_file = 65536
 **停止条件**（对齐 `uuse.md` §17.3）：datadir 文件落宿主；对象语义/校验和不一致；
 heal 无法补齐；kill -9 后已提交对象丢失或目录残缺；句柄/帧泄漏；
 fail-closed 清单出现静默降级；RocksDB/FIO/MySQL/TiKV 门禁回退 >5%；
-MinIO 同盘/同拓扑 A/B 回退 >5%（即低于 95% gate）。
+MinIO 同盘/同拓扑 A/B 回退 >5%（原 95% gate 口径；2026-10-12 用户决定冻结
+性能口径后，GET 吞吐不再作为停止/关闭条件；PUT、p99 与既有 frontend 门禁不变）。
 
 ---
 
@@ -833,7 +848,7 @@ MinIO 同盘/同拓扑 A/B 回退 >5%（即低于 95% gate）。
 | 9.2 | MinIO fork patch：`internal/uuseos` 抽象 + `cmd` 逐点替换 + Go 桥接 | 单节点冒烟（PUT/GET/list/multipart）通过；strace 无宿主落盘 |
 | 9.3 | 单节点功能矩阵 + 崩溃矩阵 + 错误注入 | §7.2/7.3 单节点全过 |
 | 9.4 | 集群环境准备 + 分布式集群验收（.250–.253 四节点）：3FS 暂停/恢复手册、hugepage/uio 复位、4 盘 format；功能 + heal + kill/重启 + 无宿主落盘 | §7.2 分布式全过；环境恢复路径已记录 |
-| 9.5 | 性能同盘 A/B + 分布式 A/B（统一 ≥95% gate）；调优（journal/arena/批量/同步窗口） | §7.4 gate（单节点与分布式均 ≥95%、p99 ≤110%）|
+| 9.5 | 性能同盘 A/B + 分布式 A/B（统一 ≥95% gate）；调优（journal/arena/批量/同步窗口） | **已冻结（2026-10-12 用户决定）**：PUT ✅ 103.3–106.0%、GET p99 ✅ 0.73–0.95x；GET 吞吐按边界记录（62–76%）不再追求；分布式 A/B 未按口径测量（网络受限）；详见 `doc/performance/minio_shard95_attribution.md` §15 |
 | 9.6 | 收口：支持边界、补丁栈 README、设计文档回填（`uuse.md` 新增 §22 + Phase 9 条目）、bug 归档 | §7.5 回归全过 |
 
 每个 shard 出口执行 §7.5 的既有 frontend 回归（对齐 TiKV 纪律）。

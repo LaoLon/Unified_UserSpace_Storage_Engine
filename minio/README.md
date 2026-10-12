@@ -31,7 +31,7 @@ C ABI shim（`shim/`）、VM 内构建/部署/验收脚本。设计依据
 | 两节点分布式（Shard-9.4） | **完成（真实引擎）**：跨节点/韧性/逐节点 namespace 对称核对全过；关键坑与修复见下 |
 | **四节点分布式（Shard-9.4 扩展）** | **完成**：`.250–.253` 四节点集群初始化成功；**QUAD-CROSS-PASS**（PUT@251→GET@253 字节一致、8 小对象四节点轮转交叉读写、LIST@250/@252 一致）；**QUAD-RESILIENCE-PASS**（杀 .253：读经 .250 851968B OK、写经 .251 quorum 3/4 成功；.253 重入后复测通过）；**四节点功能矩阵 21/21**（尺寸/multipart/version/bigdir 1000/copy/stat）；**HOST-GATE-PASS**（strace 四台同时挂表、期间跑完整矩阵：`/root/uuse-data` 下成功文件操作数全部为 0，trace 181–294 行/台）；四节点宿主目录均 **0 文件**；统一运维脚本 `/root/uuse-cluster-up.sh`/`-down.sh` 已部署（自动识别运行时目录） |
 | **RPO 边界（Shard-9.3/9.5 前置）** | **完成并修复**：根因 = uuseos **忽略 `O_DSYNC`**（审计 §5.5 定的"Close 时一次 sync"未实现），小 xl.meta 写入（`writeAllInternal`→`openFileSync`）不落 durable → kill -9 丢末对象；修复：O_DSYNC/O_SYNC → **Close 前 `Sync()` 屏障**（错误向上传播），顺带修 `O_APPEND` 语义（EOF 写）。复验：**全部 ACK 后 kill -9 → 60/60 存活**；**写入中途 kill → 45/45 存活、0 坏**；sweep 60/60 无半成品；矩阵 21/21 无回归。**RPO 边界 = 客户端 ACK 即 durable（单盘 quorum）；未 ACK 的尾部按覆盖语义保留上一已提交版本或不可见，绝不出现撕裂对象**（与 ext4+O_DSYNC 语义对齐） |
-| **性能校核（Shard-9.5，进行中）** | **Round 1**：零填充裁剪 + freeze/encode 快路径 + DMA 非零填充（PUT 47%→≈62%）。**Round 2**：shape change 可回放（barrier p50 3.9ms→0.62ms；checkpoint 由每轮 1800+ full 变为 2 full + 3–4 delta）→ **PUT 达标**：ext4 871.7/869.1 vs UUSE **900.2/901.1 MiB/s = 103.3%/103.7% ✅**。**Round 3 归因**：GET 期间 CPU idle≈78%（非 CPU 瓶颈）；读路径探针纯读峰值 5270 MiB/s@8 线程，混合负载下 4KiB 读 p50 143µs→811µs → **设备级队头阻塞**；ext4 元数据读命中页缓存、UUSE 无页缓存 → 每对象多 ~2 次设备小读；分 reactor 与 `maxChildBytes` 拆分子传输均为负结果（已回退）。**Round 4（选项 A：shim 层仅元数据缓存）**：≤64KiB 元数据文件有界缓存（64MiB+LRU）、每次命中用内存 stat（size/mtime/generation）复核、写/truncate/allocate/open(TRUNC)/remove(_all)/rename 严格失效、`UUSE_MINIO_META_CACHE=0` 可关、计数经 shim diag → **小读平均 1627→977µs（−40%）**；**最终 A/B（8s 腿×2×2、INTx、errors=0）**：PUT ext4 842.4/862.8 vs UUSE 892.8/831.9* （r1 106.0% ✅，r2 出现 ENOSPC 卷满无效）；**GET ext4 2843.0/2673.8 vs UUSE 2027.0/2031.7 MiB/s = 71.3%/76.0% ❌**；GET p99 18.8/19.1 vs 13.7/13.9ms（**0.73x ✅**）。**GET 剩余差距结论**：缓存消除了元数据重复读次数，但设备在单 qpair、QD≈8–16 下持续读吞吐 ≈2.0–2.5GB/s（ext4 内核多队列冷缓存 2.7–3.2GB/s）；UUSE 读路径自身 8 线程顺序读 5270 MiB/s → 差距在并发深度/驱动路径，非引擎读带宽。**GET 专项复测（`temp_scripts/ab7_get_250.sh`，GET-only、交替 ext4↔UUSE、每边 3 次 6s 腿、errors=0、cache 开/关对照）**：ext4 3121.0/3256.2/3343.5 + 3126.1/3213.9/3169.5（中位 3256.2/3169.5，p50 4.2–4.6ms）；UUSE cache-on 2026.7/2004.3/2023.4（中位 **2023.4**，p50 7.7ms）、cache-off 1934.7/1922.6/1955.5（中位 **1934.7**，p50 8.1ms）→ **cache 净收益 +4.6%**；吞吐比值 **62.1%（on，同轮 ext4）/61.0%（off，同轮 ext4）❌**、GET p99 比值 ≈**0.95x ✅**（UUSE 14.0 vs ext4 中位 14.7ms）。**gate 现状：PUT ✅、GET p99 ✅、GET 吞吐 ❌（62–76%，随 ext4 页缓存状态）**，9.5 保持开放（Round 5 需内核级多队列或 payload 缓存设计评审） |
+| **性能校核（Shard-9.5，已冻结 2026-10-12）** | **Round 1**：零填充裁剪 + freeze/encode 快路径 + DMA 非零填充（PUT 47%→≈62%）。**Round 2**：shape change 可回放（barrier p50 3.9ms→0.62ms；checkpoint 由每轮 1800+ full 变为 2 full + 3–4 delta）→ **PUT 达标**：ext4 871.7/869.1 vs UUSE **900.2/901.1 MiB/s = 103.3%/103.7% ✅**。**Round 3 归因**：GET 期间 CPU idle≈78%（非 CPU 瓶颈）；读路径探针纯读峰值 5270 MiB/s@8 线程，混合负载下 4KiB 读 p50 143µs→811µs → **设备级队头阻塞**；ext4 元数据读命中页缓存、UUSE 无页缓存 → 每对象多 ~2 次设备小读；分 reactor 与 `maxChildBytes` 拆分子传输均为负结果（已回退）。**Round 4（选项 A：shim 层仅元数据缓存）**：≤64KiB 元数据文件有界缓存（64MiB+LRU）、每次命中用内存 stat（size/mtime/generation）复核、写/truncate/allocate/open(TRUNC)/remove(_all)/rename 严格失效、`UUSE_MINIO_META_CACHE=0` 可关、计数经 shim diag → **小读平均 1627→977µs（−40%）**；**最终 A/B（8s 腿×2×2、INTx、errors=0）**：PUT ext4 842.4/862.8 vs UUSE 892.8/831.9* （r1 106.0% ✅，r2 出现 ENOSPC 卷满无效）；**GET ext4 2843.0/2673.8 vs UUSE 2027.0/2031.7 MiB/s = 71.3%/76.0% ❌**；GET p99 18.8/19.1 vs 13.7/13.9ms（**0.73x ✅**）。**GET 剩余差距结论**：缓存消除了元数据重复读次数，但设备在单 qpair、QD≈8–16 下持续读吞吐 ≈2.0–2.5GB/s（ext4 内核多队列冷缓存 2.7–3.2GB/s）；UUSE 读路径自身 8 线程顺序读 5270 MiB/s → 差距在并发深度/驱动路径，非引擎读带宽。**GET 专项复测（`temp_scripts/ab7_get_250.sh`，GET-only、交替 ext4↔UUSE、每边 3 次 6s 腿、errors=0、cache 开/关对照）**：ext4 3121.0/3256.2/3343.5 + 3126.1/3213.9/3169.5（中位 3256.2/3169.5，p50 4.2–4.6ms）；UUSE cache-on 2026.7/2004.3/2023.4（中位 **2023.4**，p50 7.7ms）、cache-off 1934.7/1922.6/1955.5（中位 **1934.7**，p50 8.1ms）→ **cache 净收益 +4.6%**；吞吐比值 **62.1%（on，同轮 ext4）/61.0%（off，同轮 ext4）❌**、GET p99 比值 ≈**0.95x ✅**（UUSE 14.0 vs ext4 中位 14.7ms）。**冻结决定（用户 2026-10-12）**：PUT ✅（103.3–106.0%）、GET p99 ✅（0.73–0.95x）、**GET 吞吐按已归因边界冻结**（62–76%，不再追求 gate）；**不引入通用 page cache / payload 级缓存**（MySQL/RocksDB/TiKV 自带缓存且正式口径 direct I/O；3FS 缓存属客户端与 chunk metadata；MinIO 例外已由 shim 元数据缓存覆盖）；重开条件见归因报告 §15 |
 | 虚拟 NVMe 停顿根因（2026-10-12 确认） | **已坐实：VMware 虚拟 NVMe 的 MSI-X 完成中断投递缺陷**——dmesg `I/O tag N QID M timeout, completion polled`（完成存在、中断未达，内核 30s 超时后轮询）；**`pci=nomsi` 对照实验决定性**：INTx 模式下 PUT 798 MiB/s、TTFB 17ms、**0 次内核超时**（对比 MSI-X 模式 5–35MiB/s、15.1s 均匀停顿）；已排除：补丁（stock 同样复现）、IOMMU（guest 无 vIOMMU）、磁盘（裸 fio 1718MiB/s/43.5k fsync IOPS）；**workaround 已应用**：.250 grub 加 `pci=nomsi`（原配置备份 `/etc/default/grub.bak-nomsi`，`update-grub`+重启生效；不影响 UUSE/SPDK 轮询路径）；根治需宿主侧（升级虚拟化层或换 PVSCSI/virtio-blk） |
 | 环境操作备注（.250 驱动切换） | uio→内核 nvme：unbind → 清 `driver_override` → `remove`+`rescan`（直接 bind nvme 会 ENODEV）；nvme→uio：`modprobe uio_pci_generic` → unbind → 置 override → 直接 bind（重启后需重新 modprobe）；驱动反复切换后虚拟 NVMe 可能需重启 VM 恢复干净状态 |
 | 虚拟 NVMe 停顿根因分析（2026-10-12） | 见上"虚拟 NVMe 停顿根因（已确认）"行；`pci=nomsi` 已写入 .250 grub（备份 `/etc/default/grub.bak-nomsi`，如需恢复 MSI-X 模式：还原备份 + `update-grub` + 重启） |
@@ -213,16 +213,21 @@ LD_LIBRARY_PATH=/root/code/build-uuse \
   bigdir 列举（1000+）、copy、remove、stat（矩阵 21/21，单节点与四节点）；
   跨节点读写、单节点宕机韧性、集群 heal、滚动重启、kill -9 恢复（ACK 即
   durable）、四节点同时 strace 无宿主落盘（HOST-GATE-PASS）；
-- 性能（2026-10-12 同盘 A/B，8s 腿×2×2、INTx、warp 回环 QD16 1 MiB、errors=0）：
-  **PUT 103.3%/103.7%（gate ✅）**、PUT p50 0.98x、p99 0.93–0.98x；
-  **GET 71.4%/70.3%（gate ❌，开放）**、GET p99 0.76x/0.78x（✅）；
-  分布式 A/B gate 尚未按口径测量（网络受限，需同时报告绝对值）。
+- 性能（2026-10-12 同盘 A/B，8s 腿×2×2、INTx、warp 回环 QD16 1 MiB、errors=0；
+  **性能口径已冻结，用户 2026-10-12 决定**）：
+  **PUT 103.3–106.0%（✅ 达标）**、PUT p50/p99 0.97–0.98x / 0.71–0.98x（均 ≤ 基线）；
+  **GET p99 0.73–0.95x（✅ 达标）**；**GET 吞吐 71.3–76.0%（混合口径）/
+  62.1%（GET-only 口径 ab7）→ 按边界冻结，不再追求 95% gate**；shim 元数据
+  缓存使小读 −40%、GET 净收益 +4.6%（cache on/off 对照）；
+  分布式 A/B gate 未按口径测量（网络受限，需同时报告绝对值）。
 
 **已知边界（记录，不作豁免）**
 
-- **UUSE 无宿主页缓存**：GET 冷读行为与 ext4 不同（ext4 元数据读命中页缓存）；
-  实测 GET 差距主要来自**设备对小读的队头阻塞**（4 KiB 读排在 1 MiB 传输后）
-  与每对象多次小读，见 `doc/performance/minio_shard95_attribution.md` §10/§12；
+- **UUSE 无宿主页缓存（已冻结为已知边界）**：GET 冷读行为与 ext4 不同（ext4
+  元数据读命中页缓存）；实测 GET 差距主要来自**设备在单 qpair、QD≈8–16 下的
+  持续读吞吐**（4 KiB 读排在 1 MiB 传输后）与每对象多次小读；已在前端加
+  ≤64KiB 元数据缓存（小读 −40%、GET +4.6%），payload 与通用 page cache
+  **明确不做**（各 frontend 自带缓存层），见归因报告 §10/§12/§15；
 - xattr（盘级写/删计数）v1 fail-closed + 日志（决策 Q2 未启用持久计数）；
 - `flock` 语义由 engine 进程锁覆盖（`.minio.sys` 锁文件不做真 flock）；
 - 每节点 1 盘（单 erasure set 的最小拓扑）；4 盘/节点需要先按 §6.2 收敛
@@ -234,6 +239,8 @@ LD_LIBRARY_PATH=/root/code/build-uuse \
 **禁用项（fail-closed）**：gateway/NAS/S3-over-S3、SSE/KMS、ILM tier、
 Kafka/NATS 事件、mmap、多进程共享同一 UUSE 卷、宿主路径写 datadir。
 
-**未完成（9.5 开放项）**：GET 吞吐 gate；分布式 A/B gate；验收矩阵缺证据项
-（bitrot 静默位翻转注入、`mc admin heal --dry-run`、multipart 断点续传/abort、
-超长路径、inode 上限错误面、xattr/KMS/ILM fail-closed 行为验证）。
+**冻结/未完成项（2026-10-12）**：GET 吞吐 gate（**已冻结，不再追求**）；
+分布式 A/B gate（未按口径测量，网络受限）；`mc admin heal` 修复验证（lab 无
+`mc`/madmin）；inode 上限错误面（需 1M inode，不实用）；xattr/KMS/ILM
+fail-closed 行为验证。（bitrot 静默位翻转注入、multipart 断点续传/abort、
+超长路径已于 9.6 补证，见上表 9.6 行。）

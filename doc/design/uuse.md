@@ -1694,7 +1694,7 @@ checkpoint region 必须容纳 namespace/inode/extent map/各 device allocator b
 | MinIO cgo/Go 线程模型与 client 归属冲突 | per-thread registry + 上限回落 + 计数；文件由进程 owner client 持有 |
 | MinIO datadir 文件落到宿主 OS | 审计清单 + 每 shard strace 校验；宿主白名单外出现即失败 |
 | MinIO shape change 恢复语义 | shape 记录可回放 + replay 幂等 + checkpoint 原子性不变量（§9.3、bug #51） |
-| MinIO 同盘/同拓扑 A/B 回退 >5% | 早测 + trace 归因 + 结构性修复；GET 差距（无页缓存/小读队头阻塞）按已知差异记录，不用豁免改写 gate |
+| MinIO 同盘/同拓扑 A/B 回退 >5% | 早测 + trace 归因 + 结构性修复；**性能口径已冻结（用户 2026-10-12）**：PUT（103–106%）与 p99（0.73–0.95x）达标，GET 吞吐（62–76%）按已知差异记录、不再追求 gate；不引入通用 page cache（归因报告 §15） |
 | MinIO 与 3FS 实验争抢 lab VM | 集群口径 .250–.253；3FS 暂停/恢复手册；不做未记录的破坏性操作 |
 
 ### 17.3 立即停止条件
@@ -2305,9 +2305,16 @@ gateway/NAS/S3-over-S3、SSE/KMS、ILM tier、Kafka/NATS 事件、通用 mmap、
 - 性能 gate（用户 2026-10-11 确认，单节点与分布式统一）：同盘 A/B
   PUT/GET/mixed ≥95%、p99 ≤110%、errors=0；**UUSE 无宿主页缓存**的差异必须在
   报告中列出（不是豁免，比值仍按 gate 判定）；
+- **性能口径冻结（用户 2026-10-12 决定）**：PUT ✅ 103.3–106.0%、GET p99 ✅
+  0.73–0.95x、errors=0；**GET 吞吐不再追求**，按已归因边界记录（62–76%，随
+  ext4 页缓存状态与数据集大小）；**不引入通用 page cache / payload 级缓存**
+  （MySQL/RocksDB/TiKV 自带 buffer pool/block cache 且正式口径 direct I/O；
+  3FS 缓存属客户端与 storage 侧 chunk metadata；MinIO 为唯一无自有缓存例外，
+  已由 shim 元数据缓存覆盖）。冻结依据与重开条件见
+  `doc/performance/minio_shard95_attribution.md` §12/§15；
 - 每个 shard 出口执行 RocksDB/FIO/MySQL/TiKV 无回退门禁（Phase 7/8 口径不变）。
 
-> **实现状态（Shard-9.0–9.5，2026-10-11/12）**：
+> **实现状态（Shard-9.0–9.6，2026-10-11/12；性能口径已冻结）**：
 > - **9.0**：版本冻结 + 接入点审计（file:line 全清单）完成；
 > - **9.1**：`minio/shim` C ABI 落地（smoke 14/14、lifecycle 8/8、
 >   `corruption=none`）；
@@ -2318,10 +2325,12 @@ gateway/NAS/S3-over-S3、SSE/KMS、ILM tier、Kafka/NATS 事件、通用 mmap、
 > - **9.4**：4 节点单 erasure set 完成：跨节点读写字节一致、单节点宕机韧性、
 >   逐节点 namespace 核对、集群 heal 1101 对象、**HOST-GATE-PASS**（四台同时
 >   strace 下宿主文件操作数为 0）；
-> - **9.5**（开放）：同盘 A/B **PUT 103%（达标 ✅）**、GET ≈71%（未达标 ❌）、
->   GET p99 0.76x（达标 ✅）；归因见
->   `doc/performance/minio_shard95_attribution.md`（写路径短板=每次 barrier 全量
->   checkpoint → shape change 可回放修复；读路径短板=设备对小读的队头阻塞 +
->   无页缓存）。结构性修复：shape change 可回放 journal 记录（append-only 类型
->   15–19）+ checkpoint/staged 记录原子性 + replay 幂等（bug #51）；
-> - 已知边界与 Round 4 方向：`minio/README.md` §6 与归因报告 §12。
+> - **9.5/9.6（已冻结，2026-10-12）**：同盘 A/B **PUT 103.3–106.0%（达标 ✅）**、
+>   GET p99 0.73–0.95x（达标 ✅）、**GET 吞吐 62–76%（按边界记录，不再追求）**；
+>   归因见 `doc/performance/minio_shard95_attribution.md`（写路径短板=每次 barrier
+>   全量 checkpoint → shape change 可回放修复；读路径短板=设备在单 qpair、
+>   QD≈8–16 的持续读吞吐 + 无宿主页缓存）。结构性修复：shape change 可回放
+>   journal 记录（append-only 类型 15–19）+ checkpoint/staged 记录原子性 +
+>   replay 幂等（bug #51）；shim 元数据缓存（≤64KiB、严格失效、可关）使
+>   小读 −40%、GET +4.6%；
+> - 已知边界与冻结决定：`minio/README.md` §6 与归因报告 §12/§15。

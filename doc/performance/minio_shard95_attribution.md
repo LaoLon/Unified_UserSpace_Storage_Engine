@@ -287,3 +287,42 @@ fail-closed。
 （md5 `244f3228…` vs 其余三台 `a76dac02…`），wipe 输出 `MINIO-WIPE-PASS`
 （缺 RESET 步骤）→ 留下陈旧 `format.json` → 新集群 bootstrap 死锁在
 "waiting for all servers"。重新分发当前 wipe 工具后集群一次成型。
+
+## 15. 性能口径冻结决定（用户 2026-10-12）
+
+**决定**：Shard-9.5/9.6 性能验收**冻结**，不再追求 GET 吞吐 ≥95% gate。
+
+**冻结判定（全部为实测，原始数据见 §9/§12）**：
+
+| 指标 | 冻结值 | 判定 |
+|---|---|---|
+| PUT 吞吐 | 103.3–106.0%（Round 2：900.2/901.1 vs 871.7/869.1；Round 4 ab6 r1：892.8 vs 842.4；r2 因 ENOSPC 无效） | ✅ |
+| PUT p50/p99 | 0.97–0.98x / 0.71–0.98x（Round 2 0.93–0.98x；Round 4 ab6 0.71–0.95x；均 ≤ 基线） | ✅ |
+| GET p99 | 0.73–0.95x（UUSE 13.7–14.2ms vs ext4 14.6–19.1ms） | ✅ |
+| GET 吞吐 | 71.3–76.0%（ab6 混合口径）/ 62.1%（ab7 GET-only）；cache 净收益 +4.6% | **冻结（记录）** |
+| errors | 0（全部轮次） | ✅ |
+
+**冻结依据（已完整归因，无未知项）**：
+
+1. **设备侧**：单 qpair、QD≈8–16 下持续读吞吐 ≈2.0–2.5 GB/s；ext4 内核多队列
+   同负载 2.7–3.3 GB/s（冷缓存亦然）。UUSE 读路径自身 8 线程顺序读
+   5270 MiB/s → 不是引擎读带宽，是并发深度/驱动路径；本 VM 虚拟 NVMe 的
+   MSI-X 完成中断缺陷已用 `pci=nomsi` 规避（写路径），读侧多队列需宿主侧支持；
+2. **无宿主页缓存**：ext4 的 xl.meta 小读由内核页缓存消化；UUSE 每对象 ~2 次
+   设备小读 → 已由 shim 元数据缓存消除约一半（小读 −40%、GET +4.6%）；
+3. **负结果（已回退）**：size-based reactor 拆分（1938→1790 MiB/s）、
+   `maxChildBytes` 1 MiB→256 KiB 子传输拆分（读探针 −12~21%）；
+4. **不做通用 page cache（2026-10-12 分析结论）**：MySQL/RocksDB/TiKV 自带
+   buffer pool/block cache 且正式口径用 direct I/O（`os_file_set_nocache`
+   no-op、`use_direct_reads=1`）；3FS 缓存属客户端（FUSE/USRBIO）+ storage 侧
+   chunk metadata 缓存；MinIO 是唯一"无自有缓存"例外，已用前端元数据缓存
+   精确覆盖。core 保持"无宿主页缓存"不变量。
+
+**冻结范围**：不再以 GET 吞吐 gate 作为 9.5/9.6 关闭条件；不新增 payload 级
+缓存；不再运行 GET 专项调优实验。PUT/p99/errors 与既有 RocksDB/FIO/MySQL/TiKV
+无回退门禁维持不变。
+
+**重开条件（任一出现时）**：① 宿主/虚拟化层提供多队列或中断修复，读侧并发
+深度可提升；② 明确出现"应用默认配置依赖宿主页缓存且 A/B 缺口 ≥5%"的实例，
+且同意按 MinIO 先例做前端级窄缓存（只读、有界、写失效、默认关）；③ 新
+frontend 实测暴露与"读并发/元数据小读"同类的缺口。
