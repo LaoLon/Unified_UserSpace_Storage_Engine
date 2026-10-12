@@ -706,6 +706,13 @@ journal 压缩（`checkpoint_required`）仍保留为兜底：无记录可打包
 replay 侧 `ALLOC` 按 checkpoint 中的 allocator 状态把 run 从 FREE/RESERVED/INITIALIZED
 逐级推进到 COMMITTED（`markReserved` → `markInitialized` → `commit`），`FREE` 幂等。
 
+**原子性不变量（Shard-9.5 修复）**：full checkpoint 的 `saveSnapshot` 在同一
+namespace 锁内**丢弃快照已覆盖的 staged 记录**——否则 `takeStagedRecords()` 与
+快照冻结之间的窗口会让 mutation 既进快照又被下一个 barrier 追加，恢复时二次应用。
+记录类型全部按幂等实现（CreateInode/RemoveEntry/RenameEntry/LinkEntry/FreeInode/
+Alloc/Free/SetSize/SetTimes/Truncate），因此旧卷（修复前写出的 journal）仍可
+fail-closed-free 恢复；幂等判定以"快照覆盖的状态为准"，冲突形态仍报 Corrupt。
+
 异步 journal writer（write-behind：后台线程追加、barrier 只 flush）已评估并**回退**：
 实测 1809.90 vs 1926–1958 TPS（约 −5.8%），因为 barrier 仍要等 append 的设备往返，
 额外线程与唤醒开销是净损失。回退后保留两项加固：Journal 公开入口（append/checkpoint/

@@ -61,8 +61,53 @@ Bug 等级：**致命 > 严重 > 一般**。
 - 48：已修复（Shard-118，ParentLatch/shim 就绪 condvar 锁外 notify 的栈对象 UAF 窗口）。
 - 49：已修复（Shard-118，设备测试无 CTest 资源锁，`ctest -j` 并行驱动同一 NVMe 挂起）。
 - 50：已修复（Shard-118，TiKV 正常退出丢 kvdb/raft 尾部；UUSE 无页缓存 + 异步写路径）。
+- 51：已修复（Shard-9.5，checkpoint 快照与 staged 记录非原子导致恢复时二次应用；
+  shape/Alloc 记录不幂等 → 滚动 kill -9 后 .251/.253 mount fail-closed）。
 
 ## Bug 记录
+
+### 51. checkpoint 快照与 staged 记录非原子，恢复时二次应用（shape 记录不幂等）
+
+- **状态**：已修复
+- **等级**：严重（四节点集群滚动 kill -9 后两个节点 mount fail-closed，数据不可用）
+- **时间**：2026-10-12（Shard-9.5 Round 3 验证）
+- **现象**：Round 2（shape change 可回放）部署并滚动重启后，`.251/.253` 的
+  `uusectl check` 报
+  `metadata journal replay failed: target rejected txid 6080 record type 15
+  object 5425 args 284/1: replayed CreateInode slot is occupied`；后续同一
+  场景报 `record type 8 ... extent overlaps existing mapping`；两卷此前
+  多次 mount/check 正常，且 mount 失败发生在重启（kill -9）之后的首次挂载。
+- **排查过程**：
+  1. `uusectl dump/check` 报同一 replay 错误；给 replay 加状态诊断
+     （占用者 id/dir/links/parent）后确认：快照里 inode 5425 已是
+     `dir=1 links=1 parent=284`，而 txid 6080 的 CreateInode 记录又要建它；
+  2. 扫描状态：`checkpointA=valid(txid 6079 seq 53663)`、`tail=53663`、
+     `head=57075`——即 base 的 sequence 正好在失败记录之前，快照却已包含其效果；
+  3. 代码核对：barrier 先 `takeStagedRecords()`，随后
+     `journal->checkpoint()` 内部 `saveSnapshot()` 才冻结视图（两把锁分离）→
+     **两步之间应用的 mutation 既进入快照、又留在 pendingRecords_**，被下一个
+     barrier 追加到 base sequence 之后 → 恢复时二次应用；
+  4. 旧记录类型（SetSize/Alloc/Free/SetTimes/Truncate）天然幂等，所以该窗口
+     从未暴露；Round 2 新增的 shape 记录（CreateInode 等）不幂等 → 暴露。
+- **根因**：checkpoint 的"快照覆盖范围"与"staged 记录集合"不是同一临界区；
+  恢复的正确性依赖"base sequence 之前已追加的记录都在快照里、之后的都不在"。
+- **修复**：
+  - `Namespace::saveSnapshot` 在同一 namespace 锁内丢弃快照已覆盖的 staged
+    记录（冻结之后产生的记录仍留给下一个 barrier）；
+  - replay 幂等化：`CreateInode`/`RemoveEntry`/`RenameEntry`/`LinkEntry`/
+    `FreeInode`/`Alloc` 对"快照已覆盖（可能已演化）"的形态视为已应用，
+    冲突形态仍 fail-closed（Alloc 仅在已有 descriptor 真正覆盖该逻辑 extent
+    时跳过）；
+  - `tests/namespace_test.cpp` 新增幂等回归用例；
+  - `tools/uusectl.cpp`：mount 失败后的 scan-only 回退先 `stop()` 释放进程锁
+    （此前回退必然因 `/tmp/uuse.lock` 失败，掩盖真实错误）。
+- **验证结果**：修复后 .251/.253 旧卷全部挂载成功且 namespace 完整（root 7 项：
+  `.minio.sys` + bigdir/crash/matrix/quad/warp-quad）；单节点矩阵 21/21、
+  崩溃矩阵 ACK 180/180 + sweep 60/60、`corruption=none`、CTest 29/29；
+  四节点集群重建后 health 200、矩阵 21/21、跨节点读 60/60。
+- **边界**：幂等判定以"快照覆盖的状态为准"，因此**修复前**写出的旧 journal
+  可恢复；若未来再引入新的非幂等记录类型，必须同时提供幂等判定或保证
+  `saveSnapshot` 与 staged take 的原子性（现已在 `uuse.md` §9.3 记录为不变量）。
 
 ### 50. TiKV 正常退出丢 kvdb/raft 尾部（UUSE 无页缓存），重启报 may lose data
 

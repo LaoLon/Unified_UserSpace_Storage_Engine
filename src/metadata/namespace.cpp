@@ -1330,10 +1330,13 @@ Result<void> Namespace::applyJournalRecord(const JournalRecord &record) {
         descriptor.count = count;
         descriptor.deviceId = static_cast<std::uint32_t>(device);
         /* Idempotency: a checkpoint snapshot may already contain a (possibly
-         * evolved) mapping for this logical extent; the covered state is
-         * authoritative. */
-        if (inode->extents.firstOverlapping(descriptor.logicalExtent) <
-            inode->extents.size()) {
+         * evolved) mapping covering this logical extent; the covered state is
+         * authoritative. Only a descriptor that actually covers the extent
+         * counts, otherwise the record still has to be applied. */
+        const std::size_t candidate = inode->extents.firstOverlapping(descriptor.logicalExtent);
+        const ExtentDescriptor *mapped = inode->extents.descriptorAt(candidate);
+        if (mapped != nullptr && mapped->logicalExtent <= descriptor.logicalExtent &&
+            descriptor.logicalExtent < mapped->logicalExtent + mapped->count) {
             return Result<void>(Status::Ok);
         }
         auto added =
