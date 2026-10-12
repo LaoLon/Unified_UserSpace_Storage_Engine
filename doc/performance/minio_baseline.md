@@ -61,14 +61,21 @@
 
 ## 5. 未纳入本基线的测量（边界与后续）
 
-- **远端客户端腿（.253 → .250）未纳入**：采集期间 .250 出现**宿主侧退化**——
-  内核 workqueue 抢占（`mpt_fault_reset_work [mptbase]`、`vmballoon_work` 连续
-  "hogged CPU"，multipathd 短时 ~110% CPU，load 4.1），远端 PUT 在第 1 秒后停摆
-  （460 MiB/s → 1.5 MiB/s 中位，p50 ~6.6s）；而**同一实例的回环 c16 PUT 仍有
-  911.89 MiB/s（p50 17.2ms）**，设备本体 `dd` 1.9 GB/s、单次 fsync 0.00s 正常
-  → 归因宿主/VM 状态，不在 MinIO/UUSE 路径。**待宿主侧重启 .250 后**用
-  `bl250_one.sh` + `bl253_one.sh` 重测并补入。
-- 2 客户端 + 2 存储拓扑（负扩展观察：聚合 PUT ≈111.6、GET ≈368.6 MiB/s）：
+- **远端客户端口径（.253 → .250）**：干净重启 .250 后（load 0.7、无 workqueue
+  hogged）逐项对照（同一客户端、同一 fork 二进制、同一 warp）：
+  | 对照 | 结果 |
+  |---|---|
+  | 远端 c16 PUT → **UUSE 服务端** | **505.92 MiB/s** ✅（GET 709.45 ✅） |
+  | 远端 c16 PUT → **ext4 服务端** | **0.34 MiB/s** ❌（p50 30.05s；GET 侧 829.50 ✅） |
+  | 远端**顺序** PUT → ext4（60×1MiB） | 0.503s 完成（≈120 MiB/s）✅ |
+  | 回环 c16 PUT（同实例） | 757–911 MiB/s ✅ |
+  | 设备本体（dd 512MiB 缓冲/direct + fsync） | 1.9 / 1.5 GB/s、fsync 0.00s ✅ |
+  | strace（停摆中全量 10s） | 最慢是 Go futex（≤6.5s）、无慢 I/O；4355×nanosleep、1281×mkdirat |
+  → 异常**特指 ext4 后端 + 远端客户端 + 并发 PUT**（UUSE 后端不受影响），
+  **不是** .250 VM 退化（重启后复现）、不是设备、不是网络（顺序写与 GET 均正常）。
+  根因未定位（疑似 MinIO 在该组合下的 Go 层争用，需 pprof/goroutine 分析），列待查。
+  **远端腿数据：UUSE 侧有效并采纳；ext4 侧无效，不计入对比。**
+- 2 客户端 + 2 存储拓扑（负扩展观察，UUSE 内部 1↔2 客户端对照）：
   `minio/README.md` §2。
 - ext4 + `MINIO_API_ODIRECT=on`（dio）对照实验：未做（计划见会话记录）。
 - 4 节点分布式 A/B gate：未按口径测量（性能口径已冻结）。
