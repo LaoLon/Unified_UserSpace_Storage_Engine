@@ -1,7 +1,7 @@
 # UUSE 2.0 Architecture
 
 > 更新时间：2026-09-21  
-> 本文是 `doc/design/hfs2.0.md` 的架构图解，不替代其接口、边界和验收约束。  
+> 本文是 `doc/design/uuse.md`（原 `hfs2.0.md`）的架构图解，不替代其接口、边界和验收约束。  
 > 当前正式验证口径：单 Application process、单 Engine、真实 NVMe/SPDK bdev；多 NUMA
 > 虚拟机尚未配置完成，因此多 NUMA 只描述架构，不作为当前验证结论。
 

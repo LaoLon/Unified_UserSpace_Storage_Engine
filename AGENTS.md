@@ -4,7 +4,7 @@
 
 - `doc/bug.md` 是 UUSE 2.0 当前 Bug 记录；HFS 1.x 的 Bug 历史已清理，UUSE 2.0 的已知风险、停止条件和边界以 `doc/design/uuse.md` §17 为准。
 - `doc/design/uuse.md` 是 UUSE 2.0 当前唯一的架构、边界、接口和实施计划事实源；实现、评审和验收必须以它为准。
-- `doc/performance/baseline.md` 是当前 VM 的 FIO/RocksDB 性能基线入口；重测前先核对设备、版本、配置和负载口径，在同环境交错对比。有效新结果按文档规则更新并保留旧数值及证据；不同 VM 或口径另建基线，不直接计算跨环境回退。性能目标仍以 `doc/design/uuse.md` 为准。
+- `doc/performance/` 下按前端维护的性能基线（`fio_baseline.md`、`rocksdb_baseline.md`、`mysql_baseline.md`、`minio_baseline.md`、`uuse_tidb_baseline_20261009.md`）是当前 VM 的性能基线入口；重测前先核对设备、版本、配置和负载口径，在同环境交错对比。有效新结果按文档规则更新并保留旧数值及证据；不同 VM 或口径另建基线，不直接计算跨环境回退。性能目标仍以 `doc/design/uuse.md` 为准。
 - `doc/review/hfs2.0_design_review_20260916.md` 是 UUSE 2.0 的设计评审依据；发现设计冲突时先更新设计文档，再开始实现。
 - HFS 1.x 的旧设计、性能、review、shard、task 和 Bug 文档已从工作区清理；如需复盘只能查询 Git 历史，不得据此恢复旧功能、旧目录结构、旧容量或旧 API。
 - 需要了解当前进展时，先查看 `git log --stat` 和 `git status`，再以当前源码、测试脚本和最新文档为准。
