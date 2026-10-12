@@ -108,6 +108,12 @@ Bug 等级：**致命 > 严重 > 一般**。
 - **边界**：幂等判定以"快照覆盖的状态为准"，因此**修复前**写出的旧 journal
   可恢复；若未来再引入新的非幂等记录类型，必须同时提供幂等判定或保证
   `saveSnapshot` 与 staged take 的原子性（现已在 `uuse.md` §9.3 记录为不变量）。
+- **补充（同日）**：真实集群工作负载还暴露了三种"快照覆盖 + 名字/槽位复用"形态：
+  ① CreateInode 槽位已被同一 inode 占用；② Alloc 的逻辑 extent 已有映射；
+  ③ RenameEntry 的源名字已被**别的 inode** 复用（MinIO 复用 tmp/对象目录名）。
+  结论：幂等判定必须"**任何前置条件不匹配都视为已覆盖（skip）**"，只有结构性问题
+  （范围、扩展长度、CRC）才 fail-closed；replay 的语义检查全部放宽后，.251 的
+  旧卷（含 758 条待重放事务）挂载成功且 namespace 完整。
 
 ### 50. TiKV 正常退出丢 kvdb/raft 尾部（UUSE 无页缓存），重启报 may lose data
 

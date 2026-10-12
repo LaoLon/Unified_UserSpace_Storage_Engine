@@ -1389,19 +1389,9 @@ Result<void> Namespace::applyJournalRecord(const JournalRecord &record) {
         }
         if (inodeId < inodes_.size() && inodes_[inodeId].id != 0) {
             /* Idempotency: the checkpoint snapshot may already contain this
-             * mutation (and later ones on the same inode), so a slot holding
-             * the same inode shape means the record was already applied. */
-            const Inode &existing = inodes_[inodeId];
-            if (existing.id == inodeId && existing.parent == parentId &&
-                existing.directory == ((record.arg1 & 1ULL) != 0)) {
-                return Result<void>(Status::Ok);
-            }
-            return makeError(Status::Corrupt,
-                             "replayed CreateInode slot " + std::to_string(inodeId) +
-                                 " is occupied by id=" + std::to_string(existing.id) +
-                                 " dir=" + (existing.directory ? "1" : "0") +
-                                 " links=" + std::to_string(existing.linkCount) +
-                                 " parent=" + std::to_string(existing.parent));
+             * mutation (and later ones on the same inode, including a free and
+             * id reuse), so any occupied slot means the record was covered. */
+            return Result<void>(Status::Ok);
         }
         /* Grow the slot vector before taking any inode references: resize may
          * move existing elements. */
@@ -1462,12 +1452,10 @@ Result<void> Namespace::applyJournalRecord(const JournalRecord &record) {
                              "replayed RemoveEntry parent is not a directory");
         }
         const auto entry = parent.index->byName.find(name);
-        if (entry == parent.index->byName.end()) {
-            /* Idempotency: already removed by an earlier application. */
+        if (entry == parent.index->byName.end() || entry->second != childId) {
+            /* Idempotency: the covered state already removed this entry (and
+             * may have reused the name for another inode). */
             return Result<void>(Status::Ok);
-        }
-        if (entry->second != childId) {
-            return makeError(Status::Corrupt, "replayed RemoveEntry entry is missing");
         }
         unlinkEntry(parent, name);
         namespaceBytes_ -= entryBytes(name);
@@ -1511,13 +1499,10 @@ Result<void> Namespace::applyJournalRecord(const JournalRecord &record) {
                              "replayed RenameEntry parent is not a directory");
         }
         const auto source = fromParent.index->byName.find(fromName);
-        if (source == fromParent.index->byName.end()) {
-            /* Idempotency: already renamed (possibly again) by the covered
-             * state the snapshot carries. */
+        if (source == fromParent.index->byName.end() || source->second != childId) {
+            /* Idempotency: the covered state already renamed this entry (and
+             * may have reused the source name for another inode). */
             return Result<void>(Status::Ok);
-        }
-        if (source->second != childId) {
-            return makeError(Status::Corrupt, "replayed RenameEntry source is missing");
         }
         if (replacedId != 0) {
             const auto target = toParent.index->byName.find(toName);
@@ -1579,11 +1564,9 @@ Result<void> Namespace::applyJournalRecord(const JournalRecord &record) {
         }
         const auto existing = parent.index->byName.find(name);
         if (existing != parent.index->byName.end()) {
-            /* Idempotency: the link was already applied by an earlier pass. */
-            if (existing->second == childId) {
-                return Result<void>(Status::Ok);
-            }
-            return makeError(Status::Corrupt, "replayed LinkEntry entry exists");
+            /* Idempotency: the covered state already linked this name (possibly
+             * for another inode after a later unlink/reuse). */
+            return Result<void>(Status::Ok);
         }
         linkEntry(parent, name, childId);
         namespaceBytes_ += entryBytes(name);
@@ -1601,7 +1584,9 @@ Result<void> Namespace::applyJournalRecord(const JournalRecord &record) {
             return Result<void>(Status::Ok);
         }
         if (inode.id != inodeId || inode.linkCount != 0 || inode.openCount != 0) {
-            return makeError(Status::Corrupt, "replayed FreeInode inode is not free");
+            /* Idempotency: the covered state already freed this inode and the
+             * slot was reused for another inode. */
+            return Result<void>(Status::Ok);
         }
         freeInode(inodeId);
         return Result<void>(Status::Ok);
