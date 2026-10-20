@@ -1,5 +1,7 @@
 # UUSE
 
+**English** | [简体中文](README.zh-CN.md)
+
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![C++20](https://img.shields.io/badge/C%2B%2B-20-blue)](https://en.cppreference.com/w/cpp/20)
 [![Platform](https://img.shields.io/badge/platform-Linux-lightgrey)](https://www.kernel.org/)
