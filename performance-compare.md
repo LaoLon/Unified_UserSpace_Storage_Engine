@@ -1,304 +1,293 @@
-# Performance Compare
+# Performance Comparison
 
-## Test scope
+UUSE replaces the host file system and the kernel block path with a single-process
+userspace engine that drives raw NVMe through SPDK. This document summarizes how it
+compares with the native path across six workloads: **fio**, **3FS**, **MySQL**,
+**RocksDB**, **TiKV (TiDB)**, and **MinIO**.
 
-| Item              | Value                                      |
-|-------------------|--------------------------------------------|
-| Workload          | `randrw`, read/write `50/50`               |
-| Test size         | `256 MiB`                                  |
-| Runtime           | `10 s` per run                             |
-| Repetitions       | `5 runs`, median                           |
-| CPU               | `2-3`                                      |
-| FIO               | `3.42`                                     |
-| Native device     | `/dev/nvme0n1`                             |
-| SPDK device       | `Nvme0n1`, BDF `0000:0b:00.0`              |
-| UUSE configuration | `config/uuse_nvme.conf`                     |
-| SPDK configuration | `config/uuse_nvme.json`                     |
+Measurements were collected between 2026-09-27 and 2026-10-12 on single-node lab VMs (see
+the status note below). Absolute throughput drifts between sessions, so **only ratios
+measured in the same session are meaningful**. Per-workload evidence (raw logs, commands,
+closures) is linked at the end.
 
-## 4 KiB comparison
+> **Status: virtual-machine measurements only, real-hardware numbers pending.**
+> Every result below was collected inside VMware VMs backed by a virtual NVMe controller
+> (4–6 vCPU, 7–8 GiB RAM, one disk). No bare-metal or production-hardware run has been
+> performed yet. Virtualization changes both absolute throughput and some ratios: in the
+> 4K block profile ~45% of reactor CPU is VMware MMIO doorbells and `rdtsc`, costs that
+> do not exist on real hardware. Treat these results as directional lab data and
+> re-measure on the target platform before any capacity, SLA, or procurement decision.
 
-| Path / implementation                  | `direct` | QD      | Median IOPS | Median MiB/s |
-|-----------------------------------------|:--------:|:-------:|------------:|-------------:|
-| Native raw + `io_uring`                 |    `1`   | `1x32`  |     102,424 |       400.09 |
-| Native raw + `libaio`                   |    `1`   | `1x32`  |      98,007 |       382.84 |
-| SPDK `spdk_bdev`                        |    `1`   | `1x32`  |     117,563 |       459.23 |
-| UUSE + SPDK bdev                         |    `1`   | `8x4`   |     106,253 |       415.05 |
-| SPDK `spdk_bdev`                        |    `1`   | `1x16`  |     104,730 |       409.10 |
-| ext4 file + `io_uring` (`/dev/sdb1`)    |    `1`   | `1x16`  |      18,791 |        73.40 |
-| ext4 file + `io_uring` (`/dev/sdb1`)    |    `0`   | `1x16`  |     385,886 |     1,507.37 |
+> The project was renamed from HFS to UUSE on 2026-10-04. Older documents under `doc/`
+> keep the HFS name and their evidence paths; the measurements are unchanged.
 
-> The `direct=0` result is page-cache based and is not a device-throughput result.
-> The ext4 file tests use `/dev/sdb1`, not the NVMe device used by the first four rows.
+## At a glance
 
-### Native `libaio` run
+| Workload | Native baseline | UUSE / native | Tail latency | Comment |
+|---|---|---:|---|---|
+| fio, 4K `randrw` QD32/64 | SPDK raw bdev | 94.9–102.6% | p99 0.87–0.96× | Device-bound, single reactor |
+| fio gate, 1j32 / 8j4 | SPDK raw bdev | 93.5–95.5% / 86.0–89.9% (host4) | p99 0.19–1.00× | Gate is ≥85%, p99 ≤110% |
+| 3FS, RF2 + 2 clients | XFS + Rust `chunk_engine` | 101–104% (4K rw within noise) | — | Client-bound, parity |
+| MySQL `oltp_*` | ext4 datadir | 87.6–99.8% | p99 0.57–1.15× | `write_only` is the low point |
+| RocksDB | ext4 + direct I/O | writes 93–110%, cold reads 1.6–7.8× | — | Read gap is a native-path artifact |
+| TiKV + sysbench | ext4 host | 93.7–98.4% | p99 1.02–1.09× | 5 ms sync window |
+| MinIO `warp` | ext4 | PUT 103–106%, GET 71–76% | p99 0.73–0.98× | GET gap is page cache |
 
-| Item     | Value                                                            |
-|----------|------------------------------------------------------------------|
-| Device   | `/dev/nvme0n1` (`0000:0b:00.0`)                                  |
-| Workload | `4k randrw`, read/write `50/50`                                  |
-| Queue    | `numjobs=1`, `iodepth=32`                                        |
-| FIO      | `fio-3.42`, `ioengine=libaio`                                    |
-| Direct   | `direct=1`                                                       |
-| Runs     | `99,150 / 98,007 / 97,031 / 98,092 / 97,945 IOPS`               |
-| Median   | `98,007 IOPS`, `382.84 MiB/s`                                   |
-| Evidence | `/mnt/uuse-data/fio-libaio-direct1-4k-randrw-20260921`            |
+A ratio above 100% means UUSE was faster. The native baseline differs by workload and is
+named in every table. All numbers are virtual-machine measurements; the status note above
+applies to every row.
 
-```text
-/root/code/fio-3.42/fio --name=libaio_raw --filename=/dev/nvme0n1 \
-  --ioengine=libaio --thread=1 --bs=4k --size=256m \
-  --rw=randrw --rwmixread=50 --direct=1 --iodepth=32 --numjobs=1 \
-  --randrepeat=0 \
-  --group_reporting=1 --time_based=1 --runtime=10 \
-  --output-format=json
-```
+## Test platforms
 
-## Native / SPDK / UUSE block-size matrix
+| ID | Date | Host | Device | Used for |
+|---|---|---|---|---|
+| A | 2026-09-27/29 | 6 vCPU, 7.2 GiB | `VMware NVME_0002`, `0000:13:00.0` | fio, fio gate (09-29), MySQL |
+| B | 2026-10-09/10 | host4, 4 vCPU, 7.2 GiB | `VMware NVME_0002`, `0000:13:00.0` | RocksDB, fio gate, TiKV |
+| C | 2026-10-07 | 2 storage + 2 client VMs (clients 4 vCPU) | `NVME_0002` per storage node | 3FS |
+| D | 2026-10-12 | 6 vCPU, 7.4 GiB | `VMware NVME_0002`, INTx (`pci=nomsi`) | MinIO |
 
-All rows below use `QD=32`; UUSE uses `8 jobs x iodepth=4`, while native and SPDK use
-`1 job x iodepth=32`.
+UUSE builds share SPDK `f0b63ed8`; fio cells use fio 3.42; reactor pins in the UUSE
+`.conf` match the test cpuset. Storage devices are bound to `uio_pci_generic` for UUSE
+legs and returned to the kernel driver (`ext4`) for native legs.
 
-| Block size | Native IOPS | Native MiB/s | SPDK IOPS | SPDK MiB/s | UUSE IOPS | UUSE MiB/s |
-|-----------:|------------:|-------------:|----------:|-----------:|---------:|----------:|
-|       4 KiB |     102,424 |       400.09 |   117,563 |     459.23 |  106,253 |     415.05 |
-|       8 KiB |      63,594 |       496.83 |   107,973 |     843.54 |   98,424 |     768.94 |
-|      16 KiB |      49,588 |       774.81 |    93,014 |   1,453.35 |   86,449 |   1,350.77 |
-|      32 KiB |      39,134 |     1,222.93 |    73,201 |   2,287.54 |   69,596 |   2,174.86 |
-|      64 KiB |      26,608 |     1,662.97 |    52,795 |   3,299.71 |   50,953 |   3,184.54 |
+## Method
 
-## Interpretation
+- **Interleaved A/B.** Both implementations run on the same device in the same session;
+  the volume is rebuilt (`mkfs.ext4` or `uusectl format --yes`) before every leg.
+- **Medians over repeated runs** (3–5 runs, or 2 interleaved rounds), never a single run.
+- **"Native" is defined per workload**: raw SPDK `bdev` for fio, ext4 for file-level
+  workloads, XFS + `chunk_engine` for 3FS.
+- **UUSE has no host page cache by design.** Comparisons against buffered ext4 therefore
+  include that asymmetry rather than isolating engine cost.
+- Kernel-side cells that were unstable in the VM are marked and used only as
+  directional evidence; SPDK/UUSE cells were stable across reruns.
 
-- Raw `io_uring` is already close to SPDK because it uses a raw block device, `O_DIRECT`,
-  `io_uring` submission/completion rings, and the optimized Linux NVMe/blk-mq path.
-- SPDK removes more kernel-path overhead, but the NVMe device service time dominates at
-  this queue depth; the 4 KiB SPDK gain over native is about `14.8%`.
-- `direct=0` on an ordinary file measures page-cache behavior rather than the underlying
-  disk bandwidth.
+## Block layer — fio
 
-## FIO engine matrix (2026-09-23)
+`randrw` 50/50, `direct=1`, 256 MiB working set, 10 s per run, 3-run median. UUSE runs as
+an external fio ioengine in the same process; the raw baseline is SPDK `spdk_bdev` on the
+same device, so both bypass the kernel. Total queue depth is matched: 1 job × QD for raw,
+1 job × 32 (QD32) or 2 × 32 (QD64) for UUSE.
 
-Same NVMe (`0000:0b:00.0`), `randrw` read/write 50/50, `direct=1`, 512 MiB working
-set, 10 s per run, total QD 16/32/64/128, block size 4/8/16/32/64 KiB.
-Kernel (`libaio`, `io_uring`) and SPDK run `numjobs=1 x iodepth=QD`; UUSE runs
-`numjobs=8 x iodepth=QD/8` (same total QD, per-client depth 32). UUSE config:
-1 data reactor (`metadata_cpus=0`, `data_cpus=1`, `frontend_cpus=3`); all engines
-run in cpuset `0-5`. Cells are `IOPS (MiB/s)`; `*` marks kernel cells that were
-unstable at high QD in this VM (rechecked once, same low result).
-
-| Engine | QD | 4 KiB | 8 KiB | 16 KiB | 32 KiB | 64 KiB |
+| I/O | Total QD | ext4 + libaio | SPDK raw | UUSE | UUSE / raw | p99 read (UUSE / raw) |
 |---|---:|---:|---:|---:|---:|---:|
-| libaio | 16 | 83,371 (342) | 75,831 (621) | 43,439 (712) | 29,421 (964) | 20,118 (1,318) |
-| libaio | 32 | 93,847 (384) | 64,509 (529) | 44,849 (735) | 32,984 (1,081) | 21,550 (1,412) |
-| libaio | 64 | 101,883 (417) | 66,152 (542) | 47,885 (785) | 39,011 (1,278) | 6,676 (438)* |
-| libaio | 128 | 109,061 (447) | 87,889 (720)* | 14,273 (234)* | 40,556 (1,329) | 6,857 (449)* |
-| io_uring | 16 | 86,969 (356) | 57,804 (474) | 41,626 (682) | 30,724 (1,007) | 20,323 (1,332) |
-| io_uring | 32 | 97,208 (398) | 59,266 (486) | 42,265 (693) | 8,435 (276)* | 21,396 (1,402) |
-| io_uring | 64 | 100,892 (413) | 65,263 (535) | 48,632 (797) | 36,300 (1,190) | 21,907 (1,436) |
-| io_uring | 128 | 107,601 (441) | 70,197 (575) | 14,347 (235)* | 9,303 (305)* | 5,617 (368)* |
-| spdk_bdev | 16 | 100,186 (410) | 95,191 (780) | 84,055 (1,377) | 67,797 (2,222) | 48,707 (3,192) |
-| spdk_bdev | 32 | 115,169 (472) | 104,573 (857) | 89,724 (1,470) | 69,895 (2,290) | 50,174 (3,288) |
-| spdk_bdev | 64 | 110,769 (454) | 99,067 (812) | 85,902 (1,407) | 67,710 (2,219) | 47,998 (3,146) |
-| spdk_bdev | 128 | 106,877 (438) | 97,483 (799) | 85,221 (1,396) | 72,185 (2,365) | 45,253 (2,966) |
-| UUSE | 16 | 66,076 (271) | 63,096 (517) | 57,393 (940) | 50,214 (1,645) | 39,464 (2,586) |
-| UUSE | 32 | 80,591 (330) | 76,348 (625) | 68,541 (1,123) | 57,041 (1,869) | 43,554 (2,854) |
-| UUSE | 64 | 94,887 (389) | 89,161 (730) | 78,716 (1,290) | 64,034 (2,098) | 47,364 (3,104) |
-| UUSE | 128 | 109,401 (448) | 100,660 (825) | 87,031 (1,426) | 68,245 (2,236) | 47,347 (3,103) |
+| 4 KiB | 32 | 11,546 | 95,986 | 91,081 | **94.9%** | 733 / 766 µs (0.96×) |
+| 4 KiB | 64 | 14,058 | 94,092 | 96,534 | **102.6%** | 1,221 / 1,384 µs (0.88×) |
+| 16 KiB | 32 | 47,737 | 77,568 | 76,091 | **98.1%** | 840 / 897 µs (0.94×) |
+| 16 KiB | 64 | 6,723 | 77,837 | 78,186 | **100.4%** | 1,417 / 1,581 µs (0.90×) |
+| 64 KiB | 32 | 18,356 | 45,402 | 44,152 | **97.2%** | 1,237 / 1,384 µs (0.89×) |
+| 64 KiB | 64 | 21,412 | 47,311 | 46,042 | **97.3%** | 2,212 / 2,441 µs (0.91×) |
 
-Interpretation:
+UUSE stays within ~5% of raw SPDK and its p99 is 4–13% lower. The residual cost is the
+per-operation reactor work (namespace and extent bookkeeping, completion publication),
+measured at ~1.2 µs/op, about 12% of a single data reactor. The ext4 column shows the
+kernel path is 12–15% of raw at 4 KiB, which is what the application-level results below
+have to be read against.
 
-1. **4 KiB randrw**: at QD>=64 all four engines converge at 100-115K IOPS
-   (spdk 115K @QD32, UUSE 109K, libaio 109K, io_uring 108K @QD128); UUSE is within
-   ~5% of the best raw/kernel result. This matches the single-reactor 4K cap
-   (doc/review/..._20260923.md §11.15).
-2. **>=8 KiB**: spdk_bdev leads; UUSE is second and within 0-10% of SPDK
-   (64 KiB QD64: UUSE 3,104 vs spdk 3,146 MiB/s; QD32: 2,854 vs 3,288).
-   Kernel engines top out around 1.3-1.4 GiB/s and degrade at QD128 with large
-   blocks in this VM.
-3. **Bandwidth ceiling**: 64 KiB seq device ceiling measured 3,815 MiB/s
-   (§11.15); UUSE reaches 3.1 GiB/s (~81%) and spdk_bdev 3.29 GiB/s (~86%).
-4. Kernel results at high QD/large block are unstable in this VM (marked `*`);
-   use them only as directional evidence. SPDK/UUSE numbers were stable across
-   reruns.
-5. UUSE rows in this matrix use `8 jobs x depth`; that shape understates 4 KiB
-   performance. The shape-corrected `1x32` comparison is in the QD=32 section
-   below (4 KiB: 101,691 IOPS, within 12-15% of raw SPDK at the same shape).
+### Formal gate
 
-### QD=32 same-session comparison (2026-09-23)
+4K shared-file `randrw`, same shape on both sides, UUSE/raw ≥ 85%, p99 ≤ 1.10×, errors = 0.
 
-Rerun of the QD=32 slice in one session (same parameters as above; UUSE 8x4).
-`libaio` 16 KiB first run produced a transient 11,734 IOPS; three reruns gave
-46,984 / 48,731 / 48,859 IOPS, so the table uses the stable ~48.5K value.
+| Shape | Session | UUSE / raw | p99 ratio | Result |
+|---|---|---:|---:|---|
+| 1 job × QD32 | 2026-09-29 | 90.6% | 1.00× | pass |
+| 8 jobs × QD4 | 2026-09-29 | 120.8% | 0.19× | pass (raw collapses at this shape) |
+| 1 job × QD32 | 2026-10-09 | 95.5% | 0.92× | pass |
+| 8 jobs × QD4 | 2026-10-09 | 86.0% | 0.20× | pass |
+| 1 job × QD32 | 2026-10-10 | 93.5% | 0.96× | pass |
+| 8 jobs × QD4 | 2026-10-10 | 89.9% | 0.20× | pass |
 
-| Engine | 4 KiB | 8 KiB | 16 KiB | 32 KiB | 64 KiB |
-|---|---:|---:|---:|---:|---:|
-| spdk_bdev | **113,347 (464)** | **104,003 (852)** | **87,972 (1,441)** | **70,337 (2,305)** | **48,226 (3,161)** |
-| io_uring | 94,332 (386) | 68,921 (565) | 43,047 (705) | 31,419 (1,030) | 21,494 (1,409) |
-| libaio | 91,406 (374) | 61,781 (506) | 48,500 (790) | 33,830 (1,109) | 22,359 (1,465) |
-| UUSE (8x4) | 81,248 (333) | 75,941 (622) | 68,206 (1,118) | 57,349 (1,879) | 43,805 (2,871) |
-| UUSE (1x32, 4 KiB) | 101,691 (417) | - | - | - | - |
+4 KiB throughput is **job-shape sensitive**: at the same total QD=32, `1 job × 32` reached
+101,691 IOPS while `8 × 4` reached 81,248 in the same session (2026-09-23), because the
+single data reactor saturates either way. The gate therefore fixes the shape on both
+sides instead of comparing across shapes; raw at `8j4` degrades to ~65k IOPS with
+3.46 ms p99, which is recorded as a known boundary, not as a UUSE win.
 
-Notes:
+## 3FS storage target
 
-- UUSE small-I/O results are **job-shape sensitive**. With the same total QD=32,
-  `1 job x iodepth 32` reaches 101,691 IOPS at 4 KiB vs 81,248 for `8 x 4`
-  (same-session A/B; reactor CPU ~94% in both, i.e. the single data reactor is
-  the bottleneck). Use `1x32` (or pin the 8x4 jobs away from the reactor CPU)
-  for small-I/O comparisons; the `8x4` shape inflates the UUSE gap.
-- At the same `1x32` shape UUSE is within 12-15% of raw `spdk_bdev` at 4 KiB
-  (101,691/114,845 randrw/randread vs 115,722/135,003; p99 is equal or better:
-  518 vs 553 us). The residual gap is per-op reactor CPU (~8-12 us vs ~7-8 us
-  for the raw SPDK poller).
-- UUSE is second from 8 KiB up in the `8x4` shape (64 KiB: 2,871 vs 3,161 MiB/s)
-  and reaches 109,401 IOPS at QD=128 4 KiB in the full matrix above.
-- Kernel cells remain noisy at high QD; treat them as directional only.
+UUSE runs as a third `StorageTarget` backend (`UuseChunkStore`) next to the native Rust
+`chunk_engine`. Comparison is RF2 (two replicas), two clients writing concurrently, and a
+chain that differs only in which engine serves one replica. 1 MiB sequential writes and
+4 KiB random writes are aggregated over both clients; reads are single-pass cold reads
+after `drop_caches`.
 
-### Data reactor hotspot profile (2026-09-23)
+| Dimension (2-client aggregate) | `chunk_engine` | UUSE | Ratio |
+|---|---:|---:|---:|
+| Sequential write 1 MiB, 20 s | 65.1 / 66.9 MiB/s | 67.6 / 67.9 MiB/s | 103.8% / 101.5% |
+| Random write 4 KiB, 15 s | 286 / 246 IOPS | 317 / 316 IOPS | 110.8% / 128.5% |
+| Cold read 1 MiB, single pass | 151.0 MiB/s | 153.6 / 152.3 MiB/s | 101.7% / 100.9% |
 
-`perf record -C 1 -g --call-graph dwarf` on the single data reactor during the
-4K randrw `1x32` run (~103K IOPS, reactor ~96% busy), 12 s, 5,989 samples:
+Both arms are limited by the same non-engine ceiling: the FUSE client caps its worker
+threads by vCPU count (two workers on the 4 vCPU clients) and the chain pipeline
+saturates at ~64 ops/s, so sequential writes plateau at ~65–68 MiB/s for both engines.
+These numbers show **no regression**, not the engine's ceiling; a fair headroom test
+needs more client workers or a faster transport.
 
-| Hotspot | Reactor CPU | Notes |
-|---|---:|---|
-| `nvme_pcie_qpair_process_completions` (incl. inlined doorbells) | 36.2% | CQ doorbell 25.1% + SQ doorbell 9.4%; VMware virtual NVMe MMIO exits |
-| `dataMain` (reactor loop itself) | 10.2% | drain calls, poller bookkeeping, polling-mode checks |
-| `spdk_get_ticks` (rdtsc) | 9.0% | SPDK per-poll timestamp; rdtsc is expensive in this VM |
-| `thread_poll` | 5.1% | SPDK thread dispatch |
-| UUSE core: `finish` 4.4% + `pump` 3.7% + `prepare` 2.3% + `ShardRing::drain` 1.6% | ~12% | planning/scheduler/completion publish/ring drain |
-| futex notify syscall + kernel spinlock | ~7.4% | completion wake path |
-| `__tls_get_addr` | 1.7% | TLS markers on the hot path |
-| `pthread_mutex_lock` | 0.9% | residual |
+Two caveats belong with this table: early sessions used Soft-RoCE and produced retry
+storms unrelated to the backend, and the stable configuration for the A/B was inline TCP.
+The 4K random-write difference is small in absolute terms (tens of IOPS) and within
+run-to-run noise.
 
-Conclusions and applied optimizations:
+## MySQL
 
-1. Roughly 45% of reactor CPU is VMware virtualization (MMIO doorbells + rdtsc);
-   on real NVMe those costs drop by an order of magnitude, so the `1x32` gap to
-   raw SPDK (103K vs 116K, i.e. 12-15%) is expected to shrink on hardware.
-2. UUSE core itself is ~12% (~1.2 us/op); the remaining reactor time is SPDK/VM.
-3. Optimizations implemented on top of this profile:
-   - removed hot-path TLS markers (`__tls_get_addr`), replacing them with
-     `spdk_get_thread()` identity checks;
-   - hoisted the `polling` policy string comparisons out of the reactor loops and
-     guarded the retry/completion drains on empty lists;
-   - batched completion publication: the service now accumulates up to 32
-     completion events per shard and the client publishes them with one ring
-     publish and one wake instead of per event.
-4. Post-optimization verification (same session parameters, CTest 26/26):
-   - `1x32` randrw: 102,127 IOPS (pre-opt 101,691/103,199, within noise);
-     `1x32` randread: 117,469 IOPS (pre-opt 114,845, +2.3%); `8x4`: 80,314
-     (unchanged).
-   - Re-profile: doorbell 35.9% (was 36.2%), rdtsc 9.5% (was 9.0%), `dataMain`
-     self 8.95% (was 10.2%), `__tls_get_addr` 1.54% (was 1.65%; the remainder is
-     SPDK's own `__thread` state, not UUSE).
-   - Conclusion: the reactor ceiling on this VM is set by SPDK/VM fixed costs
-     (MMIO doorbells + rdtsc), so the UUSE-side micro-optimizations are
-     neutral-to-slightly-positive but do not change the 4K cap. On real NVMe the
-     doorbell/rdtsc share shrinks by an order of magnitude; UUSE's per-op core
-     cost (~1.2 us) is then the remaining software overhead.
+sysbench 1.0.20, 10 tables × 10,000 rows, 10 s per run, `innodb_flush_log_at_trx_commit=1`,
+`innodb_use_native_aio=OFF`. UUSE datadir and ext4 datadir alternate (two rounds, mean).
 
-## RocksDB baseline (2026-09-23)
+| Scenario | 16 threads | 32 threads | 64 threads | UUSE TPS (16/32/64) |
+|---|---:|---:|---:|---|
+| `oltp_read_write` (70/30) | 89.9% | 98.9% | 91.8% | 3,126 / 4,112 / 4,256 |
+| `oltp_read_only` | 99.8% | 98.7% | 98.5% | 11,287 / 10,671 / 9,741 |
+| `oltp_write_only` | 93.4% | 87.6% | 89.7% | 5,262 / 7,512 / 9,227 |
+| `oltp_point_select` | 98.2% | 98.9% | 95.4% | 270,315 / 262,171 / 240,292 |
 
-Workload: RocksDB 8.9.1, 524,288 keys, 16B key, 1KiB value, 4KiB block,
-**block cache = 1 GiB**, `compression=none`, WAL on, sync off. Backends:
-native ext4 buffered (`bio`), native ext4 direct (`dio`), UUSE (worker-direct reads,
-write-back adapter writes). Workers pinned to CPU4,5 on all backends. Reads run three
-rounds (r1 cold after `drop_caches`, r2/r3 served by the RocksDB block cache).
-Tool: `uuse_db_bench` (`--env/--use_direct_reads/--rounds/--fresh/--worker_cpus`).
+p99 lands between 0.57× and 1.15× of native across the 12 cells; the worst cell is
+`point_select` at 64 threads (0.77 vs 0.67 ms), and `write_only` p99 is consistently
+lower on UUSE (6.2 vs 10.8 ms at 16 threads).
 
-Detailed evidence: `doc/review/uuse_rocksdb_read_latency_optimization_20260923.md`
-§11.13 (1 data reactor) and §11.14 (2 data reactors);
-VM results `/mnt/uuse-data/rocksdb-matrix-20260923.tsv`,
-`/mnt/uuse-data/high-concurrency-20260923.tsv`.
+Read-heavy scenarios are at parity because the 100k-row data set fits the default InnoDB
+buffer pool: the bottleneck is CPU, not the device. `write_only` is the consistent low
+point (87.6–93.4%) because every transaction waits for group commit and a redo barrier,
+and the engine's barrier is more expensive than ext4's. Large working set (1M rows,
+64 MiB buffer pool + `O_DIRECT`, 32 threads): `read_only` 96.1%, `point_select` 93.0%,
+`write_only` 121.3% (native was slower in that session), `read_write` not comparable
+(a 22 s device stall hit the native leg).
 
-### 1 data reactor
+An earlier large-working-set run exposed a real defect: `read_only` fell to 15% because
+~91% of I/O took the synchronous fallback path (no per-thread client on InnoDB connection
+threads) and the single data reactor spun on a full message ring. Lazy per-thread client
+creation raised it to 96.1% (p99 493 ms → 9.2 ms). The fix is part of the current tree; the
+number is kept here because it defines the shape of the remaining risk.
 
-Config: `metadata_cpus=1`, `data_reactors=1`, `data_cpus=2`, `frontend_cpus=3`,
-cpuset `1-5`; native NVMe IRQs pinned to CPU1-3.
+## RocksDB
 
-Write (Put ops/s):
+RocksDB 9.11.2, 1,280,000 keys (16 B key, 1 KiB value), 4 KiB blocks, `compression=none`,
+1 GiB block cache, direct reads, WAL on, sync off. Native is ext4 with
+`use_direct_reads=1`; UUSE uses worker-direct reads and a write-back adapter. Fresh volume
+per phase, interleaved A/B.
 
-| workload | threads | bio | dio | UUSE |
-|---|---:|---:|---:|---:|
-| fillseq | 1 | 296,544 | 287,862 | **341,275** |
-| fillseq | 2 | 211,254 | 217,852 | **235,677** |
-| fillseq | 4 | 188,314 | 205,101 | **208,404** |
-| fillseq | 8 | 201,133 | 202,693 | **237,440** |
-| fillrandom | 1 | 204,773 | 201,804 | **220,819** |
-| fillrandom | 2 | 176,590 | 202,110 | **209,027** |
-| fillrandom | 4 | 190,732 | 184,869 | 179,323 |
-| fillrandom | 8 | 171,307 | 162,018 | **189,376** |
+| Workload | native (32t) | UUSE (32t) | Ratio | native (64t) | UUSE (64t) | Ratio |
+|---|---:|---:|---:|---:|---:|---:|
+| `fillseq` | 96,213 | 98,532 | 102.4% | 96,852 | 95,293 | 98.4% |
+| `readseq` (cold) | 180,285 | 285,606 | 158.4% | 37,927 | 296,342 | 781.3% |
+| `readrandom` (cold) | 38,716 | 179,405 | 463.4% | 38,330 | 184,236 | 480.7% |
+| `fillrandom` | 91,352 | 93,206 | 102.0% | 93,281 | 90,818 | 97.4% |
+| `overwrite` | 81,177 | 89,528 | 110.3% | 81,988 | 85,138 | 103.8% |
+| `readwhilewriting` | 2,053,283 | 1,909,473 | 93.0% | 1,900,565 | 2,229,415 | 117.3% |
 
-Read r1 cold (ops/s):
+Writes are at parity or slightly ahead. **The large read ratios must not be read as a
+UUSE speedup.** Controlled attribution in the same session showed:
 
-| workload | threads | bio | dio | UUSE |
-|---|---:|---:|---:|---:|
-| readseq | 1 | 90,923 | **91,178** | 83,279 |
-| readseq | 2 | **176,618** | 175,412 | 173,083 |
-| readseq | 4 | **296,218** | 288,890 | 290,614 |
-| readseq | 8 | 376,141 | 376,802 | **432,654** |
-| readrandom | 1 | **112,416** | 79,100 | 75,145 |
-| readrandom | 2 | **210,462** | 157,126 | 163,887 |
-| readrandom | 4 | **313,902** | 250,716 | 263,718 |
-| readrandom | 8 | **405,628** | 325,155 | 360,818 |
+- warm reads (block-cache hits) are identical on both backends, ~3.2M ops/s;
+- single-threaded device read latency is identical, 55–62 µs/read;
+- the gap appears only with 32+ threads and cache misses, where the native synchronous
+  `pread` path collapses to ~170–620 µs per device read while UUSE stays at ~16 µs.
 
-### 2 data reactors
+So the multipliers describe a **native-path concurrency collapse**, not the engine's
+throughput. A separate fio anchor in the same session (ext4 + libaio, 4K `randread` QD32,
+98.5k IOPS) confirms the kernel path itself is not slow; the issue is how RocksDB's
+synchronous reads behave at high thread counts in this VM.
 
-Config: `metadata_cpus=0`, `data_reactors=2`, `data_cpus=1,2`, `frontend_cpus=3`,
-cpuset `0-5`; native NVMe IRQs pinned to CPU0-3.
+## TiKV (TiDB)
 
-Write (Put ops/s):
+TiKV v8.5.8 with the UUSE storage backend, sysbench point-select and read-write, 5
+interleaved rounds on the same device, ext4 as the host backend. Worker and apply paths
+use a 5 ms sync window.
 
-| workload | threads | bio | dio | UUSE |
-|---|---:|---:|---:|---:|
-| fillseq | 8 | 208,715 | 207,989 | **231,339** |
-| fillseq | 16 | 181,336 | 184,450 | **219,266** |
-| fillseq | 32 | 182,581 | 172,073 | **192,885** |
-| fillseq | 64 | 157,824 | 158,269 | **163,856** |
-| fillrandom | 8 | 163,924 | 169,535 | **203,569** |
-| fillrandom | 16 | 151,399 | 152,963 | **183,162** |
-| fillrandom | 32 | 142,654 | 145,860 | **166,027** |
-| fillrandom | 64 | 132,462 | 127,615 | **149,944** |
+| Metric | UUSE | native ext4 | Ratio | Gate | Result |
+|---|---:|---:|---:|---|---|
+| `point_select` TPS | 18,534 | 18,838 | 98.4% | ≥ 95% | pass |
+| `point_select` p99 | 1.30 ms | 1.27 ms | 1.02× | ≤ 1.10× | pass |
+| `read_write` TPS | 378 | 404 | 93.7% | ≥ 85% | pass |
+| `read_write` p99 | 33.12 ms | 30.26 ms | 1.09× | ≤ 1.10× | pass |
 
-Read r1 cold (ops/s):
+The 5 ms window is a deliberate durability trade-off, not a free win: it cut fsync
+barriers from 55k to 21.8k per 60 s (sync time 17.4 s → 5.3 s) and moved `read_write` from
+90.9% to 93.7%. Crash RPO is therefore ≤ 5 ms; graceful shutdown still forces a full sync
+(RPO = 0).
 
-| workload | threads | bio | dio | UUSE |
-|---|---:|---:|---:|---:|
-| readseq | 8 | 368,650 | 366,609 | **449,243** |
-| readseq | 16 | 376,366 | 383,359 | **613,753** |
-| readseq | 32 | 381,075 | 374,593 | **609,891** |
-| readseq | 64 | 367,575 | 371,342 | **614,267** |
-| readrandom | 8 | **404,108** | 324,965 | 360,904 |
-| readrandom | 16 | 417,528 | 335,780 | **433,901** |
-| readrandom | 32 | 420,380 | 332,348 | **459,260** |
-| readrandom | 64 | 407,017 | 324,078 | **476,745** |
+## MinIO
 
-### 1 vs 2 data reactors (UUSE control)
+`warp` against a single node with one disk (ErasureSD, no redundancy), 1 MiB objects, 16
+concurrent streams over loopback, 8 s legs, interleaved ext4 ↔ UUSE with a fresh format
+per leg.
 
-The 1-reactor control reruns only UUSE with the same CPU layout (metadata 0,
-frontend 3, cpuset 0-5, IRQ 0-3); only `data_reactors`/`data_cpus` change
-(`1` vs `1,2`). Evidence: `/mnt/uuse-data/one-reactor-control-20260923.tsv`.
+| Metric | ext4 (r1 / r2) | UUSE (r1 / r2) | Ratio |
+|---|---:|---:|---:|
+| PUT throughput | 871.7 / 869.1 MiB/s | 900.2 / 901.1 MiB/s | **103.3% / 103.7%** |
+| PUT p99 | 32.2 / 32.6 ms | 31.5 / 30.4 ms | 0.98× / 0.93× |
+| GET throughput | 2,721.9 / 2,758.0 MiB/s | 1,944.7 / 1,938.8 MiB/s | **71.4% / 70.3%** |
+| GET p99 | 18.2 / 18.5 ms | 13.9 / 14.4 ms | **0.76× / 0.78×** |
 
-| workload | threads | 1R | 2R | delta |
-|---|---:|---:|---:|---:|
-| fillseq | 8 / 16 / 32 / 64 | 233,703 / 216,582 / 194,288 / 157,369 | 231,339 / 219,266 / 192,885 / 163,856 | -1% / +1% / -1% / +4% |
-| fillrandom | 8 / 16 / 32 / 64 | 197,600 / 185,895 / 166,663 / 148,915 | 203,569 / 183,162 / 166,027 / 149,944 | +3% / -1% / 0% / +1% |
-| readseq r1 | 8 / 16 / 32 / 64 | 436,517 / 628,843 / 666,385 / 643,290 | 449,243 / 613,753 / 609,891 / 614,267 | +3% / -2% / -8% / -5% |
-| readrandom r1 | 8 / 16 / 32 / 64 | 349,987 / 416,637 / 450,578 / 462,710 | 360,904 / 433,901 / 459,260 / 476,745 | +3% / +4% / +2% / +3% |
-| readseq/readrandom warm | all | ~2.2M / ~1.35M | ~2.2M / ~1.34M | 0 |
+Writes reached parity after a structural fix: MinIO's create/rename on every PUT forced a
+full namespace checkpoint per barrier (p50 3.9 ms). Making shape changes replayable through
+the journal dropped the barrier to 0.62 ms and PUT from 47–64% to 103–106% of ext4.
 
-### RocksDB baseline conclusions
+GET is the one **structural regression**, and it is attributed rather than left open:
 
-1. Warm reads (r2/r3, block cache hit) are backend-independent: readseq ~2.1-2.3M
-   ops/s and readrandom ~1.3-1.4M ops/s for bio/dio/UUSE alike. A 1 GiB cache removes
-   the file-system difference; the cache belongs above UUSE.
-2. Cold reads are where the backends differ. Bio wins random reads at low concurrency
-   (page cache readahead); UUSE wins sequential reads at all levels and random reads
-   from 16 threads up (477K ops/s at t64 vs bio 407K and dio 324K).
-3. Writes: UUSE leads all cells in both reactor configurations (fillseq 164-341K,
-   fillrandom 150-221K); bio and dio are equivalent within noise.
-4. **1 vs 2 data reactors: no meaningful throughput difference.** Writes are within
-   +/-4%, cold sequential reads are equal or slightly better with 1 reactor (-8% at
-   t32 for 2R), cold random reads gain only +2~+4% with 2 reactors, and warm reads
-   are identical. The second reactor buys CPU headroom (two actor threads instead of
-   one) rather than measured throughput in this workload; an earlier "2R scales at
-   t16-64" claim compared 2R at high concurrency against 1R at t8 and is not valid.
-5. `bio` numbers include Linux page-cache effects; `fillrandom`/`readseq` wall-time
-   outliers (bio t8, dio t8) are writeback/`sync` stalls, not benchmark time.
+- ext4 serves ~90% of the payload from the page cache on this loopback workload; UUSE has
+  no page cache, so every read reaches the device;
+- ext4 absorbs the per-object `xl.meta` reads in cache; UUSE pays ~2 extra device reads per
+  object, which queue behind the 1 MiB transfer on a single queue (head-of-line blocking);
+- the engine read path itself is fast: 5,270 MiB/s at 8 threads in a direct read probe.
+
+A bounded shim metadata cache removed ~40% of the small reads and gained +4.6% GET
+(1,935 → 2,023 MiB/s). The remaining gap is the device's sustained single-queue read
+throughput (~2.0–2.5 GB/s) versus ext4's kernel multi-queue path (2.7–3.3 GB/s). The
+throughput gate was frozen at 71–76% rather than pursued further; PUT, p99, and error
+gates stay green.
+
+## Discussion
+
+1. **Device-bound paths reach parity.** When the workload actually reaches the device —
+   block I/O, 3FS chunk writes, MinIO PUT — UUSE matches or slightly beats the native
+   path. The engine's own overhead is ~1.2 µs/op, small relative to device service time
+   on this VM.
+2. **Application stacks hide the block-layer advantage.** InnoDB, RocksDB, and TiKV each
+   bring a buffer pool or block cache plus a durability barrier; the device stops being
+   the bottleneck, so end-to-end results sit at 88–100% while the fio table shows ext4
+   6–8× behind raw at 4 KiB.
+3. **Large read multipliers are baseline artifacts.** The 1.6–7.8× RocksDB read ratios
+   come from the native synchronous read path degrading under concurrency, not from UUSE
+   being faster than the device. Warm-cache and single-thread numbers are identical.
+4. **The remaining gaps are structural and known.** MinIO GET (no page cache) and MySQL
+   `write_only` (barrier cost) are design trade-offs, not tuning bugs. Both are bounded
+   and documented rather than papered over.
+5. **Ratios do not transfer.** All measurements are from 4–6 vCPU VMs with one virtual
+   NVMe; ~45% of reactor CPU in the 4K profile is VMware MMIO doorbells and `rdtsc`,
+   costs that are absent on bare metal. The gap is therefore expected to narrow there,
+   but that has not been measured yet.
+
+## Limitations
+
+- Single device, single node. The only multi-node setup is 3FS RF2; MinIO was measured
+  over loopback. No erasure-coded or multi-disk placement results.
+- Virtual NVMe: MSI-X completion behaviour required `pci=nomsi` on one host, and kernel
+  NVMe cells showed intermittent `I/O tag timeout` stalls in several sessions. Cells
+  affected by a stall are marked and excluded from conclusions.
+- 3FS numbers are capped by the FUSE client (two worker threads on the 4 vCPU clients),
+  so they prove parity, not headroom.
+- UUSE has no host page cache; results against buffered ext4 include that asymmetry.
+- **No bare-metal validation.** All results are from virtual machines (see the status note
+  at the top). Absolute values and some ratios will differ on real hardware, so these
+  numbers are not a sizing, SLA, or acceptance baseline.
+
+## Reproducing
+
+| Workload | Entry point |
+|---|---|
+| fio | [`fio/run_three_way_matrix_vm.sh`](fio/run_three_way_matrix_vm.sh), [`fio/run_four_engine_vm.sh`](fio/run_four_engine_vm.sh) |
+| 3FS | [`integrations/3fs/README.md`](integrations/3fs/README.md), [`doc/design/uuse_3fs_local_engine.md`](doc/design/uuse_3fs_local_engine.md) §5 |
+| MySQL | [`mysql/run_native_vs_uuse_sysbench_vm.sh`](mysql/run_native_vs_uuse_sysbench_vm.sh) |
+| RocksDB | [`rocksdb/run_native_vs_uuse_vm.sh`](rocksdb/run_native_vs_uuse_vm.sh) |
+| TiKV | [`tikv/run_perf_ab_vm.sh`](tikv/run_perf_ab_vm.sh), [`tikv/run_perf_ab_target_vm.sh`](tikv/run_perf_ab_target_vm.sh) |
+| MinIO | [`minio/run_perf_ab_vm.sh`](minio/run_perf_ab_vm.sh) |
+
+## References
+
+- [`doc/performance/fio_baseline.md`](doc/performance/fio_baseline.md) — three-way fio matrix, engine comparison
+- [`doc/performance/rocksdb_baseline.md`](doc/performance/rocksdb_baseline.md) — RocksDB A/B and read-gap attribution
+- [`doc/performance/mysql_baseline.md`](doc/performance/mysql_baseline.md) — MySQL matrix and seam fixes
+- [`doc/performance/uuse_tidb_baseline_20261009.md`](doc/performance/uuse_tidb_baseline_20261009.md) — TiKV Phase 8 baseline and gate
+- [`doc/performance/minio_baseline.md`](doc/performance/minio_baseline.md), [`doc/performance/minio_shard95_attribution.md`](doc/performance/minio_shard95_attribution.md) — MinIO A/B, attribution, freeze decision
+- [`doc/design/uuse_3fs_local_engine.md`](doc/design/uuse_3fs_local_engine.md) §5 — 3FS RF2 A/B
+- [`doc/design/uuse.md`](doc/design/uuse.md) §16 — acceptance gates
