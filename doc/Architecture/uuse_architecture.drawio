@@ -1,0 +1,167 @@
+<mxfile host="VSCode" agent="drawio" version="24.7.17" type="device">
+  <diagram id="uuse-architecture" name="UUSE Architecture">
+    <mxGraphModel dx="1600" dy="1000" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1600" pageHeight="1100" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <mxCell id="title" value="UUSE 2.0 架构总览" style="text;html=1;fontSize=22;fontStyle=1;align=left;verticalAlign=middle;fontColor=#333333;" vertex="1" parent="1">
+          <mxGeometry x="40" y="20" width="700" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="subtitle" value="单进程 · 单 Engine · 独占 device set · 前端与 core 同进程，或经 C ABI shim / fork seam 接入" style="text;html=1;fontSize=12;align=left;verticalAlign=middle;fontColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="40" y="60" width="1100" height="24" as="geometry" />
+        </mxCell>
+
+        <mxCell id="fe1" value="FIO 3.42&lt;br&gt;external ioengine" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="40" y="100" width="180" height="64" as="geometry" />
+        </mxCell>
+        <mxCell id="fe2" value="RocksDB 8.9.1&lt;br&gt;FileSystem adapter" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="236" y="100" width="180" height="64" as="geometry" />
+        </mxCell>
+        <mxCell id="fe3" value="MySQL 8.0.46&lt;br&gt;InnoDB os_file seam" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="432" y="100" width="180" height="64" as="geometry" />
+        </mxCell>
+        <mxCell id="fe4" value="TiKV 8.5.8&lt;br&gt;C ABI shim" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="628" y="100" width="180" height="64" as="geometry" />
+        </mxCell>
+        <mxCell id="fe5" value="MinIO S3&lt;br&gt;盘层 seam + shim" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="824" y="100" width="180" height="64" as="geometry" />
+        </mxCell>
+        <mxCell id="fe6" value="3FS&lt;br&gt;chunk store（实验）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="1020" y="100" width="180" height="64" as="geometry" />
+        </mxCell>
+        <mxCell id="fe7" value="C++ API / uusectl&lt;br&gt;Engine / Client" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="1216" y="100" width="180" height="64" as="geometry" />
+        </mxCell>
+
+        <mxCell id="adapters" value="接入层：进程内适配器（FIO / RocksDB / C++ API）· C ABI shim（TiKV / MinIO）· InnoDB os_file seam（MySQL）· ChunkStore 后端（3FS）" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="40" y="196" width="1356" height="44" as="geometry" />
+        </mxCell>
+
+        <mxCell id="engine" value="uuse::Engine — 单进程、单实例；进程锁防止重复挂载" style="rounded=0;whiteSpace=wrap;html=1;dashed=1;fillColor=none;strokeColor=#999999;verticalAlign=top;align=left;spacingLeft=10;spacingTop=6;fontSize=12;fontColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="40" y="258" width="1356" height="562" as="geometry" />
+        </mxCell>
+
+        <mxCell id="metaGroup" value="元数据控制面" style="rounded=0;whiteSpace=wrap;html=1;dashed=1;fillColor=none;strokeColor=#9673a6;verticalAlign=top;align=left;spacingLeft=10;spacingTop=6;fontSize=12;fontColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="60" y="290" width="380" height="262" as="geometry" />
+        </mxCell>
+        <mxCell id="ns" value="Namespace&lt;br&gt;inode / 目录 / extent 状态" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="72" y="320" width="356" height="66" as="geometry" />
+        </mxCell>
+        <mxCell id="journal" value="Journal / checkpoint&lt;br&gt;WAL、快照、durability" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="72" y="400" width="356" height="66" as="geometry" />
+        </mxCell>
+        <mxCell id="metareact" value="Metadata reactor&lt;br&gt;控制 I/O channel" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="72" y="480" width="356" height="66" as="geometry" />
+        </mxCell>
+
+        <mxCell id="client" value="uuse::Client&lt;br&gt;submitRead / submitWrite / poll · credit · completion queue" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="500" y="340" width="500" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="ring" value="bounded MPSC shard ring&lt;br&gt;hash(file_id) → shard" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="500" y="426" width="500" height="54" as="geometry" />
+        </mxCell>
+        <mxCell id="actor" value="ShardActor × R&lt;br&gt;inode scheduler + ready queue" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="500" y="498" width="500" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="planner" value="IoPlanner + ParentCompletion&lt;br&gt;extent lookup / split / RMW / 聚合" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="500" y="578" width="500" height="54" as="geometry" />
+        </mxCell>
+        <mxCell id="dma" value="DMA arena（大页）&lt;br&gt;BufferLease / caller buffer / bounce fallback" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="500" y="652" width="500" height="54" as="geometry" />
+        </mxCell>
+        <mxCell id="spdk" value="SPDK environment&lt;br&gt;bdev 描述符 · channel · uio / vfio" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="500" y="728" width="500" height="54" as="geometry" />
+        </mxCell>
+
+        <mxCell id="rtGroup" value="SPDK 运行时" style="rounded=0;whiteSpace=wrap;html=1;dashed=1;fillColor=none;strokeColor=#b85450;verticalAlign=top;align=left;spacingLeft=10;spacingTop=6;fontSize=12;fontColor=#b85450;" vertex="1" parent="1">
+          <mxGeometry x="1040" y="470" width="340" height="286" as="geometry" />
+        </mxCell>
+        <mxCell id="dreact" value="Data reactors × R&lt;br&gt;spdk_thread_poll 驱动 actor" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="1052" y="512" width="316" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="pools" value="Bounded pools&lt;br&gt;Operation / coroutine frame / ring capacity" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="1052" y="590" width="316" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="completion" value="完成路径&lt;br&gt;completion event → Client 队列 → 前端回调" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="1052" y="668" width="316" height="66" as="geometry" />
+        </mxCell>
+
+        <mxCell id="bdev" value="SPDK bdev set&lt;br&gt;Nvme0n1 · 配置中声明的全部 bdev" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="300" y="850" width="420" height="56" as="geometry" />
+        </mxCell>
+        <mxCell id="nvme" value="NVMe device set&lt;br&gt;PCIe · 0000:13:00.0" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="760" y="850" width="420" height="56" as="geometry" />
+        </mxCell>
+
+        <mxCell id="note" value="注：FIO / RocksDB / C++ API 与 core 同进程；MySQL / TiKV / MinIO 通过各自 fork 的 seam 接入；3FS 为实验后端。虚线表示运行时或带外路径，实线表示提交 / 调用路径。" style="text;html=1;fontSize=11;align=left;verticalAlign=middle;fontColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="40" y="930" width="1200" height="30" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e_fe1" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;endFill=1;strokeColor=#666666;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="fe1" target="adapters">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_fe2" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;endFill=1;strokeColor=#666666;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="fe2" target="adapters">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_fe3" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;endFill=1;strokeColor=#666666;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="fe3" target="adapters">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_fe4" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;endFill=1;strokeColor=#666666;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="fe4" target="adapters">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_fe5" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;endFill=1;strokeColor=#666666;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="fe5" target="adapters">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_fe6" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;endFill=1;strokeColor=#666666;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="fe6" target="adapters">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_fe7" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;endFill=1;strokeColor=#666666;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="fe7" target="adapters">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e_ad_client" value="submit / poll" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;endFill=1;strokeColor=#666666;fontSize=10;fontColor=#555555;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="adapters" target="client">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_client_ring" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;endFill=1;strokeColor=#666666;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="client" target="ring">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_ring_actor" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;endFill=1;strokeColor=#666666;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="ring" target="actor">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_actor_plan" value="同 inode 保序" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;endFill=1;strokeColor=#666666;fontSize=10;fontColor=#555555;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="actor" target="planner">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_plan_dma" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;endFill=1;strokeColor=#666666;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="planner" target="dma">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_dma_spdk" value="bdev I/O" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;endFill=1;strokeColor=#666666;fontSize=10;fontColor=#555555;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="dma" target="spdk">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_spdk_bdev" value="NVMe 命令" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;endFill=1;strokeColor=#666666;fontSize=10;fontColor=#555555;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="spdk" target="bdev">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_bdev_nvme" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;endFill=1;strokeColor=#666666;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="bdev" target="nvme">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e_ns_client" value="元数据操作" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;endFill=1;strokeColor=#9673a6;fontSize=10;fontColor=#9673a6;labelBackgroundColor=#ffffff;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="ns" target="client">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_ns_journal" value="append" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;endFill=1;strokeColor=#9673a6;fontSize=10;fontColor=#9673a6;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="ns" target="journal">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_journal_meta" value="flush / snapshot" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;endFill=1;strokeColor=#9673a6;fontSize=10;fontColor=#9673a6;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="journal" target="metareact">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_meta_spdk" value="控制 I/O" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;endFill=1;strokeColor=#9673a6;dashed=1;fontSize=10;fontColor=#9673a6;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="metareact" target="spdk">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e_actor_dreact" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;endFill=1;strokeColor=#b85450;dashed=1;fontSize=10;fontColor=#b85450;labelBackgroundColor=#ffffff;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="actor" target="dreact">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
