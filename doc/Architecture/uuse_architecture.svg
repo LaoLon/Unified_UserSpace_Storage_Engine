@@ -1,0 +1,133 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1100" viewBox="0 0 1600 1100">
+<rect width="100%" height="100%" fill="#ffffff"/>
+<text x="50.0" y="54.2" text-anchor="start" font-family="'Microsoft YaHei','Segoe UI',Arial,sans-serif" font-size="22" fill="#333333">UUSE 2.0 架构总览</text>
+<text x="50.0" y="79.7" text-anchor="start" font-family="'Microsoft YaHei','Segoe UI',Arial,sans-serif" font-size="12" fill="#666666">单进程 · 单 Engine · 独占 device set · 前端与 core 同进程，或经 C ABI shim / fork seam 接入</text>
+<rect x="40.0" y="100.0" width="180.0" height="64.0" rx="6" fill="#dae8fc" fill-opacity="1" stroke="#6c8ebf" stroke-width="1"/>
+<text x="130.0" y="132.2" text-anchor="middle" font-family="'Microsoft YaHei','Segoe UI',Arial,sans-serif" font-size="11" fill="#000000">FIO 3.42</text>
+<text x="130.0" y="146.0" text-anchor="middle" font-family="'Microsoft YaHei','Segoe UI',Arial,sans-serif" font-size="11" fill="#000000">external ioengine</text>
+<rect x="236.0" y="100.0" width="180.0" height="64.0" rx="6" fill="#dae8fc" fill-opacity="1" stroke="#6c8ebf" stroke-width="1"/>
+<text x="326.0" y="132.2" text-anchor="middle" font-family="'Microsoft YaHei','Segoe UI',Arial,sans-serif" font-size="11" fill="#000000">RocksDB 8.9.1</text>
+<text x="326.0" y="146.0" text-anchor="middle" font-family="'Microsoft YaHei','Segoe UI',Arial,sans-serif" font-size="11" fill="#000000">FileSystem adapter</text>
+<rect x="432.0" y="100.0" width="180.0" height="64.0" rx="6" fill="#dae8fc" fill-opacity="1" stroke="#6c8ebf" stroke-width="1"/>
+<text x="522.0" y="132.2" text-anchor="middle" font-family="'Microsoft YaHei','Segoe UI',Arial,sans-serif" font-size="11" fill="#000000">MySQL 8.0.46</text>
+<text x="522.0" y="146.0" text-anchor="middle" font-family="'Microsoft YaHei','Segoe UI',Arial,sans-serif" font-size="11" fill="#000000">InnoDB os_file seam</text>
+<rect x="628.0" y="100.0" width="180.0" height="64.0" rx="6" fill="#dae8fc" fill-opacity="1" stroke="#6c8ebf" stroke-width="1"/>
+<text x="718.0" y="132.2" text-anchor="middle" font-family="'Microsoft YaHei','Segoe UI',Arial,sans-serif" font-size="11" fill="#000000">TiKV 8.5.8</text>
+<text x="718.0" y="146.0" text-anchor="middle" font-family="'Microsoft YaHei','Segoe UI',Arial,sans-serif" font-size="11" fill="#000000">C ABI shim</text>
+<rect x="824.0" y="100.0" width="180.0" height="64.0" rx="6" fill="#dae8fc" fill-opacity="1" stroke="#6c8ebf" stroke-width="1"/>
+<text x="914.0" y="132.2" text-anchor="middle" font-family="'Microsoft YaHei','Segoe UI',Arial,sans-serif" font-size="11" fill="#000000">MinIO S3</text>
+<text x="914.0" y="146.0" text-anchor="middle" font-family="'Microsoft YaHei','Segoe UI',Arial,sans-serif" font-size="11" fill="#000000">盘层 seam + shim</text>
+<rect x="1020.0" y="100.0" width="180.0" height="64.0" rx="6" fill="#dae8fc" fill-opacity="1" stroke="#6c8ebf" stroke-width="1"/>
+<text x="1110.0" y="132.2" text-anchor="middle" font-family="'Microsoft YaHei','Segoe UI',Arial,sans-serif" font-size="11" fill="#000000">3FS</text>
+<text x="1110.0" y="146.0" text-anchor="middle" font-family="'Microsoft YaHei','Segoe UI',Arial,sans-serif" font-size="11" fill="#000000">chunk store（实验）</text>
+<rect x="1216.0" y="100.0" width="180.0" height="64.0" rx="6" fill="#dae8fc" fill-opacity="1" stroke="#6c8ebf" stroke-width="1"/>
+<text x="1306.0" y="132.2" text-anchor="middle" font-family="'Microsoft YaHei','Segoe UI',Arial,sans-serif" font-size="11" fill="#000000">C++ API / uusectl</text>
+<text x="1306.0" y="146.0" text-anchor="middle" font-family="'Microsoft YaHei','Segoe UI',Arial,sans-serif" font-size="11" fill="#000000">Engine / Client</text>
+<rect x="40.0" y="196.0" width="1356.0" height="44.0" rx="0" fill="#d5e8d4" fill-opacity="1" stroke="#82b366" stroke-width="1"/>
+<text x="718.0" y="225.7" text-anchor="middle" font-family="'Microsoft YaHei','Segoe UI',Arial,sans-serif" font-size="12" fill="#000000">接入层：进程内适配器（FIO / RocksDB / C++ API）· C ABI shim（TiKV / MinIO）· InnoDB os_file seam（MySQL）· ChunkStore 后端（3FS）</text>
+<rect x="40.0" y="258.0" width="1356.0" height="562.0" rx="0" fill="none" fill-opacity="1" stroke="#999999" stroke-width="1" stroke-dasharray="6 4"/>
+<text x="50.0" y="273.0" text-anchor="start" font-family="'Microsoft YaHei','Segoe UI',Arial,sans-serif" font-size="12" fill="#666666">uuse::Engine — 单进程、单实例；进程锁防止重复挂载</text>
+<rect x="60.0" y="290.0" width="380.0" height="262.0" rx="0" fill="none" fill-opacity="1" stroke="#9673a6" stroke-width="1" stroke-dasharray="6 4"/>
+<text x="70.0" y="305.0" text-anchor="start" font-family="'Microsoft YaHei','Segoe UI',Arial,sans-serif" font-size="12" fill="#9673a6">元数据控制面</text>
+<rect x="72.0" y="320.0" width="356.0" height="66.0" rx="6" fill="#e1d5e7" fill-opacity="1" stroke="#9673a6" stroke-width="1"/>
+<text x="250.0" y="353.2" text-anchor="middle" font-family="'Microsoft YaHei','Segoe UI',Arial,sans-serif" font-size="11" fill="#000000">Namespace</text>
+<text x="250.0" y="367.0" text-anchor="middle" font-family="'Microsoft YaHei','Segoe UI',Arial,sans-serif" font-size="11" fill="#000000">inode / 目录 / extent 状态</text>
+<rect x="72.0" y="400.0" width="356.0" height="66.0" rx="6" fill="#e1d5e7" fill-opacity="1" stroke="#9673a6" stroke-width="1"/>
+<text x="250.0" y="433.2" text-anchor="middle" font-family="'Microsoft YaHei','Segoe UI',Arial,sans-serif" font-size="11" fill="#000000">Journal / checkpoint</text>
+<text x="250.0" y="447.0" text-anchor="middle" font-family="'Microsoft YaHei','Segoe UI',Arial,sans-serif" font-size="11" fill="#000000">WAL、快照、durability</text>
+<rect x="72.0" y="480.0" width="356.0" height="66.0" rx="6" fill="#e1d5e7" fill-opacity="1" stroke="#9673a6" stroke-width="1"/>
+<text x="250.0" y="513.2" text-anchor="middle" font-family="'Microsoft YaHei','Segoe UI',Arial,sans-serif" font-size="11" fill="#000000">Metadata reactor</text>
+<text x="250.0" y="527.0" text-anchor="middle" font-family="'Microsoft YaHei','Segoe UI',Arial,sans-serif" font-size="11" fill="#000000">控制 I/O channel</text>
+<rect x="500.0" y="340.0" width="500.0" height="60.0" rx="6" fill="#fff2cc" fill-opacity="1" stroke="#d6b656" stroke-width="1"/>
+<text x="750.0" y="370.2" text-anchor="middle" font-family="'Microsoft YaHei','Segoe UI',Arial,sans-serif" font-size="11" fill="#000000">uuse::Client</text>
+<text x="750.0" y="384.0" text-anchor="middle" font-family="'Microsoft YaHei','Segoe UI',Arial,sans-serif" font-size="11" fill="#000000">submitRead / submitWrite / poll · credit · completion queue</text>
+<rect x="500.0" y="426.0" width="500.0" height="54.0" rx="6" fill="#fff2cc" fill-opacity="1" stroke="#d6b656" stroke-width="1"/>
+<text x="750.0" y="453.2" text-anchor="middle" font-family="'Microsoft YaHei','Segoe UI',Arial,sans-serif" font-size="11" fill="#000000">bounded MPSC shard ring</text>
+<text x="750.0" y="467.0" text-anchor="middle" font-family="'Microsoft YaHei','Segoe UI',Arial,sans-serif" font-size="11" fill="#000000">hash(file_id) → shard</text>
+<rect x="500.0" y="498.0" width="500.0" height="60.0" rx="6" fill="#fff2cc" fill-opacity="1" stroke="#d6b656" stroke-width="1"/>
+<text x="750.0" y="528.2" text-anchor="middle" font-family="'Microsoft YaHei','Segoe UI',Arial,sans-serif" font-size="11" fill="#000000">ShardActor × R</text>
+<text x="750.0" y="542.0" text-anchor="middle" font-family="'Microsoft YaHei','Segoe UI',Arial,sans-serif" font-size="11" fill="#000000">inode scheduler + ready queue</text>
+<rect x="500.0" y="578.0" width="500.0" height="54.0" rx="6" fill="#fff2cc" fill-opacity="1" stroke="#d6b656" stroke-width="1"/>
+<text x="750.0" y="605.2" text-anchor="middle" font-family="'Microsoft YaHei','Segoe UI',Arial,sans-serif" font-size="11" fill="#000000">IoPlanner + ParentCompletion</text>
+<text x="750.0" y="619.0" text-anchor="middle" font-family="'Microsoft YaHei','Segoe UI',Arial,sans-serif" font-size="11" fill="#000000">extent lookup / split / RMW / 聚合</text>
+<rect x="500.0" y="652.0" width="500.0" height="54.0" rx="6" fill="#fff2cc" fill-opacity="1" stroke="#d6b656" stroke-width="1"/>
+<text x="750.0" y="679.2" text-anchor="middle" font-family="'Microsoft YaHei','Segoe UI',Arial,sans-serif" font-size="11" fill="#000000">DMA arena（大页）</text>
+<text x="750.0" y="693.0" text-anchor="middle" font-family="'Microsoft YaHei','Segoe UI',Arial,sans-serif" font-size="11" fill="#000000">BufferLease / caller buffer / bounce fallback</text>
+<rect x="500.0" y="728.0" width="500.0" height="54.0" rx="6" fill="#f8cecc" fill-opacity="1" stroke="#b85450" stroke-width="1"/>
+<text x="750.0" y="755.2" text-anchor="middle" font-family="'Microsoft YaHei','Segoe UI',Arial,sans-serif" font-size="11" fill="#000000">SPDK environment</text>
+<text x="750.0" y="769.0" text-anchor="middle" font-family="'Microsoft YaHei','Segoe UI',Arial,sans-serif" font-size="11" fill="#000000">bdev 描述符 · channel · uio / vfio</text>
+<rect x="1040.0" y="470.0" width="340.0" height="286.0" rx="0" fill="none" fill-opacity="1" stroke="#b85450" stroke-width="1" stroke-dasharray="6 4"/>
+<text x="1050.0" y="485.0" text-anchor="start" font-family="'Microsoft YaHei','Segoe UI',Arial,sans-serif" font-size="12" fill="#b85450">SPDK 运行时</text>
+<rect x="1052.0" y="512.0" width="316.0" height="60.0" rx="6" fill="#f8cecc" fill-opacity="1" stroke="#b85450" stroke-width="1"/>
+<text x="1210.0" y="542.2" text-anchor="middle" font-family="'Microsoft YaHei','Segoe UI',Arial,sans-serif" font-size="11" fill="#000000">Data reactors × R</text>
+<text x="1210.0" y="556.0" text-anchor="middle" font-family="'Microsoft YaHei','Segoe UI',Arial,sans-serif" font-size="11" fill="#000000">spdk_thread_poll 驱动 actor</text>
+<rect x="1052.0" y="590.0" width="316.0" height="60.0" rx="6" fill="#f8cecc" fill-opacity="1" stroke="#b85450" stroke-width="1"/>
+<text x="1210.0" y="620.2" text-anchor="middle" font-family="'Microsoft YaHei','Segoe UI',Arial,sans-serif" font-size="11" fill="#000000">Bounded pools</text>
+<text x="1210.0" y="634.0" text-anchor="middle" font-family="'Microsoft YaHei','Segoe UI',Arial,sans-serif" font-size="11" fill="#000000">Operation / coroutine frame / ring capacity</text>
+<rect x="1052.0" y="668.0" width="316.0" height="66.0" rx="6" fill="#f8cecc" fill-opacity="1" stroke="#b85450" stroke-width="1"/>
+<text x="1210.0" y="701.2" text-anchor="middle" font-family="'Microsoft YaHei','Segoe UI',Arial,sans-serif" font-size="11" fill="#000000">完成路径</text>
+<text x="1210.0" y="715.0" text-anchor="middle" font-family="'Microsoft YaHei','Segoe UI',Arial,sans-serif" font-size="11" fill="#000000">completion event → Client 队列 → 前端回调</text>
+<rect x="300.0" y="850.0" width="420.0" height="56.0" rx="0" fill="#f5f5f5" fill-opacity="1" stroke="#666666" stroke-width="1"/>
+<text x="510.0" y="878.2" text-anchor="middle" font-family="'Microsoft YaHei','Segoe UI',Arial,sans-serif" font-size="12" fill="#000000">SPDK bdev set</text>
+<text x="510.0" y="893.2" text-anchor="middle" font-family="'Microsoft YaHei','Segoe UI',Arial,sans-serif" font-size="12" fill="#000000">Nvme0n1 · 配置中声明的全部 bdev</text>
+<rect x="760.0" y="850.0" width="420.0" height="56.0" rx="0" fill="#f5f5f5" fill-opacity="1" stroke="#666666" stroke-width="1"/>
+<text x="970.0" y="878.2" text-anchor="middle" font-family="'Microsoft YaHei','Segoe UI',Arial,sans-serif" font-size="12" fill="#000000">NVMe device set</text>
+<text x="970.0" y="893.2" text-anchor="middle" font-family="'Microsoft YaHei','Segoe UI',Arial,sans-serif" font-size="12" fill="#000000">PCIe · 0000:13:00.0</text>
+<text x="50.0" y="952.1" text-anchor="start" font-family="'Microsoft YaHei','Segoe UI',Arial,sans-serif" font-size="11" fill="#666666">注：FIO / RocksDB / C++ API 与 core 同进程；MySQL / TiKV / MinIO 通过各自 fork 的 seam 接入；3FS 为实验后端。虚线表示运行时或带外路径，实线表示提交 / 调用路径。</text>
+<path d="M 130.0 164.0 L 130.0 180.0 L 718.0 180.0 L 718.0 196.0" fill="none" stroke="#666666" stroke-width="1"/>
+<polygon points="718.0,196.0 722.5,187.0 713.5,187.0" fill="#666666"/>
+<path d="M 326.0 164.0 L 326.0 180.0 L 718.0 180.0 L 718.0 196.0" fill="none" stroke="#666666" stroke-width="1"/>
+<polygon points="718.0,196.0 722.5,187.0 713.5,187.0" fill="#666666"/>
+<path d="M 522.0 164.0 L 522.0 180.0 L 718.0 180.0 L 718.0 196.0" fill="none" stroke="#666666" stroke-width="1"/>
+<polygon points="718.0,196.0 722.5,187.0 713.5,187.0" fill="#666666"/>
+<path d="M 718.0 164.0 L 718.0 196.0" fill="none" stroke="#666666" stroke-width="1"/>
+<polygon points="718.0,196.0 722.5,187.0 713.5,187.0" fill="#666666"/>
+<path d="M 914.0 164.0 L 914.0 180.0 L 718.0 180.0 L 718.0 196.0" fill="none" stroke="#666666" stroke-width="1"/>
+<polygon points="718.0,196.0 722.5,187.0 713.5,187.0" fill="#666666"/>
+<path d="M 1110.0 164.0 L 1110.0 180.0 L 718.0 180.0 L 718.0 196.0" fill="none" stroke="#666666" stroke-width="1"/>
+<polygon points="718.0,196.0 722.5,187.0 713.5,187.0" fill="#666666"/>
+<path d="M 1306.0 164.0 L 1306.0 180.0 L 718.0 180.0 L 718.0 196.0" fill="none" stroke="#666666" stroke-width="1"/>
+<polygon points="718.0,196.0 722.5,187.0 713.5,187.0" fill="#666666"/>
+<path d="M 718.0 240.0 L 718.0 290.0 L 750.0 290.0 L 750.0 340.0" fill="none" stroke="#666666" stroke-width="1"/>
+<polygon points="750.0,340.0 754.5,331.0 745.5,331.0" fill="#666666"/>
+<rect x="700.5" y="282.5" width="67.0" height="12.5" fill="#ffffff"/>
+<text x="734.0" y="293.5" text-anchor="middle" font-family="'Microsoft YaHei','Segoe UI',Arial,sans-serif" font-size="10" fill="#555555">submit / poll</text>
+<path d="M 750.0 400.0 L 750.0 426.0" fill="none" stroke="#666666" stroke-width="1"/>
+<polygon points="750.0,426.0 754.5,417.0 745.5,417.0" fill="#666666"/>
+<path d="M 750.0 480.0 L 750.0 498.0" fill="none" stroke="#666666" stroke-width="1"/>
+<polygon points="750.0,498.0 754.5,489.0 745.5,489.0" fill="#666666"/>
+<path d="M 750.0 558.0 L 750.0 578.0" fill="none" stroke="#666666" stroke-width="1"/>
+<polygon points="750.0,578.0 754.5,569.0 745.5,569.0" fill="#666666"/>
+<rect x="715.5" y="560.5" width="69.0" height="12.5" fill="#ffffff"/>
+<text x="750.0" y="571.5" text-anchor="middle" font-family="'Microsoft YaHei','Segoe UI',Arial,sans-serif" font-size="10" fill="#555555">同 inode 保序</text>
+<path d="M 750.0 632.0 L 750.0 652.0" fill="none" stroke="#666666" stroke-width="1"/>
+<polygon points="750.0,652.0 754.5,643.0 745.5,643.0" fill="#666666"/>
+<path d="M 750.0 706.0 L 750.0 728.0" fill="none" stroke="#666666" stroke-width="1"/>
+<polygon points="750.0,728.0 754.5,719.0 745.5,719.0" fill="#666666"/>
+<rect x="726.5" y="709.5" width="47.0" height="12.5" fill="#ffffff"/>
+<text x="750.0" y="720.5" text-anchor="middle" font-family="'Microsoft YaHei','Segoe UI',Arial,sans-serif" font-size="10" fill="#555555">bdev I/O</text>
+<path d="M 750.0 782.0 L 750.0 816.0 L 510.0 816.0 L 510.0 850.0" fill="none" stroke="#666666" stroke-width="1"/>
+<polygon points="510.0,850.0 514.5,841.0 505.5,841.0" fill="#666666"/>
+<rect x="600.0" y="808.5" width="60.0" height="12.5" fill="#ffffff"/>
+<text x="630.0" y="819.5" text-anchor="middle" font-family="'Microsoft YaHei','Segoe UI',Arial,sans-serif" font-size="10" fill="#555555">NVMe 命令</text>
+<path d="M 720.0 878.0 L 760.0 878.0" fill="none" stroke="#666666" stroke-width="1"/>
+<polygon points="760.0,878.0 751.0,873.5 751.0,882.5" fill="#666666"/>
+<path d="M 428.0 353.0 L 464.0 353.0 L 464.0 370.0 L 500.0 370.0" fill="none" stroke="#9673a6" stroke-width="1"/>
+<polygon points="500.0,370.0 491.0,365.5 491.0,374.5" fill="#9673a6"/>
+<rect x="436.0" y="354.0" width="56.0" height="12.5" fill="#ffffff"/>
+<text x="464.0" y="365.0" text-anchor="middle" font-family="'Microsoft YaHei','Segoe UI',Arial,sans-serif" font-size="10" fill="#9673a6">元数据操作</text>
+<path d="M 250.0 386.0 L 250.0 400.0" fill="none" stroke="#9673a6" stroke-width="1"/>
+<polygon points="250.0,400.0 254.5,391.0 245.5,391.0" fill="#9673a6"/>
+<rect x="229.0" y="385.5" width="42.0" height="12.5" fill="#ffffff"/>
+<text x="250.0" y="396.5" text-anchor="middle" font-family="'Microsoft YaHei','Segoe UI',Arial,sans-serif" font-size="10" fill="#9673a6">append</text>
+<path d="M 250.0 466.0 L 250.0 480.0" fill="none" stroke="#9673a6" stroke-width="1"/>
+<polygon points="250.0,480.0 254.5,471.0 245.5,471.0" fill="#9673a6"/>
+<rect x="208.5" y="465.5" width="83.0" height="12.5" fill="#ffffff"/>
+<text x="250.0" y="476.5" text-anchor="middle" font-family="'Microsoft YaHei','Segoe UI',Arial,sans-serif" font-size="10" fill="#9673a6">flush / snapshot</text>
+<path d="M 250.0 546.0 L 250.0 755.0 L 500.0 755.0" fill="none" stroke="#9673a6" stroke-width="1" stroke-dasharray="5 4"/>
+<polygon points="500.0,755.0 491.0,750.5 491.0,759.5" fill="#9673a6"/>
+<rect x="248.5" y="747.5" width="44.0" height="12.5" fill="#ffffff"/>
+<text x="270.5" y="758.5" text-anchor="middle" font-family="'Microsoft YaHei','Segoe UI',Arial,sans-serif" font-size="10" fill="#9673a6">控制 I/O</text>
+<path d="M 1000.0 528.0 L 1026.0 528.0 L 1026.0 542.0 L 1052.0 542.0" fill="none" stroke="#b85450" stroke-width="1" stroke-dasharray="5 4"/>
+<polygon points="1052.0,542.0 1043.0,537.5 1043.0,546.5" fill="#b85450"/>
+</svg>

@@ -5,6 +5,11 @@
 > 当前正式验证口径：单 Application process、单 Engine、真实 NVMe/SPDK bdev；多 NUMA
 > 虚拟机尚未配置完成，因此多 NUMA 只描述架构，不作为当前验证结论。
 
+分层架构图（可编辑源文件 [`uuse_architecture.drawio`](uuse_architecture.drawio)，导出
+[`uuse_architecture.svg`](uuse_architecture.svg) / [`uuse_architecture.png`](uuse_architecture.png)）：
+
+![UUSE 分层架构](uuse_architecture.svg)
+
 ## 1. 结论：顶层边界基本正确，但需要补充实现边界
 
 你给出的图仍然是正确的顶层模型：UUSE 2.0 没有 `uused`，RocksDB/FIO 与 UUSE core
