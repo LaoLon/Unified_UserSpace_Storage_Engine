@@ -205,15 +205,6 @@ spdk/             SPDK 子模块（仓内构建）
 - **仅 Linux x86-64**，依赖 SPDK 与 `uio`/`vfio`。
 - **接口不稳定。** API 与磁盘格式都可能变化，目前没有迁移路径。
 
-## 参与贡献
-
-欢迎提 issue 和 PR。提交前请：
-
-- 跑 `ctest --test-dir build --output-on-failure`，保持全绿；
-- 修改行为前先更新 [`doc/design/uuse.md`](doc/design/uuse.md)，评审以它为准；
-- 提交保持聚焦，subject 使用 conventional commits（`feat:`、`fix:`、`docs:`、
-  `perf:`、`chore:`）。
-
 ## 许可证
 
 MIT，见 [LICENSE](LICENSE)。`spdk/` 子模块按其自身的 BSD-3-Clause 许可分发；

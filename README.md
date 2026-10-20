@@ -225,16 +225,6 @@ spdk/             SPDK submodule (built in-tree)
 - **Unstable interfaces.** Both the API and the on-disk format may change between
   releases, with no migration path yet.
 
-## Contributing
-
-Issues and pull requests are welcome. Before submitting:
-
-- run `ctest --test-dir build --output-on-failure` and keep it green;
-- update [`doc/design/uuse.md`](doc/design/uuse.md) before changing behaviour, since it
-  is the reference the reviews are checked against;
-- keep commits focused and use conventional-commit subjects (`feat:`, `fix:`, `docs:`,
-  `perf:`, `chore:`).
-
 ## License
 
 MIT — see [LICENSE](LICENSE). The `spdk/` submodule is distributed under its own
