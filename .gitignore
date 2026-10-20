@@ -1,6 +1,7 @@
 /build/
 /src_legacy_frozen/
 /compile_commands.json
+/.vscode/
 /spdk/build/
 /spdk/dpdk/build/
 /spdk/dpdk/build-tmp/
